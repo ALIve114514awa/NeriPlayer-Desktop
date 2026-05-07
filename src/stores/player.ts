@@ -92,6 +92,40 @@ let _interpIsPlaying = false    // 当前播放状态快照
 let _interpDurationMs = 0       // 当前时长快照
 let _interpLoopStarted = false  // rAF 循环是否已启动
 
+// ─── 批次 1.2: 连续失败熔断 ───
+let consecutivePlayFailures = 0
+const MAX_CONSECUTIVE_FAILURES = 10
+let _isAutoSkipping = false
+
+// ─── 批次 2.1: Shuffle 三栈模型 ───
+let shuffleBag: number[] = []       // 未播放索引池
+let shuffleHistory: number[] = []   // 已播放栈 (previous 回溯)
+let shuffleFuture: number[] = []    // 预排队栈 (next 或 previous 回退)
+
+// ─── 批次 2.2: playbackRequestToken 防竞态 ───
+let playbackRequestToken = 0
+
+// ─── 批次 2.3: URL 过期检测 (10min) ───
+let lastUrlResolveTime = 0
+const URL_EXPIRY_MS = 10 * 60 * 1000
+
+// ─── 批次 2.4: Track End 去重 ───
+let lastTrackEndedId: string | null = null
+let lastTrackEndedTime = 0
+
+// ─── 批次 5.1: YouTube URL 预热缓存 ───
+const prefetchedUrls = new Map<string, { url: string; time: number; bitrate: number; mime_type: string }>()
+const PREFETCH_TTL_MS = 8 * 60 * 1000
+
+// ─── 批次 1.1: 状态持久化 ───
+const PLAYER_STATE_KEY = 'neri:player-state'
+let _persistDebounceTimer: ReturnType<typeof setTimeout> | null = null
+let _progressPersistTime = 0
+const PERSIST_DEBOUNCE_MS = 250
+const PROGRESS_PERSIST_INTERVAL_MS = 15000
+// 恢复后需重新加载标记
+let _needsReload = false
+
 export const usePlayerStore = defineStore('player', () => {
   const isPlaying = ref(false)
   const currentTrack = ref<TrackInfo | null>(null)
@@ -187,6 +221,153 @@ export const usePlayerStore = defineStore('player', () => {
   // seek 后第一次接受 position 事件时的目标位置，用于检测偏差过大的旧事件
   let seekTargetMs: number | null = null
 
+  // ─── 状态持久化函数 ───
+
+  /** 保存播放器状态到 localStorage（250ms debounce） */
+  function savePlayerState() {
+    if (_persistDebounceTimer) clearTimeout(_persistDebounceTimer)
+    _persistDebounceTimer = setTimeout(() => {
+      _persistDebounceTimer = null
+      try {
+        const settings = useSettingsStore()
+        const state: Record<string, any> = {
+          queue: queue.value,
+          queueIndex: queueIndex.value,
+          volume: volume.value,
+        }
+        if (settings.keepProgress) {
+          state.positionMs = positionMs.value
+        }
+        if (settings.keepPlaybackMode) {
+          state.repeatMode = repeatMode.value
+          state.shuffleEnabled = shuffleEnabled.value
+        }
+        localStorage.setItem(PLAYER_STATE_KEY, JSON.stringify(state))
+      } catch { /* 存储失败忽略 */ }
+    }, PERSIST_DEBOUNCE_MS)
+  }
+
+  /** 从 localStorage 恢复播放器状态（store 初始化时调用，不自动播放） */
+  function loadPlayerState() {
+    try {
+      const raw = localStorage.getItem(PLAYER_STATE_KEY)
+      if (!raw) return
+      const state = JSON.parse(raw)
+      const settings = useSettingsStore()
+
+      if (Array.isArray(state.queue) && state.queue.length > 0) {
+        queue.value = state.queue.map(normalizeTrack)
+        queueIndex.value = typeof state.queueIndex === 'number'
+          ? Math.min(Math.max(state.queueIndex, 0), queue.value.length - 1)
+          : 0
+        currentTrack.value = queue.value[queueIndex.value] ?? null
+        _needsReload = true
+      }
+
+      if (settings.keepProgress && typeof state.positionMs === 'number') {
+        positionMs.value = state.positionMs
+        interpolatedPositionMs.value = state.positionMs
+      }
+
+      if (settings.keepPlaybackMode) {
+        if (state.repeatMode && ['off', 'all', 'one'].includes(state.repeatMode)) {
+          repeatMode.value = state.repeatMode
+        }
+        if (typeof state.shuffleEnabled === 'boolean') {
+          shuffleEnabled.value = state.shuffleEnabled
+          if (state.shuffleEnabled && queue.value.length > 1) {
+            rebuildShuffleBag()
+          }
+        }
+      }
+
+      if (typeof state.volume === 'number') {
+        volume.value = Math.max(0, Math.min(1, state.volume))
+      }
+
+      // 恢复 durationMs 以便 UI 显示进度条
+      if (currentTrack.value && currentTrack.value.durationMs > 0) {
+        durationMs.value = currentTrack.value.durationMs
+      }
+    } catch { /* 恢复失败忽略 */ }
+  }
+
+  /** 节流保存进度（每 15s，对齐 Android scheduleStatePersist） */
+  function maybePersistProgress() {
+    const now = Date.now()
+    if (now - _progressPersistTime >= PROGRESS_PERSIST_INTERVAL_MS) {
+      _progressPersistTime = now
+      savePlayerState()
+    }
+  }
+
+  // ─── Shuffle 三栈辅助函数 ───
+
+  /** Fisher-Yates 洗牌重建 shuffleBag，排除当前索引 */
+  function rebuildShuffleBag() {
+    shuffleBag = []
+    for (let i = 0; i < queue.value.length; i++) {
+      if (i !== queueIndex.value) shuffleBag.push(i)
+    }
+    for (let i = shuffleBag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffleBag[i], shuffleBag[j]] = [shuffleBag[j], shuffleBag[i]]
+    }
+  }
+
+  /** 队列插入后更新 shuffle 索引 */
+  function shiftShuffleIndicesForInsert(insertIdx: number) {
+    shuffleBag = shuffleBag.map(i => i >= insertIdx ? i + 1 : i)
+    shuffleHistory = shuffleHistory.map(i => i >= insertIdx ? i + 1 : i)
+    shuffleFuture = shuffleFuture.map(i => i >= insertIdx ? i + 1 : i)
+    shuffleBag.push(insertIdx) // 新曲目加入未播放池
+  }
+
+  /** 队列移除后更新 shuffle 索引 */
+  function shiftShuffleIndicesForRemove(removeIdx: number) {
+    shuffleBag = shuffleBag.filter(i => i !== removeIdx).map(i => i > removeIdx ? i - 1 : i)
+    shuffleHistory = shuffleHistory.filter(i => i !== removeIdx).map(i => i > removeIdx ? i - 1 : i)
+    shuffleFuture = shuffleFuture.filter(i => i !== removeIdx).map(i => i > removeIdx ? i - 1 : i)
+  }
+
+  // ─── YouTube URL 预热 ───
+
+  /** 预热下一首 YouTube 曲目的 URL */
+  function maybePrefetchNext() {
+    if (!queue.value.length) return
+    let nextIdx: number
+    if (shuffleEnabled.value) {
+      if (shuffleFuture.length > 0) nextIdx = shuffleFuture[shuffleFuture.length - 1]
+      else if (shuffleBag.length > 0) nextIdx = shuffleBag[0]
+      else return
+    } else {
+      nextIdx = queueIndex.value + 1
+      if (nextIdx >= queue.value.length) {
+        if (repeatMode.value === 'all') nextIdx = 0
+        else return
+      }
+    }
+
+    const nextTrack = queue.value[nextIdx]
+    if (!nextTrack || !nextTrack.id.startsWith('youtube:')) return
+
+    // 缓存未过期则跳过
+    const cached = prefetchedUrls.get(nextTrack.id)
+    if (cached && Date.now() - cached.time < PREFETCH_TTL_MS) return
+
+    const videoId = nextTrack.id.replace('youtube:', '')
+    invoke<{ url: string; bitrate: number; mime_type: string }[]>('get_youtube_audio_url', { videoId })
+      .then(streams => {
+        const best = streams?.[0]
+        if (best?.url) {
+          prefetchedUrls.set(nextTrack.id, {
+            url: best.url, time: Date.now(), bitrate: best.bitrate, mime_type: best.mime_type,
+          })
+        }
+      })
+      .catch(() => {}) // 预热失败不影响主流程
+  }
+
   /** 启动 rAF 插值循环（仅调用一次） */
   function _startInterpolationLoop() {
     if (_interpLoopStarted) return
@@ -250,6 +431,11 @@ export const usePlayerStore = defineStore('player', () => {
       _interpAnchorMs = e.payload.positionMs
       _interpAnchorTime = performance.now()
       _interpDurationMs = e.payload.durationMs
+
+      // 节流保存播放进度（每 15s）
+      if (_interpIsPlaying) {
+        maybePersistProgress()
+      }
     })
 
     // 监听音频电平
@@ -262,10 +448,39 @@ export const usePlayerStore = defineStore('player', () => {
     listen('player:track-ended', () => {
       handleTrackEnded()
     })
+
+    // ─── 系统媒体键事件（SMTC / MPRIS，来自 Rust 后端） ───
+    listen<{ isPlaying: boolean }>('media:play-state-changed', (e) => {
+      isPlaying.value = e.payload.isPlaying
+      _interpIsPlaying = e.payload.isPlaying
+      if (e.payload.isPlaying) {
+        _interpAnchorMs = positionMs.value
+        _interpAnchorTime = performance.now()
+        _interpRenderedMs = positionMs.value
+        _interpSpeed = playbackSpeed.value
+      }
+    })
+
+    listen('media:next', () => {
+      next()
+    })
+
+    listen('media:previous', () => {
+      previous()
+    })
+
+    listen<{ positionMs: number }>('media:seeked', (e) => {
+      positionMs.value = e.payload.positionMs
+      _interpAnchorMs = e.payload.positionMs
+      _interpAnchorTime = performance.now()
+      _interpRenderedMs = e.payload.positionMs
+      interpolatedPositionMs.value = e.payload.positionMs
+    })
   }
 
   async function play(track: TrackInfo) {
     initEvents()
+    const token = ++playbackRequestToken
 
     // 加入队列
     if (!queue.value.find(t => t.id === track.id)) {
@@ -280,15 +495,28 @@ export const usePlayerStore = defineStore('player', () => {
       isLoadingAudio.value = true
       audioInfo.value = null
 
+      // Crossfade 判断：当前有正在播放的曲目且 crossfade 开启
+      const settings = useSettingsStore()
+      const useCrossfade = isPlaying.value && settings.crossfadeNext
+        && settings.crossfadeOutDuration > 0 && settings.crossfadeInDuration > 0
+
       if (track.id.startsWith('netease:')) {
         // 网易云：先获取播放 URL，再调用 play_url
-        const settings = useSettingsStore()
         const songId = parseInt(track.id.replace('netease:', ''))
         const urlResult = await invoke<{ url: string | null; bitrate: number; format: string }>('get_netease_song_url', {
           songId, quality: settings.neteaseQuality,
         })
+        if (token !== playbackRequestToken) return
         if (urlResult.url) {
-          dur = await invoke<number>('play_url', { url: urlResult.url, durationHintMs: track.durationMs })
+          if (useCrossfade) {
+            dur = await invoke<number>('crossfade_url', {
+              url: urlResult.url, durationHintMs: track.durationMs,
+              fadeOutMs: settings.crossfadeOutDuration, fadeInMs: settings.crossfadeInDuration,
+            })
+          } else {
+            dur = await invoke<number>('play_url', { url: urlResult.url, durationHintMs: track.durationMs })
+          }
+          if (token !== playbackRequestToken) return
           audioInfo.value = {
             bitrate: urlResult.bitrate > 0 ? Math.round(urlResult.bitrate / 1000) : undefined,
             codec: urlResult.format ? urlResult.format.toUpperCase() : undefined,
@@ -309,25 +537,60 @@ export const usePlayerStore = defineStore('player', () => {
           avid: isAvid ? parseInt(biliId) : null,
           cid: cid || null,
         })
-        dur = await invoke<number>('play_url', { url: result.url, durationHintMs: track.durationMs })
+        if (token !== playbackRequestToken) return
+        if (useCrossfade) {
+          dur = await invoke<number>('crossfade_url', {
+            url: result.url, durationHintMs: track.durationMs,
+            fadeOutMs: settings.crossfadeOutDuration, fadeInMs: settings.crossfadeInDuration,
+          })
+        } else {
+          dur = await invoke<number>('play_url', { url: result.url, durationHintMs: track.durationMs })
+        }
+        if (token !== playbackRequestToken) return
         audioInfo.value = {
           bitrate: result.bandwidth > 0 ? Math.round(result.bandwidth / 1000) : undefined,
           codec: result.codecs || undefined,
         }
       } else if (track.id.startsWith('youtube:')) {
-        // YouTube：获取音频流，选最高码率
+        // YouTube：获取音频流，优先使用预热缓存
         const videoId = track.id.replace('youtube:', '')
-        const streams = await invoke<{ url: string; bitrate: number; mime_type: string }[]>('get_youtube_audio_url', { videoId })
-        const best = streams?.[0]
+        let best: { url: string; bitrate: number; mime_type: string } | undefined
+
+        const cached = prefetchedUrls.get(track.id)
+        if (cached && Date.now() - cached.time < PREFETCH_TTL_MS) {
+          best = cached
+          prefetchedUrls.delete(track.id)
+        } else {
+          const streams = await invoke<{ url: string; bitrate: number; mime_type: string }[]>('get_youtube_audio_url', { videoId })
+          if (token !== playbackRequestToken) return
+          best = streams?.[0]
+        }
+
         if (!best?.url) throw new Error('No YouTube audio stream')
-        dur = await invoke<number>('play_url', { url: best.url, durationHintMs: track.durationMs || 0 })
+        if (useCrossfade) {
+          dur = await invoke<number>('crossfade_url', {
+            url: best.url, durationHintMs: track.durationMs || 0,
+            fadeOutMs: settings.crossfadeOutDuration, fadeInMs: settings.crossfadeInDuration,
+          })
+        } else {
+          dur = await invoke<number>('play_url', { url: best.url, durationHintMs: track.durationMs || 0 })
+        }
+        if (token !== playbackRequestToken) return
         audioInfo.value = {
           bitrate: best.bitrate > 0 ? Math.round(best.bitrate / 1000) : undefined,
           codec: extractCodecFromMime(best.mime_type),
         }
       } else {
         // 本地文件
-        dur = await invoke<number>('play_file', { path: track.audioUrl })
+        if (useCrossfade) {
+          dur = await invoke<number>('crossfade_file', {
+            path: track.audioUrl,
+            fadeOutMs: settings.crossfadeOutDuration, fadeInMs: settings.crossfadeInDuration,
+          })
+        } else {
+          dur = await invoke<number>('play_file', { path: track.audioUrl })
+        }
+        if (token !== playbackRequestToken) return
       }
 
       durationMs.value = dur || track.durationMs
@@ -344,22 +607,59 @@ export const usePlayerStore = defineStore('player', () => {
       _interpDurationMs = durationMs.value
       interpolatedPositionMs.value = 0
 
+      // 重置连续失败计数
+      consecutivePlayFailures = 0
+      // 记录 URL 解析时间（用于过期检测）
+      lastUrlResolveTime = Date.now()
+      // 标记已加载（取消 restore 重载标记）
+      _needsReload = false
+
       // 记录播放历史
       const history = useHistoryStore()
       history.record(track)
+
+      // 持久化状态 + 预热下一首
+      savePlayerState()
+      maybePrefetchNext()
     } catch (e) {
+      if (token !== playbackRequestToken) return // 竞态过期请求，静默忽略
+
       const msg = e instanceof Error ? e.message : String(e)
       console.error('Play failed:', msg)
       playError.value = msg
       isPlaying.value = false
       isLoadingAudio.value = false
-      // 通过 Toast 通知用户
+
       const toast = useToastStore()
       toast.error((i18n.global as any).t('player.play_failed', { msg }))
+
+      // 连续失败熔断 + 自动 skip
+      consecutivePlayFailures++
+      if (consecutivePlayFailures < MAX_CONSECUTIVE_FAILURES && queue.value.length > 1) {
+        _isAutoSkipping = true
+        try {
+          await next(true)
+        } finally {
+          _isAutoSkipping = false
+        }
+      } else if (consecutivePlayFailures >= MAX_CONSECUTIVE_FAILURES) {
+        toast.error((i18n.global as any).t('player.too_many_failures', '连续播放失败过多，已停止'))
+      }
     }
   }
 
   async function togglePlayPause() {
+    // 恢复后首次播放：需要重新加载曲目
+    if (!isPlaying.value && currentTrack.value && _needsReload) {
+      _needsReload = false
+      const savedPos = positionMs.value
+      await play(currentTrack.value)
+      if (savedPos > 1000) {
+        setTimeout(() => seekTo(savedPos), 300)
+      }
+      return
+    }
+
     // 乐观更新：立即翻转 UI 状态，消除 IPC 延迟感
     const optimistic = !isPlaying.value
     isPlaying.value = optimistic
@@ -391,10 +691,31 @@ export const usePlayerStore = defineStore('player', () => {
     // 乐观更新
     isPlaying.value = false
     _interpIsPlaying = false
-    try { await invoke('pause') } catch {}
+    try {
+      const settings = useSettingsStore()
+      if (settings.fadeIn && settings.fadeOutDuration > 0) {
+        await invoke('pause_with_fade', { durationMs: settings.fadeOutDuration })
+      } else {
+        await invoke('pause')
+      }
+    } catch {}
+    savePlayerState()
   }
 
   async function resume() {
+    // URL 过期检测（10min）：在线来源 URL 过期后需重新解析
+    const isOnlineSource = currentTrack.value && (
+      currentTrack.value.id.startsWith('netease:')
+      || currentTrack.value.id.startsWith('bilibili:')
+      || currentTrack.value.id.startsWith('youtube:')
+    )
+    if (isOnlineSource && lastUrlResolveTime > 0
+      && Date.now() - lastUrlResolveTime > URL_EXPIRY_MS) {
+      // URL 已过期，重新解析
+      await play(currentTrack.value!)
+      return
+    }
+
     // 乐观更新
     isPlaying.value = true
     _interpAnchorMs = positionMs.value
@@ -402,7 +723,14 @@ export const usePlayerStore = defineStore('player', () => {
     _interpRenderedMs = positionMs.value
     _interpIsPlaying = true
     _interpSpeed = playbackSpeed.value
-    try { await invoke('resume') } catch {}
+    try {
+      const settings = useSettingsStore()
+      if (settings.fadeIn && settings.fadeInDuration > 0) {
+        await invoke('resume_with_fade', { durationMs: settings.fadeInDuration })
+      } else {
+        await invoke('resume')
+      }
+    } catch {}
   }
 
   async function seekTo(ms: number) {
@@ -434,6 +762,14 @@ export const usePlayerStore = defineStore('player', () => {
    * - off: 还有下一首则推进，否则停止播放但保留队列
    */
   async function handleTrackEnded() {
+    // Track End 去重：200ms ticker 可能重复触发
+    const trackId = currentTrack.value?.id ?? null
+    if (trackId && trackId === lastTrackEndedId && Date.now() - lastTrackEndedTime < 2000) {
+      return
+    }
+    lastTrackEndedId = trackId
+    lastTrackEndedTime = Date.now()
+
     // 睡眠定时器
     const isLast = !shuffleEnabled.value && queueIndex.value >= queue.value.length - 1
     if (sleepTimerMode.value === 'end_of_track') {
@@ -473,17 +809,41 @@ export const usePlayerStore = defineStore('player', () => {
    * 用户手动下一首（对齐 Android nextImpl）
    * - 不管 repeat_one，始终推进
    * - force=true 时列表末尾回绕
+   * - Shuffle 模式使用三栈模型
    */
   async function next(force: boolean = false) {
     if (queue.value.length === 0) return
+    // 用户手动操作重置失败计数（自动 skip 不重置）
+    if (!_isAutoSkipping) consecutivePlayFailures = 0
+
     let nextIdx: number
     if (shuffleEnabled.value) {
-      if (queue.value.length === 1) {
-        nextIdx = 0
+      // ─── Shuffle 三栈模型 ───
+      if (shuffleFuture.length > 0) {
+        // 优先从 future 栈弹出（previous 回退过的）
+        shuffleHistory.push(queueIndex.value)
+        nextIdx = shuffleFuture.pop()!
+      } else if (shuffleBag.length > 0) {
+        // 从未播放池随机取
+        shuffleHistory.push(queueIndex.value)
+        const bagIdx = Math.floor(Math.random() * shuffleBag.length)
+        nextIdx = shuffleBag[bagIdx]
+        shuffleBag.splice(bagIdx, 1)
       } else {
-        do {
-          nextIdx = Math.floor(Math.random() * queue.value.length)
-        } while (nextIdx === queueIndex.value)
+        // bag 已空
+        if (force || repeatMode.value === 'all') {
+          rebuildShuffleBag()
+          if (shuffleBag.length > 0) {
+            shuffleHistory.push(queueIndex.value)
+            const bagIdx = Math.floor(Math.random() * shuffleBag.length)
+            nextIdx = shuffleBag[bagIdx]
+            shuffleBag.splice(bagIdx, 1)
+          } else {
+            return
+          }
+        } else {
+          return // 顺序播放结束
+        }
       }
     } else {
       if (queueIndex.value < queue.value.length - 1) {
@@ -503,20 +863,38 @@ export const usePlayerStore = defineStore('player', () => {
   /**
    * 用户手动上一首（对齐 Android previousImpl）
    * - 播放超过 3 秒则回到开头
+   * - Shuffle 模式使用 history 栈回溯
    * - 非 shuffle：只有 repeat_all 才回绕到末尾
    */
   async function previous() {
+    consecutivePlayFailures = 0
     if (queue.value.length === 0) return
+
+    // 播放超过 3 秒则回到开头
     if (positionMs.value > 3000) {
       seekTo(0)
-    } else {
-      if (queueIndex.value > 0) {
-        await play(queue.value[queueIndex.value - 1])
-      } else if (repeatMode.value === 'all') {
-        await play(queue.value[queue.value.length - 1])
-      }
-      // else: 已在开头且非列表循环，不动
+      return
     }
+
+    if (shuffleEnabled.value) {
+      // Shuffle：从 history 栈回溯
+      if (shuffleHistory.length > 0) {
+        shuffleFuture.push(queueIndex.value)
+        const prevIdx = shuffleHistory.pop()!
+        await play(queue.value[prevIdx])
+      } else {
+        seekTo(0) // 无历史，重新开始当前曲目
+      }
+      return
+    }
+
+    // 非 shuffle 模式
+    if (queueIndex.value > 0) {
+      await play(queue.value[queueIndex.value - 1])
+    } else if (repeatMode.value === 'all') {
+      await play(queue.value[queue.value.length - 1])
+    }
+    // else: 已在开头且非列表循环，不动
   }
 
   async function toggleRepeatMode() {
@@ -528,6 +906,7 @@ export const usePlayerStore = defineStore('player', () => {
       const idx = modes.indexOf(repeatMode.value)
       repeatMode.value = modes[(idx + 1) % modes.length]
     }
+    savePlayerState()
   }
 
   async function toggleShuffle() {
@@ -537,10 +916,21 @@ export const usePlayerStore = defineStore('player', () => {
     } catch {
       shuffleEnabled.value = !shuffleEnabled.value
     }
+    // Shuffle 三栈管理
+    if (shuffleEnabled.value) {
+      rebuildShuffleBag()
+      shuffleHistory = []
+      shuffleFuture = []
+    } else {
+      shuffleBag = []
+      shuffleHistory = []
+      shuffleFuture = []
+    }
+    savePlayerState()
   }
 
   /**
-   * 统一播放模式循环切换：顺序播放 → 列表循环 → 单曲循环 → 随机播放 → 顺序播放
+   * 统一播放模式循环切换：顺序播放 -> 列表循环 -> 单曲循环 -> 随机播放 -> 顺序播放
    * 合并 repeat + shuffle 为一个按钮的逻辑
    */
   type PlayMode = 'sequential' | 'repeat_all' | 'repeat_one' | 'shuffle'
@@ -556,33 +946,35 @@ export const usePlayerStore = defineStore('player', () => {
     const current = playMode.value
     switch (current) {
       case 'sequential':
-        // → 列表循环
+        // -> 列表循环
         if (shuffleEnabled.value) await toggleShuffle()
         repeatMode.value = 'all'
         try { await invoke<string>('cycle_repeat') } catch {}
         break
       case 'repeat_all':
-        // → 单曲循环
+        // -> 单曲循环
         repeatMode.value = 'one'
         try { await invoke<string>('cycle_repeat') } catch {}
         break
       case 'repeat_one':
-        // → 随机播放
+        // -> 随机播放
         repeatMode.value = 'off'
         try { await invoke<string>('cycle_repeat') } catch {}
         if (!shuffleEnabled.value) await toggleShuffle()
         break
       case 'shuffle':
-        // → 顺序播放
+        // -> 顺序播放
         if (shuffleEnabled.value) await toggleShuffle()
         repeatMode.value = 'off'
         break
     }
+    savePlayerState()
   }
 
   async function setVolume(vol: number) {
     volume.value = vol
     try { await invoke('set_volume', { level: vol }) } catch {}
+    savePlayerState()
   }
 
   // 播放速度
@@ -647,6 +1039,9 @@ export const usePlayerStore = defineStore('player', () => {
     if (tracks.length === 0) return
     queue.value = [...tracks]
     queueIndex.value = 0
+    shuffleBag = []
+    shuffleHistory = []
+    shuffleFuture = []
     play(tracks[0])
   }
 
@@ -660,6 +1055,9 @@ export const usePlayerStore = defineStore('player', () => {
     }
     queue.value = shuffled
     queueIndex.value = 0
+    shuffleBag = []
+    shuffleHistory = []
+    shuffleFuture = []
     play(shuffled[0])
   }
 
@@ -667,29 +1065,43 @@ export const usePlayerStore = defineStore('player', () => {
   function addToQueueNext(track: TrackInfo) {
     const existing = queue.value.findIndex(t => t.id === track.id)
     if (existing !== -1) {
+      if (shuffleEnabled.value) shiftShuffleIndicesForRemove(existing)
       queue.value.splice(existing, 1)
       if (existing < queueIndex.value) queueIndex.value--
     }
     const idx = queueIndex.value + 1
     queue.value.splice(idx, 0, track)
+    if (shuffleEnabled.value) shiftShuffleIndicesForInsert(idx)
+    savePlayerState()
   }
 
   // 追加到队列末尾
   function addToQueueEnd(track: TrackInfo) {
     if (!queue.value.find(t => t.id === track.id)) {
       queue.value.push(track)
+      if (shuffleEnabled.value) {
+        shuffleBag.push(queue.value.length - 1)
+      }
     }
+    savePlayerState()
   }
 
   // 从队列移除指定索引
   function removeFromQueue(index: number) {
     if (index < 0 || index >= queue.value.length) return
     const wasCurrentTrack = index === queueIndex.value
+
+    if (shuffleEnabled.value) shiftShuffleIndicesForRemove(index)
+
     queue.value.splice(index, 1)
     if (queue.value.length === 0) {
       queueIndex.value = -1
       currentTrack.value = null
+      shuffleBag = []
+      shuffleHistory = []
+      shuffleFuture = []
       pause()
+      savePlayerState()
       return
     }
     if (index < queueIndex.value) {
@@ -700,12 +1112,17 @@ export const usePlayerStore = defineStore('player', () => {
       // 同步 currentTrack 到新索引指向的曲目
       currentTrack.value = queue.value[queueIndex.value]
     }
+    savePlayerState()
   }
 
   // 清空队列
   function clearQueue() {
     queue.value = []
     queueIndex.value = -1
+    shuffleBag = []
+    shuffleHistory = []
+    shuffleFuture = []
+    savePlayerState()
   }
 
   // 编辑当前曲目信息（仅前端状态，不持久化）
@@ -741,6 +1158,13 @@ export const usePlayerStore = defineStore('player', () => {
       // 等一小段让播放开始后再 seek
       setTimeout(() => seekTo(pos), 300)
     }
+  }
+
+  // ─── 初始化：恢复持久化状态 ───
+  loadPlayerState()
+  // 同步恢复的音量到后端
+  if (volume.value !== 1) {
+    invoke('set_volume', { level: volume.value }).catch(() => {})
   }
 
   return {

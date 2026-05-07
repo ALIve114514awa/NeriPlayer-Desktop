@@ -27,6 +27,9 @@ enum AudioSource {
     File(String),
 }
 
+/// Fade 步进间隔
+const FADE_STEP_MS: u64 = 20;
+
 // 音频线程命令
 enum AudioCmd {
     PlayBytes {
@@ -49,6 +52,29 @@ enum AudioCmd {
     },
     QueryEmpty {
         reply: mpsc::Sender<bool>,
+    },
+    /// 渐出后暂停：在 duration_ms 内将音量降至 0，然后 pause
+    FadeOutPause {
+        duration_ms: u32,
+    },
+    /// resume 后渐入：先 resume，然后在 duration_ms 内将音量从 0 升至目标音量
+    FadeInResume {
+        duration_ms: u32,
+    },
+    /// Crossfade 播放新字节流：对当前 sink fade out，新 sink fade in
+    CrossfadeBytes {
+        data: Vec<u8>,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    /// Crossfade 播放新文件
+    CrossfadeFile {
+        path: String,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        reply: mpsc::Sender<Result<u64, String>>,
     },
 }
 
@@ -261,11 +287,44 @@ impl PlayerEngine {
         }
     }
 
+    /// 在音频线程中执行 fade out（阻塞调用线程）
+    fn do_fade_out_sink(sink: &Sink, target_volume: f32, duration_ms: u32) {
+        if duration_ms == 0 {
+            sink.set_volume(0.0);
+            return;
+        }
+        let steps = (duration_ms as u64 / FADE_STEP_MS).max(1);
+        let start_vol = target_volume;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            sink.set_volume(start_vol * (1.0 - t));
+            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
+        }
+        sink.set_volume(0.0);
+    }
+
+    /// 在音频线程中执行 fade in（阻塞调用线程）
+    fn do_fade_in_sink(sink: &Sink, target_volume: f32, duration_ms: u32) {
+        if duration_ms == 0 {
+            sink.set_volume(target_volume);
+            return;
+        }
+        let steps = (duration_ms as u64 / FADE_STEP_MS).max(1);
+        sink.set_volume(0.0);
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            sink.set_volume(target_volume * t);
+            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
+        }
+        sink.set_volume(target_volume);
+    }
+
     /// 音频线程主循环
     fn audio_thread(rx: mpsc::Receiver<AudioCmd>, shared_level: Arc<Mutex<SharedAudioLevel>>, effects_params: Arc<std::sync::Mutex<AudioEffectsParams>>) {
         let mut stream: Option<OutputStream> = None;
         let mut handle: Option<rodio::OutputStreamHandle> = None;
         let mut current_sink: Option<Sink> = None;
+        let mut prev_sink: Option<Sink> = None; // crossfade 过渡用
         let mut current_volume: f32 = 1.0;
         let mut current_speed: f32 = 1.0;
         // 保留当前音频来源，用于 seek 时重建 decoder
@@ -461,6 +520,147 @@ impl PlayerEngine {
                     };
                     let _ = reply.send(empty);
                 }
+
+                AudioCmd::FadeOutPause { duration_ms } => {
+                    if let Some(ref sink) = current_sink {
+                        Self::do_fade_out_sink(sink, current_volume, duration_ms);
+                        sink.pause();
+                        // 恢复 volume 设置（pause 状态下不影响听感）
+                        sink.set_volume(current_volume);
+                    }
+                }
+
+                AudioCmd::FadeInResume { duration_ms } => {
+                    if let Some(ref sink) = current_sink {
+                        sink.set_volume(0.0);
+                        sink.play();
+                        Self::do_fade_in_sink(sink, current_volume, duration_ms);
+                    }
+                }
+
+                AudioCmd::CrossfadeBytes { data, duration_hint_ms, fade_out_ms, fade_in_ms, reply } => {
+                    let result = (|| -> Result<u64, String> {
+                        ensure_output!();
+                        let h = handle.as_ref()
+                            .ok_or_else(|| "No audio output available".to_string())?;
+
+                        // 将当前 sink 移入 prev_sink 进行 fade out
+                        if let Some(old_prev) = prev_sink.take() {
+                            old_prev.stop();
+                        }
+                        let old_sink = current_sink.take();
+
+                        // 创建新 sink
+                        let source = AudioSource::Bytes(data);
+                        let (dec, dur) = Self::make_decoder(&source)?;
+                        let duration_ms_val = if dur > 0 { dur } else { duration_hint_ms };
+
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
+                        let loud = LoudnessSource::new(eq, effects_params.clone());
+                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
+
+                        let new_sink = Sink::try_new(h)
+                            .map_err(|e| format!("Sink error: {}", e))?;
+                        new_sink.set_volume(0.0); // 从 0 开始 fade in
+                        new_sink.set_speed(current_speed);
+                        new_sink.append(analyzing);
+
+                        current_sink = Some(new_sink);
+                        current_source = Some(source);
+                        current_duration_ms = duration_ms_val;
+
+                        // 执行 crossfade（在音频线程中阻塞）
+                        let fade_duration = fade_out_ms.max(fade_in_ms);
+                        let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
+                        for i in 1..=steps {
+                            // fade out 旧 sink
+                            if let Some(ref old) = old_sink {
+                                let out_t = (i as f32 / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                old.set_volume(current_volume * (1.0 - out_t));
+                            }
+                            // fade in 新 sink
+                            if let Some(ref new_s) = current_sink {
+                                let in_t = (i as f32 / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                new_s.set_volume(current_volume * in_t);
+                            }
+                            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
+                        }
+                        // 清理旧 sink
+                        if let Some(old) = old_sink {
+                            old.stop();
+                        }
+                        // 确保新 sink 到目标音量
+                        if let Some(ref s) = current_sink {
+                            s.set_volume(current_volume);
+                        }
+
+                        Ok(duration_ms_val)
+                    })();
+                    let _ = reply.send(result);
+                }
+
+                AudioCmd::CrossfadeFile { path, fade_out_ms, fade_in_ms, reply } => {
+                    let result = (|| -> Result<u64, String> {
+                        ensure_output!();
+                        let h = handle.as_ref()
+                            .ok_or_else(|| "No audio output available".to_string())?;
+
+                        // 将当前 sink 移入 prev_sink 进行 fade out
+                        if let Some(old_prev) = prev_sink.take() {
+                            old_prev.stop();
+                        }
+                        let old_sink = current_sink.take();
+
+                        // 创建新 sink
+                        let source = AudioSource::File(path);
+                        let (dec, dur) = Self::make_decoder(&source)?;
+
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
+                        let loud = LoudnessSource::new(eq, effects_params.clone());
+                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
+
+                        let new_sink = Sink::try_new(h)
+                            .map_err(|e| format!("Sink error: {}", e))?;
+                        new_sink.set_volume(0.0);
+                        new_sink.set_speed(current_speed);
+                        new_sink.append(analyzing);
+
+                        current_sink = Some(new_sink);
+                        current_source = Some(source);
+                        current_duration_ms = dur;
+
+                        // 执行 crossfade
+                        let fade_duration = fade_out_ms.max(fade_in_ms);
+                        let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
+                        for i in 1..=steps {
+                            if let Some(ref old) = old_sink {
+                                let out_t = (i as f32 / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                old.set_volume(current_volume * (1.0 - out_t));
+                            }
+                            if let Some(ref new_s) = current_sink {
+                                let in_t = (i as f32 / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                new_s.set_volume(current_volume * in_t);
+                            }
+                            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
+                        }
+                        if let Some(old) = old_sink {
+                            old.stop();
+                        }
+                        if let Some(ref s) = current_sink {
+                            s.set_volume(current_volume);
+                        }
+
+                        Ok(dur)
+                    })();
+                    let _ = reply.send(result);
+                }
+            }
+
+            // 清理已完成的 prev_sink（crossfade 残留）
+            if let Some(ref ps) = prev_sink {
+                if ps.empty() {
+                    prev_sink = None;
+                }
             }
         }
     }
@@ -648,5 +848,67 @@ impl PlayerEngine {
             self.accumulated_ms += (wall_ms * self.speed as f64) as u64;
         }
         self.is_playing = false;
+    }
+
+    /// 渐出后暂停（fire-and-forget，音频线程异步执行）
+    pub fn pause_with_fade(&mut self, duration_ms: u32) {
+        if let Some(start) = self.play_start_time.take() {
+            let wall_ms = start.elapsed().as_millis() as f64;
+            self.accumulated_ms += (wall_ms * self.speed as f64) as u64;
+        }
+        let _ = self.cmd_tx.send(AudioCmd::FadeOutPause { duration_ms });
+        self.is_playing = false;
+    }
+
+    /// 渐入后恢复（fire-and-forget）
+    pub fn resume_with_fade(&mut self, duration_ms: u32) {
+        self.play_start_time = Some(Instant::now());
+        let _ = self.cmd_tx.send(AudioCmd::FadeInResume { duration_ms });
+        self.is_playing = true;
+    }
+
+    /// Crossfade 播放内存音频数据
+    pub fn crossfade_bytes(&mut self, data: Vec<u8>, duration_hint_ms: u64, fade_out_ms: u32, fade_in_ms: u32) -> AppResult<u64> {
+        self.ensure_alive();
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx.send(AudioCmd::CrossfadeBytes {
+            data, duration_hint_ms, fade_out_ms, fade_in_ms, reply: tx,
+        }).map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        // crossfade 包含 fade 时间，给更长的超时
+        let timeout = RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
+        let duration_ms = rx.recv_timeout(timeout)
+            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
+            .map_err(|e| AppError::Audio(e))?;
+
+        self.is_playing = true;
+        self.current_path = Some("__stream__".to_string());
+        self.duration_ms = duration_ms;
+        self.play_start_time = Some(Instant::now());
+        self.accumulated_ms = 0;
+
+        Ok(duration_ms)
+    }
+
+    /// Crossfade 播放本地文件
+    pub fn crossfade_file(&mut self, path: &str, fade_out_ms: u32, fade_in_ms: u32) -> AppResult<u64> {
+        self.ensure_alive();
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx.send(AudioCmd::CrossfadeFile {
+            path: path.to_string(), fade_out_ms, fade_in_ms, reply: tx,
+        }).map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        let timeout = RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
+        let duration_ms = rx.recv_timeout(timeout)
+            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
+            .map_err(|e| AppError::Audio(e))?;
+
+        self.is_playing = true;
+        self.current_path = Some(path.to_string());
+        self.duration_ms = duration_ms;
+        self.play_start_time = Some(Instant::now());
+        self.accumulated_ms = 0;
+
+        Ok(duration_ms)
     }
 }

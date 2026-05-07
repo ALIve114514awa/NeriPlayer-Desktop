@@ -91,10 +91,11 @@ export class KaraokeLine {
       const delay = rw.word.startMs - this.lineStartTime
       const duration = Math.max(1000, rw.word.durationMs)
 
+      // 对齐参考项目：4px 浮动幅度
       const anim = rw.element.animate(
         [
           { transform: 'translateY(0)' },
-          { transform: 'translateY(-0.05em)' },
+          { transform: 'translateY(-4px)' },
         ],
         {
           duration,

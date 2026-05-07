@@ -4,9 +4,11 @@ use neri_player_desktop::commands::{
     player_cmd, library_cmd, search_cmd, lyrics_cmd, settings_cmd, auth_cmd, recommend_cmd, sync_cmd, download_cmd,
 };
 use neri_player_desktop::state::AppState;
+use neri_player_desktop::audio::media_session::{MediaSessionController, MediaAction};
 use neri_player_desktop::auth;
 use tauri::{Manager, Emitter};
 use std::time::Duration;
+use std::sync::mpsc;
 
 fn main() {
     // 强制 WebView2 (Chromium) 启用 GPU 硬件加速
@@ -29,20 +31,92 @@ fn main() {
                 *state.auth.lock() = saved_auth;
             }
 
-            // 后台定时器：每 200ms 推送播放位置
+            // ── 初始化系统媒体会话 (SMTC / MPRIS) ──
+            let (media_action_tx, media_action_rx) = mpsc::channel::<MediaAction>();
+
+            // 获取 HWND（Windows 必需）
+            let hwnd: Option<*mut std::ffi::c_void> = {
+                #[cfg(target_os = "windows")]
+                {
+                    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    let result = app.get_webview_window("main").and_then(|w| {
+                        let handle = w.window_handle().ok()?;
+                        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                            Some(h.hwnd.get() as *mut std::ffi::c_void)
+                        } else {
+                            None
+                        }
+                    });
+                    result
+                }
+                #[cfg(not(target_os = "windows"))]
+                { None }
+            };
+
+            let media_session = MediaSessionController::new(hwnd, media_action_tx);
+            if media_session.is_none() {
+                eprintln!("[main] Media session not available (non-fatal)");
+            }
+
+            // 后台定时器：每 200ms 推送播放位置 + 媒体会话同步
+            let handle_ticker = handle.clone();
             std::thread::spawn(move || {
                 let mut last_ended = false;
+                let mut media_update_counter: u32 = 0;
+                // 缓存上次发送给 media session 的元数据 ID，避免重复设置
+                let mut last_media_track_id = String::new();
 
                 loop {
                     std::thread::sleep(Duration::from_millis(200));
 
-                    let state = handle.state::<AppState>();
+                    let state = handle_ticker.state::<AppState>();
+
+                    // ── 处理媒体键事件 ──
+                    while let Ok(action) = media_action_rx.try_recv() {
+                        match action {
+                            MediaAction::Play | MediaAction::Toggle => {
+                                let mut player = state.player.lock();
+                                if player.is_playing {
+                                    player.pause();
+                                } else {
+                                    player.resume();
+                                }
+                                let playing = player.is_playing;
+                                drop(player);
+                                let _ = handle_ticker.emit("media:play-state-changed",
+                                    serde_json::json!({ "isPlaying": playing }));
+                            }
+                            MediaAction::Pause => {
+                                state.player.lock().pause();
+                                let _ = handle_ticker.emit("media:play-state-changed",
+                                    serde_json::json!({ "isPlaying": false }));
+                            }
+                            MediaAction::Next => {
+                                let _ = handle_ticker.emit("media:next", ());
+                            }
+                            MediaAction::Previous => {
+                                let _ = handle_ticker.emit("media:previous", ());
+                            }
+                            MediaAction::SeekTo(ms) => {
+                                let _ = state.player.lock().seek_to(ms);
+                                let _ = handle_ticker.emit("media:seeked",
+                                    serde_json::json!({ "positionMs": ms }));
+                            }
+                        }
+                    }
 
                     // ── Phase 1: 快速快照（锁持有 <1μs） ──
                     let snapshot = {
                         let player = state.player.lock();
                         if player.current_path.is_none() {
                             last_ended = false;
+                            // 空闲时也更新 media session 状态
+                            if !last_media_track_id.is_empty() {
+                                if let Some(ref ms) = media_session {
+                                    ms.stop();
+                                }
+                                last_media_track_id.clear();
+                            }
                             continue;
                         }
                         (
@@ -57,7 +131,7 @@ fn main() {
 
                     // ── Phase 2: 发射事件（无锁） ──
                     if snap_playing || snap_pos > 0 {
-                        let _ = handle.emit("player:position", serde_json::json!({
+                        let _ = handle_ticker.emit("player:position", serde_json::json!({
                             "positionMs": snap_pos,
                             "durationMs": snap_dur,
                             "isPlaying": snap_playing,
@@ -66,10 +140,39 @@ fn main() {
 
                     if snap_playing {
                         if let Ok(audio) = shared_level.lock() {
-                            let _ = handle.emit("player:audio-level", serde_json::json!({
+                            let _ = handle_ticker.emit("player:audio-level", serde_json::json!({
                                 "level": audio.level,
                                 "beat": audio.beat_impulse,
                             }));
+                        }
+                    }
+
+                    // ── Phase 2.5: 媒体会话同步（每 1s = 每 5 个 tick） ──
+                    if let Some(ref ms) = media_session {
+                        media_update_counter += 1;
+
+                        // 元数据更新：检查当前曲目是否变化
+                        let current_track_id = {
+                            let q = state.queue.lock();
+                            q.current().map(|t| t.id.clone()).unwrap_or_default()
+                        };
+                        if !current_track_id.is_empty() && current_track_id != last_media_track_id {
+                            last_media_track_id = current_track_id;
+                            let q = state.queue.lock();
+                            if let Some(track) = q.current() {
+                                ms.update_metadata(
+                                    &track.title,
+                                    &track.artist,
+                                    &track.album,
+                                    track.cover_url.as_deref(),
+                                    track.duration_ms,
+                                );
+                            }
+                        }
+
+                        if media_update_counter >= 5 {
+                            media_update_counter = 0;
+                            ms.update_playback(snap_playing, snap_pos);
                         }
                     }
 
@@ -81,7 +184,7 @@ fn main() {
                             last_ended = true;
                             player.mark_ended();
                             drop(player);
-                            let _ = handle.emit("player:track-ended", ());
+                            let _ = handle_ticker.emit("player:track-ended", ());
                         } else if !finished {
                             last_ended = false;
                         }
@@ -104,6 +207,10 @@ fn main() {
             player_cmd::set_loudness_gain,
             player_cmd::set_equalizer,
             player_cmd::reset_audio_effects,
+            player_cmd::pause_with_fade,
+            player_cmd::resume_with_fade,
+            player_cmd::crossfade_url,
+            player_cmd::crossfade_file,
             player_cmd::get_player_state,
             player_cmd::next_track,
             player_cmd::prev_track,

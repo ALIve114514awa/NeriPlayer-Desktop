@@ -132,6 +132,68 @@ pub async fn reset_audio_effects(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 #[tauri::command]
+pub async fn pause_with_fade(duration_ms: u32, state: State<'_, AppState>) -> AppResult<()> {
+    state.player.lock().pause_with_fade(duration_ms);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resume_with_fade(duration_ms: u32, state: State<'_, AppState>) -> AppResult<()> {
+    state.player.lock().resume_with_fade(duration_ms);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn crossfade_url(
+    url: String,
+    duration_hint_ms: u64,
+    fade_out_ms: u32,
+    fade_in_ms: u32,
+    state: State<'_, AppState>,
+) -> AppResult<u64> {
+    // 根据 URL 域名动态设置 Referer
+    let referer = if url.contains("bilibili.com") || url.contains("bilivideo.") {
+        "https://www.bilibili.com"
+    } else if url.contains("youtube.com") || url.contains("googlevideo.com") {
+        "https://music.youtube.com"
+    } else {
+        "https://music.163.com"
+    };
+
+    let resp = state.http().get(&url)
+        .header("Referer", referer)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .send().await
+        .map_err(|e| AppError::Network(e))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::Api(format!("HTTP {}: stream fetch failed", resp.status())));
+    }
+
+    let bytes = resp.bytes().await
+        .map_err(|e| AppError::Network(e))?;
+
+    if bytes.is_empty() {
+        return Err(AppError::Audio("Empty audio data received".into()));
+    }
+
+    let data = bytes.to_vec();
+    let mut player = state.player.lock();
+    player.crossfade_bytes(data, duration_hint_ms, fade_out_ms, fade_in_ms)
+}
+
+#[tauri::command]
+pub async fn crossfade_file(
+    path: String,
+    fade_out_ms: u32,
+    fade_in_ms: u32,
+    state: State<'_, AppState>,
+) -> AppResult<u64> {
+    let mut player = state.player.lock();
+    player.crossfade_file(&path, fade_out_ms, fade_in_ms)
+}
+
+#[tauri::command]
 pub async fn get_player_state(state: State<'_, AppState>) -> AppResult<PlayerStateDto> {
     let player = state.player.lock();
     let queue = state.queue.lock();
