@@ -85,6 +85,12 @@ export const useSettingsStore = defineStore('settings', () => {
   const downloadNameTemplate = ref(loadSetting('download_template', '{artist} - {title}'))
   const downloadDir = ref(loadSetting('download_dir', ''))
 
+  // 一起听
+  const ltServerUrl = ref(loadSetting('lt_server_url', 'https://neriplayer.hancat.work'))
+  const ltNickname = ref(loadSetting('lt_nickname', ''))
+  const ltAllowMemberControl = ref(loadSetting('lt_allow_member_control', true))
+  const ltAutoPauseOnMemberChange = ref(loadSetting('lt_auto_pause_on_change', true))
+  const ltShareAudioLinks = ref(loadSetting('lt_share_audio_links', true))
   // 自动持久化：watch 所有 ref，变化时保存
   const allSettings: Record<string, any> = {
     dark_mode: darkMode, theme_color: themeColor, cover_style: coverStyle,
@@ -110,6 +116,10 @@ export const useSettingsStore = defineStore('settings', () => {
     bg_image_alpha: backgroundImageAlpha, dev_mode: devModeEnabled,
     cache_size: maxCacheSize, download_template: downloadNameTemplate,
     download_dir: downloadDir,
+    lt_server_url: ltServerUrl, lt_nickname: ltNickname,
+    lt_allow_member_control: ltAllowMemberControl,
+    lt_auto_pause_on_change: ltAutoPauseOnMemberChange,
+    lt_share_audio_links: ltShareAudioLinks,
   }
 
   for (const [key, refVal] of Object.entries(allSettings)) {
@@ -133,5 +143,6 @@ export const useSettingsStore = defineStore('settings', () => {
     backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
     devModeEnabled,
     maxCacheSize, downloadNameTemplate, downloadDir,
+    ltServerUrl, ltNickname, ltAllowMemberControl, ltAutoPauseOnMemberChange, ltShareAudioLinks,
   }
 })

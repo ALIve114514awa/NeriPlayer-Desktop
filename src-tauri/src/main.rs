@@ -1,14 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use neri_player_desktop::audio::media_session::{MediaAction, MediaSessionController};
+use neri_player_desktop::auth;
 use neri_player_desktop::commands::{
-    player_cmd, library_cmd, search_cmd, lyrics_cmd, settings_cmd, auth_cmd, recommend_cmd, sync_cmd, download_cmd,
+    auth_cmd, download_cmd, library_cmd, listen_together_cmd, lyrics_cmd, player_cmd,
+    recommend_cmd, search_cmd, settings_cmd, sync_cmd,
 };
 use neri_player_desktop::state::AppState;
-use neri_player_desktop::audio::media_session::{MediaSessionController, MediaAction};
-use neri_player_desktop::auth;
-use tauri::{Manager, Emitter};
-use std::time::Duration;
 use std::sync::mpsc;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
 
 fn main() {
     // 强制 WebView2 (Chromium) 启用 GPU 硬件加速
@@ -19,6 +20,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::new())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -50,7 +52,9 @@ fn main() {
                     result
                 }
                 #[cfg(not(target_os = "windows"))]
-                { None }
+                {
+                    None
+                }
             };
 
             let media_session = MediaSessionController::new(hwnd, media_action_tx);
@@ -83,13 +87,17 @@ fn main() {
                                 }
                                 let playing = player.is_playing;
                                 drop(player);
-                                let _ = handle_ticker.emit("media:play-state-changed",
-                                    serde_json::json!({ "isPlaying": playing }));
+                                let _ = handle_ticker.emit(
+                                    "media:play-state-changed",
+                                    serde_json::json!({ "isPlaying": playing }),
+                                );
                             }
                             MediaAction::Pause => {
                                 state.player.lock().pause();
-                                let _ = handle_ticker.emit("media:play-state-changed",
-                                    serde_json::json!({ "isPlaying": false }));
+                                let _ = handle_ticker.emit(
+                                    "media:play-state-changed",
+                                    serde_json::json!({ "isPlaying": false }),
+                                );
                             }
                             MediaAction::Next => {
                                 let _ = handle_ticker.emit("media:next", ());
@@ -99,8 +107,8 @@ fn main() {
                             }
                             MediaAction::SeekTo(ms) => {
                                 let _ = state.player.lock().seek_to(ms);
-                                let _ = handle_ticker.emit("media:seeked",
-                                    serde_json::json!({ "positionMs": ms }));
+                                let _ = handle_ticker
+                                    .emit("media:seeked", serde_json::json!({ "positionMs": ms }));
                             }
                         }
                     }
@@ -131,19 +139,25 @@ fn main() {
 
                     // ── Phase 2: 发射事件（无锁） ──
                     if snap_playing || snap_pos > 0 {
-                        let _ = handle_ticker.emit("player:position", serde_json::json!({
-                            "positionMs": snap_pos,
-                            "durationMs": snap_dur,
-                            "isPlaying": snap_playing,
-                        }));
+                        let _ = handle_ticker.emit(
+                            "player:position",
+                            serde_json::json!({
+                                "positionMs": snap_pos,
+                                "durationMs": snap_dur,
+                                "isPlaying": snap_playing,
+                            }),
+                        );
                     }
 
                     if snap_playing {
                         if let Ok(audio) = shared_level.lock() {
-                            let _ = handle_ticker.emit("player:audio-level", serde_json::json!({
-                                "level": audio.level,
-                                "beat": audio.beat_impulse,
-                            }));
+                            let _ = handle_ticker.emit(
+                                "player:audio-level",
+                                serde_json::json!({
+                                    "level": audio.level,
+                                    "beat": audio.beat_impulse,
+                                }),
+                            );
                         }
                     }
 
@@ -179,7 +193,8 @@ fn main() {
                     // ── Phase 3: 慢检测 — 重新获取锁（is_finished 内部有 200ms recv） ──
                     {
                         let mut player = state.player.lock();
-                        let finished = player.is_finished() && player.is_playing && player.position_ms() > 500;
+                        let finished =
+                            player.is_finished() && player.is_playing && player.position_ms() > 500;
                         if finished && !last_ended {
                             last_ended = true;
                             player.mark_ended();
@@ -197,6 +212,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             player_cmd::play_file,
             player_cmd::play_url,
+            player_cmd::play_url_fast,
+            player_cmd::play_url_streaming,
             player_cmd::pause,
             player_cmd::resume,
             player_cmd::toggle_play_pause,
@@ -210,6 +227,8 @@ fn main() {
             player_cmd::pause_with_fade,
             player_cmd::resume_with_fade,
             player_cmd::crossfade_url,
+            player_cmd::crossfade_url_fast,
+            player_cmd::crossfade_url_streaming,
             player_cmd::crossfade_file,
             player_cmd::get_player_state,
             player_cmd::next_track,
@@ -277,10 +296,20 @@ fn main() {
             sync_cmd::disconnect_webdav_sync,
             download_cmd::download_track,
             download_cmd::list_downloads,
+            download_cmd::validate_downloads,
             download_cmd::delete_download,
+            download_cmd::cancel_download,
+            download_cmd::cancel_all_downloads,
             download_cmd::set_download_dir,
             download_cmd::get_default_download_dir,
             download_cmd::reveal_file,
+            listen_together_cmd::lt_create_room,
+            listen_together_cmd::lt_join_room,
+            listen_together_cmd::lt_get_room_state,
+            listen_together_cmd::lt_connect_ws,
+            listen_together_cmd::lt_disconnect_ws,
+            listen_together_cmd::lt_send_event,
+            listen_together_cmd::lt_send_ping,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

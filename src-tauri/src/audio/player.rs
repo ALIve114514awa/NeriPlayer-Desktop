@@ -2,16 +2,17 @@
 // OutputStream 是 !Send，必须在创建它的线程上操作。
 // 所有 Sink 操作通过 channel 发送到专用音频线程执行。
 
+use rodio::source::SeekError;
+use rodio::{Decoder, OutputStream, Sink, Source};
 use std::io::{BufReader, Cursor};
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use rodio::{Decoder, OutputStream, Sink, Source};
-use rodio::source::SeekError;
 
 use crate::audio::analyzer::{AudioAnalyzer, SharedAudioLevel};
 use crate::audio::effects::{AudioEffectsParams, EqualizerSource, LoudnessSource};
+use crate::audio::growing::GrowingAudioReader;
 use crate::error::{AppError, AppResult};
 
 /// 播放操作 recv 超时（网络音频解码可能慢）
@@ -25,6 +26,15 @@ const ANALYSIS_FRAME_SIZE: usize = 2048;
 enum AudioSource {
     Bytes(Vec<u8>),
     File(String),
+    Growing(GrowingAudioReader, u64),
+}
+
+impl AudioSource {
+    fn abort_if_stream(&self) {
+        if let AudioSource::Growing(reader, _) = self {
+            reader.abort();
+        }
+    }
 }
 
 /// Fade 步进间隔
@@ -39,6 +49,11 @@ enum AudioCmd {
     },
     PlayFile {
         path: String,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    PlayStream {
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
         reply: mpsc::Sender<Result<u64, String>>,
     },
     Pause,
@@ -72,6 +87,14 @@ enum AudioCmd {
     /// Crossfade 播放新文件
     CrossfadeFile {
         path: String,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    /// Crossfade 播放边下边读的音频流
+    CrossfadeStream {
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
         fade_out_ms: u32,
         fade_in_ms: u32,
         reply: mpsc::Sender<Result<u64, String>>,
@@ -251,7 +274,10 @@ impl PlayerEngine {
     fn ensure_alive(&mut self) {
         if !self.thread_alive.load(Ordering::SeqCst) {
             eprintln!("[PlayerEngine] audio thread dead, respawning...");
-            let (tx, alive) = Self::spawn_audio_thread(self.shared_audio_level.clone(), self.effects_params.clone());
+            let (tx, alive) = Self::spawn_audio_thread(
+                self.shared_audio_level.clone(),
+                self.effects_params.clone(),
+            );
             self.cmd_tx = tx;
             self.thread_alive = alive;
             let _ = self.cmd_tx.send(AudioCmd::SetVolume(self.volume));
@@ -262,26 +288,37 @@ impl PlayerEngine {
     }
 
     /// 从 source 创建 decoder，成功返回 (decoder_box, duration_ms)
-    fn make_decoder(source: &AudioSource) -> Result<(Box<dyn Source<Item = i16> + Send>, u64), String> {
+    fn make_decoder(
+        source: &AudioSource,
+    ) -> Result<(Box<dyn Source<Item = i16> + Send>, u64), String> {
         match source {
             AudioSource::Bytes(data) => {
                 let cursor = Cursor::new(data.clone());
-                let dec = Decoder::new(cursor)
-                    .map_err(|e| format!("Decode error: {}", e))?;
-                let dur = dec.total_duration()
+                let dec = Decoder::new(cursor).map_err(|e| format!("Decode error: {}", e))?;
+                let dur = dec
+                    .total_duration()
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 Ok((Box::new(dec), dur))
             }
             AudioSource::File(path) => {
-                let file = std::fs::File::open(path)
-                    .map_err(|e| format!("Cannot open file: {}", e))?;
+                let file =
+                    std::fs::File::open(path).map_err(|e| format!("Cannot open file: {}", e))?;
                 let reader = BufReader::new(file);
-                let dec = Decoder::new(reader)
-                    .map_err(|e| format!("Decode error: {}", e))?;
-                let dur = dec.total_duration()
+                let dec = Decoder::new(reader).map_err(|e| format!("Decode error: {}", e))?;
+                let dur = dec
+                    .total_duration()
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                Ok((Box::new(dec), dur))
+            }
+            AudioSource::Growing(reader, duration_hint_ms) => {
+                let dec = Decoder::new(BufReader::new(reader.clone()))
+                    .map_err(|e| format!("Decode error: {}", e))?;
+                let dur = dec
+                    .total_duration()
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(*duration_hint_ms);
                 Ok((Box::new(dec), dur))
             }
         }
@@ -320,7 +357,11 @@ impl PlayerEngine {
     }
 
     /// 音频线程主循环
-    fn audio_thread(rx: mpsc::Receiver<AudioCmd>, shared_level: Arc<Mutex<SharedAudioLevel>>, effects_params: Arc<std::sync::Mutex<AudioEffectsParams>>) {
+    fn audio_thread(
+        rx: mpsc::Receiver<AudioCmd>,
+        shared_level: Arc<Mutex<SharedAudioLevel>>,
+        effects_params: Arc<std::sync::Mutex<AudioEffectsParams>>,
+    ) {
         let mut stream: Option<OutputStream> = None;
         let mut handle: Option<rodio::OutputStreamHandle> = None;
         let mut current_sink: Option<Sink> = None;
@@ -358,15 +399,26 @@ impl PlayerEngine {
             };
 
             match cmd {
-                AudioCmd::PlayBytes { data, duration_hint_ms, reply } => {
+                AudioCmd::PlayBytes {
+                    data,
+                    duration_hint_ms,
+                    reply,
+                } => {
                     let result = (|| -> Result<u64, String> {
                         let data_len = data.len();
-                        eprintln!("[audio-thread] PlayBytes: {} bytes, hint={}ms", data_len, duration_hint_ms);
+                        eprintln!(
+                            "[audio-thread] PlayBytes: {} bytes, hint={}ms",
+                            data_len, duration_hint_ms
+                        );
 
                         ensure_output!();
-                        let h = handle.as_ref()
+                        let h = handle
+                            .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
+                        if let Some(old_source) = current_source.take() {
+                            old_source.abort_if_stream();
+                        }
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
@@ -382,8 +434,7 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h)
-                            .map_err(|e| format!("Sink error: {}", e))?;
+                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -399,9 +450,13 @@ impl PlayerEngine {
                 AudioCmd::PlayFile { path, reply } => {
                     let result = (|| -> Result<u64, String> {
                         ensure_output!();
-                        let h = handle.as_ref()
+                        let h = handle
+                            .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
+                        if let Some(old_source) = current_source.take() {
+                            old_source.abort_if_stream();
+                        }
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
@@ -414,8 +469,7 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h)
-                            .map_err(|e| format!("Sink error: {}", e))?;
+                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -424,6 +478,50 @@ impl PlayerEngine {
                         current_source = Some(source);
                         current_duration_ms = dur;
                         Ok(dur)
+                    })();
+                    let _ = reply.send(result);
+                }
+
+                AudioCmd::PlayStream {
+                    reader,
+                    duration_hint_ms,
+                    reply,
+                } => {
+                    let result = (|| -> Result<u64, String> {
+                        eprintln!("[audio-thread] PlayStream: hint={}ms", duration_hint_ms);
+                        ensure_output!();
+                        let h = handle
+                            .as_ref()
+                            .ok_or_else(|| "No audio output available".to_string())?;
+
+                        if let Some(old_source) = current_source.take() {
+                            old_source.abort_if_stream();
+                        }
+                        if let Some(old_sink) = current_sink.take() {
+                            old_sink.stop();
+                        }
+
+                        let source = AudioSource::Growing(reader, duration_hint_ms);
+                        let (dec, dur) = Self::make_decoder(&source)?;
+                        let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
+                        eprintln!(
+                            "[audio-thread] streaming decoder ok, duration={}ms",
+                            duration_ms
+                        );
+
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
+                        let loud = LoudnessSource::new(eq, effects_params.clone());
+                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
+
+                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        sink.set_volume(current_volume);
+                        sink.set_speed(current_speed);
+                        sink.append(analyzing);
+
+                        current_sink = Some(sink);
+                        current_source = Some(source);
+                        current_duration_ms = duration_ms;
+                        Ok(duration_ms)
                     })();
                     let _ = reply.send(result);
                 }
@@ -441,10 +539,12 @@ impl PlayerEngine {
                 }
 
                 AudioCmd::Stop => {
+                    if let Some(old_source) = current_source.take() {
+                        old_source.abort_if_stream();
+                    }
                     if let Some(sink) = current_sink.take() {
                         sink.stop();
                     }
-                    current_source = None;
                     current_duration_ms = 0;
                     // 重置共享电平
                     SharedAudioLevel::reset(&shared_level);
@@ -478,12 +578,17 @@ impl PlayerEngine {
                         }
 
                         // 原生 seek 失败——重建 decoder + skip samples（最后手段）
-                        let source = current_source.as_ref()
+                        let source = current_source
+                            .as_ref()
                             .ok_or_else(|| "Nothing is playing".to_string())?;
-                        let h = handle.as_ref()
+                        let h = handle
+                            .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
-                        let was_paused = current_sink.as_ref().map(|s| s.is_paused()).unwrap_or(false);
+                        let was_paused = current_sink
+                            .as_ref()
+                            .map(|s| s.is_paused())
+                            .unwrap_or(false);
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
@@ -497,8 +602,7 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h)
-                            .map_err(|e| format!("Sink error: {}", e))?;
+                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -538,16 +642,24 @@ impl PlayerEngine {
                     }
                 }
 
-                AudioCmd::CrossfadeBytes { data, duration_hint_ms, fade_out_ms, fade_in_ms, reply } => {
+                AudioCmd::CrossfadeBytes {
+                    data,
+                    duration_hint_ms,
+                    fade_out_ms,
+                    fade_in_ms,
+                    reply,
+                } => {
                     let result = (|| -> Result<u64, String> {
                         ensure_output!();
-                        let h = handle.as_ref()
+                        let h = handle
+                            .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
                         // 将当前 sink 移入 prev_sink 进行 fade out
                         if let Some(old_prev) = prev_sink.take() {
                             old_prev.stop();
                         }
+                        let old_source = current_source.take();
                         let old_sink = current_sink.take();
 
                         // 创建新 sink
@@ -559,8 +671,8 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let new_sink = Sink::try_new(h)
-                            .map_err(|e| format!("Sink error: {}", e))?;
+                        let new_sink =
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
                         new_sink.set_volume(0.0); // 从 0 开始 fade in
                         new_sink.set_speed(current_speed);
                         new_sink.append(analyzing);
@@ -575,12 +687,16 @@ impl PlayerEngine {
                         for i in 1..=steps {
                             // fade out 旧 sink
                             if let Some(ref old) = old_sink {
-                                let out_t = (i as f32 / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                let out_t = (i as f32
+                                    / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                                    .min(1.0);
                                 old.set_volume(current_volume * (1.0 - out_t));
                             }
                             // fade in 新 sink
                             if let Some(ref new_s) = current_sink {
-                                let in_t = (i as f32 / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                let in_t = (i as f32
+                                    / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                                    .min(1.0);
                                 new_s.set_volume(current_volume * in_t);
                             }
                             std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
@@ -588,6 +704,9 @@ impl PlayerEngine {
                         // 清理旧 sink
                         if let Some(old) = old_sink {
                             old.stop();
+                        }
+                        if let Some(old_source) = old_source {
+                            old_source.abort_if_stream();
                         }
                         // 确保新 sink 到目标音量
                         if let Some(ref s) = current_sink {
@@ -599,16 +718,23 @@ impl PlayerEngine {
                     let _ = reply.send(result);
                 }
 
-                AudioCmd::CrossfadeFile { path, fade_out_ms, fade_in_ms, reply } => {
+                AudioCmd::CrossfadeFile {
+                    path,
+                    fade_out_ms,
+                    fade_in_ms,
+                    reply,
+                } => {
                     let result = (|| -> Result<u64, String> {
                         ensure_output!();
-                        let h = handle.as_ref()
+                        let h = handle
+                            .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
                         // 将当前 sink 移入 prev_sink 进行 fade out
                         if let Some(old_prev) = prev_sink.take() {
                             old_prev.stop();
                         }
+                        let old_source = current_source.take();
                         let old_sink = current_sink.take();
 
                         // 创建新 sink
@@ -619,8 +745,8 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let new_sink = Sink::try_new(h)
-                            .map_err(|e| format!("Sink error: {}", e))?;
+                        let new_sink =
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
                         new_sink.set_volume(0.0);
                         new_sink.set_speed(current_speed);
                         new_sink.append(analyzing);
@@ -634,11 +760,15 @@ impl PlayerEngine {
                         let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
                         for i in 1..=steps {
                             if let Some(ref old) = old_sink {
-                                let out_t = (i as f32 / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                let out_t = (i as f32
+                                    / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                                    .min(1.0);
                                 old.set_volume(current_volume * (1.0 - out_t));
                             }
                             if let Some(ref new_s) = current_sink {
-                                let in_t = (i as f32 / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                                let in_t = (i as f32
+                                    / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                                    .min(1.0);
                                 new_s.set_volume(current_volume * in_t);
                             }
                             std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
@@ -646,11 +776,87 @@ impl PlayerEngine {
                         if let Some(old) = old_sink {
                             old.stop();
                         }
+                        if let Some(old_source) = old_source {
+                            old_source.abort_if_stream();
+                        }
                         if let Some(ref s) = current_sink {
                             s.set_volume(current_volume);
                         }
 
                         Ok(dur)
+                    })();
+                    let _ = reply.send(result);
+                }
+
+                AudioCmd::CrossfadeStream {
+                    reader,
+                    duration_hint_ms,
+                    fade_out_ms,
+                    fade_in_ms,
+                    reply,
+                } => {
+                    let result = (|| -> Result<u64, String> {
+                        eprintln!(
+                            "[audio-thread] CrossfadeStream: hint={}ms",
+                            duration_hint_ms
+                        );
+                        ensure_output!();
+                        let h = handle
+                            .as_ref()
+                            .ok_or_else(|| "No audio output available".to_string())?;
+
+                        if let Some(old_prev) = prev_sink.take() {
+                            old_prev.stop();
+                        }
+                        let old_source = current_source.take();
+                        let old_sink = current_sink.take();
+
+                        let source = AudioSource::Growing(reader, duration_hint_ms);
+                        let (dec, dur) = Self::make_decoder(&source)?;
+                        let duration_ms_val = if dur > 0 { dur } else { duration_hint_ms };
+
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
+                        let loud = LoudnessSource::new(eq, effects_params.clone());
+                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
+
+                        let new_sink =
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        new_sink.set_volume(0.0);
+                        new_sink.set_speed(current_speed);
+                        new_sink.append(analyzing);
+
+                        current_sink = Some(new_sink);
+                        current_source = Some(source);
+                        current_duration_ms = duration_ms_val;
+
+                        let fade_duration = fade_out_ms.max(fade_in_ms);
+                        let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
+                        for i in 1..=steps {
+                            if let Some(ref old) = old_sink {
+                                let out_t = (i as f32
+                                    / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                                    .min(1.0);
+                                old.set_volume(current_volume * (1.0 - out_t));
+                            }
+                            if let Some(ref new_s) = current_sink {
+                                let in_t = (i as f32
+                                    / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                                    .min(1.0);
+                                new_s.set_volume(current_volume * in_t);
+                            }
+                            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
+                        }
+                        if let Some(old) = old_sink {
+                            old.stop();
+                        }
+                        if let Some(old_source) = old_source {
+                            old_source.abort_if_stream();
+                        }
+                        if let Some(ref s) = current_sink {
+                            s.set_volume(current_volume);
+                        }
+
+                        Ok(duration_ms_val)
                     })();
                     let _ = reply.send(result);
                 }
@@ -669,12 +875,15 @@ impl PlayerEngine {
     pub fn play_file(&mut self, path: &str) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
-        self.cmd_tx.send(AudioCmd::PlayFile {
-            path: path.to_string(),
-            reply: tx,
-        }).map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+        self.cmd_tx
+            .send(AudioCmd::PlayFile {
+                path: path.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
 
-        let duration_ms = rx.recv_timeout(RECV_TIMEOUT)
+        let duration_ms = rx
+            .recv_timeout(RECV_TIMEOUT)
             .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
             .map_err(|e| AppError::Audio(e))?;
 
@@ -691,18 +900,51 @@ impl PlayerEngine {
     pub fn play_bytes(&mut self, data: Vec<u8>, duration_hint_ms: u64) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
-        self.cmd_tx.send(AudioCmd::PlayBytes {
-            data,
-            duration_hint_ms,
-            reply: tx,
-        }).map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+        self.cmd_tx
+            .send(AudioCmd::PlayBytes {
+                data,
+                duration_hint_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
 
-        let duration_ms = rx.recv_timeout(RECV_TIMEOUT)
+        let duration_ms = rx
+            .recv_timeout(RECV_TIMEOUT)
             .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
             .map_err(|e| AppError::Audio(e))?;
 
         self.is_playing = true;
         self.current_path = Some("__stream__".to_string());
+        self.duration_ms = duration_ms;
+        self.play_start_time = Some(Instant::now());
+        self.accumulated_ms = 0;
+
+        Ok(duration_ms)
+    }
+
+    /// 播放边下载边读取的音频流（用于远程 MP3 首播加速）
+    pub fn play_stream(
+        &mut self,
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
+    ) -> AppResult<u64> {
+        self.ensure_alive();
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(AudioCmd::PlayStream {
+                reader,
+                duration_hint_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        let duration_ms = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
+            .map_err(|e| AppError::Audio(e))?;
+
+        self.is_playing = true;
+        self.current_path = Some("__streaming__".to_string());
         self.duration_ms = duration_ms;
         self.play_start_time = Some(Instant::now());
         self.accumulated_ms = 0;
@@ -717,11 +959,15 @@ impl PlayerEngine {
             (true, Some(start)) => {
                 let wall_ms = start.elapsed().as_millis() as f64;
                 (wall_ms * self.speed as f64) as u64
-            },
+            }
             _ => 0,
         };
         let pos = self.accumulated_ms + elapsed;
-        if self.duration_ms > 0 { pos.min(self.duration_ms) } else { pos }
+        if self.duration_ms > 0 {
+            pos.min(self.duration_ms)
+        } else {
+            pos
+        }
     }
 
     pub fn pause(&mut self) {
@@ -794,7 +1040,11 @@ impl PlayerEngine {
     pub fn seek_to(&mut self, position_ms: u64) -> AppResult<()> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
-        self.cmd_tx.send(AudioCmd::Seek { position_ms, reply: tx })
+        self.cmd_tx
+            .send(AudioCmd::Seek {
+                position_ms,
+                reply: tx,
+            })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
 
         rx.recv_timeout(FAST_RECV_TIMEOUT)
@@ -821,7 +1071,11 @@ impl PlayerEngine {
         }
 
         let (tx, rx) = mpsc::channel();
-        if self.cmd_tx.send(AudioCmd::QueryEmpty { reply: tx }).is_err() {
+        if self
+            .cmd_tx
+            .send(AudioCmd::QueryEmpty { reply: tx })
+            .is_err()
+        {
             return true;
         }
         let sink_empty = rx.recv_timeout(Duration::from_millis(200)).unwrap_or(true);
@@ -868,16 +1122,30 @@ impl PlayerEngine {
     }
 
     /// Crossfade 播放内存音频数据
-    pub fn crossfade_bytes(&mut self, data: Vec<u8>, duration_hint_ms: u64, fade_out_ms: u32, fade_in_ms: u32) -> AppResult<u64> {
+    pub fn crossfade_bytes(
+        &mut self,
+        data: Vec<u8>,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+    ) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
-        self.cmd_tx.send(AudioCmd::CrossfadeBytes {
-            data, duration_hint_ms, fade_out_ms, fade_in_ms, reply: tx,
-        }).map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+        self.cmd_tx
+            .send(AudioCmd::CrossfadeBytes {
+                data,
+                duration_hint_ms,
+                fade_out_ms,
+                fade_in_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
 
         // crossfade 包含 fade 时间，给更长的超时
-        let timeout = RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
-        let duration_ms = rx.recv_timeout(timeout)
+        let timeout =
+            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
+        let duration_ms = rx
+            .recv_timeout(timeout)
             .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
             .map_err(|e| AppError::Audio(e))?;
 
@@ -891,20 +1159,68 @@ impl PlayerEngine {
     }
 
     /// Crossfade 播放本地文件
-    pub fn crossfade_file(&mut self, path: &str, fade_out_ms: u32, fade_in_ms: u32) -> AppResult<u64> {
+    pub fn crossfade_file(
+        &mut self,
+        path: &str,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+    ) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
-        self.cmd_tx.send(AudioCmd::CrossfadeFile {
-            path: path.to_string(), fade_out_ms, fade_in_ms, reply: tx,
-        }).map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+        self.cmd_tx
+            .send(AudioCmd::CrossfadeFile {
+                path: path.to_string(),
+                fade_out_ms,
+                fade_in_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
 
-        let timeout = RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
-        let duration_ms = rx.recv_timeout(timeout)
+        let timeout =
+            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
+        let duration_ms = rx
+            .recv_timeout(timeout)
             .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
             .map_err(|e| AppError::Audio(e))?;
 
         self.is_playing = true;
         self.current_path = Some(path.to_string());
+        self.duration_ms = duration_ms;
+        self.play_start_time = Some(Instant::now());
+        self.accumulated_ms = 0;
+
+        Ok(duration_ms)
+    }
+
+    /// Crossfade 播放边下载边读取的音频流
+    pub fn crossfade_stream(
+        &mut self,
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+    ) -> AppResult<u64> {
+        self.ensure_alive();
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(AudioCmd::CrossfadeStream {
+                reader,
+                duration_hint_ms,
+                fade_out_ms,
+                fade_in_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        let timeout =
+            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
+        let duration_ms = rx
+            .recv_timeout(timeout)
+            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
+            .map_err(|e| AppError::Audio(e))?;
+
+        self.is_playing = true;
+        self.current_path = Some("__streaming__".to_string());
         self.duration_ms = duration_ms;
         self.play_start_time = Some(Instant::now());
         self.accumulated_ms = 0;

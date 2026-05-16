@@ -5,6 +5,7 @@ import { usePlayerStore, type TrackInfo, normalizeTrack, displayAlbum } from '@/
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
+import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -73,12 +74,14 @@ async function loadDetail() {
 const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | null; index: number }>({
   show: false, x: 0, y: 0, track: null, index: -1,
 })
+const showAddToPlaylist = ref(false)
+const addToPlaylistTarget = ref<TrackInfo | null>(null)
 
 function openTrackMenu(e: MouseEvent, track: TrackInfo, index: number) {
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
   const menuWidth = 200
-  const menuHeight = 160
+  const menuHeight = 184
   let x = rect.left - menuWidth - 4
   let y = rect.top
   if (x < 8) x = rect.right + 4
@@ -88,8 +91,26 @@ function openTrackMenu(e: MouseEvent, track: TrackInfo, index: number) {
   trackMenu.value = { show: true, x, y, track, index }
 }
 
+function openTrackContextMenu(e: MouseEvent, track: TrackInfo, index: number) {
+  const menuWidth = 200
+  const menuHeight = 184
+  trackMenu.value = {
+    show: true,
+    x: Math.max(8, Math.min(e.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(e.clientY, window.innerHeight - menuHeight - 8)),
+    track,
+    index,
+  }
+}
+
 function closeTrackMenu() {
   trackMenu.value.show = false
+}
+
+function openAddToPlaylist(track: TrackInfo) {
+  closeTrackMenu()
+  addToPlaylistTarget.value = track
+  showAddToPlaylist.value = true
 }
 
 // 删除确认
@@ -128,6 +149,11 @@ function addToQueueEnd(track: TrackInfo) {
 function playAll() {
   if (tracks.value.length === 0) return
   player.playAll(tracks.value)
+}
+
+function shufflePlay() {
+  if (tracks.value.length === 0) return
+  player.shufflePlay(tracks.value)
 }
 
 function playTrack(track: TrackInfo) {
@@ -184,10 +210,15 @@ onMounted(loadDetail)
           <p class="hero-meta">
             {{ t('player.track_count', { count: tracks.length }) }} · {{ totalDuration }}
           </p>
-          <button class="play-all-btn" @click="playAll" v-if="tracks.length > 0">
-            <span class="material-symbols-rounded filled">play_arrow</span>
-            {{ t('player.play_all') }}
-          </button>
+          <div class="hero-actions" v-if="tracks.length > 0">
+            <button class="play-all-btn" @click="playAll">
+              <span class="material-symbols-rounded filled">play_arrow</span>
+              {{ t('player.play_all') }}
+            </button>
+            <button class="hero-icon-btn" :title="t('player.shuffle_play')" @click="shufflePlay">
+              <span class="material-symbols-rounded">shuffle</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -201,6 +232,7 @@ onMounted(loadDetail)
           class="track-item"
           :class="{ active: player.currentTrack?.id === track.id }"
           @click="playTrack(track)"
+          @contextmenu.prevent.stop="openTrackContextMenu($event, track, index)"
         >
           <div class="track-index">
             <div v-if="player.currentTrack?.id === track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
@@ -234,6 +266,10 @@ onMounted(loadDetail)
             <span class="material-symbols-rounded" style="font-size: 20px">add_to_queue</span>
             <span>{{ t('player.add_to_queue') }}</span>
           </button>
+          <button class="ctx-item" @click="openAddToPlaylist(trackMenu.track!)">
+            <span class="material-symbols-rounded" style="font-size: 20px">playlist_add</span>
+            <span>{{ t('player.add_to_playlist') }}</span>
+          </button>
           <button class="ctx-item danger" @click="requestRemove(trackMenu.track!)">
             <span class="material-symbols-rounded" style="font-size: 20px">delete</span>
             <span>{{ t('library.remove_from_playlist') }}</span>
@@ -253,11 +289,13 @@ onMounted(loadDetail)
     >
       <p class="dialog-msg">{{ t('library.remove_confirm_msg', { name: removeTarget?.title || '' }) }}</p>
     </M3Dialog>
+
+    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" />
   </div>
 </template>
 
 <style scoped lang="scss">
-@import '@/styles/detail-view.scss';
+@use '@/styles/detail-view.scss' as *;
 
 .track-more {
   width: 32px;
@@ -325,5 +363,7 @@ onMounted(loadDetail)
   &:hover { background: var(--md-surface-container-highest); }
   &.danger { color: var(--md-error); }
   &.danger:hover { background: color-mix(in srgb, var(--md-error) 8%, transparent); }
+  &:disabled { cursor: default; opacity: 0.45; }
+  &:disabled:hover { background: transparent; }
 }
 </style>

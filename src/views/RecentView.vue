@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { usePlayerStore } from '@/stores/player'
+import { usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useHistoryStore } from '@/stores/history'
 import { useI18n } from 'vue-i18n'
+import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 
 const router = useRouter()
 const player = usePlayerStore()
@@ -12,6 +13,11 @@ const { t } = useI18n()
 
 const searchQuery = ref('')
 const showClearConfirm = ref(false)
+const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | null }>({
+  show: false, x: 0, y: 0, track: null,
+})
+const showAddToPlaylist = ref(false)
+const addToPlaylistTarget = ref<TrackInfo | null>(null)
 
 const filteredEntries = computed(() => {
   if (!searchQuery.value) return history.entries
@@ -62,6 +68,50 @@ function clearHistory() {
   history.clear()
   showClearConfirm.value = false
 }
+
+function clampMenuPosition(x: number, y: number, menuWidth = 200, menuHeight = 136) {
+  return {
+    x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
+  }
+}
+
+function openTrackMenu(e: MouseEvent, track: TrackInfo) {
+  const btn = e.currentTarget as HTMLElement
+  const rect = btn.getBoundingClientRect()
+  const menuWidth = 200
+  const menuHeight = 136
+  let x = rect.left - menuWidth - 4
+  let y = rect.top
+  if (x < 8) x = rect.right + 4
+  const pos = clampMenuPosition(x, y, menuWidth, menuHeight)
+  trackMenu.value = { show: true, x: pos.x, y: pos.y, track }
+}
+
+function openTrackContextMenu(e: MouseEvent, track: TrackInfo) {
+  const pos = clampMenuPosition(e.clientX, e.clientY)
+  trackMenu.value = { show: true, x: pos.x, y: pos.y, track }
+}
+
+function closeTrackMenu() {
+  trackMenu.value.show = false
+}
+
+function addToQueueNext(track: TrackInfo) {
+  closeTrackMenu()
+  player.addToQueueNext(track)
+}
+
+function addToQueueEnd(track: TrackInfo) {
+  closeTrackMenu()
+  player.addToQueueEnd(track)
+}
+
+function openAddToPlaylist(track: TrackInfo) {
+  closeTrackMenu()
+  addToPlaylistTarget.value = track
+  showAddToPlaylist.value = true
+}
 </script>
 
 <template>
@@ -104,6 +154,7 @@ function clearHistory() {
           class="track-item"
           :class="{ active: player.currentTrack?.id === entry.track.id }"
           @click="playEntry(index)"
+          @contextmenu.prevent.stop="openTrackContextMenu($event, entry.track)"
         >
           <div class="track-index">
             <div v-if="player.currentTrack?.id === entry.track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
@@ -119,6 +170,9 @@ function clearHistory() {
           </div>
           <div class="track-time-ago">{{ formatRelativeTime(entry.playedAt) }}</div>
           <div class="track-duration">{{ formatDuration(entry.track.durationMs) }}</div>
+          <button class="track-more" @click.stop="openTrackMenu($event, entry.track)">
+            <span class="material-symbols-rounded">more_vert</span>
+          </button>
           <button class="track-remove" @click.stop="history.remove(entry.track.id)">
             <span class="material-symbols-rounded">close</span>
           </button>
@@ -139,11 +193,32 @@ function clearHistory() {
         </div>
       </div>
     </Teleport>
+
+    <Teleport to="body">
+      <div v-if="trackMenu.show" class="context-overlay" @click="closeTrackMenu" @contextmenu.prevent="closeTrackMenu">
+        <div class="context-menu" :style="{ left: trackMenu.x + 'px', top: trackMenu.y + 'px' }">
+          <button class="ctx-item" @click="addToQueueNext(trackMenu.track!)">
+            <span class="material-symbols-rounded" style="font-size: 20px">queue_play_next</span>
+            <span>{{ t('player.play_next') }}</span>
+          </button>
+          <button class="ctx-item" @click="addToQueueEnd(trackMenu.track!)">
+            <span class="material-symbols-rounded" style="font-size: 20px">add_to_queue</span>
+            <span>{{ t('player.add_to_queue') }}</span>
+          </button>
+          <button class="ctx-item" @click="openAddToPlaylist(trackMenu.track!)">
+            <span class="material-symbols-rounded" style="font-size: 20px">playlist_add</span>
+            <span>{{ t('player.add_to_playlist') }}</span>
+          </button>
+        </div>
+      </div>
+    </Teleport>
+
+    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" />
   </div>
 </template>
 
 <style scoped lang="scss">
-@import '@/styles/detail-view.scss';
+@use '@/styles/detail-view.scss' as *;
 
 .header-title {
   font-size: 18px;

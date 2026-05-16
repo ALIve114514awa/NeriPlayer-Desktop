@@ -3,6 +3,7 @@ import { ref, watch, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
 import type { TrackInfo } from '@/stores/player'
+import { useToastStore } from '@/stores/toast'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import M3Input from '@/components/ui/M3Input.vue'
 
@@ -16,6 +17,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const toast = useToastStore()
 
 interface PlaylistInfo { id: number; name: string; track_count: number; modified_at: number }
 
@@ -48,7 +50,8 @@ async function loadPlaylists() {
 async function addToPlaylist(playlistId: number) {
   if (!props.track) return
   try {
-    await invoke('add_to_playlist', { playlistId, track: props.track })
+    await invoke('add_to_playlist', { playlistId, track: toBackendTrack(props.track) })
+    toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
     console.error('Add to playlist failed:', e)
@@ -66,7 +69,8 @@ async function createAndAdd() {
   if (!newName.value.trim() || !props.track) return
   try {
     const pl = await invoke<PlaylistInfo>('create_playlist', { name: newName.value.trim() })
-    await invoke('add_to_playlist', { playlistId: pl.id, track: props.track })
+    await invoke('add_to_playlist', { playlistId: pl.id, track: toBackendTrack(props.track) })
+    toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
     console.error('Create & add failed:', e)
@@ -75,6 +79,26 @@ async function createAndAdd() {
 
 function close() {
   emit('update:open', false)
+}
+
+function inferSource(track: TrackInfo) {
+  if (track.id.startsWith('netease:')) return 'netease'
+  if (track.id.startsWith('bilibili:')) return 'bilibili'
+  if (track.id.startsWith('youtube:')) return 'youtube'
+  return 'local'
+}
+
+function toBackendTrack(track: TrackInfo) {
+  return {
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album || '',
+    duration_ms: track.durationMs || 0,
+    source: inferSource(track),
+    url: track.audioUrl || '',
+    cover_url: track.coverUrl || null,
+  }
 }
 </script>
 

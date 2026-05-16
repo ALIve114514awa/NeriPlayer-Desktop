@@ -263,7 +263,49 @@ function closeDlContextMenu() {
 const showDlDeleteDialog = ref(false)
 const dlDeleteTarget = ref<any>(null)
 
+async function cancelActiveDownload(trackId: string) {
+  await downloadStore.cancelDownload(trackId)
+}
+
+function activeDownloadStatusText(status: string) {
+  switch (status) {
+    case 'resolving': return t('download.resolving')
+    case 'cancelling': return t('download.cancelling')
+    case 'cancelled': return t('download.cancelled')
+    case 'error': return t('download.download_failed')
+    case 'already_exists': return t('download.already_exists')
+    default: return t('download.downloading')
+  }
+}
+
+function activeDownloadProgressText(task: {
+  status: string
+  progress?: number
+  downloadedBytes?: number
+  totalBytes?: number
+  message?: string
+}) {
+  if (task.status === 'resolving' || task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'already_exists') {
+    return activeDownloadStatusText(task.status)
+  }
+  if (task.status === 'error') {
+    return task.message
+      ? `${activeDownloadStatusText(task.status)} · ${task.message}`
+      : activeDownloadStatusText(task.status)
+  }
+
+  const downloaded = typeof task.downloadedBytes === 'number' ? formatFileSize(task.downloadedBytes) : null
+  const total = typeof task.totalBytes === 'number' && task.totalBytes > 0 ? formatFileSize(task.totalBytes) : null
+  const percent = typeof task.progress === 'number' ? `${task.progress}%` : null
+
+  if (downloaded && total && percent) return `${activeDownloadStatusText(task.status)} · ${downloaded} / ${total} · ${percent}`
+  if (downloaded && total) return `${activeDownloadStatusText(task.status)} · ${downloaded} / ${total}`
+  if (downloaded && percent) return `${activeDownloadStatusText(task.status)} · ${downloaded} · ${percent}`
+  return activeDownloadStatusText(task.status)
+}
+
 function requestDlDelete(track: any) {
+  if (isDownloadedTrackInUse(track)) return
   closeDlContextMenu()
   dlDeleteTarget.value = track
   showDlDeleteDialog.value = true
@@ -280,9 +322,30 @@ async function revealDownloadFile(track: any) {
 
 async function confirmDlDelete() {
   if (!dlDeleteTarget.value) return
-  await downloadStore.deleteDownload(dlDeleteTarget.value.id)
+  const deleted = dlDeleteTarget.value
+  await downloadStore.deleteDownload(deleted.id)
+  player.handleDownloadedFileRemoved(deleted.id, deleted.filePath)
   showDlDeleteDialog.value = false
   dlDeleteTarget.value = null
+}
+
+function isDownloadedTrackInUse(track: any) {
+  return player.isPlayingFromDownload && player.currentTrack?.id === track?.id
+}
+
+async function redownloadDownloadedTrack(track: any) {
+  if (isDownloadedTrackInUse(track)) return
+  closeDlContextMenu()
+  player.handleDownloadedFileRemoved(track.id, track.filePath)
+  await downloadStore.redownloadTrack({
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album || '',
+    durationMs: track.durationMs || 0,
+    coverUrl: track.coverUrl || '',
+    audioUrl: '',
+  })
 }
 
 // 拉取云端歌单
@@ -395,6 +458,52 @@ onUnmounted(() => {
 
     <!-- Tab: 下载 -->
     <div v-else-if="activeTab === 2" class="playlist-list">
+      <template v-if="downloadStore.activeDownloads.length > 0">
+        <div class="subsection-label">
+          <span class="material-symbols-rounded" style="font-size: 18px">downloading</span>
+          <span>{{ t('download.active_tasks', { count: downloadStore.activeDownloads.length }) }}</span>
+        </div>
+        <div
+          v-for="task in downloadStore.activeDownloads"
+          :key="'active-' + task.trackId"
+          class="playlist-item active-download-item"
+        >
+          <div class="pl-icon">
+            <span class="material-symbols-rounded filled" style="font-size: 22px">
+              {{ task.status === 'resolving' ? 'network_node' : task.status === 'error' ? 'error' : task.status === 'cancelled' ? 'cancel' : 'downloading' }}
+            </span>
+          </div>
+          <div class="pl-info">
+            <div class="pl-name">{{ task.title }}</div>
+            <div class="pl-count">{{ task.artist }} · {{ activeDownloadProgressText(task) }}</div>
+            <div
+              class="download-progress-bar"
+              :class="{
+                indeterminate: task.status === 'downloading' && !task.totalBytes,
+                error: task.status === 'error',
+                muted: task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'already_exists',
+              }"
+            >
+              <div
+                class="download-progress-fill"
+                :style="{ width: `${Math.max(4, task.status === 'cancelled' || task.status === 'already_exists' ? 100 : task.progress ?? 0)}%` }"
+              />
+            </div>
+          </div>
+          <button
+            class="pl-more danger"
+            :disabled="task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'error' || task.status === 'already_exists'"
+            @click.stop="cancelActiveDownload(task.trackId)"
+          >
+            <span class="material-symbols-rounded" style="font-size: 20px">close</span>
+          </button>
+        </div>
+        <div v-if="downloadStore.downloads.length > 0" class="subsection-label" style="margin-top: 10px;">
+          <span class="material-symbols-rounded" style="font-size: 18px">download_done</span>
+          <span>{{ t('download.downloaded_items') }}</span>
+        </div>
+      </template>
+
       <template v-if="downloadStore.downloads.length > 0">
         <div
           v-for="dl in downloadStore.downloads"
@@ -417,7 +526,7 @@ onUnmounted(() => {
           </button>
         </div>
       </template>
-      <div v-else class="empty-tab">
+      <div v-else-if="downloadStore.activeDownloads.length === 0" class="empty-tab">
         <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">download</span></div>
         <p class="empty-title">{{ t('library.downloads_empty_title') }}</p>
         <p class="empty-desc">{{ t('library.downloads_empty_desc') }}</p>
@@ -492,7 +601,19 @@ onUnmounted(() => {
             <span class="material-symbols-rounded" style="font-size: 20px">folder_open</span>
             <span>{{ t('download.open_folder') }}</span>
           </button>
-          <button class="ctx-item danger" @click="requestDlDelete(dlContextMenu.track!)">
+          <button
+            class="ctx-item"
+            :disabled="isDownloadedTrackInUse(dlContextMenu.track)"
+            @click="redownloadDownloadedTrack(dlContextMenu.track!)"
+          >
+            <span class="material-symbols-rounded" style="font-size: 20px">refresh</span>
+            <span>{{ t('download.redownload') }}</span>
+          </button>
+          <button
+            class="ctx-item danger"
+            :disabled="isDownloadedTrackInUse(dlContextMenu.track)"
+            @click="requestDlDelete(dlContextMenu.track!)"
+          >
             <span class="material-symbols-rounded" style="font-size: 20px">delete</span>
             <span>{{ t('common.delete') }}</span>
           </button>
@@ -669,6 +790,16 @@ onUnmounted(() => {
   gap: 2px;
 }
 
+.subsection-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-on-surface-variant);
+}
+
 .playlist-item {
   display: flex;
   align-items: center;
@@ -798,6 +929,54 @@ onUnmounted(() => {
 
   .playlist-item:hover & { opacity: 1; }
   &:hover { background: var(--md-surface-container-high); }
+
+  &.danger {
+    opacity: 1;
+    color: var(--md-error);
+  }
+}
+
+.active-download-item {
+  cursor: default;
+}
+
+.download-progress-bar {
+  position: relative;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--md-surface-container-highest);
+}
+
+.download-progress-fill {
+  height: 100%;
+  min-width: 4px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--md-primary), color-mix(in srgb, var(--md-primary) 70%, white));
+  transition: width 180ms ease;
+}
+
+.download-progress-bar.indeterminate .download-progress-fill {
+  width: 36% !important;
+  animation: download-indeterminate 1.2s ease-in-out infinite;
+}
+
+.download-progress-bar.error .download-progress-fill {
+  background: var(--md-error);
+}
+
+.download-progress-bar.muted .download-progress-fill {
+  background: var(--md-outline);
+}
+
+@keyframes download-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
 }
 
 /* 空状态 */
@@ -886,6 +1065,11 @@ onUnmounted(() => {
   font-family: inherit;
 
   &:hover { background: var(--md-surface-container-highest); }
+  &:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
 
   &.danger { color: var(--md-error); }
   &.danger:hover { background: color-mix(in srgb, var(--md-error) 8%, transparent); }

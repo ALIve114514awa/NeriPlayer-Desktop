@@ -43,3 +43,7 @@ prost = "0.13"
 flate2 = "1"
 souvlaki = "0.7"
 raw-window-handle = "0.6"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+tauri-plugin-clipboard-manager = "2.3.2"
+tempfile = "3"

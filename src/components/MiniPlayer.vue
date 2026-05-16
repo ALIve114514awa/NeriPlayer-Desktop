@@ -1,14 +1,18 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { usePlayerStore } from '@/stores/player'
+import { useListenTogetherStore } from '@/stores/listenTogether'
 import { useI18n } from 'vue-i18n'
 import QueuePanel from './QueuePanel.vue'
+import ListenTogetherPanel from './ListenTogetherPanel.vue'
 
 const emit = defineEmits<{ expand: [] }>()
 const player = usePlayerStore()
+const lt = useListenTogetherStore()
 const { t } = useI18n()
 
 const showQueue = ref(false)
+const showLtPanel = ref(false)
 const showVolumeSlider = ref(false)
 
 // 进度条拖拽
@@ -150,6 +154,10 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
           <div class="mp-title">{{ player.currentTrack?.title || t('player.not_playing') }}</div>
           <div class="mp-artist">{{ player.currentTrack?.artist || '' }}</div>
           <div v-if="player.durationMs > 0" class="mp-time">{{ currentTimeFormatted }} / {{ durationFormatted }}</div>
+          <div v-if="player.isPlayingFromDownload" class="mp-download-chip">
+            <span class="material-symbols-rounded">download_done</span>
+            {{ t('player.playing_from_download') }}
+          </div>
         </div>
       </div>
 
@@ -191,7 +199,7 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
         </button>
       </div>
 
-      <!-- 右：音量 + 队列 + 展开 -->
+      <!-- 右：音量 + 一起听 + 队列 + 展开 -->
       <div class="mp-right">
         <div class="mp-volume-wrap">
           <button class="mp-tool-btn" @click="showVolumeSlider = !showVolumeSlider">
@@ -210,7 +218,14 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
             <div class="mp-volume-label">{{ volumePercent }}%</div>
           </div>
         </div>
-        <button class="mp-tool-btn" @click="showQueue = !showQueue">
+        <button
+          class="mp-tool-btn"
+          :class="{ active: lt.isConnected }"
+          @click="showLtPanel = !showLtPanel; if (showLtPanel) showQueue = false"
+        >
+          <span class="material-symbols-rounded">group</span>
+        </button>
+        <button class="mp-tool-btn" @click="showQueue = !showQueue; if (showQueue) showLtPanel = false">
           <span class="material-symbols-rounded">queue_music</span>
         </button>
         <button class="mp-tool-btn" @click="emit('expand')">
@@ -221,6 +236,9 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
 
     <!-- 队列面板 -->
     <QueuePanel v-if="showQueue" @close="showQueue = false" />
+
+    <!-- 一起听面板 -->
+    <ListenTogetherPanel v-if="showLtPanel" @close="showLtPanel = false" />
   </div>
 </template>
 
@@ -389,6 +407,26 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   margin-top: 1px;
 }
 
+.mp-download-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 2px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--md-primary);
+  background: color-mix(in srgb, var(--md-primary) 12%, transparent);
+  white-space: nowrap;
+
+  .material-symbols-rounded {
+    font-size: 12px;
+  }
+}
+
 /* ── 中：播放控制 ── */
 .mp-center {
   display: flex;
@@ -472,6 +510,7 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
 
   &:hover { background: var(--md-surface-variant); color: var(--md-on-surface); }
   &:active { transform: scale(0.9); }
+  &.active { color: var(--md-primary); }
 }
 
 /* 音量弹窗 */

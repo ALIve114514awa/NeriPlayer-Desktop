@@ -176,6 +176,37 @@
   &:active { transform: scale(0.97); }
 }
 
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.hero-actions .play-all-btn {
+  margin-top: 0;
+}
+
+.hero-icon-btn {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-on-surface-variant);
+  background: var(--md-surface-container);
+  transition: background var(--duration-short), color var(--duration-short), transform var(--duration-short);
+
+  .material-symbols-rounded { font-size: 22px; }
+  &:hover {
+    color: var(--md-primary);
+    background: color-mix(in srgb, var(--md-primary) 12%, var(--md-surface-container));
+    transform: translateY(-1px);
+  }
+  &:active { transform: scale(0.96); }
+}
+
 // 歌曲列表
 .track-list {
   display: flex;
@@ -299,4 +330,69 @@
   color: var(--md-on-surface-variant);
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
+}
+
+.track-more {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-on-surface-variant);
+  opacity: 0;
+  transition: opacity var(--duration-short), background var(--duration-short), color var(--duration-short);
+  flex-shrink: 0;
+
+  .track-item:hover & { opacity: 0.6; }
+  &:hover { opacity: 1 !important; background: var(--md-surface-container-high); }
+  .material-symbols-rounded { font-size: 18px; }
+}
+
+.context-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+}
+
+.context-menu {
+  position: fixed;
+  min-width: 200px;
+  background: var(--md-surface-container-high);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--md-outline-variant);
+  padding: 4px 0;
+  z-index: 501;
+  animation: ctx-in 120ms ease-out;
+}
+
+@keyframes ctx-in {
+  from { opacity: 0; transform: scale(0.95) translateY(-4px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--md-on-surface);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background 150ms, color 150ms;
+  font-family: inherit;
+
+  &:hover { background: var(--md-surface-container-highest); }
+  &.danger { color: var(--md-error); }
+  &.danger:hover { background: color-mix(in srgb, var(--md-error) 8%, transparent); }
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+  &:disabled:hover { background: transparent; }
 }

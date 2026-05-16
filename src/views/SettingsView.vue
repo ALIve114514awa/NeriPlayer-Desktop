@@ -39,6 +39,7 @@ const {
   backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
   devModeEnabled,
   maxCacheSize, downloadNameTemplate, downloadDir,
+  ltServerUrl, ltNickname, ltAllowMemberControl, ltAutoPauseOnMemberChange, ltShareAudioLinks,
 } = storeToRefs(settings)
 
 // 折叠过渡 hooks
@@ -176,9 +177,61 @@ async function handleBypassProxyChange(val: boolean) {
   }
 }
 
+// ── 一起听 ──
+function resetLtIdentity() {
+  localStorage.removeItem('neri:lt-uuid')
+  ltNickname.value = ''
+  toast.success(t('listen_together.identity_reset'))
+}
+
 // ── 下载管理 ──
 const activeDownloadCount = computed(() => downloadStore.downloading.size)
 const completedDownloadCount = computed(() => downloadStore.downloads.length)
+const activeDownloadTasks = computed(() => downloadStore.activeDownloads)
+
+function formatDownloadSize(bytes?: number): string {
+  if (typeof bytes !== 'number') return ''
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function activeDownloadStatusText(status: string) {
+  switch (status) {
+    case 'resolving': return t('download.resolving')
+    case 'cancelling': return t('download.cancelling')
+    case 'cancelled': return t('download.cancelled')
+    case 'error': return t('download.download_failed')
+    case 'already_exists': return t('download.already_exists')
+    default: return t('download.downloading')
+  }
+}
+
+function activeDownloadProgressText(task: {
+  status: string
+  progress?: number
+  downloadedBytes?: number
+  totalBytes?: number
+  message?: string
+}) {
+  if (task.status === 'resolving' || task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'already_exists') {
+    return activeDownloadStatusText(task.status)
+  }
+  if (task.status === 'error') {
+    return task.message
+      ? `${activeDownloadStatusText(task.status)} · ${task.message}`
+      : activeDownloadStatusText(task.status)
+  }
+
+  const downloaded = typeof task.downloadedBytes === 'number' ? formatDownloadSize(task.downloadedBytes) : ''
+  const total = typeof task.totalBytes === 'number' && task.totalBytes > 0 ? formatDownloadSize(task.totalBytes) : ''
+  const percent = typeof task.progress === 'number' ? `${task.progress}%` : ''
+
+  if (downloaded && total && percent) return `${downloaded} / ${total} · ${percent}`
+  if (downloaded && total) return `${downloaded} / ${total}`
+  if (downloaded && percent) return `${downloaded} · ${percent}`
+  return activeDownloadStatusText(task.status)
+}
 
 // ── 下载目录 ──
 const defaultDownloadDir = ref('')
@@ -243,6 +296,10 @@ function resetDownloadTemplate() {
 
 function cancelAllDownloads() {
   downloadStore.cancelAllDownloads()
+}
+
+function cancelDownload(trackId: string) {
+  downloadStore.cancelDownload(trackId)
 }
 
 function goToDownloads() {
@@ -800,19 +857,144 @@ async function confirmClearGitHub() {
       </label>
     </div>
 
+    <!-- 一起听 -->
+    <div class="section-label clickable" @click="toggleSection('listen_together')">
+      <span class="material-symbols-rounded" style="font-size: 18px">group</span>
+      <span>{{ t('listen_together.title') }}</span>
+      <span class="material-symbols-rounded section-arrow" :class="{ expanded: isExpanded('listen_together') }">expand_more</span>
+    </div>
+
+    <div class="setting-card">
+      <div class="setting-icon-wrap"><span class="material-symbols-rounded">dns</span></div>
+      <div class="setting-info">
+        <div class="setting-title">{{ t('listen_together.server_url') }}</div>
+        <div class="setting-desc" style="word-break: break-all">{{ ltServerUrl || 'https://neriplayer.hancat.work' }}</div>
+      </div>
+      <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">edit</span>
+    </div>
+
+    <Transition @enter="onExpandEnter" @after-enter="onExpandAfterEnter" @leave="onExpandLeave" @after-leave="onExpandAfterLeave"><div v-if="isExpanded('listen_together')">
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">edit</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('listen_together.server_url') }}</div>
+        </div>
+        <input
+          type="text"
+          class="lt-url-input"
+          :value="ltServerUrl"
+          @change="ltServerUrl = ($event.target as HTMLInputElement).value.trim() || 'https://neriplayer.hancat.work'"
+        />
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">badge</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('listen_together.nickname') }}</div>
+        </div>
+        <input
+          type="text"
+          class="lt-url-input"
+          style="width: 140px"
+          :value="ltNickname"
+          @change="ltNickname = ($event.target as HTMLInputElement).value"
+          maxlength="20"
+          :placeholder="t('listen_together.nickname')"
+        />
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">tune</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('listen_together.allow_member_control') }}</div>
+        </div>
+        <label class="m3-switch">
+          <input type="checkbox" v-model="ltAllowMemberControl" />
+          <span class="track"><span class="thumb"><span v-if="ltAllowMemberControl" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span>
+        </label>
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">pause_circle</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('listen_together.auto_pause_on_change') }}</div>
+        </div>
+        <label class="m3-switch">
+          <input type="checkbox" v-model="ltAutoPauseOnMemberChange" />
+          <span class="track"><span class="thumb"><span v-if="ltAutoPauseOnMemberChange" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span>
+        </label>
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">link</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('listen_together.share_audio_links') }}</div>
+        </div>
+        <label class="m3-switch">
+          <input type="checkbox" v-model="ltShareAudioLinks" />
+          <span class="track"><span class="thumb"><span v-if="ltShareAudioLinks" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span>
+        </label>
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">restart_alt</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('listen_together.reset_identity') }}</div>
+          <div class="setting-desc">{{ t('listen_together.reset_identity_desc') }}</div>
+        </div>
+        <button class="m3-chip sm" @click="resetLtIdentity">{{ t('listen_together.reset_btn') }}</button>
+      </div>
+    </div></Transition>
+
     <!-- 下载管理 -->
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">download</span>
       <span>{{ t('settings.download_manage') }}</span>
     </div>
 
-    <div v-if="activeDownloadCount > 0" class="setting-card">
-      <div class="setting-icon-wrap"><span class="material-symbols-rounded">downloading</span></div>
-      <div class="setting-info">
-        <div class="setting-title">{{ t('settings.download_progress', { completed: completedDownloadCount, total: completedDownloadCount + activeDownloadCount }) }}</div>
+    <template v-if="activeDownloadCount > 0">
+      <div class="setting-card download-summary-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">downloading</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('download.active_tasks', { count: activeDownloadCount }) }}</div>
+          <div class="setting-desc">{{ completedDownloadCount > 0 ? t('player.track_count', { count: completedDownloadCount }) : t('settings.no_active_downloads') }}</div>
+        </div>
+        <button class="m3-chip sm" style="color: var(--md-error); border-color: var(--md-error)" @click="cancelAllDownloads">{{ t('settings.cancel_all_downloads') }}</button>
       </div>
-      <button class="m3-chip sm" style="color: var(--md-error); border-color: var(--md-error)" @click="cancelAllDownloads">{{ t('settings.cancel_all_downloads') }}</button>
-    </div>
+      <div
+        v-for="task in activeDownloadTasks"
+        :key="'settings-download-' + task.trackId"
+        class="setting-card sub-card active-download-card"
+      >
+        <div class="setting-icon-wrap">
+          <span class="material-symbols-rounded">{{ task.status === 'resolving' ? 'network_node' : task.status === 'error' ? 'error' : task.status === 'cancelled' ? 'cancel' : 'downloading' }}</span>
+        </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ task.title }}</div>
+          <div class="setting-desc">{{ task.artist }} · {{ activeDownloadProgressText(task) }}</div>
+          <div
+            class="settings-download-progress"
+            :class="{
+              indeterminate: task.status === 'downloading' && !task.totalBytes,
+              error: task.status === 'error',
+              muted: task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'already_exists',
+            }"
+          >
+            <div
+              class="settings-download-progress-fill"
+              :style="{ width: `${Math.max(4, task.status === 'cancelled' || task.status === 'already_exists' ? 100 : task.progress ?? 0)}%` }"
+            />
+          </div>
+        </div>
+        <button
+          class="download-cancel-btn"
+          :disabled="task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'error' || task.status === 'already_exists'"
+          @click="cancelDownload(task.trackId)"
+        >
+          <span class="material-symbols-rounded">close</span>
+        </button>
+      </div>
+    </template>
     <div v-else class="setting-card" style="cursor: pointer" @click="goToDownloads">
       <div class="setting-icon-wrap"><span class="material-symbols-rounded">folder_open</span></div>
       <div class="setting-info">
@@ -1520,6 +1702,79 @@ async function confirmClearGitHub() {
 .setting-title { font-size: 14px; font-weight: 500; }
 .setting-desc { font-size: 12px; color: var(--md-on-surface-variant); margin-top: 2px; }
 
+.download-summary-card {
+  border-color: color-mix(in srgb, var(--md-primary) 24%, var(--md-outline-variant));
+}
+
+.active-download-card {
+  align-items: flex-start;
+
+  .setting-icon-wrap {
+    width: 36px;
+    height: 36px;
+  }
+}
+
+.settings-download-progress {
+  position: relative;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--md-surface-container-highest);
+}
+
+.settings-download-progress-fill {
+  height: 100%;
+  min-width: 4px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--md-primary), color-mix(in srgb, var(--md-primary) 70%, white));
+  transition: width 180ms ease;
+}
+
+.settings-download-progress.indeterminate .settings-download-progress-fill {
+  width: 36% !important;
+  animation: settings-download-indeterminate 1.2s ease-in-out infinite;
+}
+
+.settings-download-progress.error .settings-download-progress-fill {
+  background: var(--md-error);
+}
+
+.settings-download-progress.muted .settings-download-progress-fill {
+  background: var(--md-outline);
+}
+
+.download-cancel-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-error);
+  flex-shrink: 0;
+  transition: background var(--duration-short);
+
+  &:hover {
+    background: color-mix(in srgb, var(--md-error) 12%, transparent);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+  }
+
+  .material-symbols-rounded {
+    font-size: 18px;
+  }
+}
+
+@keyframes settings-download-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(280%); }
+}
+
 /* 深色模式切换胶囊 */
 .dark-mode-pills {
   display: flex;
@@ -1684,6 +1939,22 @@ async function confirmClearGitHub() {
 
 .quality-card {
   flex-wrap: wrap;
+}
+
+/* 一起听服务器地址输入 */
+.lt-url-input {
+  width: 200px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--md-outline-variant);
+  background: var(--md-surface-container-highest);
+  color: var(--md-on-surface);
+  font-size: 12px;
+  text-align: right;
+  outline: none;
+  flex-shrink: 0;
+  transition: border-color 150ms;
+  &:focus { border-color: var(--md-primary); }
 }
 
 /* M3 Slider */

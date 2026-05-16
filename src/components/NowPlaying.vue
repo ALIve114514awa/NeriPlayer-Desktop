@@ -574,6 +574,61 @@ const currentSource = computed(() => {
   return 'local'
 })
 
+const currentTrackId = computed(() => player.currentTrack?.id || '')
+const currentDownloadTask = computed(() => currentTrackId.value ? downloadStore.downloading.get(currentTrackId.value) : undefined)
+const isCurrentDownloaded = computed(() => currentTrackId.value ? downloadStore.isDownloaded(currentTrackId.value) : false)
+const isCurrentDownloading = computed(() => !!currentDownloadTask.value)
+
+function downloadTaskStatusText(status?: string) {
+  switch (status) {
+    case 'resolving': return t('download.resolving')
+    case 'downloading': return t('download.downloading')
+    case 'cancelling': return t('download.cancelling')
+    case 'cancelled': return t('download.cancelled')
+    case 'error': return t('download.download_failed')
+    case 'already_exists': return t('download.already_exists')
+    default: return ''
+  }
+}
+
+const downloadActionIcon = computed(() => {
+  if (player.isPlayingFromDownload) return 'download_done'
+  if (isCurrentDownloading.value) {
+    const status = currentDownloadTask.value?.status
+    if (status === 'error') return 'error'
+    if (status === 'cancelled') return 'cancel'
+    return 'downloading'
+  }
+  if (isCurrentDownloaded.value) return 'refresh'
+  return 'download'
+})
+
+const downloadActionLabel = computed(() => {
+  if (player.isPlayingFromDownload) return t('player.playing_from_download')
+  if (isCurrentDownloading.value) return downloadTaskStatusText(currentDownloadTask.value?.status) || t('download.downloading')
+  if (isCurrentDownloaded.value) return t('download.redownload')
+  return t('library.tab_downloads')
+})
+
+const downloadActionDesc = computed(() => {
+  if (player.isPlayingFromDownload) return t('download.using_local_file')
+  if (isCurrentDownloading.value) {
+    const task = currentDownloadTask.value
+    if (!task) return ''
+    if (task.message) return task.message
+    if (typeof task.progress === 'number') return `${task.progress}%`
+    return ''
+  }
+  if (isCurrentDownloaded.value) return t('download.redownload_desc')
+  return t('download.download_desc')
+})
+
+const downloadActionDisabled = computed(() =>
+  !player.currentTrack
+  || player.isPlayingFromDownload
+  || (isCurrentDownloading.value && currentDownloadTask.value?.status !== 'error' && currentDownloadTask.value?.status !== 'cancelled')
+)
+
 const neteaseQualities = [
   { key: 'standard', label: 'settings.q_standard' },
   { key: 'higher', label: 'settings.q_high' },
@@ -608,12 +663,17 @@ function currentQualityKey(): string {
   return ''
 }
 
-// 下载歌曲
-async function handleDownload() {
+// 下载/重新下载歌曲
+async function handleDownloadAction() {
   const track = player.currentTrack
   if (!track) return
   showMoreSheet.value = false
-  await downloadStore.downloadTrack(track)
+  if (isCurrentDownloaded.value && !player.isPlayingFromDownload) {
+    player.handleDownloadedFileRemoved(track.id, downloadStore.getDownloadedTrack(track.id)?.filePath)
+    await downloadStore.redownloadTrack(track)
+  } else {
+    await downloadStore.downloadTrack(track)
+  }
 }
 
 // 分享歌曲
@@ -839,10 +899,14 @@ const sliderActiveColor = computed(() => {
             <span>{{ player.currentTimeFormatted }}</span>
             <span>{{ player.durationFormatted }}</span>
           </div>
-          <div v-if="player.audioInfo" class="np-audio-info">
-            <span v-if="settings.showAudioCodec && player.audioInfo.codec" class="np-audio-codec">{{ player.audioInfo.codec }}</span>
-            <template v-if="settings.showAudioCodec && player.audioInfo.codec && settings.showQualitySwitch && player.audioInfo.bitrate"> · </template>
-            <span v-if="settings.showQualitySwitch && player.audioInfo.bitrate">{{ player.audioInfo.bitrate }}kbps</span>
+          <div v-if="player.audioInfo || player.isPlayingFromDownload" class="np-audio-info">
+            <span v-if="player.isPlayingFromDownload" class="np-download-chip">
+              <span class="material-symbols-rounded">download_done</span>
+              {{ t('player.playing_from_download') }}
+            </span>
+            <span v-if="audioInfoDisplay" class="np-audio-detail" :class="{ separated: player.isPlayingFromDownload }">
+              {{ audioInfoDisplay }}
+            </span>
           </div>
         </div>
 
@@ -1159,22 +1223,17 @@ const sliderActiveColor = computed(() => {
               </div>
             </button>
 
-            <!-- 下载（仅在线来源且未下载时显示） -->
+            <!-- 下载（在线来源：下载 / 重新下载 / 本地播放状态） -->
             <button
               v-if="currentSource !== 'local'"
               class="np-more-list-item"
-              :disabled="!player.currentTrack || downloadStore.isDownloaded(player.currentTrack?.id || '') || downloadStore.isDownloading(player.currentTrack?.id || '')"
-              @click="handleDownload"
+              :disabled="downloadActionDisabled"
+              @click="handleDownloadAction"
             >
-              <span class="material-symbols-rounded">{{
-                downloadStore.isDownloaded(player.currentTrack?.id || '') ? 'download_done' :
-                downloadStore.isDownloading(player.currentTrack?.id || '') ? 'downloading' : 'download'
-              }}</span>
+              <span class="material-symbols-rounded">{{ downloadActionIcon }}</span>
               <div class="np-more-list-info">
-                <span class="np-more-list-headline">{{
-                  downloadStore.isDownloaded(player.currentTrack?.id || '') ? t('download.downloaded') :
-                  downloadStore.isDownloading(player.currentTrack?.id || '') ? t('download.downloading') : t('library.tab_downloads')
-                }}</span>
+                <span class="np-more-list-headline">{{ downloadActionLabel }}</span>
+                <span v-if="downloadActionDesc" class="np-more-list-desc">{{ downloadActionDesc }}</span>
               </div>
             </button>
           </template>
@@ -1711,17 +1770,47 @@ const sliderActiveColor = computed(() => {
 }
 
 .np-audio-info {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   text-align: center;
   font-size: 10px;
   font-weight: 600;
   color: rgba(255,255,255,0.60);
   letter-spacing: 0.5px;
   margin-top: 0px;
+  min-height: 18px;
 }
 
 .np-audio-codec {
   color: var(--np-primary-container, var(--md-primary-container, #E8DEF8));
   transition: color 0.6s ease;
+}
+
+.np-audio-detail {
+  color: rgba(255,255,255,0.60);
+
+  &.separated::before {
+    content: '·';
+    margin-right: 6px;
+    color: rgba(255,255,255,0.42);
+  }
+}
+
+.np-download-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--np-primary-container, var(--md-primary-container, #E8DEF8));
+  background: rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.14);
+
+  .material-symbols-rounded {
+    font-size: 12px;
+  }
 }
 
 /* 控制栏 */
