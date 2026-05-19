@@ -15,12 +15,14 @@ const props = withDefaults(defineProps<{
   currentTimeMs: number
   previewTimeMs?: number | null
   isPlaying: boolean
+  lyricOffsetMs?: number
   accentColor?: string
   accentContainerColor?: string
 }>(), {
   currentTimeMs: 0,
   previewTimeMs: null,
   isPlaying: false,
+  lyricOffsetMs: undefined,
   accentColor: '',
   accentContainerColor: '',
 })
@@ -86,7 +88,10 @@ const isClearText = computed(() =>
 )
 
 // --- 时间 ---
-const offsetMs = computed(() => settings.cloudMusicOffset || 0)
+const offsetMs = computed(() => {
+  if (typeof props.lyricOffsetMs === 'number') return props.lyricOffsetMs
+  return settings.cloudMusicOffset || 0
+})
 const effectiveTimeMs = computed(() =>
   props.previewTimeMs != null ? props.previewTimeMs : props.currentTimeMs
 )

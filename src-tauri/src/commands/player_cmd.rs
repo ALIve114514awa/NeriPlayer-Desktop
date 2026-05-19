@@ -45,6 +45,8 @@ pub async fn play_url(
         "https://www.bilibili.com"
     } else if url.contains("youtube.com") || url.contains("googlevideo.com") {
         "https://music.youtube.com"
+    } else if url.contains("qqmusic.qq.com") || url.contains("y.qq.com") {
+        "https://y.qq.com"
     } else {
         "https://music.163.com"
     };
@@ -308,6 +310,8 @@ fn playback_referer(url: &str) -> &'static str {
         "https://www.bilibili.com"
     } else if url.contains("youtube.com") || url.contains("googlevideo.com") {
         "https://music.youtube.com"
+    } else if url.contains("qqmusic.qq.com") || url.contains("y.qq.com") {
+        "https://y.qq.com"
     } else {
         "https://music.163.com"
     }

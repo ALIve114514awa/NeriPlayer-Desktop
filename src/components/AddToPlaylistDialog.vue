@@ -99,6 +99,7 @@ function close() {
 
 function inferSource(track: TrackInfo) {
   if (track.id.startsWith('netease:')) return 'netease'
+  if (track.id.startsWith('qq:')) return 'qq'
   if (track.id.startsWith('bilibili:')) return 'bilibili'
   if (track.id.startsWith('youtube:')) return 'youtube'
   return 'local'

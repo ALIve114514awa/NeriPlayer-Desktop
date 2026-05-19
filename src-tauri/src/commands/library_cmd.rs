@@ -6,8 +6,11 @@ use crate::library::{scanner, playlist::PlaylistStore};
 use crate::sync::models::SyncFavoritePlaylist;
 
 #[tauri::command]
-pub async fn scan_music_directory(dir: String) -> AppResult<Vec<TrackInfo>> {
-    tokio::task::spawn_blocking(move || scanner::scan_directory(&dir))
+pub async fn scan_music_directory(
+    dir: String,
+    name_template: Option<String>,
+) -> AppResult<Vec<TrackInfo>> {
+    tokio::task::spawn_blocking(move || scanner::scan_directory(&dir, name_template.as_deref()))
         .await
         .map_err(|e| AppError::Other(e.to_string()))?
 }
@@ -62,7 +65,12 @@ pub async fn list_playlists() -> AppResult<Vec<PlaylistInfo>> {
     }
 
     let mut list: Vec<PlaylistInfo> = store.playlists.iter().map(|p| {
-        let cover = p.tracks.last().and_then(|t| t.cover_url.clone());
+        let cover = p.tracks.iter().rev().find_map(|t| {
+            t.cover_url
+                .as_ref()
+                .filter(|url| !url.trim().is_empty())
+                .cloned()
+        });
         let mut seen = std::collections::HashSet::new();
         let unique_count = p.tracks.iter()
             .filter(|t| !t.id.is_empty() && seen.insert(t.id.clone()))

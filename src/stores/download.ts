@@ -204,6 +204,8 @@ export const useDownloadStore = defineStore('download', () => {
 
     const source = track.id.startsWith('netease:')
       ? 'netease'
+      : track.id.startsWith('qq:')
+        ? 'qq'
       : track.id.startsWith('bilibili:')
         ? 'bilibili'
         : track.id.startsWith('youtube:')
@@ -232,6 +234,15 @@ export const useDownloadStore = defineStore('download', () => {
           quality: settings.neteaseQuality,
         })
         if (!result.url) throw new Error('No URL')
+        audioUrl = result.url
+      } else if (track.id.startsWith('qq:')) {
+        const settings = useSettingsStore()
+        const songMid = track.id.replace('qq:', '')
+        const result = await invoke<{ url: string | null }>('get_qq_song_url', {
+          songMid,
+          quality: settings.qqMusicQuality,
+        })
+        if (!result.url) throw new Error('No QQ Music URL')
         audioUrl = result.url
       } else if (track.id.startsWith('bilibili:')) {
         const biliId = track.id.replace('bilibili:', '')

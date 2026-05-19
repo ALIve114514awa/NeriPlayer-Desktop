@@ -91,6 +91,7 @@ pub struct TrackInfo {
 pub enum TrackSource {
     Local,
     Netease,
+    Qq,
     Bilibili,
     Youtube,
 }

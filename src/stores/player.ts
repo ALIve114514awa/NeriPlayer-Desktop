@@ -413,6 +413,14 @@ export const usePlayerStore = defineStore('player', () => {
       })
       return result.url ? { url: result.url, bitrate: result.bitrate, format: result.format } : null
     }
+    if (track.id.startsWith('qq:')) {
+      const songMid = track.id.replace('qq:', '')
+      const result = await invoke<{ url: string | null; bitrate: number; format: string }>('get_qq_song_url', {
+        songMid,
+        quality: useSettingsStore().qqMusicQuality,
+      })
+      return result.url ? { url: result.url, bitrate: result.bitrate, format: result.format } : null
+    }
     if (track.id.startsWith('bilibili:')) {
       const biliId = track.id.replace('bilibili:', '')
       const isAvid = /^\d+$/.test(biliId)
@@ -676,6 +684,26 @@ export const usePlayerStore = defineStore('player', () => {
           }
         } else {
           throw new Error('No playback URL')
+        }
+      } else if (track.id.startsWith('qq:')) {
+        _currentLoadedFromDownloadPath = null
+        isPlayingFromDownload.value = false
+        const result = takePrefetchedPlaybackUrl(track.id) || await resolvePlaybackUrl(track)
+        if (!result?.url) throw new Error('No QQ Music audio stream')
+        if (token !== playbackRequestToken) return
+        if (useCrossfade) {
+          dur = await invoke<number>('crossfade_url_fast', {
+            url: result.url, durationHintMs: track.durationMs,
+            fadeOutMs: transitionFadeOutMs, fadeInMs: transitionFadeInMs,
+          })
+        } else {
+          dur = await invoke<number>('play_url_fast', { url: result.url, durationHintMs: track.durationMs })
+        }
+        if (token !== playbackRequestToken) return
+        audioInfo.value = {
+          bitrate: (result.bitrate || 0) > 0 ? Math.round((result.bitrate || 0) / 1000) : undefined,
+          codec: result.format ? result.format.toUpperCase() : undefined,
+          format: result.format || undefined,
         }
       } else if (track.id.startsWith('bilibili:')) {
         _currentLoadedFromDownloadPath = null
@@ -1378,6 +1406,7 @@ export const usePlayerStore = defineStore('player', () => {
 function isOnlineTrack(track: TrackInfo): boolean {
   return (
     track.id.startsWith('netease:')
+    || track.id.startsWith('qq:')
     || track.id.startsWith('bilibili:')
     || track.id.startsWith('youtube:')
   )

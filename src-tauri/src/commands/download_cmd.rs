@@ -1,4 +1,6 @@
 use crate::error::{AppError, AppResult};
+use crate::lyrics::manager::LyricsManager;
+use crate::lyrics::parser::LyricLine;
 use crate::state::AppState;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -81,6 +83,159 @@ fn ext_from_content_type(content_type: &str) -> &str {
     } else {
         "mp3"
     }
+}
+
+fn ext_from_image_content_type(content_type: &str) -> &str {
+    if content_type.contains("png") {
+        "png"
+    } else if content_type.contains("webp") {
+        "webp"
+    } else if content_type.contains("gif") {
+        "gif"
+    } else {
+        "jpg"
+    }
+}
+
+fn make_lrc_timestamp(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    let centis = (ms % 1000) / 10;
+    format!("{:02}:{:02}.{:02}", minutes, seconds, centis)
+}
+
+fn build_lrc_text(lines: &[LyricLine]) -> Option<String> {
+    let mut out = String::new();
+    for line in lines {
+        let text = line.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push('[');
+        out.push_str(&make_lrc_timestamp(line.start_ms));
+        out.push(']');
+        out.push_str(text);
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn build_translation_lrc_text(lines: &[LyricLine]) -> Option<String> {
+    let mut out = String::new();
+    for line in lines {
+        let Some(translated) = line.translation.as_deref() else {
+            continue;
+        };
+        let text = translated.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push('[');
+        out.push_str(&make_lrc_timestamp(line.start_ms));
+        out.push(']');
+        out.push_str(text);
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn extract_netease_id(track_id: &str) -> Option<u64> {
+    track_id
+        .strip_prefix("netease:")
+        .and_then(|id| id.parse::<u64>().ok())
+}
+
+fn extract_qq_song_mid(track_id: &str) -> Option<&str> {
+    track_id.strip_prefix("qq:").filter(|id| !id.is_empty())
+}
+
+async fn write_download_sidecars(
+    client: &reqwest::Client,
+    file_path: &std::path::Path,
+    track_id: &str,
+    title: &str,
+    artist: &str,
+    duration_ms: u64,
+    cover_url: Option<&str>,
+) -> AppResult<()> {
+    let base_path = file_path.with_extension("");
+    let mut written_files: Vec<PathBuf> = Vec::new();
+
+    // 1) 歌词 sidecar
+    let lyrics_manager = LyricsManager::new(client);
+    let lyrics = lyrics_manager
+        .fetch_lyrics(
+            title,
+            artist,
+            duration_ms / 1000,
+            None,
+            extract_netease_id(track_id),
+            extract_qq_song_mid(track_id),
+        )
+        .await
+        .unwrap_or_default();
+
+    if let Some(lrc_text) = build_lrc_text(&lyrics) {
+        let lrc_path = base_path.with_extension("lrc");
+        std::fs::write(&lrc_path, lrc_text)?;
+        written_files.push(lrc_path);
+    }
+
+    if let Some(tlrc_text) = build_translation_lrc_text(&lyrics) {
+        let tlrc_path = base_path.with_extension("tlrc");
+        std::fs::write(&tlrc_path, tlrc_text)?;
+        written_files.push(tlrc_path);
+    }
+
+    // 2) 封面 sidecar
+    if let Some(raw_cover_url) = cover_url {
+        let normalized_cover_url = if raw_cover_url.starts_with("//") {
+            format!("https:{}", raw_cover_url)
+        } else {
+            raw_cover_url.to_string()
+        };
+        if !normalized_cover_url.trim().is_empty() {
+            if let Ok(resp) = client
+                .get(&normalized_cover_url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    let content_type = resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("image/jpeg")
+                        .to_lowercase();
+                    if content_type.starts_with("image/") {
+                        if let Ok(bytes) = resp.bytes().await {
+                            if !bytes.is_empty() {
+                                let ext = ext_from_image_content_type(&content_type);
+                                let cover_path = base_path.with_extension(ext);
+                                std::fs::write(&cover_path, &bytes)?;
+                                written_files.push(cover_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if written_files.is_empty() {
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// 获取下载目录，不存在则创建
@@ -179,6 +334,42 @@ fn write_manifest(app: &AppHandle, tracks: &[DownloadedTrack]) -> AppResult<()> 
     Ok(())
 }
 
+fn candidate_download_sidecars(audio_path: &std::path::Path) -> Vec<PathBuf> {
+    let Some(parent) = audio_path.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = audio_path.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+
+    [
+        "lrc",
+        "tlrc",
+        "txt",
+        "translated.lrc",
+        "translation.lrc",
+        "jpg",
+        "jpeg",
+        "png",
+        "webp",
+        "gif",
+    ]
+    .into_iter()
+    .map(|suffix| parent.join(format!("{}.{}", stem, suffix)))
+    .collect()
+}
+
+fn remove_download_artifacts(file_path: &str) {
+    let audio_path = std::path::Path::new(file_path);
+    // 先删同名 sidecar，再删主音频；全部忽略错误，避免手动删除/占用时影响 manifest 清理。
+    for sidecar in candidate_download_sidecars(audio_path) {
+        if sidecar.is_file() {
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+    let _ = std::fs::remove_file(audio_path);
+}
+
 fn validate_manifest_files(app: &AppHandle) -> AppResult<DownloadManifestValidation> {
     let manifest = read_manifest(app)?;
     let mut valid = Vec::with_capacity(manifest.len());
@@ -197,6 +388,8 @@ fn validate_manifest_files(app: &AppHandle) -> AppResult<DownloadManifestValidat
             }
             valid.push(track);
         } else {
+            // 主音频已丢失时，也顺手清理同名歌词/封面 sidecar，避免残留。
+            remove_download_artifacts(&track.file_path);
             removed_count += 1;
             changed = true;
         }
@@ -267,6 +460,8 @@ async fn perform_download(
         "https://www.bilibili.com"
     } else if url.contains("youtube.com") || url.contains("googlevideo.com") {
         "https://music.youtube.com"
+    } else if url.contains("qqmusic.qq.com") || url.contains("y.qq.com") {
+        "https://y.qq.com"
     } else {
         "https://music.163.com"
     };
@@ -354,6 +549,24 @@ async fn perform_download(
     if file_size == 0 {
         let _ = tokio::fs::remove_file(&file_path).await;
         return Err(AppError::Audio("Empty audio data received".into()));
+    }
+
+    // 下载 sidecar（歌词/翻译歌词/封面），失败不影响主音频
+    if let Err(e) = write_download_sidecars(
+        &client,
+        &file_path,
+        &track_id,
+        &title,
+        &artist,
+        duration_ms,
+        cover_url.as_deref(),
+    )
+    .await
+    {
+        eprintln!(
+            "[download] write sidecars failed: track_id={}, title={}, error={}",
+            track_id, title, e
+        );
     }
 
     // 构造记录
@@ -507,8 +720,8 @@ pub async fn delete_download(app: AppHandle, track_id: String) -> AppResult<()> 
     let idx = manifest.iter().position(|t| t.id == track_id);
     if let Some(i) = idx {
         let track = manifest.remove(i);
-        // 删除磁盘文件（忽略错误，文件可能已被手动删除）
-        let _ = std::fs::remove_file(&track.file_path);
+        // 删除磁盘文件 + 同名 sidecar（忽略错误，文件可能已被手动删除）
+        remove_download_artifacts(&track.file_path);
         write_manifest(&app, &manifest)?;
     } else {
         return Err(AppError::NotFound("Download not found".into()));

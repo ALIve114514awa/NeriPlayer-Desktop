@@ -4,6 +4,7 @@ import { usePlayerStore, displayAlbum } from '@/stores/player'
 import { useSyncStore } from '@/stores/sync'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
+import { HISTORY_CHANGED_EVENT } from '@/stores/history'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import MiniPlayer from '@/components/MiniPlayer.vue'
@@ -139,7 +140,9 @@ const bgImageStyle = computed(() => {
 
 // 防抖自动同步（歌单变更后 30s 触发，批量合并快速操作）
 const DEBOUNCE_SYNC_MS = 30_000
+const HISTORY_BATCHED_SYNC_MS = 10 * 60 * 1000
 let debounceSyncTimer: ReturnType<typeof setTimeout> | null = null
+let historyBatchedTimer: ReturnType<typeof setTimeout> | null = null
 let unlistenPlaylistChanged: UnlistenFn | null = null
 
 function scheduleDebouncedSync() {
@@ -156,6 +159,44 @@ function scheduleDebouncedSync() {
       syncStore.syncWebDav(true)
     }
   }, DEBOUNCE_SYNC_MS)
+}
+
+function triggerSilentSync() {
+  const syncStore = useSyncStore()
+  if (syncStore.isSyncing) return
+  if (syncStore.github.configured && syncStore.github.autoSync) {
+    syncStore.syncGitHub(true)
+  } else if (syncStore.webdav.configured && syncStore.webdav.autoSync) {
+    syncStore.syncWebDav(true)
+  }
+}
+
+function scheduleHistorySync() {
+  const syncStore = useSyncStore()
+  if (syncStore.isSyncing) return
+
+  // 优先使用 GitHub 历史同步频率配置
+  if (syncStore.github.configured && syncStore.github.autoSync) {
+    if (syncStore.github.historyUpdateMode === 'immediate') {
+      triggerSilentSync()
+      return
+    }
+    if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
+    historyBatchedTimer = setTimeout(() => {
+      historyBatchedTimer = null
+      triggerSilentSync()
+    }, HISTORY_BATCHED_SYNC_MS)
+    return
+  }
+
+  // WebDAV 没有独立频率配置，默认采用批量同步，避免频繁请求
+  if (syncStore.webdav.configured && syncStore.webdav.autoSync) {
+    if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
+    historyBatchedTimer = setTimeout(() => {
+      historyBatchedTimer = null
+      triggerSilentSync()
+    }, HISTORY_BATCHED_SYNC_MS)
+  }
 }
 
 // 启动时初始化：加载同步配置 + 检查登录状态 + 自动同步
@@ -180,12 +221,17 @@ onMounted(async () => {
   unlistenPlaylistChanged = await listen('playlists-changed', () => {
     scheduleDebouncedSync()
   })
+
+  // 监听前端播放历史变更事件，触发历史自动同步
+  window.addEventListener(HISTORY_CHANGED_EVENT, scheduleHistorySync as EventListener)
 })
 
 onUnmounted(() => {
   resetFlipState()
   if (nowPlayingMotionTimer) clearTimeout(nowPlayingMotionTimer)
   if (debounceSyncTimer) clearTimeout(debounceSyncTimer)
+  if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
+  window.removeEventListener(HISTORY_CHANGED_EVENT, scheduleHistorySync as EventListener)
   if (unlistenPlaylistChanged) unlistenPlaylistChanged()
 })
 </script>

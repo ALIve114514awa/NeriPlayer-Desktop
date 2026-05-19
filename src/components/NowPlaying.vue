@@ -29,7 +29,7 @@ const toast = useToastStore()
 const downloadStore = useDownloadStore()
 const router = useRouter()
 const { t } = useI18n()
-const showLyrics = ref(false)
+const playViewMode = ref<'cover' | 'lyrics'>('cover')
 const coverLoadError = ref(false)
 const showVolumeSlider = ref(false)
 const showQueue = ref(false)
@@ -65,6 +65,7 @@ function onEqBandChange(index: number, value: number) {
 const playbackSourceLabel = computed(() => {
   const id = player.currentTrack?.id || ''
   if (id.startsWith('netease:')) return t('player.source_netease')
+  if (id.startsWith('qq:')) return t('player.source_qq')
   if (id.startsWith('bilibili:')) return t('player.source_bilibili')
   if (id.startsWith('youtube:')) return t('player.source_youtube')
   if (id.startsWith('local:') || player.currentTrack?.audioUrl?.startsWith('file:')) return t('player.source_local')
@@ -73,12 +74,25 @@ const playbackSourceLabel = computed(() => {
 const playbackSourceIcon = computed(() => {
   const id = player.currentTrack?.id || ''
   if (id.startsWith('netease:')) return 'cloud'
+  if (id.startsWith('qq:')) return 'music_note'
   if (id.startsWith('bilibili:')) return 'smart_display'
   if (id.startsWith('youtube:')) return 'play_circle'
   return 'folder'
 })
 const showSourceBadge = computed(() => settings.showCoverBadge && playbackSourceLabel.value !== '')
 const sourceBadgeKey = computed(() => `${nowPlayingTrackKey.value}:${playbackSourceIcon.value}:${playbackSourceLabel.value || 'none'}`)
+
+function platformLabel(source?: string) {
+  switch ((source || '').toLowerCase()) {
+    case 'netease': return t('player.source_netease')
+    case 'qq': return t('player.source_qq')
+    case 'bilibili': return t('player.source_bilibili')
+    case 'youtube': return t('player.source_youtube')
+    case 'lrclib': return 'LRCLIB'
+    case 'local': return t('player.source_local')
+    default: return source || ''
+  }
+}
 
 // --- 歌词编辑器 ---
 const lyricsEditorText = ref('')
@@ -156,7 +170,51 @@ async function applyLyricsFromEditor() {
 const lyricFillQuery = ref('')
 const lyricFillResults = ref<any[]>([])
 const isLyricFilling = ref(false)
-const lyricFillPlatform = ref<'netease' | 'lrclib'>('netease')
+const lyricFillPlatform = ref<'netease' | 'lrclib' | 'qq'>('netease')
+
+function togglePlayViewMode() {
+  playViewMode.value = playViewMode.value === 'cover' ? 'lyrics' : 'cover'
+}
+
+async function parseLyricsFromSearchResult(result: any): Promise<any[] | null> {
+  if (result?.synced_lyrics) {
+    const parsed = await invoke<any[]>('parse_lrc_content', { content: String(result.synced_lyrics) })
+    let parsedTranslations: any[] = []
+    if (result?.translated_lyrics) {
+      try {
+        parsedTranslations = await invoke<any[]>('parse_lrc_content', { content: String(result.translated_lyrics) })
+      } catch {}
+    }
+    const translationByTime = new Map(
+      parsedTranslations.map(l => [Math.round(Number(l.start_ms || 0)), l.text || '']),
+    )
+    return parsed.map(l => ({
+      startMs: l.start_ms,
+      durationMs: l.duration_ms,
+      words: (l.words || []).map((w: any) => ({
+        startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
+      })),
+      text: l.text,
+      translation: translationByTime.get(Math.round(Number(l.start_ms || 0))) || l.translation || undefined,
+    }))
+  }
+
+  if (result?.plain_lyrics) {
+    return String(result.plain_lyrics)
+      .split(/\r?\n/)
+      .map((line: string) => line.trim())
+      .filter(Boolean)
+      .map((line: string, index: number) => ({
+        startMs: index * 3000,
+        durationMs: 3000,
+        words: [],
+        text: line,
+        translation: undefined,
+      }))
+  }
+
+  return null
+}
 
 async function doLyricFillSearch() {
   const q = lyricFillQuery.value.trim()
@@ -164,7 +222,11 @@ async function doLyricFillSearch() {
   isLyricFilling.value = true
   lyricFillResults.value = []
   try {
-    const results = await invoke<any[]>('search', { query: q, platform: lyricFillPlatform.value })
+    const results = await invoke<any[]>('search', {
+      query: q,
+      platform: lyricFillPlatform.value,
+      includeLyrics: true,
+    })
     lyricFillResults.value = results
   } catch (e) {
     console.error('Lyric fill search failed:', e)
@@ -175,43 +237,23 @@ async function doLyricFillSearch() {
 
 async function applyLyricFill(result: any) {
   try {
-    if (result.synced_lyrics || result.plain_lyrics) {
-      if (result.synced_lyrics) {
-        const parsed = await invoke<any[]>('parse_lrc_content', { content: result.synced_lyrics })
-        fetchedLyrics.value = parsed.map(l => ({
-          startMs: l.start_ms,
-          durationMs: l.duration_ms,
-          words: (l.words || []).map((w: any) => ({
-            startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-          })),
-          text: l.text,
-          translation: l.translation || undefined,
-        }))
-      } else {
-        fetchedLyrics.value = String(result.plain_lyrics)
-          .split(/\r?\n/)
-          .map((line: string) => line.trim())
-          .filter(Boolean)
-          .map((line: string, index: number) => ({
-            startMs: index * 3000,
-            durationMs: 3000,
-            words: [],
-            text: line,
-            translation: undefined,
-          }))
-      }
+    const directLyrics = await parseLyricsFromSearchResult(result)
+    if (directLyrics && directLyrics.length > 0) {
+      fetchedLyrics.value = directLyrics
       toast.success(t('player.lyrics_fill_applied'))
       goBackToMain()
       return
     }
     const idText = String(result.id || '')
     const neteaseId = idText.startsWith('netease:') ? parseInt(idText.replace('netease:', '')) : null
+    const qqSongMid = idText.startsWith('qq:') ? idText.replace('qq:', '') : null
     const lyrics = await invoke<any[]>('fetch_lyrics', {
       title: result.title || '',
       artist: result.artist || '',
       durationSecs: Math.floor((result.duration_ms || 0) / 1000),
       audioPath: null,
       neteaseId: neteaseId,
+      qqSongMid,
     })
     fetchedLyrics.value = lyrics.map(l => ({
       startMs: l.start_ms,
@@ -324,6 +366,7 @@ const localLikedTrackIds = ref<Set<string>>(new Set())
 
 function inferTrackSource(trackId: string) {
   if (trackId.startsWith('netease:')) return 'netease'
+  if (trackId.startsWith('qq:')) return 'qq'
   if (trackId.startsWith('bilibili:')) return 'bilibili'
   if (trackId.startsWith('youtube:')) return 'youtube'
   return 'local'
@@ -586,6 +629,7 @@ watch(() => player.currentTrack?.id, async (id) => {
   try {
     const track = player.currentTrack
     const neteaseId = id.startsWith('netease:') ? parseInt(id.replace('netease:', '')) : undefined
+    const qqSongMid = id.startsWith('qq:') ? id.replace('qq:', '') : undefined
 
     const lyrics = await invoke<any[]>('fetch_lyrics', {
       title: track.title,
@@ -593,6 +637,7 @@ watch(() => player.currentTrack?.id, async (id) => {
       durationSecs: Math.floor(track.durationMs / 1000),
       audioPath: track.audioUrl || null,
       neteaseId: neteaseId || null,
+      qqSongMid: qqSongMid || null,
     })
 
     fetchedLyrics.value = lyrics.map(l => ({
@@ -730,7 +775,7 @@ watch(showMoreSheet, (v) => { if (!v) setTimeout(() => { moreSheetView.value = '
 const searchQuery = ref('')
 const searchResults = ref<any[]>([])
 const isSearching = ref(false)
-const infoSearchPlatform = ref<'netease' | 'bilibili' | 'youtube'>('netease')
+const infoSearchPlatform = ref<'netease' | 'bilibili' | 'youtube' | 'qq'>('netease')
 const infoApplyCandidate = ref<any | null>(null)
 const applyInfoFields = ref({
   title: true,
@@ -754,7 +799,11 @@ async function doSearch() {
   searchResults.value = []
   infoApplyCandidate.value = null
   try {
-    const results = await invoke<any[]>('search', { query: q, platform: infoSearchPlatform.value })
+    const results = await invoke<any[]>('search', {
+      query: q,
+      platform: infoSearchPlatform.value,
+      includeLyrics: infoSearchPlatform.value === 'qq',
+    })
     searchResults.value = results
   } catch (e) {
     console.error('Search failed:', e)
@@ -783,25 +832,32 @@ async function confirmApplySearchResult() {
   if (Object.keys(patch).length > 0) player.updateCurrentTrackInfo(patch)
   if (applyInfoFields.value.lyrics) {
     try {
-      const idText = String(result.id || '')
-      const neteaseId = idText.startsWith('netease:') ? parseInt(idText.replace('netease:', '')) : null
-      const lyrics = await invoke<any[]>('fetch_lyrics', {
-        title: result.title || player.currentTrack?.title || '',
-        artist: result.artist || player.currentTrack?.artist || '',
-        durationSecs: Math.floor((result.duration_ms || player.currentTrack?.durationMs || 0) / 1000),
-        audioPath: null,
-        neteaseId,
-      })
-      if (lyrics.length) {
-        fetchedLyrics.value = lyrics.map(l => ({
-          startMs: l.start_ms,
-          durationMs: l.duration_ms,
-          words: (l.words || []).map((w: any) => ({
-            startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-          })),
-          text: l.text,
-          translation: l.translation || undefined,
-        }))
+      const directLyrics = await parseLyricsFromSearchResult(result)
+      if (directLyrics && directLyrics.length > 0) {
+        fetchedLyrics.value = directLyrics
+      } else {
+        const idText = String(result.id || '')
+        const neteaseId = idText.startsWith('netease:') ? parseInt(idText.replace('netease:', '')) : null
+        const qqSongMid = idText.startsWith('qq:') ? idText.replace('qq:', '') : null
+        const lyrics = await invoke<any[]>('fetch_lyrics', {
+          title: result.title || player.currentTrack?.title || '',
+          artist: result.artist || player.currentTrack?.artist || '',
+          durationSecs: Math.floor((result.duration_ms || player.currentTrack?.durationMs || 0) / 1000),
+          audioPath: null,
+          neteaseId,
+          qqSongMid,
+        })
+        if (lyrics.length) {
+          fetchedLyrics.value = lyrics.map(l => ({
+            startMs: l.start_ms,
+            durationMs: l.duration_ms,
+            words: (l.words || []).map((w: any) => ({
+              startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
+            })),
+            text: l.text,
+            translation: l.translation || undefined,
+          }))
+        }
       }
     } catch (e) {
       console.warn('Apply info lyrics failed:', e)
@@ -844,9 +900,18 @@ function restoreInfo() {
 const currentSource = computed(() => {
   const id = player.currentTrack?.id || ''
   if (id.startsWith('netease:')) return 'netease'
+  if (id.startsWith('qq:')) return 'qq'
   if (id.startsWith('bilibili:')) return 'bilibili'
   if (id.startsWith('youtube:')) return 'youtube'
   return 'local'
+})
+
+const currentLyricOffsetMs = computed<number>({
+  get: () => currentSource.value === 'qq' ? settings.qqMusicOffset : settings.cloudMusicOffset,
+  set: (value: number) => {
+    if (currentSource.value === 'qq') settings.qqMusicOffset = value
+    else settings.cloudMusicOffset = value
+  },
 })
 
 const currentTrackId = computed(() => player.currentTrack?.id || '')
@@ -948,6 +1013,12 @@ const neteaseQualities = [
   { key: 'jymaster', label: 'settings.q_master' },
 ]
 
+const qqQualities = [
+  { key: 'standard', label: 'settings.q_standard' },
+  { key: 'high', label: 'settings.q_high_yt' },
+  { key: 'lossless', label: 'settings.q_lossless' },
+]
+
 const youtubeQualities = [
   { key: 'low', label: 'settings.q_low' },
   { key: 'medium', label: 'settings.q_medium' },
@@ -958,6 +1029,8 @@ const youtubeQualities = [
 async function switchQuality(key: string) {
   if (currentSource.value === 'netease') {
     settings.neteaseQuality = key
+  } else if (currentSource.value === 'qq') {
+    settings.qqMusicQuality = key
   } else if (currentSource.value === 'youtube') {
     settings.youtubeQuality = key
   }
@@ -967,6 +1040,7 @@ async function switchQuality(key: string) {
 
 function currentQualityKey(): string {
   if (currentSource.value === 'netease') return settings.neteaseQuality
+  if (currentSource.value === 'qq') return settings.qqMusicQuality
   if (currentSource.value === 'youtube') return settings.youtubeQuality
   return ''
 }
@@ -1197,7 +1271,7 @@ const sliderActiveColor = computed(() => {
     </header>
 
     <!-- 双栏 -->
-    <div class="np-body" :class="{ 'np-body--no-header': props.hideHeader }">
+    <div class="np-body" :class="[{ 'np-body--no-header': props.hideHeader }, playViewMode === 'lyrics' ? 'np-body--lyrics-mode' : 'np-body--cover-mode']">
       <!-- 左侧 -->
       <section class="np-left" :class="{ 'np-left--beat-active': isVisualBeatActive }">
         <div class="cover-wrap" :class="{ 'cover-wrap--switching': isTrackSwitchAnimating, 'cover-wrap--beat-active': isVisualBeatActive }" @contextmenu="openContextMenu($event, 'cover')">
@@ -1391,6 +1465,14 @@ const sliderActiveColor = computed(() => {
               <span class="volume-label">{{ Math.round(player.volume * 100) }}%</span>
             </div>
           </div>
+          <button
+            class="tool-btn tool-btn--feedback"
+            :class="{ active: playViewMode === 'lyrics' }"
+            :title="playViewMode === 'lyrics' ? t('player.view_mode_cover') : t('player.view_mode_lyrics')"
+            @click="togglePlayViewMode"
+          >
+            <span class="material-symbols-rounded">{{ playViewMode === 'lyrics' ? 'album' : 'lyrics' }}</span>
+          </button>
           <!-- 音效 (AudioFX) -->
           <div class="speed-wrap">
             <button class="tool-btn tool-btn--feedback" :class="{ active: showAudioFxPanel || player.hasActiveEffects }" @click="triggerControlFeedbackPulse(); toggleToolbarPanel('audiofx')">
@@ -1499,6 +1581,7 @@ const sliderActiveColor = computed(() => {
           :current-time-ms="player.interpolatedPositionMs"
           :preview-time-ms="previewPositionMs"
           :is-playing="player.isPlaying"
+          :lyric-offset-ms="currentLyricOffsetMs"
           :accent-color="sliderActiveColor"
           :accent-container-color="(dynamicColorVars as any)['--np-primary-container'] || sliderActiveColor"
           @seek="(ms) => player.seekTo(ms)"
@@ -1589,7 +1672,7 @@ const sliderActiveColor = computed(() => {
               <span class="material-symbols-rounded">timer</span>
               <div class="np-more-list-info">
                 <span class="np-more-list-headline">{{ t('player.lyric_offset') }}</span>
-                <span class="np-more-list-desc">{{ settings.cloudMusicOffset > 0 ? '+' : '' }}{{ settings.cloudMusicOffset }}ms</span>
+                <span class="np-more-list-desc">{{ currentLyricOffsetMs > 0 ? '+' : '' }}{{ currentLyricOffsetMs }}ms · {{ currentSource === 'qq' ? t('player.source_qq') : t('player.source_netease') }}</span>
               </div>
               <span class="material-symbols-rounded np-more-chevron">chevron_right</span>
             </button>
@@ -1614,7 +1697,7 @@ const sliderActiveColor = computed(() => {
             </button>
 
             <!-- 歌词填充（对齐 Android FillOptionsDialog） -->
-            <button class="np-more-list-item" @click="lyricFillQuery = player.currentTrack?.title || ''; lyricFillResults = []; lyricFillPlatform = currentSource === 'netease' ? 'netease' : 'lrclib'; goToSubView('lyrics-fill')">
+            <button class="np-more-list-item" @click="lyricFillQuery = player.currentTrack?.title || ''; lyricFillResults = []; lyricFillPlatform = currentSource === 'netease' ? 'netease' : (currentSource === 'qq' ? 'qq' : 'lrclib'); goToSubView('lyrics-fill')">
               <span class="material-symbols-rounded">lyrics</span>
               <div class="np-more-list-info">
                 <span class="np-more-list-headline">{{ t('player.lyrics_fill') }}</span>
@@ -1665,14 +1748,15 @@ const sliderActiveColor = computed(() => {
               <h4 class="np-more-title">{{ t('player.lyric_offset') }}</h4>
             </div>
             <div class="np-more-item">
+              <div class="np-more-label">{{ currentSource === 'qq' ? t('settings.qq_offset') : t('settings.netease_offset') }}</div>
               <div class="np-more-row">
                 <input type="range" min="-2000" max="2000" step="50"
-                  :value="settings.cloudMusicOffset"
+                  :value="currentLyricOffsetMs"
                   class="np-more-slider"
-                  @input="settings.cloudMusicOffset = parseInt(($event.target as HTMLInputElement).value)"
+                  @input="currentLyricOffsetMs = parseInt(($event.target as HTMLInputElement).value)"
                 />
-                <span class="np-offset-value" :class="{ positive: settings.cloudMusicOffset > 0, negative: settings.cloudMusicOffset < 0 }">
-                  {{ settings.cloudMusicOffset > 0 ? '+' : '' }}{{ settings.cloudMusicOffset }}ms
+                <span class="np-offset-value" :class="{ positive: currentLyricOffsetMs > 0, negative: currentLyricOffsetMs < 0 }">
+                  {{ currentLyricOffsetMs > 0 ? '+' : '' }}{{ currentLyricOffsetMs }}ms
                 </span>
               </div>
             </div>
@@ -1770,6 +1854,12 @@ const sliderActiveColor = computed(() => {
                 网易云
               </button>
               <button
+                :class="{ active: infoSearchPlatform === 'qq' }"
+                @click="infoSearchPlatform = 'qq'; searchResults = []; infoApplyCandidate = null"
+              >
+                QQ 音乐
+              </button>
+              <button
                 :class="{ active: infoSearchPlatform === 'bilibili' }"
                 @click="infoSearchPlatform = 'bilibili'; searchResults = []; infoApplyCandidate = null"
               >
@@ -1797,7 +1887,7 @@ const sliderActiveColor = computed(() => {
                   <span class="np-more-search-title">{{ r.title }}</span>
                   <span class="np-more-search-artist">{{ r.artist }}</span>
                 </div>
-                <span class="np-more-search-source">{{ r.source }}</span>
+                <span class="np-more-search-source">{{ platformLabel(r.source) }}</span>
               </button>
             </div>
             <div v-if="infoApplyCandidate" class="np-more-field-picker">
@@ -1966,6 +2056,18 @@ const sliderActiveColor = computed(() => {
                 <span v-if="currentQualityKey() === q.key" class="material-symbols-rounded" style="font-size: 18px">check</span>
               </button>
             </div>
+            <div v-else-if="currentSource === 'qq'" class="np-more-quality-list">
+              <button
+                v-for="q in qqQualities"
+                :key="q.key"
+                class="np-more-quality-item"
+                :class="{ active: currentQualityKey() === q.key }"
+                @click="switchQuality(q.key)"
+              >
+                <span>{{ t(q.label) }}</span>
+                <span v-if="currentQualityKey() === q.key" class="material-symbols-rounded" style="font-size: 18px">check</span>
+              </button>
+            </div>
             <div v-else-if="currentSource === 'youtube'" class="np-more-quality-list">
               <button
                 v-for="q in youtubeQualities"
@@ -2056,6 +2158,12 @@ const sliderActiveColor = computed(() => {
                 @click="lyricFillPlatform = 'netease'; lyricFillResults = []"
               >
                 网易云
+              </button>
+              <button
+                :class="{ active: lyricFillPlatform === 'qq' }"
+                @click="lyricFillPlatform = 'qq'; lyricFillResults = []"
+              >
+                QQ 音乐
               </button>
               <button
                 :class="{ active: lyricFillPlatform === 'lrclib' }"
@@ -2263,10 +2371,45 @@ const sliderActiveColor = computed(() => {
   &.np-body--no-header {
     padding-top: 64px; /* 56px 播放器顶栏 + 8px 间距 */
   }
+
+  &.np-body--lyrics-mode {
+    .np-left {
+      flex: 0 0 0%;
+      opacity: 0;
+      transform: translateX(-18px) scale(0.985);
+      pointer-events: none;
+      overflow: hidden;
+      padding: 0;
+      gap: 0;
+    }
+
+    .np-right {
+      flex: 1 1 100%;
+      padding: 0 40px;
+      transform: translateX(0);
+      filter: none;
+    }
+  }
+
+  &.np-body--cover-mode {
+    .np-left {
+      flex: 1 1 50%;
+      opacity: 1;
+      transform: translateX(0) scale(1);
+      pointer-events: auto;
+      padding: 0 20px 0 40px;
+    }
+
+    .np-right {
+      flex: 1 1 50%;
+      padding: 0 40px 0 0;
+    }
+  }
 }
 
 .np-left {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2282,6 +2425,7 @@ const sliderActiveColor = computed(() => {
 
 .np-right {
   flex: 1;
+  min-width: 0;
   background: transparent;
   display: flex;
   align-items: stretch;

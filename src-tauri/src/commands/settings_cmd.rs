@@ -1,14 +1,17 @@
-use serde::Serialize;
-use tauri::{Manager, State};
+use crate::api::bilibili::client::BiliClient;
+use crate::api::netease::client::NeteaseClient;
+use crate::api::qq::client::QqMusicClient;
+use crate::api::youtube::client::YouTubeClient;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::api::netease::client::NeteaseClient;
-use crate::api::bilibili::client::BiliClient;
-use crate::api::youtube::client::YouTubeClient;
+use serde::Serialize;
+use tauri::{Manager, State};
 
 #[tauri::command]
 pub async fn get_app_data_dir(app: tauri::AppHandle) -> AppResult<String> {
-    let dir = app.path().app_data_dir()
+    let dir = app
+        .path()
+        .app_data_dir()
         .map_err(|e| AppError::Other(e.to_string()))?;
     Ok(dir.to_string_lossy().to_string())
 }
@@ -33,6 +36,21 @@ pub async fn get_netease_song_url(
         url: result.url,
         bitrate: result.br,
         format: result.r#type,
+    })
+}
+
+#[tauri::command]
+pub async fn get_qq_song_url(
+    song_mid: String,
+    quality: String,
+    state: State<'_, AppState>,
+) -> AppResult<SongUrlResult> {
+    let client = QqMusicClient::new(&state.http());
+    let result = client.get_song_url(&song_mid, &quality).await?;
+    Ok(SongUrlResult {
+        url: result.url,
+        bitrate: result.bitrate,
+        format: result.format,
     })
 }
 
@@ -66,7 +84,9 @@ pub async fn get_bili_audio_url(
     };
 
     let streams = client.get_audio_url(&real_bvid, real_cid).await?;
-    let best = streams.into_iter().next()
+    let best = streams
+        .into_iter()
+        .next()
         .ok_or_else(|| AppError::Api("No audio stream found".into()))?;
     Ok(BiliAudioResult {
         url: best.url,
@@ -91,12 +111,15 @@ pub async fn get_youtube_audio_url(
 ) -> AppResult<Vec<YtAudioResult>> {
     let client = YouTubeClient::new(&state.http());
     let streams = client.get_streams(&video_id).await?;
-    Ok(streams.into_iter().map(|s| YtAudioResult {
-        url: s.url,
-        bitrate: s.bitrate,
-        mime_type: s.mime_type,
-        content_length: s.content_length,
-    }).collect())
+    Ok(streams
+        .into_iter()
+        .map(|s| YtAudioResult {
+            url: s.url,
+            bitrate: s.bitrate,
+            mime_type: s.mime_type,
+            content_length: s.content_length,
+        })
+        .collect())
 }
 
 /// 将字节数据保存到本地文件（供前端封面保存等场景使用）
@@ -107,10 +130,7 @@ pub async fn save_file_bytes(path: String, data: Vec<u8>) -> AppResult<()> {
 
 /// 设置绕过代理（前端保存设置后通知后端重建 HTTP Client）
 #[tauri::command]
-pub async fn set_bypass_proxy(
-    bypass: bool,
-    state: State<'_, AppState>,
-) -> AppResult<()> {
+pub async fn set_bypass_proxy(bypass: bool, state: State<'_, AppState>) -> AppResult<()> {
     state.rebuild_http(bypass);
     Ok(())
 }

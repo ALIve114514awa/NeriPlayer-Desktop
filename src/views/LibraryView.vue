@@ -5,12 +5,14 @@ import { useRouter, useRoute } from 'vue-router'
 defineOptions({ name: 'LibraryView' })
 import { useI18n } from 'vue-i18n'
 import { useLibraryStore } from '@/stores/library'
-import { usePlayerStore } from '@/stores/player'
+import { usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useRecommendStore } from '@/stores/recommend'
 import { useAuthStore } from '@/stores/auth'
 import { useDownloadStore } from '@/stores/download'
+import { useToastStore } from '@/stores/toast'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import M3Input from '@/components/ui/M3Input.vue'
 
@@ -22,6 +24,7 @@ const player = usePlayerStore()
 const recommend = useRecommendStore()
 const auth = useAuthStore()
 const downloadStore = useDownloadStore()
+const toast = useToastStore()
 
 // 喜欢的歌曲计数
 const likedCount = computed(() => recommend.likedSongIds.size)
@@ -69,6 +72,38 @@ async function loadPlaylists() {
   }
 }
 
+function inferTrackSource(track: TrackInfo) {
+  if (track.id.startsWith('netease:')) return 'netease'
+  if (track.id.startsWith('qq:')) return 'qq'
+  if (track.id.startsWith('bilibili:')) return 'bilibili'
+  if (track.id.startsWith('youtube:')) return 'youtube'
+  return 'local'
+}
+
+function toBackendTrack(track: TrackInfo) {
+  return {
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album || '',
+    duration_ms: track.durationMs || 0,
+    source: inferTrackSource(track),
+    url: track.audioUrl || '',
+    cover_url: track.coverUrl || null,
+  }
+}
+
+function platformLabel(source?: string) {
+  switch ((source || '').toLowerCase()) {
+    case 'netease': return t('player.source_netease')
+    case 'qq': return t('player.source_qq')
+    case 'bilibili': return t('player.source_bilibili')
+    case 'youtube': return t('player.source_youtube')
+    case 'local': return t('player.source_local')
+    default: return source || '—'
+  }
+}
+
 // M3 Dialog 创建播放列表
 const showCreateDialog = ref(false)
 const newPlaylistName = ref('')
@@ -100,6 +135,63 @@ const contextMenu = ref<{ show: boolean; x: number; y: number; playlist: Playlis
 const LIKED_NAMES = ['我喜欢的音乐', '我喜歡的音樂', 'お気に入りの曲', 'Liked Songs']
 const LOCAL_NAMES = ['本地音乐', '本機音樂', 'ローカル音楽', 'Local Music']
 const ALL_PROTECTED = [...LIKED_NAMES, ...LOCAL_NAMES]
+
+async function ensureLocalPlaylistId(): Promise<number> {
+  const raw = await invoke<PlaylistInfo[]>('list_playlists')
+  const localPlaylist = raw.find((pl) => LOCAL_NAMES.includes(pl.name))
+  if (localPlaylist) return localPlaylist.id
+
+  const created = await invoke<PlaylistInfo>('create_playlist', { name: t('home.local_music') })
+  return created.id
+}
+
+async function syncScannedTracksToLocalPlaylist(scannedTracks: TrackInfo[]) {
+  const localPlaylistId = await ensureLocalPlaylistId()
+
+  const existingTracks = await invoke<any[]>('get_playlist_tracks', { id: localPlaylistId })
+  const existingIds = (existingTracks || [])
+    .map((track: any) => String(track?.id || ''))
+    .filter(Boolean)
+
+  if (existingIds.length > 0) {
+    await invoke('remove_tracks_from_playlist', {
+      playlistId: localPlaylistId,
+      trackIds: existingIds,
+    })
+  }
+
+  if (scannedTracks.length > 0) {
+    await invoke('add_tracks_to_playlist', {
+      playlistId: localPlaylistId,
+      tracks: scannedTracks.map(toBackendTrack),
+    })
+  }
+
+  await loadPlaylists()
+}
+
+async function selectAndScanLocalMusic() {
+  if (library.isScanning) return
+  try {
+    const result = await dialogOpen({ directory: true, multiple: false })
+    if (!result) return
+
+    const dir = typeof result === 'string' ? result : (result as any).path || String(result)
+    if (!dir || dir === '[object Object]') return
+
+    await library.scanDirectory(dir)
+    if (library.scanError) {
+      toast.error(t('library.scan_failed'))
+      return
+    }
+
+    await syncScannedTracksToLocalPlaylist(library.tracks)
+    toast.success(t('library.scan_success', { count: library.tracks.length }))
+  } catch (e) {
+    console.error('Scan local music failed:', e)
+    toast.error(t('library.scan_failed'))
+  }
+}
 
 function isProtectedPlaylist(pl: PlaylistInfo) {
   return ALL_PROTECTED.includes(pl.name)
@@ -405,12 +497,22 @@ onUnmounted(() => {
 
     <!-- Tab: 本地 -->
     <div v-if="activeTab === 0" class="playlist-list">
+      <div class="new-playlist-row" :class="{ disabled: library.isScanning }" @click="selectAndScanLocalMusic">
+        <span class="material-symbols-rounded" :class="{ spinning: library.isScanning }" style="font-size: 20px">
+          {{ library.isScanning ? 'progress_activity' : 'folder_search' }}
+        </span>
+        <div class="new-playlist-copy">
+          <span>{{ library.isScanning ? t('library.scanning') : t('library.scan_local_music') }}</span>
+          <small v-if="library.lastScanDir" class="new-playlist-sub">{{ library.lastScanDir }}</small>
+        </div>
+      </div>
       <!-- 新建歌单（对齐 Android：+ 新建歌单 行） -->
       <div class="new-playlist-row" @click="openCreateDialog">
         <span class="material-symbols-rounded" style="font-size: 20px">add</span>
         <span>{{ t('library.create_playlist') }}</span>
       </div>
       <div class="list-divider" />
+      <p v-if="library.scanError" class="scan-error">{{ t('library.scan_failed') }}</p>
 
       <!-- 歌单列表 -->
       <div v-for="pl in playlists" :key="pl.id" class="playlist-item" @click="router.push({ name: 'local-playlist', params: { id: pl.id } })">
@@ -451,7 +553,7 @@ onUnmounted(() => {
           </div>
           <div class="pl-info">
             <div class="pl-name">{{ fpl.name }}</div>
-            <div class="pl-count">{{ t('player.track_count', { count: fpl.trackCount }) }} · {{ fpl.source }}</div>
+            <div class="pl-count">{{ t('player.track_count', { count: fpl.trackCount }) }} · {{ platformLabel(fpl.source) }}</div>
           </div>
           <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
         </div>
@@ -526,7 +628,7 @@ onUnmounted(() => {
           </div>
           <div class="pl-info">
             <div class="pl-name">{{ dl.title }}</div>
-            <div class="pl-count">{{ dl.artist }} · {{ formatFileSize(dl.fileSize) }} · {{ dl.source }}</div>
+            <div class="pl-count">{{ dl.artist }} · {{ formatFileSize(dl.fileSize) }} · {{ platformLabel(dl.source) }}</div>
           </div>
           <button class="pl-more" @click.stop="openDlContextMenu($event, dl)">
             <span class="material-symbols-rounded" style="font-size: 20px">more_vert</span>
@@ -849,6 +951,44 @@ onUnmounted(() => {
   transition: background var(--duration-short);
 
   &:hover { background: var(--md-surface-container); }
+
+  &.disabled {
+    opacity: 0.6;
+    cursor: progress;
+    pointer-events: none;
+  }
+}
+
+.new-playlist-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.new-playlist-sub {
+  max-width: 100%;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--md-on-surface-variant);
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scan-error {
+  margin: 6px 12px 2px;
+  font-size: 12px;
+  color: var(--md-error);
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .list-divider {

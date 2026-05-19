@@ -29,6 +29,7 @@ const fallbackMessages: Record<string, string> = {
   'download.reveal_failed': '打开所在目录失败',
   'download.in_use_hint': '当前歌曲正在使用本地下载文件，切歌或暂停后再操作',
   'player.source_netease': '网易云',
+  'player.source_qq': 'QQ 音乐',
   'player.source_bilibili': '哔哩哔哩',
   'player.source_youtube': 'YouTube',
   'player.source_local': '本地',
@@ -130,6 +131,7 @@ function formatDate(ts?: number): string {
 function sourceLabel(source?: string): string {
   switch ((source || '').toLowerCase()) {
     case 'netease': return t('player.source_netease')
+    case 'qq': return t('player.source_qq')
     case 'bilibili': return t('player.source_bilibili')
     case 'youtube': return t('player.source_youtube')
     case 'local': return t('player.source_local')

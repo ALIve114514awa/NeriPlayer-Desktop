@@ -20,6 +20,9 @@ export function trackInfoToLtTrack(
   if (track.id.startsWith('netease:')) {
     channelId = LtChannels.NETEASE
     audioId = track.id.replace('netease:', '')
+  } else if (track.id.startsWith('qq:')) {
+    channelId = LtChannels.QQ_MUSIC
+    audioId = track.id.replace('qq:', '')
   } else if (track.id.startsWith('bilibili:')) {
     channelId = LtChannels.BILIBILI
     audioId = track.id.replace('bilibili:', '')
@@ -63,6 +66,9 @@ export function ltTrackToTrackInfo(lt: ListenTogetherTrack): TrackInfo {
   switch (lt.channelId) {
     case LtChannels.NETEASE:
       id = `netease:${lt.audioId}`
+      break
+    case LtChannels.QQ_MUSIC:
+      id = `qq:${lt.audioId}`
       break
     case LtChannels.BILIBILI:
       id = `bilibili:${lt.audioId}`

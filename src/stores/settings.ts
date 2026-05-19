@@ -47,7 +47,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const lyricBlur = ref(loadSetting('lyric_blur', true))
   const lyricBlurAmount = ref(loadSetting('lyric_blur_amount', 1.5))
   const cloudMusicOffset = ref(loadSetting('cloud_offset', 0))
-  const qqMusicOffset = ref(loadSetting('qq_offset', 0))
+  const qqMusicOffset = ref(loadSetting('qq_offset', 500))
 
   // 封面样式
   const coverStyle = ref<'disc' | 'card'>(loadSetting('cover_style', 'card'))
@@ -62,6 +62,7 @@ export const useSettingsStore = defineStore('settings', () => {
 
   // 音质
   const neteaseQuality = ref(loadSetting('netease_quality', 'exhigh'))
+  const qqMusicQuality = ref(loadSetting('qq_quality', 'high'))
   const youtubeQuality = ref(loadSetting('youtube_quality', 'very_high'))
   const biliQuality = ref(loadSetting('bili_quality', 'high'))
 
@@ -109,7 +110,7 @@ export const useSettingsStore = defineStore('settings', () => {
     dynamic_bg: dynamicBackground, audio_reactive: audioReactive,
     cover_blur_bg: coverBlurBg, cover_blur_amount: coverBlurAmount,
     cover_blur_darken: coverBlurDarken,
-    netease_quality: neteaseQuality, youtube_quality: youtubeQuality,
+    netease_quality: neteaseQuality, qq_quality: qqMusicQuality, youtube_quality: youtubeQuality,
     bili_quality: biliQuality, bypass_proxy: bypassProxy,
     intl_enabled: internationalizationEnabled,
     bg_image_uri: backgroundImageUri, bg_image_blur: backgroundImageBlur,
@@ -138,7 +139,7 @@ export const useSettingsStore = defineStore('settings', () => {
     cloudMusicOffset, qqMusicOffset,
     advancedLyrics, dynamicBackground, audioReactive,
     coverBlurBg, coverBlurAmount, coverBlurDarken,
-    neteaseQuality, youtubeQuality, biliQuality,
+    neteaseQuality, qqMusicQuality, youtubeQuality, biliQuality,
     bypassProxy, internationalizationEnabled,
     backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
     devModeEnabled,

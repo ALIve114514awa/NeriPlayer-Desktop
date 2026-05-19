@@ -72,6 +72,14 @@ const platformHubs = computed(() => [
     action: () => router.push({ name: 'explore' }),
   },
   {
+    key: 'qq',
+    title: t('settings.qq_account'),
+    subtitle: t('explore.qq_hint'),
+    icon: '/icons/ic_qq_music.svg',
+    color: '#1fce6d',
+    action: () => router.push({ name: 'explore', query: { platform: 'qq' } }),
+  },
+  {
     key: 'bilibili',
     title: t('settings.bilibili_account'),
     subtitle: auth.bilibili.loggedIn

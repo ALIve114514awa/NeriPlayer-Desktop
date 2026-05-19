@@ -5,6 +5,7 @@
 
 export const LtChannels = {
   NETEASE: 'netease',
+  QQ_MUSIC: 'qqMusic',
   BILIBILI: 'bilibili',
   YOUTUBE_MUSIC: 'youtubeMusic',
   LOCAL: 'local',
