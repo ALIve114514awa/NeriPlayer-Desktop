@@ -37,6 +37,20 @@ impl AudioSource {
     }
 }
 
+fn stop_prev_transition(
+    prev_sink: &mut Option<Arc<Sink>>,
+    prev_source: &mut Option<AudioSource>,
+    prev_cleanup_deadline: &mut Option<Instant>,
+) {
+    if let Some(old_prev) = prev_sink.take() {
+        old_prev.stop();
+    }
+    if let Some(old_prev_source) = prev_source.take() {
+        old_prev_source.abort_if_stream();
+    }
+    *prev_cleanup_deadline = None;
+}
+
 /// Fade 步进间隔
 const FADE_STEP_MS: u64 = 20;
 
@@ -356,6 +370,46 @@ impl PlayerEngine {
         sink.set_volume(target_volume);
     }
 
+    fn spawn_crossfade_worker(
+        old_sink: Option<Arc<Sink>>,
+        new_sink: Arc<Sink>,
+        target_volume: f32,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+    ) {
+        let _ = std::thread::Builder::new()
+            .name("audio-crossfade".into())
+            .spawn(move || {
+                let fade_duration = fade_out_ms.max(fade_in_ms);
+                if fade_duration == 0 {
+                    if let Some(ref old) = old_sink {
+                        old.stop();
+                    }
+                    new_sink.set_volume(target_volume);
+                    return;
+                }
+
+                let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
+                for i in 1..=steps {
+                    if let Some(ref old) = old_sink {
+                        let out_t = (i as f32
+                            / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
+                            .min(1.0);
+                        old.set_volume(target_volume * (1.0 - out_t));
+                    }
+                    let in_t =
+                        (i as f32 / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32).min(1.0);
+                    new_sink.set_volume(target_volume * in_t);
+                    std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
+                }
+
+                if let Some(ref old) = old_sink {
+                    old.stop();
+                }
+                new_sink.set_volume(target_volume);
+            });
+    }
+
     /// 音频线程主循环
     fn audio_thread(
         rx: mpsc::Receiver<AudioCmd>,
@@ -364,8 +418,10 @@ impl PlayerEngine {
     ) {
         let mut stream: Option<OutputStream> = None;
         let mut handle: Option<rodio::OutputStreamHandle> = None;
-        let mut current_sink: Option<Sink> = None;
-        let mut prev_sink: Option<Sink> = None; // crossfade 过渡用
+        let mut current_sink: Option<Arc<Sink>> = None;
+        let mut prev_sink: Option<Arc<Sink>> = None; // crossfade 过渡用
+        let mut prev_source: Option<AudioSource> = None;
+        let mut prev_cleanup_deadline: Option<Instant> = None;
         let mut current_volume: f32 = 1.0;
         let mut current_speed: f32 = 1.0;
         // 保留当前音频来源，用于 seek 时重建 decoder
@@ -391,7 +447,20 @@ impl PlayerEngine {
         loop {
             let cmd = match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(cmd) => cmd,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let should_cleanup_prev = prev_cleanup_deadline
+                        .map(|deadline| Instant::now() >= deadline)
+                        .unwrap_or(false)
+                        || prev_sink.as_ref().map(|sink| sink.empty()).unwrap_or(false);
+                    if should_cleanup_prev {
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     eprintln!("[audio-thread] channel disconnected, exiting");
                     break;
@@ -422,6 +491,11 @@ impl PlayerEngine {
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
 
                         let source = AudioSource::Bytes(data);
                         let (dec, dur) = Self::make_decoder(&source)?;
@@ -434,7 +508,8 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let sink =
+                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -460,6 +535,11 @@ impl PlayerEngine {
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
 
                         let source = AudioSource::File(path);
                         let (dec, dur) = Self::make_decoder(&source)?;
@@ -469,7 +549,8 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let sink =
+                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -500,6 +581,11 @@ impl PlayerEngine {
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
 
                         let source = AudioSource::Growing(reader, duration_hint_ms);
                         let (dec, dur) = Self::make_decoder(&source)?;
@@ -513,7 +599,8 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let sink =
+                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -545,6 +632,11 @@ impl PlayerEngine {
                     if let Some(sink) = current_sink.take() {
                         sink.stop();
                     }
+                    stop_prev_transition(
+                        &mut prev_sink,
+                        &mut prev_source,
+                        &mut prev_cleanup_deadline,
+                    );
                     current_duration_ms = 0;
                     // 重置共享电平
                     SharedAudioLevel::reset(&shared_level);
@@ -592,6 +684,11 @@ impl PlayerEngine {
                         if let Some(old_sink) = current_sink.take() {
                             old_sink.stop();
                         }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
 
                         let (dec, _) = Self::make_decoder(source)?;
                         let skip_duration = Duration::from_millis(position_ms);
@@ -602,7 +699,8 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let sink = Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let sink =
+                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
                         sink.set_volume(current_volume);
                         sink.set_speed(current_speed);
                         sink.append(analyzing);
@@ -655,10 +753,11 @@ impl PlayerEngine {
                             .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
-                        // 将当前 sink 移入 prev_sink 进行 fade out
-                        if let Some(old_prev) = prev_sink.take() {
-                            old_prev.stop();
-                        }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
                         let old_source = current_source.take();
                         let old_sink = current_sink.take();
 
@@ -671,47 +770,36 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let new_sink =
-                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let new_sink = Arc::new(
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?,
+                        );
                         new_sink.set_volume(0.0); // 从 0 开始 fade in
                         new_sink.set_speed(current_speed);
                         new_sink.append(analyzing);
 
-                        current_sink = Some(new_sink);
+                        current_sink = Some(new_sink.clone());
                         current_source = Some(source);
                         current_duration_ms = duration_ms_val;
 
-                        // 执行 crossfade（在音频线程中阻塞）
-                        let fade_duration = fade_out_ms.max(fade_in_ms);
-                        let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
-                        for i in 1..=steps {
-                            // fade out 旧 sink
-                            if let Some(ref old) = old_sink {
-                                let out_t = (i as f32
-                                    / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
-                                    .min(1.0);
-                                old.set_volume(current_volume * (1.0 - out_t));
-                            }
-                            // fade in 新 sink
-                            if let Some(ref new_s) = current_sink {
-                                let in_t = (i as f32
-                                    / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32)
-                                    .min(1.0);
-                                new_s.set_volume(current_volume * in_t);
-                            }
-                            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
-                        }
-                        // 清理旧 sink
-                        if let Some(old) = old_sink {
-                            old.stop();
-                        }
-                        if let Some(old_source) = old_source {
+                        if let Some(ref old) = old_sink {
+                            prev_sink = Some(old.clone());
+                            prev_source = old_source;
+                            prev_cleanup_deadline = Some(
+                                Instant::now()
+                                    + Duration::from_millis(
+                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
+                                    ),
+                            );
+                        } else if let Some(old_source) = old_source {
                             old_source.abort_if_stream();
                         }
-                        // 确保新 sink 到目标音量
-                        if let Some(ref s) = current_sink {
-                            s.set_volume(current_volume);
-                        }
+                        Self::spawn_crossfade_worker(
+                            old_sink,
+                            new_sink,
+                            current_volume,
+                            fade_out_ms,
+                            fade_in_ms,
+                        );
 
                         Ok(duration_ms_val)
                     })();
@@ -730,10 +818,11 @@ impl PlayerEngine {
                             .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
-                        // 将当前 sink 移入 prev_sink 进行 fade out
-                        if let Some(old_prev) = prev_sink.take() {
-                            old_prev.stop();
-                        }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
                         let old_source = current_source.take();
                         let old_sink = current_sink.take();
 
@@ -745,43 +834,36 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let new_sink =
-                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let new_sink = Arc::new(
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?,
+                        );
                         new_sink.set_volume(0.0);
                         new_sink.set_speed(current_speed);
                         new_sink.append(analyzing);
 
-                        current_sink = Some(new_sink);
+                        current_sink = Some(new_sink.clone());
                         current_source = Some(source);
                         current_duration_ms = dur;
 
-                        // 执行 crossfade
-                        let fade_duration = fade_out_ms.max(fade_in_ms);
-                        let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
-                        for i in 1..=steps {
-                            if let Some(ref old) = old_sink {
-                                let out_t = (i as f32
-                                    / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
-                                    .min(1.0);
-                                old.set_volume(current_volume * (1.0 - out_t));
-                            }
-                            if let Some(ref new_s) = current_sink {
-                                let in_t = (i as f32
-                                    / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32)
-                                    .min(1.0);
-                                new_s.set_volume(current_volume * in_t);
-                            }
-                            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
-                        }
-                        if let Some(old) = old_sink {
-                            old.stop();
-                        }
-                        if let Some(old_source) = old_source {
+                        if let Some(ref old) = old_sink {
+                            prev_sink = Some(old.clone());
+                            prev_source = old_source;
+                            prev_cleanup_deadline = Some(
+                                Instant::now()
+                                    + Duration::from_millis(
+                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
+                                    ),
+                            );
+                        } else if let Some(old_source) = old_source {
                             old_source.abort_if_stream();
                         }
-                        if let Some(ref s) = current_sink {
-                            s.set_volume(current_volume);
-                        }
+                        Self::spawn_crossfade_worker(
+                            old_sink,
+                            new_sink,
+                            current_volume,
+                            fade_out_ms,
+                            fade_in_ms,
+                        );
 
                         Ok(dur)
                     })();
@@ -805,9 +887,11 @@ impl PlayerEngine {
                             .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
 
-                        if let Some(old_prev) = prev_sink.take() {
-                            old_prev.stop();
-                        }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
                         let old_source = current_source.take();
                         let old_sink = current_sink.take();
 
@@ -819,53 +903,40 @@ impl PlayerEngine {
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
-                        let new_sink =
-                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?;
+                        let new_sink = Arc::new(
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?,
+                        );
                         new_sink.set_volume(0.0);
                         new_sink.set_speed(current_speed);
                         new_sink.append(analyzing);
 
-                        current_sink = Some(new_sink);
+                        current_sink = Some(new_sink.clone());
                         current_source = Some(source);
                         current_duration_ms = duration_ms_val;
 
-                        let fade_duration = fade_out_ms.max(fade_in_ms);
-                        let steps = (fade_duration as u64 / FADE_STEP_MS).max(1);
-                        for i in 1..=steps {
-                            if let Some(ref old) = old_sink {
-                                let out_t = (i as f32
-                                    / (fade_out_ms as u64 / FADE_STEP_MS).max(1) as f32)
-                                    .min(1.0);
-                                old.set_volume(current_volume * (1.0 - out_t));
-                            }
-                            if let Some(ref new_s) = current_sink {
-                                let in_t = (i as f32
-                                    / (fade_in_ms as u64 / FADE_STEP_MS).max(1) as f32)
-                                    .min(1.0);
-                                new_s.set_volume(current_volume * in_t);
-                            }
-                            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
-                        }
-                        if let Some(old) = old_sink {
-                            old.stop();
-                        }
-                        if let Some(old_source) = old_source {
+                        if let Some(ref old) = old_sink {
+                            prev_sink = Some(old.clone());
+                            prev_source = old_source;
+                            prev_cleanup_deadline = Some(
+                                Instant::now()
+                                    + Duration::from_millis(
+                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
+                                    ),
+                            );
+                        } else if let Some(old_source) = old_source {
                             old_source.abort_if_stream();
                         }
-                        if let Some(ref s) = current_sink {
-                            s.set_volume(current_volume);
-                        }
+                        Self::spawn_crossfade_worker(
+                            old_sink,
+                            new_sink,
+                            current_volume,
+                            fade_out_ms,
+                            fade_in_ms,
+                        );
 
                         Ok(duration_ms_val)
                     })();
                     let _ = reply.send(result);
-                }
-            }
-
-            // 清理已完成的 prev_sink（crossfade 残留）
-            if let Some(ref ps) = prev_sink {
-                if ps.empty() {
-                    prev_sink = None;
                 }
             }
         }

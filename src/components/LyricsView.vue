@@ -15,14 +15,20 @@ const props = withDefaults(defineProps<{
   currentTimeMs: number
   previewTimeMs?: number | null
   isPlaying: boolean
+  accentColor?: string
+  accentContainerColor?: string
 }>(), {
   currentTimeMs: 0,
   previewTimeMs: null,
   isPlaying: false,
+  accentColor: '',
+  accentContainerColor: '',
 })
 
 const emit = defineEmits<{ seek: [timeMs: number] }>()
 const containerRef = ref<HTMLDivElement>()
+const isLyricsSwitching = ref(false)
+let lyricsSwitchTimer: ReturnType<typeof setTimeout> | null = null
 
 // --- KaraokeLine 实例管理 ---
 const karaokeLines = ref<Map<number, KaraokeLine>>(new Map())
@@ -30,6 +36,11 @@ let lastActiveIndex = -1
 
 function hasWordTiming(line: LyricLine): boolean {
   return line.words && line.words.length > 0 && line.words.some(w => w.durationMs > 0)
+}
+
+function lyricTextFromWords(line: LyricLine): string {
+  if (line.text && line.text.trim()) return line.text
+  return (line.words || []).map(w => w.text).join('')
 }
 
 function buildKaraokeLines() {
@@ -98,7 +109,7 @@ function scrollToActive(idx: number, behavior: ScrollBehavior = 'smooth') {
     const lineEls = containerRef.value!.querySelectorAll('.lyric-line')
     const el = lineEls[idx] as HTMLElement
     if (!el) { isAutoScrolling = false; return }
-    const target = el.offsetTop - containerRef.value!.clientHeight * 0.40
+    const target = Math.max(0, el.offsetTop - containerRef.value!.clientHeight * 0.30)
     containerRef.value!.scrollTo({ top: target, behavior })
     setTimeout(() => { isAutoScrolling = false }, behavior === 'instant' ? 50 : 500)
   })
@@ -140,7 +151,20 @@ watch(() => props.isPlaying, (playing) => {
 
 // 歌词数据变化时重建
 watch(() => props.lyrics, () => {
-  nextTick(() => buildKaraokeLines())
+  isLyricsSwitching.value = true
+  if (lyricsSwitchTimer) clearTimeout(lyricsSwitchTimer)
+  nextTick(() => {
+    buildKaraokeLines()
+    lastActiveIndex = -1
+    if (activeIndex.value >= 0) {
+      karaokeLines.value.get(activeIndex.value)?.enable(adjustedTimeMs.value, props.isPlaying)
+      lastActiveIndex = activeIndex.value
+      scrollToActive(activeIndex.value, 'instant')
+    }
+  })
+  lyricsSwitchTimer = setTimeout(() => {
+    isLyricsSwitching.value = false
+  }, 420)
 }, { deep: false })
 
 onMounted(() => {
@@ -158,6 +182,7 @@ onMounted(() => {
 onUnmounted(() => {
   containerRef.value?.removeEventListener('scroll', onScroll)
   if (scrollEndTimer) clearTimeout(scrollEndTimer)
+  if (lyricsSwitchTimer) clearTimeout(lyricsSwitchTimer)
   for (const kl of karaokeLines.value.values()) kl.dispose()
 })
 
@@ -169,37 +194,57 @@ function dist(index: number): number {
 // 对齐 ModernKaraokeLyricsView 预设参数
 function blurForDist(d: number): number {
   if (!settings.lyricBlur || d === 0) return 0
-  // 对齐 Android AdvancedLyricsView: blurDelta = lyricBlurAmount * 0.45, clamped [0, 4]
-  // CSS blur 视觉比 Compose 更重，再折半
-  const blurDelta = Math.min(4, settings.lyricBlurAmount * 0.3)
-  return blurDelta * d
+  const blurUnit = Math.min(4, settings.lyricBlurAmount * 0.45)
+  if (d === 1) return blurUnit * 1.0
+  if (d === 2) return blurUnit * 1.5
+  if (d === 3) return blurUnit * 2.0
+  if (d === 4) return blurUnit * 2.5
+  return blurUnit * 4.0
 }
 
 function scaleForDist(d: number): number {
-  // focusedScale = 1.015, unfocusedScale = 0.965
-  if (d === 0) return 1.015
-  return 0.965
+  if (d <= 0) return 1.1
+  if (d === 1) return 0.9
+  return Math.max(0.8, 0.88 - (d - 2) * 0.02)
 }
 
 function alphaForDist(d: number): number {
-  // activeAlpha = 1.0, inactiveAlpha = 0.28
-  if (d === 0) return 1.0
-  return 0.28
+  if (d === 0) return 1
+  if (settings.lyricBlur) {
+    if (d === 1) return 0.72
+    if (d === 2) return 0.4
+    return Math.max(0.16, 0.4 - 0.08 * (d - 2))
+  }
+  if (d === 1) return 0.4
+  if (d === 2) return 0.35
+  return Math.max(0.16, 0.35 - 0.08 * (d - 2))
 }
 
 function seekToLine(line: LyricLine) {
   clearTextHoldIndex.value = null
   emit('seek', line.startMs)
 }
+
 </script>
 
 <template>
-  <div class="lyrics-scroll" ref="containerRef" :style="{ '--lyric-font-scale': settings.lyricFontScale }">
+  <div
+    class="lyrics-scroll"
+    ref="containerRef"
+    :class="{
+      'lyrics-scroll-switching': isLyricsSwitching,
+    }"
+    :style="{
+      '--lyric-font-scale': settings.lyricFontScale,
+      '--lyric-accent': props.accentColor || 'rgba(255,255,255,0.92)',
+      '--lyric-accent-soft': props.accentContainerColor || 'rgba(255,255,255,0.22)',
+    }"
+  >
     <div class="lyrics-pad-top" />
 
     <div
       v-for="(line, i) in lyrics"
-      :key="i"
+      :key="`${line.startMs}:${line.text}:${i}`"
       class="lyric-line"
       :class="{
         active: i === activeIndex,
@@ -213,11 +258,12 @@ function seekToLine(line: LyricLine) {
       }"
       @click="seekToLine(line)"
     >
-      <!-- 逐字模式：KaraokeLine 直接操作这个容器的 DOM -->
-      <span v-if="hasWordTiming(line)" class="line-text kw-container" />
-
-      <!-- 整行模式 -->
-      <span v-else class="line-text">{{ line.text }}</span>
+      <!-- 逐字歌词：底层完整文本常驻，上层 karaoke mask 只负责当前高亮，避免未唱部分被 mask 透明掉 -->
+      <span v-if="hasWordTiming(line)" class="line-text line-text--karaoke">
+        <span class="line-text-base">{{ lyricTextFromWords(line) }}</span>
+        <span class="line-text-highlight kw-container" aria-hidden="true" />
+      </span>
+      <span v-else class="line-text">{{ lyricTextFromWords(line) }}</span>
 
       <!-- 翻译 -->
       <span
@@ -238,50 +284,54 @@ function seekToLine(line: LyricLine) {
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 0 16px;
-  // 上下渐隐：top 20px, bottom 100px
-  mask-image: linear-gradient(to bottom, transparent 0%, black 20px, black calc(100% - 100px), transparent 100%);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 20px, black calc(100% - 100px), transparent 100%);
+  padding: 0 28px 0 40px;
+  mask-image: linear-gradient(to bottom, transparent 0%, black 112px, black calc(100% - 196px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 112px, black calc(100% - 196px), transparent 100%);
   text-align: left;
+  transition: opacity 260ms ease, transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
   &::-webkit-scrollbar { display: none; }
   scrollbar-width: none;
 }
 
-.lyrics-pad-top { height: 42%; }
-.lyrics-pad-bottom { height: 50%; }
+.lyrics-scroll-switching {
+  opacity: 0.78;
+  transform: translateY(8px);
+}
+
+.lyrics-pad-top { height: 34%; }
+.lyrics-pad-bottom { height: 44%; }
 
 .lyric-line {
   position: relative;
-  padding: 8px 16px;
-  // transform-origin 左下角（对齐参考项目 LTR 模式）
-  transform-origin: left bottom;
+  width: 100%;
+  max-width: 720px;
+  margin: 0;
+  padding: 10px 8px 10px 0;
+  text-align: left;
+  transform-origin: left center;
   transform: scale(var(--scale, 1));
   opacity: var(--alpha, 1);
   filter: blur(var(--blur, 0px));
-  // 对齐参考项目：scale 600ms, opacity 400ms, blur 300ms
   transition:
-    transform 600ms cubic-bezier(0.2, 0, 0, 1),
-    opacity 400ms cubic-bezier(0.4, 0, 0.2, 1),
-    filter 300ms ease-out;
+    transform 380ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 260ms ease,
+    filter 260ms ease,
+    letter-spacing 260ms ease;
   cursor: pointer;
   will-change: transform, opacity, filter;
-  // additive blend — 对齐参考项目 BlendMode.Plus
-  mix-blend-mode: plus-lighter;
 
   &:hover {
-    opacity: 0.6 !important;
+    opacity: min(1, calc(var(--alpha, 1) + 0.06)) !important;
     filter: blur(0px) !important;
   }
   &.active {
     filter: none;
-    // 活跃行也保持左下角 origin
-    transform-origin: left bottom;
+    transform-origin: left center;
   }
   &.clear-text {
     transform: none;
-    opacity: 0.5;
+    opacity: 0.56;
     filter: none;
-    mix-blend-mode: normal;
     transition: opacity 0.15s;
     &.active { opacity: 1; }
   }
@@ -289,40 +339,82 @@ function seekToLine(line: LyricLine) {
 
 .line-text {
   display: block;
-  // 对齐参考项目 32sp Bold, lineHeight 38sp
-  font-size: calc(32px * var(--lyric-font-scale, 1));
+  font-size: calc(18px * var(--lyric-font-scale, 1));
   font-weight: 700;
-  line-height: calc(38px * var(--lyric-font-scale, 1));
-  letter-spacing: -0.2px;
-  color: rgba(255, 255, 255, 0.2);
+  line-height: calc(21.24px * var(--lyric-font-scale, 1));
+  letter-spacing: 0;
+  color: rgba(255, 255, 255, 0.22);
   white-space: pre-wrap;
-  transition: color 0.4s;
+  text-wrap: pretty;
+  transition: color 0.22s ease, text-shadow 0.22s ease, transform 0.22s ease, opacity 0.22s ease;
   position: relative;
   z-index: 1;
-  .active & { color: white; }
-  .clear-text & { color: rgba(255, 255, 255, 0.35); }
+  .active & {
+    color: white;
+    text-shadow: 0 0 12px color-mix(in srgb, var(--lyric-accent-soft) 10%, transparent);
+  }
+  .past & { color: rgba(255, 255, 255, 0.28); }
+  .clear-text & { color: rgba(255, 255, 255, 0.42); }
   .clear-text.active & { color: white; }
+}
+
+.line-text--karaoke {
+  display: grid;
+  grid-template-areas: 'text';
+}
+
+.line-text-base,
+.line-text-highlight {
+  grid-area: text;
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.line-text-base {
+  color: inherit;
+}
+
+.line-text-highlight {
+  color: white;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.lyric-line.active .line-text-highlight {
+  opacity: 1;
+}
+
+.lyric-line:not(.active) .line-text-highlight {
+  display: none;
 }
 
 // KaraokeLine 创建的逐字 <span> 样式
 :deep(.kw) {
   display: inline;
   color: inherit;
+  text-shadow: inherit;
+  font-weight: inherit;
+}
+
+:deep(.line-text--active.kw-container .kw),
+:deep(.lyric-line.active .kw-container .kw) {
+  color: white;
 }
 
 .line-tl {
   display: block;
-  // 对齐参考项目伴唱行 19sp SemiBold, lineHeight 24sp
-  font-size: calc(19px * var(--lyric-font-scale, 1));
+  font-size: calc(11.16px * var(--lyric-font-scale, 1));
   font-weight: 600;
   color: rgba(255, 255, 255, 0.24);
   margin-top: 4px;
-  line-height: calc(24px * var(--lyric-font-scale, 1));
+  line-height: calc(12.5px * var(--lyric-font-scale, 1));
   position: relative;
   z-index: 1;
 
-  // 翻译行 alpha = 0.4 * activeColor (对齐参考项目)
-  .active & { color: rgba(255, 255, 255, 0.70); }
+  .active & {
+    color: rgba(255, 255, 255, 0.72);
+    text-shadow: none;
+  }
   .past & { color: rgba(255, 255, 255, 0.18); }
 }
 </style>

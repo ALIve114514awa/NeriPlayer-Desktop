@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { UnlistenFn } from '@tauri-apps/api/event'
@@ -9,6 +9,8 @@ const props = defineProps<{
   nowPlaying?: boolean
   trackName?: string
   albumName?: string
+  transitioning?: boolean
+  transitionState?: 'opening' | 'closing' | null
 }>()
 
 const emit = defineEmits<{
@@ -17,6 +19,9 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const titleBarTrackText = computed(() => props.albumName || props.trackName || '')
+const titleBarTrackKey = computed(() => `${props.nowPlaying ? 'np' : 'base'}:${titleBarTrackText.value || 'empty'}`)
+const titleBarSideKey = computed(() => props.nowPlaying ? 'np' : 'brand')
 
 const isMaximized = ref(false)
 let unlistenResize: UnlistenFn | null = null
@@ -58,35 +63,54 @@ onUnmounted(() => {
 <template>
   <header
     class="title-bar"
-    :class="{ 'tb-force-light': forceLight, 'tb-np-mode': nowPlaying }"
+    :class="{
+      'tb-force-light': forceLight,
+      'tb-np-mode': nowPlaying,
+      'tb-transitioning': transitioning,
+      'tb-opening': transitionState === 'opening',
+      'tb-closing': transitionState === 'closing',
+    }"
     data-tauri-drag-region
   >
-    <!-- 普通模式：logo + 名称 -->
-    <div v-if="!nowPlaying" class="tb-brand" data-tauri-drag-region>
-      <img src="/app-icon.png" alt="logo" class="tb-icon" />
-      <span class="tb-title">NeriPlayer</span>
-    </div>
+    <div class="tb-left-slot">
+      <transition name="tb-side-swap" mode="out-in">
+        <!-- 普通模式：logo + 名称 -->
+        <div v-if="!nowPlaying" :key="titleBarSideKey" class="tb-brand" data-tauri-drag-region>
+          <img src="/app-icon.png" alt="logo" class="tb-icon" />
+          <span class="tb-title">NeriPlayer</span>
+        </div>
 
-    <!-- 播放器模式：折叠按钮（覆盖 logo 区域） -->
-    <div v-else class="tb-np-left">
-      <button class="tb-np-btn tb-np-collapse" type="button" @click="emit('collapse')">
-        <span class="material-symbols-rounded">keyboard_arrow_down</span>
-      </button>
+        <!-- 播放器模式：折叠按钮（覆盖 logo 区域） -->
+        <div v-else :key="titleBarSideKey" class="tb-np-left">
+          <button class="tb-np-btn tb-np-collapse" type="button" @click="emit('collapse')">
+            <span class="material-symbols-rounded">keyboard_arrow_down</span>
+          </button>
+        </div>
+      </transition>
     </div>
 
     <!-- 播放器模式：居中播放信息 -->
-    <div v-if="nowPlaying" class="tb-np-center" data-tauri-drag-region>
-      <span class="tb-np-label">{{ t('player.now_playing') }}</span>
-      <span class="tb-np-track">{{ albumName || trackName || '' }}</span>
-    </div>
+    <transition name="tb-center-fade">
+      <div v-if="nowPlaying" class="tb-np-center" data-tauri-drag-region>
+        <span class="tb-np-label">{{ t('player.now_playing') }}</span>
+        <transition name="tb-track-swap" mode="out-in">
+          <span :key="titleBarTrackKey" class="tb-np-track">{{ titleBarTrackText }}</span>
+        </transition>
+      </div>
+    </transition>
 
     <!-- 拖拽占位 -->
     <div class="tb-drag" data-tauri-drag-region></div>
 
-    <!-- 播放器模式：更多按钮 -->
-    <button v-if="nowPlaying" class="tb-np-btn tb-np-more" type="button" @click="emit('toggleMore')">
-      <span class="material-symbols-rounded">more_vert</span>
-    </button>
+    <div class="tb-right-slot">
+      <transition name="tb-side-swap" mode="out-in">
+        <!-- 播放器模式：更多按钮 -->
+        <button v-if="nowPlaying" :key="`more:${titleBarSideKey}`" class="tb-np-btn tb-np-more" type="button" @click="emit('toggleMore')">
+          <span class="material-symbols-rounded">more_vert</span>
+        </button>
+        <div v-else :key="`spacer:${titleBarSideKey}`" class="tb-np-more-spacer" aria-hidden="true"></div>
+      </transition>
+    </div>
 
     <!-- 窗口控制 -->
     <div class="tb-controls">
@@ -129,12 +153,30 @@ onUnmounted(() => {
   z-index: 1000;
   pointer-events: none;
   transition: color 300ms var(--ease-standard),
-              height 300ms var(--ease-standard);
+              height 300ms var(--ease-standard),
+              background 320ms var(--ease-standard),
+              backdrop-filter 320ms var(--ease-standard),
+              box-shadow 320ms var(--ease-standard),
+              padding 320ms var(--ease-standard);
 
   &.tb-np-mode {
     height: 56px;
     padding-top: 8px;
   }
+}
+
+.title-bar.tb-transitioning {
+  background: linear-gradient(to bottom, rgba(14, 13, 18, 0.26), rgba(14, 13, 18, 0));
+  backdrop-filter: blur(14px) saturate(1.08);
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.title-bar.tb-opening {
+  animation: tb-shell-breathe-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.title-bar.tb-closing {
+  animation: tb-shell-breathe-out 320ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .title-bar.tb-force-light {
@@ -144,10 +186,18 @@ onUnmounted(() => {
 .tb-brand,
 .tb-controls,
 .tb-ctrl,
+.tb-left-slot,
 .tb-np-left,
 .tb-np-btn,
-.tb-np-more {
+.tb-np-more,
+.tb-right-slot {
   pointer-events: auto;
+}
+
+.tb-left-slot,
+.tb-right-slot {
+  display: flex;
+  align-items: center;
 }
 
 /* ========== 普通模式 ========== */
@@ -251,6 +301,75 @@ onUnmounted(() => {
   line-height: 1.2;
 }
 
+.tb-transitioning .tb-np-center {
+  animation: tb-center-float 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tb-transitioning .tb-np-btn,
+.tb-transitioning .tb-ctrl {
+  transition:
+    background var(--duration-short) var(--ease-standard),
+    opacity var(--duration-short) var(--ease-standard),
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tb-opening .tb-np-btn,
+.tb-opening .tb-ctrl {
+  transform: translateY(1px) scale(0.98);
+}
+
+.tb-closing .tb-np-btn,
+.tb-closing .tb-ctrl {
+  transform: translateY(-1px) scale(0.985);
+}
+
+.tb-track-swap-enter-active,
+.tb-track-swap-leave-active {
+  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tb-track-swap-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.tb-track-swap-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.tb-side-swap-enter-active,
+.tb-side-swap-leave-active {
+  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tb-side-swap-enter-from {
+  opacity: 0;
+  transform: translateX(-10px) scale(0.96);
+}
+
+.tb-side-swap-leave-to {
+  opacity: 0;
+  transform: translateX(10px) scale(0.96);
+}
+
+.tb-center-fade-enter-active,
+.tb-center-fade-leave-active {
+  transition: opacity 240ms ease, transform 300ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tb-center-fade-enter-from,
+.tb-center-fade-leave-to {
+  opacity: 0;
+  transform: translate(-50%, calc(-50% + 8px));
+}
+
+.tb-np-more-spacer {
+  width: 40px;
+  height: 40px;
+}
+
 .tb-np-more {
   align-self: center;
   margin-right: 4px;
@@ -319,5 +438,38 @@ onUnmounted(() => {
   background: #e81123 !important;
   color: #fff;
   opacity: 1;
+}
+
+@keyframes tb-shell-breathe-in {
+  0% {
+    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.12), rgba(14, 13, 18, 0));
+    backdrop-filter: blur(6px) saturate(1.02);
+  }
+  100% {
+    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.26), rgba(14, 13, 18, 0));
+    backdrop-filter: blur(14px) saturate(1.08);
+  }
+}
+
+@keyframes tb-shell-breathe-out {
+  0% {
+    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.24), rgba(14, 13, 18, 0));
+    backdrop-filter: blur(14px) saturate(1.08);
+  }
+  100% {
+    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.08), rgba(14, 13, 18, 0));
+    backdrop-filter: blur(4px) saturate(1.02);
+  }
+}
+
+@keyframes tb-center-float {
+  0% {
+    opacity: 0.72;
+    transform: translate(-50%, calc(-50% + 8px)) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
 }
 </style>

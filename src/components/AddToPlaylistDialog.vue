@@ -9,7 +9,8 @@ import M3Input from '@/components/ui/M3Input.vue'
 
 const props = defineProps<{
   open: boolean
-  track: TrackInfo | null
+  track?: TrackInfo | null
+  tracks?: TrackInfo[]
 }>()
 
 const emit = defineEmits<{
@@ -47,10 +48,20 @@ async function loadPlaylists() {
   }
 }
 
+function targetTracks(): TrackInfo[] {
+  if (props.tracks?.length) return props.tracks
+  return props.track ? [props.track] : []
+}
+
 async function addToPlaylist(playlistId: number) {
-  if (!props.track) return
+  const targets = targetTracks()
+  if (targets.length === 0) return
   try {
-    await invoke('add_to_playlist', { playlistId, track: toBackendTrack(props.track) })
+    if (targets.length === 1) {
+      await invoke('add_to_playlist', { playlistId, track: toBackendTrack(targets[0]) })
+    } else {
+      await invoke('add_tracks_to_playlist', { playlistId, tracks: targets.map(toBackendTrack) })
+    }
     toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
@@ -66,10 +77,15 @@ function toggleCreateInput() {
 }
 
 async function createAndAdd() {
-  if (!newName.value.trim() || !props.track) return
+  const targets = targetTracks()
+  if (!newName.value.trim() || targets.length === 0) return
   try {
     const pl = await invoke<PlaylistInfo>('create_playlist', { name: newName.value.trim() })
-    await invoke('add_to_playlist', { playlistId: pl.id, track: toBackendTrack(props.track) })
+    if (targets.length === 1) {
+      await invoke('add_to_playlist', { playlistId: pl.id, track: toBackendTrack(targets[0]) })
+    } else {
+      await invoke('add_tracks_to_playlist', { playlistId: pl.id, tracks: targets.map(toBackendTrack) })
+    }
     toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {

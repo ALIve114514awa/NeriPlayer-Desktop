@@ -2,6 +2,8 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePlayerStore, type TrackInfo, normalizeTrack, displayAlbum } from '@/stores/player'
+import { useDownloadStore } from '@/stores/download'
+import { useToastStore } from '@/stores/toast'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
@@ -10,12 +12,17 @@ import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
+const downloadStore = useDownloadStore()
+const toast = useToastStore()
 const { t } = useI18n()
 
 const isLoading = ref(true)
 const error = ref<string | null>(null)
 const playlistName = ref('')
 const searchQuery = ref('')
+const selectionMode = ref(false)
+const selectedIds = ref<Set<string>>(new Set())
+const isBatchRemoving = ref(false)
 
 const tracks = ref<TrackInfo[]>([])
 
@@ -23,9 +30,16 @@ const filteredTracks = computed(() => {
   if (!searchQuery.value) return tracks.value
   const q = searchQuery.value.toLowerCase()
   return tracks.value.filter(t =>
-    t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q)
+    t.title.toLowerCase().includes(q)
+    || t.artist.toLowerCase().includes(q)
+    || displayAlbum(t.album || '').toLowerCase().includes(q)
   )
 })
+
+const selectedTracks = computed(() => tracks.value.filter(t => selectedIds.value.has(t.id)))
+const selectedCount = computed(() => selectedIds.value.size)
+const visibleSelectedCount = computed(() => filteredTracks.value.filter(t => selectedIds.value.has(t.id)).length)
+const allVisibleSelected = computed(() => filteredTracks.value.length > 0 && visibleSelectedCount.value === filteredTracks.value.length)
 
 // 总时长
 const totalDuration = computed(() => {
@@ -76,8 +90,13 @@ const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | 
 })
 const showAddToPlaylist = ref(false)
 const addToPlaylistTarget = ref<TrackInfo | null>(null)
+const addToPlaylistTargets = ref<TrackInfo[]>([])
 
 function openTrackMenu(e: MouseEvent, track: TrackInfo, index: number) {
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
   const menuWidth = 200
@@ -92,6 +111,10 @@ function openTrackMenu(e: MouseEvent, track: TrackInfo, index: number) {
 }
 
 function openTrackContextMenu(e: MouseEvent, track: TrackInfo, index: number) {
+  if (!selectionMode.value) {
+    enterSelectionMode(track)
+    return
+  }
   const menuWidth = 200
   const menuHeight = 184
   trackMenu.value = {
@@ -110,30 +133,59 @@ function closeTrackMenu() {
 function openAddToPlaylist(track: TrackInfo) {
   closeTrackMenu()
   addToPlaylistTarget.value = track
+  addToPlaylistTargets.value = []
+  showAddToPlaylist.value = true
+}
+
+function openBatchAddToPlaylist() {
+  if (selectedTracks.value.length === 0) return
+  closeTrackMenu()
+  addToPlaylistTarget.value = null
+  addToPlaylistTargets.value = selectedTracks.value
   showAddToPlaylist.value = true
 }
 
 // 删除确认
 const showRemoveDialog = ref(false)
 const removeTarget = ref<TrackInfo | null>(null)
+const removeMode = ref<'single' | 'batch'>('single')
 
 function requestRemove(track: TrackInfo) {
   closeTrackMenu()
+  removeMode.value = 'single'
   removeTarget.value = track
   showRemoveDialog.value = true
 }
 
+function requestBatchRemove() {
+  if (selectedCount.value === 0) return
+  closeTrackMenu()
+  removeMode.value = 'batch'
+  removeTarget.value = null
+  showRemoveDialog.value = true
+}
+
 async function confirmRemove() {
-  if (!removeTarget.value) return
   const id = Number(route.params.id)
   try {
-    await invoke('remove_from_playlist', { playlistId: id, trackId: removeTarget.value.id })
-    tracks.value = tracks.value.filter(t => t.id !== removeTarget.value!.id)
+    if (removeMode.value === 'batch') {
+      isBatchRemoving.value = true
+      const ids = [...selectedIds.value]
+      await invoke('remove_tracks_from_playlist', { playlistId: id, trackIds: ids })
+      tracks.value = tracks.value.filter(t => !selectedIds.value.has(t.id))
+      toast.success(`已移除 ${ids.length} 首歌曲`)
+      leaveSelectionMode()
+    } else if (removeTarget.value) {
+      await invoke('remove_from_playlist', { playlistId: id, trackId: removeTarget.value.id })
+      tracks.value = tracks.value.filter(t => t.id !== removeTarget.value!.id)
+    }
   } catch (e) {
     console.error('Remove failed:', e)
+  } finally {
+    isBatchRemoving.value = false
+    showRemoveDialog.value = false
+    removeTarget.value = null
   }
-  showRemoveDialog.value = false
-  removeTarget.value = null
 }
 
 function addToQueueNext(track: TrackInfo) {
@@ -144,6 +196,52 @@ function addToQueueNext(track: TrackInfo) {
 function addToQueueEnd(track: TrackInfo) {
   closeTrackMenu()
   player.addToQueueEnd(track)
+}
+
+function enterSelectionMode(track?: TrackInfo) {
+  selectionMode.value = true
+  if (track) selectedIds.value = new Set(selectedIds.value).add(track.id)
+}
+
+function leaveSelectionMode() {
+  selectionMode.value = false
+  selectedIds.value = new Set()
+}
+
+function toggleSelected(trackId: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(trackId)) next.delete(trackId)
+  else next.add(trackId)
+  selectedIds.value = next
+  if (selectionMode.value && next.size === 0) selectionMode.value = false
+}
+
+function toggleSelectAllVisible() {
+  if (allVisibleSelected.value) {
+    const next = new Set(selectedIds.value)
+    for (const track of filteredTracks.value) next.delete(track.id)
+    selectedIds.value = next
+    if (next.size === 0) selectionMode.value = false
+    return
+  }
+  const next = new Set(selectedIds.value)
+  for (const track of filteredTracks.value) next.add(track.id)
+  selectedIds.value = next
+  if (next.size > 0) selectionMode.value = true
+}
+
+function playSelected() {
+  if (selectedTracks.value.length === 0) return
+  player.playAll(selectedTracks.value)
+}
+
+function addSelectedToQueueEnd() {
+  for (const track of selectedTracks.value) player.addToQueueEnd(track)
+  toast.success(`已添加 ${selectedTracks.value.length} 首到队列`)
+}
+
+function downloadSelected() {
+  for (const track of selectedTracks.value) downloadStore.downloadTrack(track)
 }
 
 function playAll() {
@@ -157,6 +255,10 @@ function shufflePlay() {
 }
 
 function playTrack(track: TrackInfo) {
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
   player.clearQueue()
   for (const t of filteredTracks.value) {
     player.addToQueueEnd(t)
@@ -172,7 +274,11 @@ const playlistCover = computed(() => {
   return ''
 })
 
-onMounted(loadDetail)
+onMounted(() => {
+  loadDetail()
+  downloadStore.initEvents()
+  downloadStore.loadDownloads()
+})
 </script>
 
 <template>
@@ -218,6 +324,9 @@ onMounted(loadDetail)
             <button class="hero-icon-btn" :title="t('player.shuffle_play')" @click="shufflePlay">
               <span class="material-symbols-rounded">shuffle</span>
             </button>
+            <button class="hero-icon-btn" title="多选" @click="enterSelectionMode()">
+              <span class="material-symbols-rounded">checklist</span>
+            </button>
           </div>
         </div>
       </div>
@@ -225,16 +334,48 @@ onMounted(loadDetail)
       <div v-if="filteredTracks.length === 0" class="state-center">
         <p>{{ t('player.empty_playlist') }}</p>
       </div>
-      <div v-else class="track-list">
+      <template v-else>
+        <div v-if="selectionMode" class="selection-toolbar">
+          <div class="selection-count">已选择 {{ selectedCount }} 首</div>
+          <button class="selection-btn" @click="toggleSelectAllVisible">
+            <span class="material-symbols-rounded">{{ allVisibleSelected ? 'deselect' : 'select_all' }}</span>
+            {{ allVisibleSelected ? '取消全选' : '全选当前' }}
+          </button>
+          <button class="selection-btn" :disabled="selectedCount === 0" @click="playSelected">
+            <span class="material-symbols-rounded filled">play_arrow</span>
+            播放
+          </button>
+          <button class="selection-btn" :disabled="selectedCount === 0" @click="addSelectedToQueueEnd">
+            <span class="material-symbols-rounded">add_to_queue</span>
+            加到队尾
+          </button>
+          <button class="selection-btn" :disabled="selectedCount === 0" @click="openBatchAddToPlaylist">
+            <span class="material-symbols-rounded">playlist_add</span>
+            加到歌单
+          </button>
+          <button class="selection-btn" :disabled="selectedCount === 0" @click="downloadSelected">
+            <span class="material-symbols-rounded">download</span>
+            下载
+          </button>
+          <button class="selection-btn danger" :disabled="selectedCount === 0" @click="requestBatchRemove">
+            <span class="material-symbols-rounded">delete</span>
+            移除
+          </button>
+          <button class="selection-btn ghost" @click="leaveSelectionMode">取消</button>
+        </div>
+        <div class="track-list">
         <div
           v-for="(track, index) in filteredTracks"
           :key="track.id"
           class="track-item"
-          :class="{ active: player.currentTrack?.id === track.id }"
+          :class="{ active: player.currentTrack?.id === track.id, selected: selectedIds.has(track.id), 'selection-mode': selectionMode }"
           @click="playTrack(track)"
           @contextmenu.prevent.stop="openTrackContextMenu($event, track, index)"
         >
-          <div class="track-index">
+          <button v-if="selectionMode" class="track-select" @click.stop="toggleSelected(track.id)">
+            <span class="material-symbols-rounded filled">{{ selectedIds.has(track.id) ? 'check_circle' : 'radio_button_unchecked' }}</span>
+          </button>
+          <div v-else class="track-index">
             <div v-if="player.currentTrack?.id === track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
             <span v-else class="index-num">{{ index + 1 }}</span>
           </div>
@@ -251,7 +392,8 @@ onMounted(loadDetail)
             <span class="material-symbols-rounded">more_vert</span>
           </button>
         </div>
-      </div>
+        </div>
+      </template>
     </template>
 
     <!-- 曲目右键菜单 -->
@@ -281,21 +423,101 @@ onMounted(loadDetail)
     <!-- 删除确认对话框 -->
     <M3Dialog
       v-model:open="showRemoveDialog"
-      :title="t('library.remove_from_playlist')"
+      :title="removeMode === 'batch' ? '批量移除歌曲' : t('library.remove_from_playlist')"
       icon="delete"
-      :confirm-text="t('library.remove_from_playlist')"
+      :confirm-text="removeMode === 'batch' ? '移除选中' : t('library.remove_from_playlist')"
+      :confirm-disabled="isBatchRemoving"
       confirm-danger
       @confirm="confirmRemove"
     >
-      <p class="dialog-msg">{{ t('library.remove_confirm_msg', { name: removeTarget?.title || '' }) }}</p>
+      <p class="dialog-msg">{{ removeMode === 'batch' ? `确定要从当前歌单移除选中的 ${selectedCount} 首歌曲吗？` : t('library.remove_confirm_msg', { name: removeTarget?.title || '' }) }}</p>
     </M3Dialog>
 
-    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" />
+    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" :tracks="addToPlaylistTargets" />
   </div>
 </template>
 
 <style scoped lang="scss">
 @use '@/styles/detail-view.scss' as *;
+
+
+.selection-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  margin: 0 0 10px;
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--md-surface-container-high) 92%, transparent);
+  border: 1px solid color-mix(in srgb, var(--md-primary) 18%, var(--md-outline-variant));
+  backdrop-filter: blur(18px);
+}
+
+.selection-count {
+  padding: 0 8px;
+  margin-right: auto;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--md-primary);
+}
+
+.selection-btn {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 12px;
+  border-radius: var(--radius-full);
+  background: var(--md-surface-container-highest);
+  color: var(--md-on-surface-variant);
+  font-size: 12px;
+  font-weight: 700;
+  transition: background var(--duration-short), color var(--duration-short), opacity var(--duration-short), transform var(--duration-short);
+
+  .material-symbols-rounded { font-size: 18px; }
+  &:hover:not(:disabled) { background: var(--md-secondary-container); color: var(--md-on-secondary-container); }
+  &:active:not(:disabled) { transform: scale(0.97); }
+  &:disabled { opacity: 0.42; cursor: not-allowed; }
+
+  &.danger {
+    color: var(--md-error);
+    background: color-mix(in srgb, var(--md-error) 10%, transparent);
+  }
+
+  &.ghost {
+    background: transparent;
+  }
+}
+
+.track-select {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-full);
+  color: var(--md-primary);
+  flex-shrink: 0;
+
+  .material-symbols-rounded { font-size: 22px; }
+  &:hover { background: color-mix(in srgb, var(--md-primary) 10%, transparent); }
+}
+
+:deep(.track-item.selected),
+.track-item.selected {
+  background: color-mix(in srgb, var(--md-primary) 14%, transparent);
+}
+
+.track-item.selection-mode .track-more {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.track-item.selection-mode .track-duration {
+  opacity: 0.45;
+}
 
 .track-more {
   width: 32px;

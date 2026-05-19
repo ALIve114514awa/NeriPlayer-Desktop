@@ -22,7 +22,7 @@ interface RealWord {
 function generateFadeGradient(
   widthRatio: number,
   bright = 'rgba(0,0,0,1)',
-  dark = 'rgba(0,0,0,0.2)',
+  dark = 'rgba(0,0,0,0)',
 ): [string, number] {
   const totalAspect = 2 + widthRatio
   const widthInTotal = widthRatio / totalAspect
@@ -84,18 +84,17 @@ export class KaraokeLine {
 
   /**
    * 浮动动画 — 对齐 AMLL initFloatAnimation
-   * translateY(0) → translateY(-0.05em)
+   * 桌面端收敛处理，只保留极轻微抬升，避免歌词高光“抖”
    */
   private initFloatAnimations(): void {
     for (const rw of this.words) {
       const delay = rw.word.startMs - this.lineStartTime
       const duration = Math.max(1000, rw.word.durationMs)
 
-      // 对齐参考项目：4px 浮动幅度
       const anim = rw.element.animate(
         [
           { transform: 'translateY(0)' },
-          { transform: 'translateY(-4px)' },
+          { transform: 'translateY(-1.5px)' },
         ],
         {
           duration,
@@ -128,7 +127,9 @@ export class KaraokeLine {
       el.style.maskImage = maskImage
       el.style.webkitMaskImage = maskImage
       el.style.maskRepeat = 'no-repeat'
+      el.style.webkitMaskRepeat = 'no-repeat'
       el.style.maskSize = `${totalAspect * 100}% 100%`
+      el.style.webkitMaskSize = `${totalAspect * 100}% 100%`
 
       // 计算所有 word 在此 word 之前的总宽度
       const idx = this.words.indexOf(rw)

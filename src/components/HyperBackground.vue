@@ -31,7 +31,7 @@ let startTime = 0
 let beatEnvelope = 0
 
 // 平滑过渡状态（对齐 Android 逐帧 lerp，消除切歌闪烁）
-const LERP_SPEED = 0.04 // 每帧插值速率，~60fps 下 ≈0.8s 过渡完成
+const LERP_SPEED = 0.032 // 每帧插值速率，过渡更柔和，切歌时更接近网易云式铺开
 const smoothColors: number[][] = [
   [0.4, 0.31, 0.64, 1],
   [0.49, 0.36, 0.75, 1],

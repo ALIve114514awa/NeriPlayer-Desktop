@@ -36,7 +36,7 @@ watch(() => props.coverUrl, (newUrl) => {
         frontUrl.value = newUrl
         showBack.value = false
         backUrl.value = ''
-      }, 600) // 与 CSS transition 时长一致
+      }, 720) // 与 CSS transition 时长一致
     })
   }
   img.onerror = () => {
@@ -96,7 +96,7 @@ watch(() => props.coverUrl, (newUrl) => {
 .cover-blur-img.back {
   z-index: 1;
   opacity: 0;
-  transition: opacity 0.6s ease;
+  transition: opacity 0.72s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .cover-blur-img.back.visible {

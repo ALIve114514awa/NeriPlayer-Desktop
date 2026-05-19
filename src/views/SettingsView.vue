@@ -303,7 +303,7 @@ function cancelDownload(trackId: string) {
 }
 
 function goToDownloads() {
-  router.push('/library?tab=downloads')
+  router.push('/downloads')
 }
 
 // ── YouTube 国际化 ──

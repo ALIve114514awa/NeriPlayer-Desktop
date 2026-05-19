@@ -16,6 +16,7 @@ const router = createRouter({
     { path: '/explore', name: 'explore', component: () => import('./views/ExploreView.vue') },
     { path: '/library', name: 'library', component: () => import('./views/LibraryView.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
+    { path: '/downloads', name: 'downloads', component: () => import('./views/DownloadsView.vue') },
     { path: '/recent', name: 'recent', component: () => import('./views/RecentView.vue') },
     { path: '/playlist/netease/:id', name: 'netease-playlist', component: () => import('./views/NeteasePlaylistView.vue') },
     { path: '/album/netease/:id', name: 'netease-album', component: () => import('./views/NeteasePlaylistView.vue'), props: { isAlbum: true } },

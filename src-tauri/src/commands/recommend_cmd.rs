@@ -150,6 +150,16 @@ pub async fn get_album_detail(
     client.get_album_detail(album_id).await
 }
 
+/// 获取歌曲详情（网易云）
+#[tauri::command]
+pub async fn get_netease_song_detail(
+    song_id: u64,
+    state: State<'_, AppState>,
+) -> AppResult<Value> {
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    client.get_song_detail(&[song_id]).await
+}
+
 /// 获取用户收藏的专辑列表（网易云）
 #[tauri::command]
 pub async fn get_user_stared_albums(

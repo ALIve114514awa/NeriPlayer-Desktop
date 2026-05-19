@@ -6,7 +6,18 @@ import { useI18n } from 'vue-i18n'
 import QueuePanel from './QueuePanel.vue'
 import ListenTogetherPanel from './ListenTogetherPanel.vue'
 
+type CoverSnapshot = {
+  rect: { left: number; top: number; width: number; height: number }
+  borderRadius: string
+  src: string
+}
+
 const emit = defineEmits<{ expand: [] }>()
+const props = withDefaults(defineProps<{
+  coverHiddenByFlip?: boolean
+}>(), {
+  coverHiddenByFlip: false,
+})
 const player = usePlayerStore()
 const lt = useListenTogetherStore()
 const { t } = useI18n()
@@ -111,6 +122,32 @@ const currentTimeMs = computed(() =>
 
 const currentTimeFormatted = computed(() => formatTime(currentTimeMs.value))
 const durationFormatted = computed(() => formatTime(player.durationMs))
+const miniTrackKey = computed(() => player.currentTrack?.id || 'empty')
+const miniDownloadStateKey = computed(() =>
+  `${miniTrackKey.value}:${player.isPlayingFromDownload ? 'download' : 'stream'}`
+)
+const coverRef = ref<HTMLDivElement>()
+
+function getCoverSnapshot(): CoverSnapshot | null {
+  const el = coverRef.value
+  const src = player.currentTrack?.coverUrl || ''
+  if (!el || !src) return null
+  const rect = el.getBoundingClientRect()
+  return {
+    rect: {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    },
+    borderRadius: getComputedStyle(el).borderRadius,
+    src,
+  }
+}
+
+defineExpose({
+  getCoverSnapshot,
+})
 </script>
 
 <template>
@@ -141,23 +178,37 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
     <div class="mp-body">
       <!-- 左：封面 + 歌曲信息 -->
       <div class="mp-left" @click="emit('expand')">
-        <div class="mp-cover" :class="{ playing: player.isPlaying }">
-          <img
-            v-if="player.currentTrack?.coverUrl"
-            :src="player.currentTrack.coverUrl"
-            referrerpolicy="no-referrer"
-            class="mp-cover-img"
-          />
-          <span v-else class="material-symbols-rounded filled" style="font-size: 20px; opacity: 0.6">music_note</span>
+        <div ref="coverRef" class="mp-cover" :class="{ playing: player.isPlaying, 'mp-cover-hidden': props.coverHiddenByFlip }">
+          <transition name="mp-cover-swap" mode="out-in">
+            <img
+              v-if="player.currentTrack?.coverUrl"
+              :key="`cover:${miniTrackKey}`"
+              :src="player.currentTrack.coverUrl"
+              referrerpolicy="no-referrer"
+              class="mp-cover-img"
+            />
+            <span
+              v-else
+              :key="`placeholder:${miniTrackKey}`"
+              class="material-symbols-rounded filled"
+              style="font-size: 20px; opacity: 0.6"
+            >music_note</span>
+          </transition>
         </div>
         <div class="mp-info">
-          <div class="mp-title">{{ player.currentTrack?.title || t('player.not_playing') }}</div>
-          <div class="mp-artist">{{ player.currentTrack?.artist || '' }}</div>
-          <div v-if="player.durationMs > 0" class="mp-time">{{ currentTimeFormatted }} / {{ durationFormatted }}</div>
-          <div v-if="player.isPlayingFromDownload" class="mp-download-chip">
-            <span class="material-symbols-rounded">download_done</span>
-            {{ t('player.playing_from_download') }}
-          </div>
+          <transition name="mp-meta-swap" mode="out-in">
+            <div :key="miniTrackKey" class="mp-meta">
+              <div class="mp-title">{{ player.currentTrack?.title || t('player.not_playing') }}</div>
+              <div class="mp-artist">{{ player.currentTrack?.artist || '' }}</div>
+              <div v-if="player.durationMs > 0" class="mp-time">{{ currentTimeFormatted }} / {{ durationFormatted }}</div>
+              <transition name="mp-chip-fade" mode="out-in">
+                <div v-if="player.isPlayingFromDownload" :key="miniDownloadStateKey" class="mp-download-chip">
+                  <span class="material-symbols-rounded">download_done</span>
+                  {{ t('player.playing_from_download') }}
+                </div>
+              </transition>
+            </div>
+          </transition>
         </div>
       </div>
 
@@ -252,6 +303,8 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   background: var(--md-surface-container);
   z-index: 100;
   border-top: 1px solid var(--md-surface-container-highest);
+  backdrop-filter: blur(18px) saturate(1.04);
+  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease, backdrop-filter 320ms ease;
 }
 
 /* ── 顶部进度条（通栏） ── */
@@ -336,6 +389,7 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   padding: 0 16px;
   height: 71px; // 76 - 5px 进度条
   gap: 16px;
+  transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
 }
 
 /* ── 左：封面 + 信息 ── */
@@ -348,7 +402,7 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   cursor: pointer;
   padding: 4px;
   border-radius: var(--radius-md);
-  transition: background 150ms;
+  transition: background 150ms, transform 260ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
 
   &:hover { background: var(--md-surface-container-high); }
 }
@@ -362,10 +416,14 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: border-radius 500ms var(--ease-standard);
+  transition: border-radius 500ms var(--ease-standard), transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
   overflow: hidden;
 
   &.playing { border-radius: var(--radius-md); }
+}
+
+.mp-cover-hidden {
+  opacity: 0;
 }
 
 .mp-cover-img {
@@ -377,6 +435,12 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
 
 .mp-info {
   flex: 1;
+  min-width: 0;
+  position: relative;
+  transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
+}
+
+.mp-meta {
   min-width: 0;
 }
 
@@ -432,6 +496,7 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   display: flex;
   align-items: center;
   gap: 4px;
+  transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
 }
 
 .mp-ctrl-btn {
@@ -494,6 +559,7 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
   align-items: center;
   justify-content: flex-end;
   gap: 2px;
+  transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
 }
 
 .mp-tool-btn {
@@ -580,4 +646,40 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
 }
 .mp-icon-enter-from { transform: scale(0.5); opacity: 0; }
 .mp-icon-leave-to { transform: scale(0.5); opacity: 0; }
+
+.mp-cover-swap-enter-active,
+.mp-cover-swap-leave-active {
+  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.mp-cover-swap-enter-from,
+.mp-cover-swap-leave-to {
+  opacity: 0;
+  transform: scale(0.92);
+}
+
+.mp-meta-swap-enter-active,
+.mp-meta-swap-leave-active {
+  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.mp-meta-swap-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.mp-meta-swap-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.mp-chip-fade-enter-active,
+.mp-chip-fade-leave-active {
+  transition: opacity 180ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.mp-chip-fade-enter-from {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.mp-chip-fade-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
 </style>

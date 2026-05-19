@@ -15,6 +15,10 @@ pub struct SearchResult {
     pub duration_ms: u64,
     pub source: String,
     pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synced_lyrics: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plain_lyrics: Option<String>,
 }
 
 #[tauri::command]
@@ -47,6 +51,8 @@ async fn search_netease(query: &str, state: &State<'_, AppState>) -> AppResult<V
         duration_ms: r.duration_ms,
         source: "netease".into(),
         cover_url: r.cover_url,
+        synced_lyrics: None,
+        plain_lyrics: None,
     }).collect())
 }
 
@@ -86,6 +92,8 @@ async fn search_bilibili(query: &str, state: &State<'_, AppState>) -> AppResult<
                 duration_ms: duration,
                 source: "bilibili".into(),
                 cover_url: cover,
+                synced_lyrics: None,
+                plain_lyrics: None,
             })
         })
         .collect();
@@ -140,6 +148,8 @@ async fn search_youtube(_query: &str, state: &State<'_, AppState>) -> AppResult<
                             duration_ms: 0, // InnerTube 不直接返回时长
                             source: "youtube".into(),
                             cover_url: thumbnail,
+                            synced_lyrics: None,
+                            plain_lyrics: None,
                         });
                     }
                 }
@@ -162,5 +172,7 @@ async fn search_lrclib(query: &str, state: &State<'_, AppState>) -> AppResult<Ve
         duration_ms: (r.duration * 1000.0) as u64,
         source: "lrclib".into(),
         cover_url: None,
+        synced_lyrics: r.synced_lyrics,
+        plain_lyrics: r.plain_lyrics,
     }).collect())
 }

@@ -153,6 +153,31 @@ pub async fn add_to_playlist(app: AppHandle, playlist_id: i64, track: TrackInfo)
     Ok(())
 }
 
+
+#[tauri::command]
+pub async fn add_tracks_to_playlist(app: AppHandle, playlist_id: i64, tracks: Vec<TrackInfo>) -> AppResult<usize> {
+    let path = playlists_path();
+    let mut store = PlaylistStore::load(&path);
+    let pl = store.playlists.iter_mut().find(|p| p.id == playlist_id)
+        .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
+
+    let mut added = 0_usize;
+    for track in tracks {
+        if track.id.is_empty() || pl.tracks.iter().any(|t| t.id == track.id) {
+            continue;
+        }
+        pl.tracks.push(track);
+        added += 1;
+    }
+
+    if added > 0 {
+        pl.modified_at = chrono::Utc::now().timestamp_millis() as u64;
+        store.save(&path)?;
+        let _ = app.emit("playlists-changed", ());
+    }
+    Ok(added)
+}
+
 #[tauri::command]
 pub async fn remove_from_playlist(app: AppHandle, playlist_id: i64, track_id: String) -> AppResult<()> {
     let path = playlists_path();
@@ -164,6 +189,31 @@ pub async fn remove_from_playlist(app: AppHandle, playlist_id: i64, track_id: St
     store.save(&path)?;
     let _ = app.emit("playlists-changed", ());
     Ok(())
+}
+
+
+#[tauri::command]
+pub async fn remove_tracks_from_playlist(app: AppHandle, playlist_id: i64, track_ids: Vec<String>) -> AppResult<usize> {
+    let path = playlists_path();
+    let mut store = PlaylistStore::load(&path);
+    let pl = store.playlists.iter_mut().find(|p| p.id == playlist_id)
+        .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
+
+    let ids: std::collections::HashSet<String> = track_ids.into_iter().collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let before = pl.tracks.len();
+    pl.tracks.retain(|t| !ids.contains(&t.id));
+    let removed = before.saturating_sub(pl.tracks.len());
+
+    if removed > 0 {
+        pl.modified_at = chrono::Utc::now().timestamp_millis() as u64;
+        store.save(&path)?;
+        let _ = app.emit("playlists-changed", ());
+    }
+    Ok(removed)
 }
 
 /// 获取收藏歌单列表

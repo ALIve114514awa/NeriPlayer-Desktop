@@ -31,10 +31,12 @@ const tabs = computed(() => [
   { label: t('library.tab_favorites'), icon: 'favorite', key: 'favorites' },
   { label: t('library.tab_downloads'), icon: 'download', key: 'downloads' },
   { label: t('library.tab_netease_playlists'), icon: 'queue_music', key: 'netease_playlists' },
+  { label: t('library.bilibili_favorites'), icon: 'video_library', key: 'bilibili_favorites' },
+  { label: 'YouTube Music', icon: 'subscriptions', key: 'youtube_playlists' },
   { label: t('library.tab_netease_albums'), icon: 'album', key: 'netease_albums' },
 ])
 // 根据路由 query 参数设置初始标签
-const tabKeyToIndex: Record<string, number> = { local: 0, favorites: 1, downloads: 2, netease_playlists: 3, netease_albums: 4 }
+const tabKeyToIndex: Record<string, number> = { local: 0, favorites: 1, downloads: 2, netease_playlists: 3, bilibili_favorites: 4, youtube_playlists: 5, netease_albums: 6 }
 const initialTab = typeof route.query.tab === 'string' ? (tabKeyToIndex[route.query.tab] ?? 0) : 0
 const activeTab = ref(initialTab)
 
@@ -187,6 +189,8 @@ async function confirmRename() {
 const neteasePlaylists = computed(() => recommend.userPlaylists['netease'] || [])
 // 哔哩哔哩收藏夹
 const biliPlaylists = computed(() => recommend.userPlaylists['bilibili'] || [])
+// YouTube Music 资料库歌单
+const youtubePlaylists = computed(() => recommend.userPlaylists['youtube'] || [])
 
 // 收藏歌单（从同步数据中获取）
 interface FavoritePlaylist {
@@ -355,6 +359,9 @@ onMounted(() => {
   }
   if (auth.bilibili.loggedIn && !biliPlaylists.value.length) {
     recommend.fetchUserPlaylists('bilibili')
+  }
+  if (auth.youtube.loggedIn && !youtubePlaylists.value.length) {
+    recommend.fetchUserPlaylists('youtube')
   }
   // 网易云收藏专辑
   if (auth.netease.loggedIn && !recommend.userAlbums.length) {
@@ -560,8 +567,76 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Tab: 网易云-专辑 -->
+    <!-- Tab: Bili 收藏夹 -->
     <div v-else-if="activeTab === 4" class="playlist-list">
+      <template v-if="biliPlaylists.length > 0">
+        <div class="platform-summary bilibili">
+          <span class="platform-icon-mask" style="mask-image: url('/icons/ic_bilibili.svg')"></span>
+          <div>
+            <div class="platform-title">{{ t('library.bilibili_favorites') }}</div>
+            <div class="platform-desc">{{ t('player.video_count', { count: biliPlaylists.reduce((sum, p) => sum + (p.trackCount || 0), 0) }) }}</div>
+          </div>
+        </div>
+        <div
+          v-for="bpl in biliPlaylists"
+          :key="'bili-' + bpl.id"
+          class="playlist-item"
+          @click="router.push({ name: 'bili-playlist', params: { mediaId: bpl.id } })"
+        >
+          <div class="pl-icon bilibili" :class="{ 'has-cover': bpl.coverUrl }">
+            <img v-if="bpl.coverUrl" :src="bpl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
+            <span v-else class="material-symbols-rounded filled" style="font-size: 22px">video_library</span>
+          </div>
+          <div class="pl-info">
+            <div class="pl-name">{{ bpl.name }}</div>
+            <div class="pl-count">{{ t('player.video_count', { count: bpl.trackCount || 0 }) }}</div>
+          </div>
+          <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
+        </div>
+      </template>
+      <div v-else class="empty-tab">
+        <div class="empty-circle platform-empty bilibili"><span class="platform-icon-mask" style="mask-image: url('/icons/ic_bilibili.svg')"></span></div>
+        <p class="empty-title">{{ t('library.bilibili_favorites') }}</p>
+        <p class="empty-desc">{{ auth.bilibili.loggedIn ? t('explore.no_playlists') : t('explore.login_for_playlists') }}</p>
+      </div>
+    </div>
+
+    <!-- Tab: YouTube Music 歌单 -->
+    <div v-else-if="activeTab === 5" class="playlist-list">
+      <template v-if="youtubePlaylists.length > 0">
+        <div class="platform-summary youtube">
+          <span class="platform-icon-mask" style="mask-image: url('/icons/ic_youtube.svg')"></span>
+          <div>
+            <div class="platform-title">YouTube Music</div>
+            <div class="platform-desc">{{ t('player.track_count', { count: youtubePlaylists.length }) }}</div>
+          </div>
+        </div>
+        <div
+          v-for="ypl in youtubePlaylists"
+          :key="'yt-' + ypl.id"
+          class="playlist-item"
+          @click="router.push({ name: 'youtube-playlist', params: { browseId: ypl.id } })"
+        >
+          <div class="pl-icon youtube" :class="{ 'has-cover': ypl.coverUrl }">
+            <img v-if="ypl.coverUrl" :src="ypl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
+            <span v-else class="material-symbols-rounded filled" style="font-size: 22px">subscriptions</span>
+          </div>
+          <div class="pl-info">
+            <div class="pl-name">{{ ypl.name }}</div>
+            <div class="pl-count">{{ ypl.description || 'YouTube Music' }}</div>
+          </div>
+          <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
+        </div>
+      </template>
+      <div v-else class="empty-tab">
+        <div class="empty-circle platform-empty youtube"><span class="platform-icon-mask" style="mask-image: url('/icons/ic_youtube.svg')"></span></div>
+        <p class="empty-title">YouTube Music</p>
+        <p class="empty-desc">{{ auth.youtube.loggedIn ? t('explore.no_playlists') : t('explore.login_for_playlists') }}</p>
+      </div>
+    </div>
+
+    <!-- Tab: 网易云-专辑 -->
+    <div v-else-if="activeTab === 6" class="playlist-list">
       <div v-if="recommend.userAlbums.length > 0">
         <div
           v-for="album in recommend.userAlbums"
@@ -890,6 +965,63 @@ onUnmounted(() => {
   background: #00a1d620;
   overflow: hidden;
 }
+
+.pl-icon.youtube {
+  background: #ff003320;
+  overflow: hidden;
+}
+
+
+.platform-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  margin-bottom: 8px;
+  border-radius: 20px;
+  border: 1px solid var(--md-outline-variant);
+  background:
+    radial-gradient(circle at 12% 20%, color-mix(in srgb, var(--platform-color) 22%, transparent), transparent 34%),
+    var(--md-surface-container);
+
+  &.bilibili { --platform-color: #00a1d6; }
+  &.youtube { --platform-color: #ff0033; }
+}
+
+.platform-icon-mask {
+  display: block;
+  width: 26px;
+  height: 26px;
+  background: var(--platform-color, var(--md-primary));
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  flex-shrink: 0;
+}
+
+.platform-title {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.platform-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--md-on-surface-variant);
+}
+
+.empty-circle.platform-empty {
+  opacity: 0.85;
+
+  &.bilibili { --platform-color: #00a1d6; }
+  &.youtube { --platform-color: #ff0033; }
+
+  .platform-icon-mask {
+    width: 40px;
+    height: 40px;
+  }
+}
+
 
 /* 分组分割线 */
 .section-divider {

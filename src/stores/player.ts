@@ -622,7 +622,6 @@ export const usePlayerStore = defineStore('player', () => {
       const downloaded = useDownloadStore().getDownloadedTrack(track.id)
       if (downloaded?.filePath && isOnlineTrack(track)) {
         try {
-          if (useOverlapCrossfade) commitTrack()
           dur = await playDownloadedFile(downloaded.filePath, useCrossfade, transitionFadeOutMs, transitionFadeInMs)
           if (token !== playbackRequestToken) return
           playedFromDownloadedFile = true
@@ -649,7 +648,6 @@ export const usePlayerStore = defineStore('player', () => {
         const urlResult = cached || await resolvePlaybackUrl(track)
         if (token !== playbackRequestToken) return
         if (urlResult?.url) {
-          if (useOverlapCrossfade) commitTrack()
           try {
             if (useCrossfade) {
               dur = await invoke<number>('crossfade_url_streaming', {
@@ -685,7 +683,6 @@ export const usePlayerStore = defineStore('player', () => {
         const result = takePrefetchedPlaybackUrl(track.id) || await resolvePlaybackUrl(track)
         if (!result?.url) throw new Error('No Bilibili audio stream')
         if (token !== playbackRequestToken) return
-        if (useOverlapCrossfade) commitTrack()
         if (useCrossfade) {
           dur = await invoke<number>('crossfade_url_fast', {
             url: result.url, durationHintMs: track.durationMs,
@@ -707,7 +704,6 @@ export const usePlayerStore = defineStore('player', () => {
         if (token !== playbackRequestToken) return
 
         if (!best?.url) throw new Error('No YouTube audio stream')
-        if (useOverlapCrossfade) commitTrack()
         if (useCrossfade) {
           dur = await invoke<number>('crossfade_url_fast', {
             url: best.url, durationHintMs: track.durationMs || 0,
@@ -725,7 +721,6 @@ export const usePlayerStore = defineStore('player', () => {
         _currentLoadedFromDownloadPath = null
         isPlayingFromDownload.value = false
         // 本地文件
-        if (useOverlapCrossfade) commitTrack()
         if (useCrossfade) {
           dur = await invoke<number>('crossfade_file', {
             path: track.audioUrl,
@@ -777,7 +772,20 @@ export const usePlayerStore = defineStore('player', () => {
       console.error('Play failed:', msg)
       playError.value = msg
       isPlayingFromDownload.value = false
-      isPlaying.value = false
+      const shouldRestorePreviousPlaybackState = useOverlapCrossfade && wasPlayingBeforeSwitch && !trackCommitted
+      if (shouldRestorePreviousPlaybackState) {
+        try {
+          const state = await invoke<{ is_playing?: boolean }>('get_player_state')
+          isPlaying.value = !!state?.is_playing
+          _interpIsPlaying = isPlaying.value
+        } catch {
+          isPlaying.value = true
+          _interpIsPlaying = true
+        }
+      } else {
+        isPlaying.value = false
+        _interpIsPlaying = false
+      }
       isLoadingAudio.value = false
 
       const toast = useToastStore()
