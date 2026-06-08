@@ -22,7 +22,7 @@ interface RealWord {
 function generateFadeGradient(
   widthRatio: number,
   bright = 'rgba(0,0,0,1)',
-  dark = 'rgba(0,0,0,0.2)',
+  dark = 'rgba(0,0,0,0)',
 ): [string, number] {
   const totalAspect = 2 + widthRatio
   const widthInTotal = widthRatio / totalAspect
@@ -84,7 +84,7 @@ export class KaraokeLine {
 
   /**
    * 浮动动画 — 对齐 AMLL initFloatAnimation
-   * translateY(0) → translateY(-0.05em)
+   * 桌面端收敛处理，只保留极轻微抬升，避免歌词高光“抖”
    */
   private initFloatAnimations(): void {
     for (const rw of this.words) {
@@ -94,7 +94,7 @@ export class KaraokeLine {
       const anim = rw.element.animate(
         [
           { transform: 'translateY(0)' },
-          { transform: 'translateY(-0.05em)' },
+          { transform: 'translateY(-1.5px)' },
         ],
         {
           duration,
@@ -127,7 +127,9 @@ export class KaraokeLine {
       el.style.maskImage = maskImage
       el.style.webkitMaskImage = maskImage
       el.style.maskRepeat = 'no-repeat'
+      el.style.webkitMaskRepeat = 'no-repeat'
       el.style.maskSize = `${totalAspect * 100}% 100%`
+      el.style.webkitMaskSize = `${totalAspect * 100}% 100%`
 
       // 计算所有 word 在此 word 之前的总宽度
       const idx = this.words.indexOf(rw)
@@ -255,6 +257,19 @@ export class KaraokeLine {
       }
       rw.maskAnimation?.play()
     }
+  }
+
+  /** 获取当前行的高亮进度 (0..1)，用于辉光跟踪 */
+  getProgress(): number {
+    if (!this.isEnabled || this.totalDuration <= 0) return 0
+    // 取第一个 mask animation 的 currentTime 作为参考
+    for (const rw of this.words) {
+      if (rw.maskAnimation) {
+        const ct = (rw.maskAnimation.currentTime as number) || 0
+        return Math.max(0, Math.min(1, ct / this.totalDuration))
+      }
+    }
+    return 0
   }
 
   dispose(): void {

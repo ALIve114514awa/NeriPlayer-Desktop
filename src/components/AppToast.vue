@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useToastStore } from '@/stores/toast'
-import { ref, watch, nextTick } from 'vue'
+import type { ToastMessage } from '@/stores/toast'
+import { ref } from 'vue'
 
 const toast = useToastStore()
 
@@ -15,10 +16,13 @@ function onDismiss(id: number) {
   }, 200)
 }
 
-// 自动触发退出动画（当 toast 即将被 setTimeout 移除时）
-watch(() => toast.messages.length, () => {
-  // 预留：消息列表变化时不做额外操作，dismiss 已由 store 内 setTimeout 触发
-})
+function onAction(msg: ToastMessage) {
+  if (!msg.action) return
+  void Promise.resolve(msg.action.handler()).catch((e) => {
+    console.error('Toast action failed:', e)
+  })
+  onDismiss(msg.id)
+}
 </script>
 
 <template>
@@ -35,6 +39,14 @@ watch(() => toast.messages.length, () => {
           {{ msg.type === 'success' ? 'check_circle' : msg.type === 'error' ? 'error' : 'info' }}
         </span>
         <span class="toast-text">{{ msg.text }}</span>
+        <button
+          v-if="msg.action"
+          class="toast-action"
+          type="button"
+          @click.stop="onAction(msg)"
+        >
+          {{ msg.action.label }}
+        </button>
       </div>
     </div>
   </Teleport>
@@ -68,8 +80,9 @@ watch(() => toast.messages.length, () => {
   cursor: pointer;
   animation: toast-in 250ms cubic-bezier(0.2, 0, 0, 1) forwards;
   min-width: 200px;
-  max-width: 400px;
+  max-width: min(460px, calc(100vw - 32px));
   user-select: none;
+  backdrop-filter: blur(18px);
 }
 
 .toast-item.toast-leaving {
@@ -95,6 +108,35 @@ watch(() => toast.messages.length, () => {
 
 .toast-text {
   line-height: 1.4;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toast-action {
+  flex-shrink: 0;
+  margin-left: 8px;
+  border: 0;
+  border-radius: 999px;
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--md-primary, #D0BCFF) 22%, transparent);
+  color: var(--md-primary, #D0BCFF);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 160ms ease, transform 160ms ease, color 160ms ease;
+}
+
+.toast-action:hover {
+  background: var(--md-primary, #D0BCFF);
+  color: var(--md-on-primary, #381E72);
+  transform: translateY(-1px);
+}
+
+.toast-action:active {
+  transform: translateY(0) scale(0.98);
 }
 
 @keyframes toast-in {

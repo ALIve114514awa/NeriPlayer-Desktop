@@ -61,7 +61,7 @@ pub async fn validate_github_token(
     state: State<'_, AppState>,
     token: String,
 ) -> AppResult<Value> {
-    let api = crate::sync::github_api::GitHubApiClient::new(&state.http, &token);
+    let api = crate::sync::github_api::GitHubApiClient::new(&state.http(), &token);
     let username = api.validate_token().await?;
 
     // 暂存 token（还没配置完，只保存 token 和 owner）
@@ -88,7 +88,7 @@ pub async fn create_github_repo(
         return Err(AppError::Api("Token not validated yet".into()));
     }
 
-    let api = crate::sync::github_api::GitHubApiClient::new(&state.http, &config.token);
+    let api = crate::sync::github_api::GitHubApiClient::new(&state.http(), &config.token);
     api.create_repository(&repo_name).await?;
 
     let updated = GitHubSyncConfig {
@@ -121,7 +121,7 @@ pub async fn use_existing_github_repo(
         return Err(AppError::Api("Token not validated yet".into()));
     }
 
-    let api = crate::sync::github_api::GitHubApiClient::new(&state.http, &config.token);
+    let api = crate::sync::github_api::GitHubApiClient::new(&state.http(), &config.token);
     let _branch = api.check_repository(&owner, &repo).await?;
 
     let updated = GitHubSyncConfig {
@@ -149,7 +149,7 @@ pub async fn configure_github_sync(
     token: String,
     repo: String,
 ) -> AppResult<Value> {
-    let api = crate::sync::github_api::GitHubApiClient::new(&state.http, &token);
+    let api = crate::sync::github_api::GitHubApiClient::new(&state.http(), &token);
     let owner = api.validate_token().await?;
 
     if let Err(_) = api.check_repository(&owner, &repo).await {
@@ -182,7 +182,7 @@ pub async fn sync_github(app: AppHandle, state: State<'_, AppState>) -> AppResul
     }
 
     let local_data = manager::build_local_sync_data(&app);
-    let result = manager::sync_github(&state.http, &mut config, &local_data).await?;
+    let result = manager::sync_github(&state.http(), &mut config, &local_data).await?;
     save_github_config(&app, &config);
     // 通知前端歌单数据可能已变更
     let _ = app.emit("playlists-changed", ());
@@ -221,7 +221,7 @@ pub async fn configure_webdav_sync(
 ) -> AppResult<Value> {
     let bp = base_path.unwrap_or_default();
     let api = crate::sync::webdav_api::WebDavApiClient::new(
-        &state.http, &server_url, &username, &password, &bp,
+        &state.http(), &server_url, &username, &password, &bp,
     );
     api.validate_connection().await?;
 
@@ -250,7 +250,7 @@ pub async fn sync_webdav(app: AppHandle, state: State<'_, AppState>) -> AppResul
     }
 
     let local_data = manager::build_local_sync_data(&app);
-    let result = manager::sync_webdav(&state.http, &mut config, &local_data).await?;
+    let result = manager::sync_webdav(&state.http(), &mut config, &local_data).await?;
     save_webdav_config(&app, &config);
     let _ = app.emit("playlists-changed", ());
     Ok(result)
@@ -292,26 +292,58 @@ pub async fn update_webdav_sync_settings(
     Ok(())
 }
 
-/// 清除应用缓存（音频/图片缓存目录）
+/// 清除应用缓存（音频/图片缓存目录 + app_data_dir 下的临时缓存子目录）
 #[tauri::command]
 pub async fn clear_app_cache(app: AppHandle) -> AppResult<Value> {
-    let cache_dir = app.path().app_cache_dir().map_err(|e| AppError::Other(e.to_string()))?;
     let mut cleared: u64 = 0;
-    if cache_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    cleared += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = std::fs::remove_file(&path);
-                } else if path.is_dir() {
-                    if let Ok(size) = dir_size(&path) { cleared += size; }
-                    let _ = std::fs::remove_dir_all(&path);
+    let mut failed: u64 = 0;
+
+    // 1. 清理 app_cache_dir
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        let (c, f) = clear_directory_contents(&cache_dir);
+        cleared += c;
+        failed += f;
+    }
+
+    // 2. 清理 app_data_dir 下的缓存子目录（covers, temp 等）
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        for sub in &["covers", "temp", "cache", "thumbnails"] {
+            let sub_dir = data_dir.join(sub);
+            if sub_dir.exists() && sub_dir.is_dir() {
+                let (c, f) = clear_directory_contents(&sub_dir);
+                cleared += c;
+                failed += f;
+            }
+        }
+    }
+
+    log::info!("clear_app_cache: cleared {} bytes, {} failures", cleared, failed);
+    Ok(serde_json::json!({ "clearedBytes": cleared, "failedCount": failed }))
+}
+
+/// 清除目录下所有内容，返回 (cleared_bytes, failed_count)
+fn clear_directory_contents(dir: &std::path::Path) -> (u64, u64) {
+    let mut cleared: u64 = 0;
+    let mut failed: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(&path).is_ok() {
+                    cleared += size;
+                } else {
+                    failed += 1;
+                }
+            } else if path.is_dir() {
+                if let Ok(size) = dir_size(&path) { cleared += size; }
+                if std::fs::remove_dir_all(&path).is_err() {
+                    failed += 1;
                 }
             }
         }
     }
-    Ok(serde_json::json!({ "clearedBytes": cleared }))
+    (cleared, failed)
 }
 
 fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {

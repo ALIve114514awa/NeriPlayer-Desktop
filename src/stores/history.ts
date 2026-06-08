@@ -9,6 +9,7 @@ export interface PlayedEntry {
 
 const STORAGE_KEY = 'neri:play-history'
 const MAX_ENTRIES = 1000
+export const HISTORY_CHANGED_EVENT = 'neri:history-changed'
 
 export const useHistoryStore = defineStore('history', () => {
   const entries = ref<PlayedEntry[]>([])
@@ -31,6 +32,13 @@ export const useHistoryStore = defineStore('history', () => {
     }
   }
 
+  function emitHistoryChanged(type: 'record' | 'remove' | 'clear') {
+    if (typeof window === 'undefined') return
+    window.dispatchEvent(new CustomEvent(HISTORY_CHANGED_EVENT, {
+      detail: { type, at: Date.now() },
+    }))
+  }
+
   // 记录播放（去重：同 ID 更新时间戳，移到最前）
   function record(track: TrackInfo) {
     const idx = entries.value.findIndex(e => e.track.id === track.id)
@@ -40,18 +48,23 @@ export const useHistoryStore = defineStore('history', () => {
       entries.value = entries.value.slice(0, MAX_ENTRIES)
     }
     save()
+    emitHistoryChanged('record')
   }
 
   // 删除单条
   function remove(trackId: string) {
+    const before = entries.value.length
     entries.value = entries.value.filter(e => e.track.id !== trackId)
     save()
+    if (entries.value.length !== before) emitHistoryChanged('remove')
   }
 
   // 清空全部
   function clear() {
+    if (entries.value.length === 0) return
     entries.value = []
     save()
+    emitHistoryChanged('clear')
   }
 
   // 初始化加载

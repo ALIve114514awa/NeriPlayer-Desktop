@@ -1,5 +1,6 @@
 // 深色/浅色模式管理 + 圆形扩散过渡动画
-import { applyThemeColor, getSavedThemeColor } from './themeColor'
+// 参考 Android 端 pending state 模式：视觉切换与持久化解耦，消除卡顿
+import { applyThemeColor, applyThemeColorVisual, getSavedThemeColor } from './themeColor'
 
 export type ThemeMode = 'system' | 'dark' | 'light'
 
@@ -15,22 +16,30 @@ function resolvedIsDark(mode: ThemeMode): boolean {
   return window.matchMedia('(prefers-color-scheme: dark)').matches
 }
 
-/** 无动画直接应用 */
-export function applyTheme(mode: ThemeMode) {
+/**
+ * 仅做视觉切换（不写 localStorage），供 startViewTransition 回调使用
+ * 将 isDark 预计算后传入 applyThemeColorVisual，避免回调内
+ * classList 写后读触发强制 reflow
+ */
+function applyThemeVisual(mode: ThemeMode) {
   currentMode = mode
-  localStorage.setItem('theme-mode', mode)
   const dark = resolvedIsDark(mode)
   document.documentElement.classList.toggle('light-theme', !dark)
   document.documentElement.classList.toggle('dark-theme', dark)
-  // 重新应用主题色的 light/dark 变量集
-  applyThemeColor(getSavedThemeColor())
+  // 直接传入 dark 状态，跳过 classList 二次读取
+  applyThemeColorVisual(getSavedThemeColor(), dark)
+}
+
+/** 无动画直接应用（含持久化，用于初始化和 fallback） */
+export function applyTheme(mode: ThemeMode) {
+  applyThemeVisual(mode)
+  localStorage.setItem('theme-mode', mode)
 }
 
 /**
  * 带圆形扩散动画的主题切换
- * @param mode 目标模式
- * @param x 点击位置 x
- * @param y 点击位置 y
+ * 核心优化：transition 回调内只做纯视觉 DOM 操作，
+ * localStorage 写入移到 microtask 异步执行
  */
 export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: number) {
   // 如果浏览器不支持 View Transition，直接切换
@@ -46,8 +55,12 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
   )
 
   const transition = (document as any).startViewTransition(() => {
-    applyTheme(mode)
+    // 仅视觉切换，不含 localStorage 写入
+    applyThemeVisual(mode)
   })
+
+  // 异步持久化，不阻塞动画关键路径
+  queueMicrotask(() => localStorage.setItem('theme-mode', mode))
 
   try {
     await transition.ready
@@ -61,7 +74,7 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
         ],
       },
       {
-        duration: 800,
+        duration: 500,
         easing: 'cubic-bezier(0.2, 0, 0, 1)',
         pseudoElement: '::view-transition-new(root)',
       },

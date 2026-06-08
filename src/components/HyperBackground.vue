@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { hyperBackgroundVertexShader, hyperBackgroundFragmentShader } from '@/shaders/hyperBackground'
 
 const props = withDefaults(defineProps<{
@@ -28,6 +28,22 @@ let gl: WebGLRenderingContext | null = null
 let program: WebGLProgram | null = null
 let animFrame = 0
 let startTime = 0
+let beatEnvelope = 0
+
+// 平滑过渡状态（对齐 Android 逐帧 lerp，消除切歌闪烁）
+const LERP_SPEED = 0.032 // 每帧插值速率，过渡更柔和，切歌时更接近网易云式铺开
+const smoothColors: number[][] = [
+  [0.4, 0.31, 0.64, 1],
+  [0.49, 0.36, 0.75, 1],
+  [0.56, 0.49, 0.69, 1],
+  [0.29, 0.24, 0.43, 1],
+]
+let smoothLightOffset = 0
+let smoothSaturateOffset = 0
+
+function lerpVal(current: number, target: number, t: number): number {
+  return current + (target - current) * t
+}
 
 // Uniform locations
 let uResolution: WebGLUniformLocation | null = null
@@ -95,6 +111,15 @@ function initGL() {
   uLightOffset = gl.getUniformLocation(program, 'u_lightOffset')
   uSaturateOffset = gl.getUniformLocation(program, 'u_saturateOffset')
 
+  // 初始化平滑颜色为当前 props
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      smoothColors[i][j] = props.colors[i][j]
+    }
+  }
+  smoothLightOffset = props.lightOffset
+  smoothSaturateOffset = props.saturateOffset
+
   startTime = performance.now() / 1000
   render()
 }
@@ -108,18 +133,29 @@ function render() {
   if (c.width !== w || c.height !== h) { c.width = w; c.height = h }
   gl.viewport(0, 0, w, h)
 
+  // 逐帧 lerp 颜色（对齐 Android 的平滑过渡，消除切歌时的画面闪烁）
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      smoothColors[i][j] = lerpVal(smoothColors[i][j], props.colors[i][j], LERP_SPEED)
+    }
+  }
+  smoothLightOffset = lerpVal(smoothLightOffset, props.lightOffset, LERP_SPEED)
+  smoothSaturateOffset = lerpVal(smoothSaturateOffset, props.saturateOffset, LERP_SPEED)
+
   const time = performance.now() / 1000 - startTime
   gl.uniform2f(uResolution, w, h)
   gl.uniform1f(uTime, time)
   gl.uniform1f(uMusicLevel, props.musicLevel)
-  gl.uniform1f(uBeat, props.beatImpulse)
-  gl.uniform4fv(uColor0, props.colors[0])
-  gl.uniform4fv(uColor1, props.colors[1])
-  gl.uniform4fv(uColor2, props.colors[2])
-  gl.uniform4fv(uColor3, props.colors[3])
+  // Beat 脉冲衰减：0.92/frame @60fps → ~500ms 自然衰减，对齐 Android beatEnv * 0.92f
+  beatEnvelope = Math.max(beatEnvelope * 0.92, props.beatImpulse)
+  gl.uniform1f(uBeat, beatEnvelope)
+  gl.uniform4fv(uColor0, smoothColors[0])
+  gl.uniform4fv(uColor1, smoothColors[1])
+  gl.uniform4fv(uColor2, smoothColors[2])
+  gl.uniform4fv(uColor3, smoothColors[3])
   gl.uniform1f(uDarkMode, props.isDark ? 1.0 : 0.0)
-  gl.uniform1f(uLightOffset, props.lightOffset)
-  gl.uniform1f(uSaturateOffset, props.saturateOffset)
+  gl.uniform1f(uLightOffset, smoothLightOffset)
+  gl.uniform1f(uSaturateOffset, smoothSaturateOffset)
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   animFrame = requestAnimationFrame(render)

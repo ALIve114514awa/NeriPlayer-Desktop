@@ -15,14 +15,22 @@ const props = withDefaults(defineProps<{
   currentTimeMs: number
   previewTimeMs?: number | null
   isPlaying: boolean
+  lyricOffsetMs?: number
+  accentColor?: string
+  accentContainerColor?: string
 }>(), {
   currentTimeMs: 0,
   previewTimeMs: null,
   isPlaying: false,
+  lyricOffsetMs: undefined,
+  accentColor: '',
+  accentContainerColor: '',
 })
 
 const emit = defineEmits<{ seek: [timeMs: number] }>()
 const containerRef = ref<HTMLDivElement>()
+const isLyricsSwitching = ref(false)
+let lyricsSwitchTimer: ReturnType<typeof setTimeout> | null = null
 
 // --- KaraokeLine 实例管理 ---
 const karaokeLines = ref<Map<number, KaraokeLine>>(new Map())
@@ -30,6 +38,11 @@ let lastActiveIndex = -1
 
 function hasWordTiming(line: LyricLine): boolean {
   return line.words && line.words.length > 0 && line.words.some(w => w.durationMs > 0)
+}
+
+function lyricTextFromWords(line: LyricLine): string {
+  if (line.text && line.text.trim()) return line.text
+  return (line.words || []).map(w => w.text).join('')
 }
 
 function buildKaraokeLines() {
@@ -75,7 +88,10 @@ const isClearText = computed(() =>
 )
 
 // --- 时间 ---
-const offsetMs = computed(() => settings.cloudMusicOffset || 0)
+const offsetMs = computed(() => {
+  if (typeof props.lyricOffsetMs === 'number') return props.lyricOffsetMs
+  return settings.cloudMusicOffset || 0
+})
 const effectiveTimeMs = computed(() =>
   props.previewTimeMs != null ? props.previewTimeMs : props.currentTimeMs
 )
@@ -98,7 +114,7 @@ function scrollToActive(idx: number, behavior: ScrollBehavior = 'smooth') {
     const lineEls = containerRef.value!.querySelectorAll('.lyric-line')
     const el = lineEls[idx] as HTMLElement
     if (!el) { isAutoScrolling = false; return }
-    const target = el.offsetTop - containerRef.value!.clientHeight * 0.30
+    const target = Math.max(0, el.offsetTop - containerRef.value!.clientHeight * 0.30)
     containerRef.value!.scrollTo({ top: target, behavior })
     setTimeout(() => { isAutoScrolling = false }, behavior === 'instant' ? 50 : 500)
   })
@@ -140,7 +156,20 @@ watch(() => props.isPlaying, (playing) => {
 
 // 歌词数据变化时重建
 watch(() => props.lyrics, () => {
-  nextTick(() => buildKaraokeLines())
+  isLyricsSwitching.value = true
+  if (lyricsSwitchTimer) clearTimeout(lyricsSwitchTimer)
+  nextTick(() => {
+    buildKaraokeLines()
+    lastActiveIndex = -1
+    if (activeIndex.value >= 0) {
+      karaokeLines.value.get(activeIndex.value)?.enable(adjustedTimeMs.value, props.isPlaying)
+      lastActiveIndex = activeIndex.value
+      scrollToActive(activeIndex.value, 'instant')
+    }
+  })
+  lyricsSwitchTimer = setTimeout(() => {
+    isLyricsSwitching.value = false
+  }, 420)
 }, { deep: false })
 
 onMounted(() => {
@@ -158,6 +187,7 @@ onMounted(() => {
 onUnmounted(() => {
   containerRef.value?.removeEventListener('scroll', onScroll)
   if (scrollEndTimer) clearTimeout(scrollEndTimer)
+  if (lyricsSwitchTimer) clearTimeout(lyricsSwitchTimer)
   for (const kl of karaokeLines.value.values()) kl.dispose()
 })
 
@@ -166,24 +196,60 @@ function dist(index: number): number {
   return Math.abs(index - activeIndex.value)
 }
 
+// 对齐 ModernKaraokeLyricsView 预设参数
 function blurForDist(d: number): number {
   if (!settings.lyricBlur || d === 0) return 0
-  return Math.min(d * 0.35, 2)
+  const blurUnit = Math.min(4, settings.lyricBlurAmount * 0.45)
+  if (d === 1) return blurUnit * 1.0
+  if (d === 2) return blurUnit * 1.5
+  if (d === 3) return blurUnit * 2.0
+  if (d === 4) return blurUnit * 2.5
+  return blurUnit * 4.0
+}
+
+function scaleForDist(d: number): number {
+  if (d <= 0) return 1.1
+  if (d === 1) return 0.9
+  return Math.max(0.8, 0.88 - (d - 2) * 0.02)
+}
+
+function alphaForDist(d: number): number {
+  if (d === 0) return 1
+  if (settings.lyricBlur) {
+    if (d === 1) return 0.72
+    if (d === 2) return 0.4
+    return Math.max(0.16, 0.4 - 0.08 * (d - 2))
+  }
+  if (d === 1) return 0.4
+  if (d === 2) return 0.35
+  return Math.max(0.16, 0.35 - 0.08 * (d - 2))
 }
 
 function seekToLine(line: LyricLine) {
   clearTextHoldIndex.value = null
   emit('seek', line.startMs)
 }
+
 </script>
 
 <template>
-  <div class="lyrics-scroll" ref="containerRef" :style="{ '--lyric-font-scale': settings.lyricFontScale }">
+  <div
+    class="lyrics-scroll"
+    ref="containerRef"
+    :class="{
+      'lyrics-scroll-switching': isLyricsSwitching,
+    }"
+    :style="{
+      '--lyric-font-scale': settings.lyricFontScale,
+      '--lyric-accent': props.accentColor || 'rgba(255,255,255,0.92)',
+      '--lyric-accent-soft': props.accentContainerColor || 'rgba(255,255,255,0.22)',
+    }"
+  >
     <div class="lyrics-pad-top" />
 
     <div
       v-for="(line, i) in lyrics"
-      :key="i"
+      :key="`${line.startMs}:${line.text}:${i}`"
       class="lyric-line"
       :class="{
         active: i === activeIndex,
@@ -192,18 +258,19 @@ function seekToLine(line: LyricLine) {
       }"
       :style="isClearText ? {} : {
         '--blur': `${blurForDist(dist(i))}px`,
-        '--scale': i === activeIndex ? '1.015' : '0.965',
-        '--alpha': i === activeIndex ? '0.95' : (activeIndex >= 0 && i < activeIndex ? '0.7' : '0.6'),
+        '--scale': String(scaleForDist(dist(i))),
+        '--alpha': String(alphaForDist(dist(i))),
       }"
       @click="seekToLine(line)"
     >
-      <!-- 逐字模式：KaraokeLine 直接操作这个容器的 DOM -->
-      <span v-if="hasWordTiming(line)" class="line-text kw-container" />
+      <!-- 逐字歌词：底层完整文本常驻，上层 karaoke mask 只负责当前高亮，避免未唱部分被 mask 透明掉 -->
+      <span v-if="hasWordTiming(line)" class="line-text line-text--karaoke">
+        <span class="line-text-base">{{ lyricTextFromWords(line) }}</span>
+        <span class="line-text-highlight kw-container" aria-hidden="true" />
+      </span>
+      <span v-else class="line-text">{{ lyricTextFromWords(line) }}</span>
 
-      <!-- 整行模式 -->
-      <span v-else class="line-text">{{ line.text }}</span>
-
-      <!-- 翻译 — 所有行都显示 -->
+      <!-- 翻译 -->
       <span
         v-if="line.translation && settings.showTranslation"
         class="line-tl"
@@ -215,42 +282,60 @@ function seekToLine(line: LyricLine) {
 </template>
 
 <style scoped lang="scss">
+// 对齐 accompanist-lyrics-ui ModernKaraokeLyricsView 预设
+
 .lyrics-scroll {
   width: 100%;
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 0 24px;
-  mask-image: linear-gradient(to bottom, transparent 0%, black 20px, black calc(100% - 100px), transparent 100%);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 20px, black calc(100% - 100px), transparent 100%);
+  padding: 0 28px 0 40px;
+  mask-image: linear-gradient(to bottom, transparent 0%, black 112px, black calc(100% - 196px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 112px, black calc(100% - 196px), transparent 100%);
+  text-align: left;
+  transition: opacity 260ms ease, transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
   &::-webkit-scrollbar { display: none; }
   scrollbar-width: none;
 }
 
-.lyrics-pad-top { height: 30%; }
-.lyrics-pad-bottom { height: 50%; }
+.lyrics-scroll-switching {
+  opacity: 0.78;
+  transform: translateY(8px);
+}
+
+.lyrics-pad-top { height: 34%; }
+.lyrics-pad-bottom { height: 44%; }
 
 .lyric-line {
-  padding: 8px 16px;
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  margin: 0;
+  padding: 10px 8px 10px 0;
+  text-align: left;
   transform-origin: left center;
   transform: scale(var(--scale, 1));
   opacity: var(--alpha, 1);
   filter: blur(var(--blur, 0px));
   transition:
-    transform 500ms cubic-bezier(0, 0, 0.2, 1),
-    opacity 400ms cubic-bezier(0.4, 0, 0.2, 1),
-    filter 300ms ease-out;
+    transform 380ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 260ms ease,
+    filter 260ms ease,
+    letter-spacing 260ms ease;
   cursor: pointer;
   will-change: transform, opacity, filter;
 
   &:hover {
-    opacity: 0.6 !important;
+    opacity: min(1, calc(var(--alpha, 1) + 0.06)) !important;
     filter: blur(0px) !important;
   }
-  &.active { filter: none; }
+  &.active {
+    filter: none;
+    transform-origin: left center;
+  }
   &.clear-text {
     transform: none;
-    opacity: 0.5;
+    opacity: 0.56;
     filter: none;
     transition: opacity 0.15s;
     &.active { opacity: 1; }
@@ -259,42 +344,82 @@ function seekToLine(line: LyricLine) {
 
 .line-text {
   display: block;
-  font-size: calc(24px * var(--lyric-font-scale, 1));
+  font-size: calc(18px * var(--lyric-font-scale, 1));
   font-weight: 700;
-  line-height: 1.5;
-  letter-spacing: -0.2px;
-  color: rgba(255, 255, 255, 0.2);
+  line-height: calc(21.24px * var(--lyric-font-scale, 1));
+  letter-spacing: 0;
+  color: rgba(255, 255, 255, 0.22);
   white-space: pre-wrap;
-  transition: color 0.4s;
-  .active & { color: white; }
-  .clear-text & { color: rgba(255, 255, 255, 0.45); }
+  text-wrap: pretty;
+  transition: color 0.22s ease, text-shadow 0.22s ease, transform 0.22s ease, opacity 0.22s ease;
+  position: relative;
+  z-index: 1;
+  .active & {
+    color: white;
+    text-shadow: 0 0 12px color-mix(in srgb, var(--lyric-accent-soft) 10%, transparent);
+  }
+  .past & { color: rgba(255, 255, 255, 0.28); }
+  .clear-text & { color: rgba(255, 255, 255, 0.42); }
   .clear-text.active & { color: white; }
+}
+
+.line-text--karaoke {
+  display: grid;
+  grid-template-areas: 'text';
+}
+
+.line-text-base,
+.line-text-highlight {
+  grid-area: text;
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.line-text-base {
+  color: inherit;
+}
+
+.line-text-highlight {
+  color: white;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.lyric-line.active .line-text-highlight {
+  opacity: 1;
+}
+
+.lyric-line:not(.active) .line-text-highlight {
+  display: none;
 }
 
 // KaraokeLine 创建的逐字 <span> 样式
 :deep(.kw) {
   display: inline;
   color: inherit;
-  // mask 由 Web Animation API 驱动，此处不需要 transition
+  text-shadow: inherit;
+  font-weight: inherit;
+}
+
+:deep(.line-text--active.kw-container .kw),
+:deep(.lyric-line.active .kw-container .kw) {
+  color: white;
 }
 
 .line-tl {
   display: block;
-  font-size: calc(14px * var(--lyric-font-scale, 1));
-  font-weight: 400;
-  // 翻译 color alpha 必须低于歌词文字的 color alpha
-  // 歌词文字 base = 0.2，翻译 = 0.15（始终比歌词少 5% 左右）
-  // 行级 opacity 已经控制了整体亮度
-  color: rgba(255, 255, 255, 0.15);
+  font-size: calc(11.16px * var(--lyric-font-scale, 1));
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.24);
   margin-top: 4px;
-  line-height: 1.35;
+  line-height: calc(12.5px * var(--lyric-font-scale, 1));
+  position: relative;
+  z-index: 1;
 
-  .active & { color: rgba(255, 255, 255, 0.45); }
-  .past & { color: rgba(255, 255, 255, 0.15); }
+  .active & {
+    color: rgba(255, 255, 255, 0.72);
+    text-shadow: none;
+  }
+  .past & { color: rgba(255, 255, 255, 0.18); }
 }
-
-.tl-fade-enter-active { transition: opacity 0.25s ease; }
-.tl-fade-leave-active { transition: opacity 0.15s ease; }
-.tl-fade-enter-from,
-.tl-fade-leave-to { opacity: 0; }
 </style>

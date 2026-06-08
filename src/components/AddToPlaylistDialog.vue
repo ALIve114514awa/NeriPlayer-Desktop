@@ -3,12 +3,14 @@ import { ref, watch, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
 import type { TrackInfo } from '@/stores/player'
+import { useToastStore } from '@/stores/toast'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import M3Input from '@/components/ui/M3Input.vue'
 
 const props = defineProps<{
   open: boolean
-  track: TrackInfo | null
+  track?: TrackInfo | null
+  tracks?: TrackInfo[]
 }>()
 
 const emit = defineEmits<{
@@ -16,6 +18,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const toast = useToastStore()
 
 interface PlaylistInfo { id: number; name: string; track_count: number; modified_at: number }
 
@@ -45,10 +48,21 @@ async function loadPlaylists() {
   }
 }
 
+function targetTracks(): TrackInfo[] {
+  if (props.tracks?.length) return props.tracks
+  return props.track ? [props.track] : []
+}
+
 async function addToPlaylist(playlistId: number) {
-  if (!props.track) return
+  const targets = targetTracks()
+  if (targets.length === 0) return
   try {
-    await invoke('add_to_playlist', { playlistId, track: props.track })
+    if (targets.length === 1) {
+      await invoke('add_to_playlist', { playlistId, track: toBackendTrack(targets[0]) })
+    } else {
+      await invoke('add_tracks_to_playlist', { playlistId, tracks: targets.map(toBackendTrack) })
+    }
+    toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
     console.error('Add to playlist failed:', e)
@@ -63,10 +77,16 @@ function toggleCreateInput() {
 }
 
 async function createAndAdd() {
-  if (!newName.value.trim() || !props.track) return
+  const targets = targetTracks()
+  if (!newName.value.trim() || targets.length === 0) return
   try {
     const pl = await invoke<PlaylistInfo>('create_playlist', { name: newName.value.trim() })
-    await invoke('add_to_playlist', { playlistId: pl.id, track: props.track })
+    if (targets.length === 1) {
+      await invoke('add_to_playlist', { playlistId: pl.id, track: toBackendTrack(targets[0]) })
+    } else {
+      await invoke('add_tracks_to_playlist', { playlistId: pl.id, tracks: targets.map(toBackendTrack) })
+    }
+    toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
     console.error('Create & add failed:', e)
@@ -75,6 +95,27 @@ async function createAndAdd() {
 
 function close() {
   emit('update:open', false)
+}
+
+function inferSource(track: TrackInfo) {
+  if (track.id.startsWith('netease:')) return 'netease'
+  if (track.id.startsWith('qq:')) return 'qq'
+  if (track.id.startsWith('bilibili:')) return 'bilibili'
+  if (track.id.startsWith('youtube:')) return 'youtube'
+  return 'local'
+}
+
+function toBackendTrack(track: TrackInfo) {
+  return {
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album || '',
+    duration_ms: track.durationMs || 0,
+    source: inferSource(track),
+    url: track.audioUrl || '',
+    cover_url: track.coverUrl || null,
+  }
 }
 </script>
 

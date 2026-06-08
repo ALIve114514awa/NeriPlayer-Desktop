@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import type { TrackInfo } from './player'
+import { useSettingsStore } from './settings'
 
 export const useLibraryStore = defineStore('library', () => {
   const tracks = ref<TrackInfo[]>([])
@@ -14,7 +15,11 @@ export const useLibraryStore = defineStore('library', () => {
     scanError.value = null
 
     try {
-      const results = await invoke<any[]>('scan_music_directory', { dir })
+      const settings = useSettingsStore()
+      const results = await invoke<any[]>('scan_music_directory', {
+        dir,
+        nameTemplate: settings.downloadNameTemplate || null,
+      })
 
       // 后端返回的字段名是 snake_case，映射到前端 camelCase
       tracks.value = results.map(t => ({
@@ -23,7 +28,7 @@ export const useLibraryStore = defineStore('library', () => {
         artist: t.artist,
         album: t.album,
         durationMs: t.duration_ms,
-        coverUrl: t.cover_url || '',
+        coverUrl: toDisplayableCoverUrl(t.cover_url),
         audioUrl: t.url,
       }))
 
@@ -36,6 +41,12 @@ export const useLibraryStore = defineStore('library', () => {
     } finally {
       isScanning.value = false
     }
+  }
+
+  function toDisplayableCoverUrl(value?: string | null) {
+    if (!value) return ''
+    if (/^(https?:|asset:|data:|blob:)/i.test(value)) return value
+    return convertFileSrc(value)
   }
 
   // 启动时恢复上次扫描路径

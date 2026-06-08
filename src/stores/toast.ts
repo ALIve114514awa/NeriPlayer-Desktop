@@ -6,6 +6,17 @@ export interface ToastMessage {
   text: string
   type: 'success' | 'error' | 'info'
   duration: number
+  action?: ToastAction
+}
+
+export interface ToastAction {
+  label: string
+  handler: () => void | Promise<void>
+}
+
+export interface ToastOptions {
+  duration?: number
+  action?: ToastAction
 }
 
 export interface NotificationEntry {
@@ -27,9 +38,18 @@ export const useToastStore = defineStore('toast', () => {
   /** 未读通知数 */
   const unreadCount = computed(() => history.value.filter(n => !n.read).length)
 
-  function show(text: string, type: ToastMessage['type'] = 'info', duration = 3000) {
+  function normalizeOptions(optionsOrDuration?: number | ToastOptions, fallbackDuration = 3000): ToastOptions {
+    if (typeof optionsOrDuration === 'number') {
+      return { duration: optionsOrDuration }
+    }
+    return optionsOrDuration || { duration: fallbackDuration }
+  }
+
+  function show(text: string, type: ToastMessage['type'] = 'info', optionsOrDuration: number | ToastOptions = 3000) {
+    const options = normalizeOptions(optionsOrDuration, 3000)
+    const duration = options.duration ?? 3000
     const id = nextId++
-    messages.value.push({ id, text, type, duration })
+    messages.value.push({ id, text, type, duration, action: options.action })
     setTimeout(() => dismiss(id), duration)
 
     // 同步写入历史
@@ -46,12 +66,13 @@ export const useToastStore = defineStore('toast', () => {
     }
   }
 
-  function success(text: string, duration = 3000) {
-    show(text, 'success', duration)
+  function success(text: string, optionsOrDuration: number | ToastOptions = 3000) {
+    show(text, 'success', optionsOrDuration)
   }
 
-  function error(text: string, duration = 4000) {
-    show(text, 'error', duration)
+  function error(text: string, optionsOrDuration: number | ToastOptions = 4000) {
+    const options = normalizeOptions(optionsOrDuration, 4000)
+    show(text, 'error', options)
   }
 
   function dismiss(id: number) {

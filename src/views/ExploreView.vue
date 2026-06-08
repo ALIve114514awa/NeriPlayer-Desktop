@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
 defineOptions({ name: 'ExploreView' })
 import { useI18n } from 'vue-i18n'
@@ -8,8 +8,10 @@ import { useSearchStore } from '@/stores/search'
 import { usePlayerStore } from '@/stores/player'
 import { useAuthStore } from '@/stores/auth'
 import { useRecommendStore, type PlaylistInfo } from '@/stores/recommend'
+import { invoke } from '@tauri-apps/api/core'
 
 const router = useRouter()
+const route = useRoute()
 const { t } = useI18n()
 const searchStore = useSearchStore()
 const player = usePlayerStore()
@@ -21,11 +23,16 @@ const searchQuery = ref('')
 const isFocused = ref(false)
 
 // ===== 平台 Tab =====
-type PlatformTab = 'netease' | 'bilibili' | 'youtube'
-const activeTab = ref<PlatformTab>('netease')
+type PlatformTab = 'netease' | 'qq' | 'bilibili' | 'youtube'
+const PLATFORM_KEYS: PlatformTab[] = ['netease', 'qq', 'bilibili', 'youtube']
+const initialPlatform = PLATFORM_KEYS.includes(String(route.query.platform) as PlatformTab)
+  ? String(route.query.platform) as PlatformTab
+  : 'netease'
+const activeTab = ref<PlatformTab>(initialPlatform)
 
 const platformTabs = computed(() => [
   { key: 'netease' as PlatformTab, label: t('settings.netease_account'), icon: '/icons/ic_netease.svg' },
+  { key: 'qq' as PlatformTab, label: t('settings.qq_account'), icon: '/icons/ic_qq_music.svg' },
   { key: 'bilibili' as PlatformTab, label: t('settings.bilibili_account'), icon: '/icons/ic_bilibili.svg' },
   { key: 'youtube' as PlatformTab, label: t('settings.youtube_account'), icon: '/icons/ic_youtube.svg' },
 ])
@@ -61,6 +68,94 @@ const visibleTags = computed(() =>
 const qualityPlaylists = ref<PlaylistInfo[]>([])
 const isLoadingPlaylists = ref(false)
 
+interface SearchResult {
+  id: string
+  title: string
+  artist: string
+  album: string
+  duration_ms: number
+  source: string
+  cover_url: string | null
+}
+
+interface DiscoveryShelf {
+  key: string
+  title: string
+  subtitle: string
+  platform: PlatformTab
+  items: SearchResult[]
+}
+
+const biliDiscoveryShelves = ref<DiscoveryShelf[]>([])
+const youtubeDiscoveryShelves = ref<DiscoveryShelf[]>([])
+const isLoadingBiliDiscovery = ref(false)
+const isLoadingYoutubeDiscovery = ref(false)
+
+const biliDiscoveryQueries = [
+  { key: 'bili-hot', title: 'B站音乐现场', subtitle: 'Live / 翻唱 / 演奏', query: '音乐现场' },
+  { key: 'bili-vocal', title: '热门翻唱', subtitle: 'UP 主精选音乐内容', query: '翻唱 音乐' },
+  { key: 'bili-acg', title: 'ACG 音乐', subtitle: '动画 / 游戏 / 虚拟歌手', query: 'ACG 音乐' },
+]
+
+const youtubeDiscoveryQueries = [
+  { key: 'yt-new', title: 'YouTube Music 新鲜听', subtitle: 'New music and mixes', query: 'new music mix' },
+  { key: 'yt-live', title: 'Live Sessions', subtitle: '现场 / Session / Acoustic', query: 'live session music' },
+  { key: 'yt-focus', title: 'Focus & Chill', subtitle: '学习 / 工作 / 放松', query: 'focus chill music' },
+]
+
+const qqDiscoveryQueries = [
+  { key: 'qq-hot', title: 'QQ 音乐热歌', subtitle: '流行 / 新歌 / 榜单', query: '热歌' },
+  { key: 'qq-acg', title: 'QQ 音乐 ACG', subtitle: '动画 / 游戏 / 虚拟歌手', query: 'ACG 音乐' },
+  { key: 'qq-chill', title: 'QQ 音乐轻听', subtitle: '治愈 / 学习 / 放松', query: '轻音乐' },
+]
+const qqDiscoveryShelves = ref<DiscoveryShelf[]>([])
+const isLoadingQqDiscovery = ref(false)
+
+async function loadDiscoveryShelves(platform: 'bilibili' | 'youtube') {
+  const queries = platform === 'bilibili' ? biliDiscoveryQueries : youtubeDiscoveryQueries
+  const loading = platform === 'bilibili' ? isLoadingBiliDiscovery : isLoadingYoutubeDiscovery
+  const target = platform === 'bilibili' ? biliDiscoveryShelves : youtubeDiscoveryShelves
+  if (target.value.length > 0 || loading.value) return
+
+  loading.value = true
+  try {
+    const results = await Promise.all(queries.map(async q => {
+      try {
+        const items = await invoke<SearchResult[]>('search', { query: q.query, platform })
+        return { key: q.key, title: q.title, subtitle: q.subtitle, platform, items: items.slice(0, 10) }
+      } catch {
+        return { key: q.key, title: q.title, subtitle: q.subtitle, platform, items: [] }
+      }
+    }))
+    target.value = results.filter(shelf => shelf.items.length > 0)
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadQqDiscoveryShelves() {
+  if (qqDiscoveryShelves.value.length > 0 || isLoadingQqDiscovery.value) return
+  isLoadingQqDiscovery.value = true
+  try {
+    const results = await Promise.all(qqDiscoveryQueries.map(async q => {
+      try {
+        const items = await invoke<SearchResult[]>('search', { query: q.query, platform: 'qq' })
+        return { key: q.key, title: q.title, subtitle: q.subtitle, platform: 'qq' as PlatformTab, items: items.slice(0, 10) }
+      } catch {
+        return { key: q.key, title: q.title, subtitle: q.subtitle, platform: 'qq' as PlatformTab, items: [] }
+      }
+    }))
+    qqDiscoveryShelves.value = results.filter(shelf => shelf.items.length > 0)
+  } finally {
+    isLoadingQqDiscovery.value = false
+  }
+}
+
+async function loadYoutubeHomeFeedIfAvailable() {
+  if (!auth.youtube.loggedIn || recommend.homeFeedShelves.length > 0) return
+  await recommend.fetchHomeFeed()
+}
+
 async function loadQualityByTag(tagKey: string) {
   selectedTag.value = tagKey
   isLoadingPlaylists.value = true
@@ -84,10 +179,24 @@ watch(searchQuery, (q) => {
   }, 300)
 })
 
+
+watch(() => route.query.platform, (platform) => {
+  if (typeof platform === 'string' && PLATFORM_KEYS.includes(platform as PlatformTab)) {
+    activeTab.value = platform as PlatformTab
+  }
+})
+
 // 切换平台 Tab 时，如果有搜索关键词则重新搜索
 watch(activeTab, (tab) => {
   if (searchQuery.value.trim()) {
     searchStore.search(searchQuery.value, tab)
+    return
+  }
+  if (tab === 'qq') void loadQqDiscoveryShelves()
+  if (tab === 'bilibili') void loadDiscoveryShelves('bilibili')
+  if (tab === 'youtube') {
+    void loadDiscoveryShelves('youtube')
+    void loadYoutubeHomeFeedIfAvailable()
   }
 })
 
@@ -113,11 +222,50 @@ function goToPlaylist(pl: PlaylistInfo) {
   router.push({ name: 'netease-playlist', params: { id: pl.id } })
 }
 
+function playDiscoveryItem(item: SearchResult) {
+  playResult(item)
+}
+
+function platformLabel(source?: string) {
+  switch ((source || '').toLowerCase()) {
+    case 'netease': return t('player.source_netease')
+    case 'qq': return t('player.source_qq')
+    case 'bilibili': return t('player.source_bilibili')
+    case 'youtube': return t('player.source_youtube')
+    case 'local': return t('player.source_local')
+    default: return source || ''
+  }
+}
+
+function goToYoutubeShelfItem(item: any) {
+  if (item.browseId) {
+    router.push({ name: 'youtube-playlist', params: { browseId: item.browseId } })
+    return
+  }
+  if (item.videoId) {
+    player.play({
+      id: `youtube:${item.videoId}`,
+      title: item.title,
+      artist: item.subtitle || 'YouTube Music',
+      album: '',
+      durationMs: 0,
+      coverUrl: item.coverUrl || '',
+      audioUrl: '',
+    })
+  }
+}
+
 // ===== 初始化 =====
 onMounted(() => {
   // 首次加载网易云精品歌单
   if (qualityPlaylists.value.length === 0) {
     loadQualityByTag('tag_all')
+  }
+  if (activeTab.value === 'bilibili') void loadDiscoveryShelves('bilibili')
+  if (activeTab.value === 'qq') void loadQqDiscoveryShelves()
+  if (activeTab.value === 'youtube') {
+    void loadDiscoveryShelves('youtube')
+    void loadYoutubeHomeFeedIfAvailable()
   }
 })
 </script>
@@ -179,7 +327,7 @@ onMounted(() => {
           <div class="result-title">{{ r.title }}</div>
           <div class="result-meta">{{ r.artist }}<span v-if="r.album"> · {{ r.album }}</span></div>
         </div>
-        <div class="result-source">{{ r.source }}</div>
+        <div class="result-source">{{ platformLabel(r.source) }}</div>
         <div class="result-duration">{{ formatDuration(r.duration_ms) }}</div>
       </div>
     </div>
@@ -230,31 +378,124 @@ onMounted(() => {
         </div>
       </template>
 
-      <!-- B站 Tab：搜索提示 -->
-      <template v-else-if="activeTab === 'bilibili'">
-        <div class="empty-state">
-          <div class="empty-circle">
-            <span
-              class="tab-icon large"
-              :style="{ maskImage: 'url(/icons/ic_bilibili.svg)' }"
-            ></span>
+      <!-- QQ 音乐 Tab：默认发现内容 -->
+      <template v-else-if="activeTab === 'qq'">
+        <div class="platform-hero qq">
+          <span class="tab-icon large" :style="{ maskImage: 'url(/icons/ic_qq_music.svg)' }"></span>
+          <div>
+            <h2>{{ t('settings.qq_account') }}</h2>
+            <p>{{ t('explore.qq_hint') }}</p>
           </div>
-          <p class="empty-title">{{ t('settings.bilibili_account') }}</p>
-          <p class="empty-desc">{{ t('explore.bili_hint') }}</p>
+        </div>
+        <div v-if="isLoadingQqDiscovery" class="loading-state">
+          <span class="material-symbols-rounded spinning">progress_activity</span>
+        </div>
+        <div v-else-if="qqDiscoveryShelves.length > 0" class="discovery-stack">
+          <section v-for="shelf in qqDiscoveryShelves" :key="shelf.key" class="discovery-shelf">
+            <div class="discovery-header">
+              <div>
+                <h2 class="section-title">{{ shelf.title }}</h2>
+                <p>{{ shelf.subtitle }}</p>
+              </div>
+            </div>
+            <div class="discovery-row">
+              <div v-for="item in shelf.items" :key="item.id" class="discovery-card" @click="playDiscoveryItem(item)">
+                <div class="discovery-cover">
+                  <img v-if="item.cover_url" :src="item.cover_url" referrerpolicy="no-referrer" loading="lazy" />
+                  <span v-else class="material-symbols-rounded filled">music_note</span>
+                </div>
+                <div class="discovery-title">{{ item.title }}</div>
+                <div class="discovery-meta">{{ item.artist }}</div>
+              </div>
+            </div>
+          </section>
         </div>
       </template>
 
-      <!-- YouTube Tab：搜索提示 -->
-      <template v-else-if="activeTab === 'youtube'">
-        <div class="empty-state">
-          <div class="empty-circle">
-            <span
-              class="tab-icon large"
-              :style="{ maskImage: 'url(/icons/ic_youtube.svg)' }"
-            ></span>
+      <!-- B站 Tab：默认发现内容 -->
+      <template v-else-if="activeTab === 'bilibili'">
+        <div class="platform-hero bilibili">
+          <span class="tab-icon large" :style="{ maskImage: 'url(/icons/ic_bilibili.svg)' }"></span>
+          <div>
+            <h2>{{ t('settings.bilibili_account') }}</h2>
+            <p>{{ t('explore.bili_hint') }} · 为你预置音乐现场、翻唱和 ACG 音乐入口</p>
           </div>
-          <p class="empty-title">{{ t('settings.youtube_account') }}</p>
-          <p class="empty-desc">{{ t('explore.yt_hint') }}</p>
+        </div>
+        <div v-if="isLoadingBiliDiscovery" class="loading-state">
+          <span class="material-symbols-rounded spinning">progress_activity</span>
+        </div>
+        <div v-else-if="biliDiscoveryShelves.length > 0" class="discovery-stack">
+          <section v-for="shelf in biliDiscoveryShelves" :key="shelf.key" class="discovery-shelf">
+            <div class="discovery-header">
+              <div>
+                <h2 class="section-title">{{ shelf.title }}</h2>
+                <p>{{ shelf.subtitle }}</p>
+              </div>
+            </div>
+            <div class="discovery-row">
+              <div v-for="item in shelf.items" :key="item.id" class="discovery-card video" @click="playDiscoveryItem(item)">
+                <div class="discovery-cover wide">
+                  <img v-if="item.cover_url" :src="item.cover_url" referrerpolicy="no-referrer" loading="lazy" />
+                  <span v-else class="material-symbols-rounded filled">movie</span>
+                </div>
+                <div class="discovery-title">{{ item.title }}</div>
+                <div class="discovery-meta">{{ item.artist }}</div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </template>
+
+      <!-- YouTube Tab：默认发现内容 -->
+      <template v-else-if="activeTab === 'youtube'">
+        <div class="platform-hero youtube">
+          <span class="tab-icon large" :style="{ maskImage: 'url(/icons/ic_youtube.svg)' }"></span>
+          <div>
+            <h2>{{ t('settings.youtube_account') }}</h2>
+            <p>{{ auth.youtube.loggedIn ? '优先展示 YouTube Music 首页 Feed，并补充默认搜索发现' : t('explore.yt_hint') }}</p>
+          </div>
+        </div>
+
+        <div v-if="auth.youtube.loggedIn && recommend.homeFeedShelves.length > 0" class="discovery-stack">
+          <section v-for="shelf in recommend.homeFeedShelves.slice(0, 4)" :key="shelf.title" class="discovery-shelf">
+            <div class="discovery-header">
+              <h2 class="section-title">{{ shelf.title }}</h2>
+            </div>
+            <div class="discovery-row">
+              <div v-for="item in shelf.items.slice(0, 10)" :key="item.browseId || item.videoId || item.title" class="discovery-card" @click="goToYoutubeShelfItem(item)">
+                <div class="discovery-cover">
+                  <img v-if="item.coverUrl" :src="item.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
+                  <span v-else class="material-symbols-rounded filled">music_note</span>
+                </div>
+                <div class="discovery-title">{{ item.title }}</div>
+                <div class="discovery-meta">{{ item.subtitle }}</div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div v-if="isLoadingYoutubeDiscovery" class="loading-state">
+          <span class="material-symbols-rounded spinning">progress_activity</span>
+        </div>
+        <div v-else-if="youtubeDiscoveryShelves.length > 0" class="discovery-stack">
+          <section v-for="shelf in youtubeDiscoveryShelves" :key="shelf.key" class="discovery-shelf">
+            <div class="discovery-header">
+              <div>
+                <h2 class="section-title">{{ shelf.title }}</h2>
+                <p>{{ shelf.subtitle }}</p>
+              </div>
+            </div>
+            <div class="discovery-row">
+              <div v-for="item in shelf.items" :key="item.id" class="discovery-card" @click="playDiscoveryItem(item)">
+                <div class="discovery-cover">
+                  <img v-if="item.cover_url" :src="item.cover_url" referrerpolicy="no-referrer" loading="lazy" />
+                  <span v-else class="material-symbols-rounded filled">music_note</span>
+                </div>
+                <div class="discovery-title">{{ item.title }}</div>
+                <div class="discovery-meta">{{ item.artist }}</div>
+              </div>
+            </div>
+          </section>
         </div>
       </template>
     </template>
@@ -488,6 +729,110 @@ onMounted(() => {
   font-size: 11px;
   color: var(--md-on-surface-variant);
   margin-top: 2px;
+}
+
+
+/* 多平台默认发现 */
+.platform-hero {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 14% 18%, color-mix(in srgb, var(--platform-color) 24%, transparent), transparent 36%),
+    var(--md-surface-container);
+  border: 1px solid color-mix(in srgb, var(--platform-color) 26%, var(--md-outline-variant));
+
+  &.bilibili { --platform-color: #00a1d6; }
+  &.qq { --platform-color: #1fce6d; }
+  &.youtube { --platform-color: #ff0033; }
+
+  .tab-icon { background: var(--platform-color); }
+
+  h2 {
+    font-size: 18px;
+    font-weight: 800;
+    margin-bottom: 3px;
+  }
+
+  p {
+    font-size: 13px;
+    color: var(--md-on-surface-variant);
+  }
+}
+
+.discovery-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.discovery-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 10px;
+
+  p {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--md-on-surface-variant);
+  }
+}
+
+.discovery-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 14px 12px;
+}
+
+.discovery-card {
+  min-width: 0;
+  cursor: pointer;
+  border-radius: 14px;
+  transition: transform var(--duration-short) var(--ease-standard);
+
+  &:hover { transform: translateY(-2px); }
+}
+
+.discovery-cover {
+  aspect-ratio: 1;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--md-surface-variant);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  &.wide { aspect-ratio: 16 / 9; }
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .material-symbols-rounded { opacity: 0.45; }
+}
+
+.discovery-title {
+  margin-top: 7px;
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discovery-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--md-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 空状态 */

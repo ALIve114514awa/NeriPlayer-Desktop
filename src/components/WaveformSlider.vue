@@ -8,7 +8,7 @@ const props = withDefaults(defineProps<{
   inactiveColor?: string
 }>(), {
   activeColor: '#fff',
-  inactiveColor: 'rgba(255,255,255,0.3)',
+  inactiveColor: 'rgba(255,255,255,0.35)',
 })
 
 const emit = defineEmits<{
@@ -127,6 +127,7 @@ function clamp01(v: number) { return Math.max(0, Math.min(1, v)) }
   <div
     ref="containerRef"
     class="waveform-container"
+    :style="{ '--wave-active-color': activeColor, '--wave-inactive-color': inactiveColor }"
     @pointerdown="handlePointerDown"
   >
     <svg
@@ -135,8 +136,8 @@ function clamp01(v: number) { return Math.max(0, Math.min(1, v)) }
       viewBox="0 0 500 8"
       preserveAspectRatio="none"
     >
-      <path class="wave-inactive" fill="none" :stroke="inactiveColor" stroke-width="2" stroke-linecap="round" />
-      <path class="wave-active" fill="none" :stroke="activeColor" stroke-width="3" stroke-linecap="round" />
+      <path class="wave-inactive" fill="none" stroke-width="2" stroke-linecap="round" />
+      <path class="wave-active" fill="none" stroke-width="3" stroke-linecap="round" />
     </svg>
     <!-- thumb 独立于 SVG，不受拉伸影响 -->
     <div class="thumb" />
@@ -170,14 +171,26 @@ function clamp01(v: number) { return Math.max(0, Math.min(1, v)) }
   shape-rendering: geometricPrecision;
 }
 
+.wave-inactive {
+  stroke: var(--wave-inactive-color, rgba(255,255,255,0.35));
+  transition: stroke 0.72s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.wave-active {
+  stroke: var(--wave-active-color, #fff);
+  transition: stroke 0.72s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 .thumb {
   position: absolute;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--waveform-thumb-color, #fff);
   transform: translate(-50%, -50%);
-  transition: width 150ms, height 150ms;
+  transition: width 150ms, height 150ms,
+              background 0.72s cubic-bezier(0.22, 1, 0.36, 1),
+              box-shadow 0.72s cubic-bezier(0.22, 1, 0.36, 1);
   box-shadow: 0 0 4px rgba(255, 255, 255, 0.3);
   pointer-events: none;
   z-index: 1;

@@ -234,13 +234,18 @@ const SURFACE_PROPS = [
   '--md-surface-container-lowest', '--md-surface-bright',
 ] as const
 
-/** 应用主题色到 CSS 变量 */
-export function applyThemeColor(key: string) {
+/**
+ * 仅视觉应用主题色 CSS 变量（不持久化）
+ * @param isDark 直接传入避免 classList 读取导致强制 reflow
+ */
+export function applyThemeColorVisual(key: string, isDark?: boolean) {
   const scheme = THEME_COLORS.find(c => c.key === key)
   if (!scheme) return
 
-  const isDark = !document.documentElement.classList.contains('light-theme')
-  const vars = isDark ? scheme.dark : scheme.light
+  // 直接使用传入的 isDark，避免在 startViewTransition 回调内
+  // 读取 classList（写后读会触发强制 reflow，是卡顿的主因）
+  const dark = isDark ?? !document.documentElement.classList.contains('light-theme')
+  const vars = dark ? scheme.dark : scheme.light
   const root = document.documentElement.style
 
   // 先清除所有 surface 行内样式，确保 CSS class 的值能生效
@@ -254,7 +259,7 @@ export function applyThemeColor(key: string) {
   root.setProperty('--md-seed', scheme.seed)
 
   // 深色模式下给 surface 微混主题色 ~1.5%（浅色不动，保持中性白底）
-  if (isDark) {
+  if (dark) {
     const primaryRgb = vars['--md-primary']
     const match = primaryRgb?.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/)
     if (match) {
@@ -268,11 +273,18 @@ export function applyThemeColor(key: string) {
       root.setProperty('--md-surface-container-highest', `rgb(${Math.round(54 + r * 0.02)}, ${Math.round(52 + g * 0.02)}, ${Math.round(59 + b * 0.02)})`)
     }
   }
+}
 
+/** 应用主题色到 CSS 变量（含持久化） */
+export function applyThemeColor(key: string, isDark?: boolean) {
+  applyThemeColorVisual(key, isDark)
   localStorage.setItem('theme-color', key)
 }
 
-/** 带扩散动画的主题色切换 */
+/**
+ * 带圆形扩散动画的主题色切换
+ * 参考 Android 端 pending state 模式：先切换视觉 → 异步持久化
+ */
 export async function switchThemeColorWithRipple(key: string, x: number, y: number) {
   if (!(document as any).startViewTransition) {
     applyThemeColor(key)
@@ -284,9 +296,16 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
     Math.max(y, window.innerHeight - y),
   )
 
+  // 预计算当前 dark/light 状态，避免 transition 回调中读 classList
+  const isDark = !document.documentElement.classList.contains('light-theme')
+
   const transition = (document as any).startViewTransition(() => {
-    applyThemeColor(key)
+    // 仅做视觉切换，不含 localStorage 写入
+    applyThemeColorVisual(key, isDark)
   })
+
+  // 异步持久化，不阻塞动画关键路径
+  queueMicrotask(() => localStorage.setItem('theme-color', key))
 
   try {
     await transition.ready
@@ -298,7 +317,7 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
         ],
       },
       {
-        duration: 750,
+        duration: 500,
         easing: 'cubic-bezier(0.2, 0, 0, 1)',
         pseudoElement: '::view-transition-new(root)',
       },

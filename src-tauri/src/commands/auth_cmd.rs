@@ -106,7 +106,7 @@ pub async fn login_netease(app: AppHandle, state: State<'_, AppState>) -> AppRes
     cookies::inject_cookies(&state.cookie_jar, &entries);
 
     // 调用 API 获取用户信息
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     let (user_id, nickname, avatar_url) = match client.get_user_account().await {
         Ok(account) => {
             let profile = &account["profile"];
@@ -173,7 +173,7 @@ pub async fn login_bilibili(app: AppHandle, state: State<'_, AppState>) -> AppRe
         .and_then(|c| c.value.parse::<u64>().ok());
 
     // 调用 B站 nav API 获取用户信息
-    let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+    let client = crate::api::bilibili::client::BiliClient::new(&state.http());
     let (nickname, avatar_url) = match client.get_user_info().await {
         Ok(info) => {
             let data = &info["data"];
@@ -282,7 +282,7 @@ pub async fn login_with_cookies(
                 return Err(AppError::Other("Missing required cookie: MUSIC_U".into()));
             }
 
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
             let (user_id, nickname, avatar_url) = match client.get_user_account().await {
                 Ok(account) => {
                     let profile = &account["profile"];
@@ -313,7 +313,7 @@ pub async fn login_with_cookies(
                 .find(|c| c.name == "DedeUserID")
                 .and_then(|c| c.value.parse::<u64>().ok());
 
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
             let (nickname, avatar_url) = match client.get_user_info().await {
                 Ok(info) => {
                     let data = &info["data"];

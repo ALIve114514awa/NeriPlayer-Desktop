@@ -56,9 +56,52 @@ const dailySongs = computed(() => {
 
 // 用户歌单（多平台合并）
 const myPlaylists = computed(() => {
-  const all = Object.values(recommend.userPlaylists).flat()
+  const all = Object.entries(recommend.userPlaylists).flatMap(([platform, list]) =>
+    list.map(pl => ({ ...pl, platform })),
+  )
   return all.slice(0, 12)
 })
+
+const platformHubs = computed(() => [
+  {
+    key: 'netease',
+    title: t('settings.netease_account'),
+    subtitle: recommend.recommendedPlaylists.length > 0 ? t('home.recommended_playlists') : t('explore.login_for_recommend'),
+    icon: '/icons/ic_netease.svg',
+    color: '#e74c3c',
+    action: () => router.push({ name: 'explore' }),
+  },
+  {
+    key: 'qq',
+    title: t('settings.qq_account'),
+    subtitle: t('explore.qq_hint'),
+    icon: '/icons/ic_qq_music.svg',
+    color: '#1fce6d',
+    action: () => router.push({ name: 'explore', query: { platform: 'qq' } }),
+  },
+  {
+    key: 'bilibili',
+    title: t('settings.bilibili_account'),
+    subtitle: auth.bilibili.loggedIn
+      ? t('player.video_count', { count: recommend.userPlaylists.bilibili?.length || 0 })
+      : t('explore.bili_hint'),
+    icon: '/icons/ic_bilibili.svg',
+    color: '#00a1d6',
+    action: () => router.push({ name: 'explore', query: { platform: 'bilibili' } }),
+  },
+  {
+    key: 'youtube',
+    title: t('settings.youtube_account'),
+    subtitle: auth.youtube.loggedIn
+      ? t('player.track_count', { count: recommend.userPlaylists.youtube?.length || 0 })
+      : t('explore.yt_hint'),
+    icon: '/icons/ic_youtube.svg',
+    color: '#ff0033',
+    action: () => router.push({ name: 'explore', query: { platform: 'youtube' } }),
+  },
+])
+
+const youtubeHomeItems = computed(() => recommend.homeFeedShelves.flatMap(s => s.items).slice(0, 14))
 
 // 热力飙升 / 私人雷达（通过搜索 API 获取，与 Android 行为一致）
 interface SearchResult {
@@ -117,19 +160,13 @@ function formatDuration(ms: number): string {
 
 async function handleQuickAction(action: string) {
   if (action === 'local') {
-    try {
-      const { open } = await import('@tauri-apps/plugin-dialog')
-      const dir = await open({ directory: true, title: 'Select Music Folder' })
-      if (dir) library.scanDirectory(dir as string)
-    } catch (e) {
-      console.error('Dialog failed:', e)
-    }
+    router.push({ name: 'library', query: { tab: 'local' } })
   } else if (action === 'recent') {
     router.push('/recent')
   } else if (action === 'favorites') {
-    router.push({ name: 'local-playlist', params: { id: -1001 } })
+    router.push({ name: 'library', query: { tab: 'favorites' } })
   } else if (action === 'downloads') {
-    // TODO: 下载管理页
+    router.push({ name: 'downloads' })
   }
 }
 
@@ -147,6 +184,34 @@ function playDailySong(song: any) {
   player.play(track)
 }
 
+function openPlatformPlaylist(pl: any) {
+  if (pl.platform === 'bilibili') {
+    router.push({ name: 'bili-playlist', params: { mediaId: pl.id } })
+  } else if (pl.platform === 'youtube') {
+    router.push({ name: 'youtube-playlist', params: { browseId: pl.id } })
+  } else {
+    router.push({ name: 'netease-playlist', params: { id: pl.id } })
+  }
+}
+
+function openYoutubeHomeItem(item: any) {
+  if (item.browseId) {
+    router.push({ name: 'youtube-playlist', params: { browseId: item.browseId } })
+    return
+  }
+  if (item.videoId) {
+    player.play({
+      id: `youtube:${item.videoId}`,
+      title: item.title,
+      artist: item.subtitle || 'YouTube Music',
+      album: '',
+      durationMs: 0,
+      coverUrl: item.coverUrl || '',
+      audioUrl: '',
+    })
+  }
+}
+
 // 启动时恢复上次扫描 + 拉取推荐
 onMounted(() => {
   if (library.tracks.length === 0) library.restoreLastScan()
@@ -159,6 +224,13 @@ onMounted(() => {
     if (recommend.recommendedSongs.length === 0) recommend.fetchRecommendedSongs()
     if (!recommend.userPlaylists['netease']?.length) recommend.fetchUserPlaylists('netease')
   }
+  if (auth.bilibili.loggedIn && !recommend.userPlaylists.bilibili?.length) {
+    recommend.fetchUserPlaylists('bilibili')
+  }
+  if (auth.youtube.loggedIn) {
+    if (!recommend.userPlaylists.youtube?.length) recommend.fetchUserPlaylists('youtube')
+    if (recommend.homeFeedShelves.length === 0) recommend.fetchHomeFeed()
+  }
 })
 
 // 登录状态变化时刷新推荐
@@ -167,6 +239,17 @@ watch(() => auth.netease.loggedIn, (loggedIn) => {
     recommend.fetchRecommendedPlaylists()
     recommend.fetchRecommendedSongs()
     recommend.fetchUserPlaylists('netease')
+  }
+})
+
+watch(() => auth.bilibili.loggedIn, (loggedIn) => {
+  if (loggedIn) recommend.fetchUserPlaylists('bilibili')
+})
+
+watch(() => auth.youtube.loggedIn, (loggedIn) => {
+  if (loggedIn) {
+    recommend.fetchUserPlaylists('youtube')
+    recommend.fetchHomeFeed()
   }
 })
 
@@ -246,6 +329,24 @@ function formatNotifTime(ts: number): string {
         </div>
         <span class="quick-title">{{ item.title }}</span>
         <span class="material-symbols-rounded quick-arrow">chevron_right</span>
+      </div>
+    </section>
+
+    <!-- 多平台入口 -->
+    <section class="section platform-hubs">
+      <div
+        v-for="hub in platformHubs"
+        :key="hub.key"
+        class="platform-hub-card"
+        :style="{ '--hub-color': hub.color }"
+        @click="hub.action()"
+      >
+        <span class="platform-hub-icon" :style="{ maskImage: `url(${hub.icon})` }"></span>
+        <div class="platform-hub-copy">
+          <div class="platform-hub-title">{{ hub.title }}</div>
+          <div class="platform-hub-subtitle">{{ hub.subtitle }}</div>
+        </div>
+        <span class="material-symbols-rounded">arrow_forward</span>
       </div>
     </section>
 
@@ -366,6 +467,35 @@ function formatNotifTime(ts: number): string {
       </div>
     </section>
 
+    <!-- YouTube Music 首页 Feed -->
+    <section v-if="youtubeHomeItems.length > 0" class="section">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="platform-inline-icon" style="--platform-color: #ff0033; mask-image: url('/icons/ic_youtube.svg')"></span>
+          YouTube Music
+        </h2>
+        <button class="section-more" @click="router.push({ name: 'explore', query: { platform: 'youtube' } })">
+          <span>{{ t('home.more') }}</span>
+          <span class="material-symbols-rounded" style="font-size: 18px">arrow_forward</span>
+        </button>
+      </div>
+      <div class="daily-scroll">
+        <div
+          v-for="item in youtubeHomeItems"
+          :key="item.browseId || item.videoId || item.title"
+          class="daily-card"
+          @click="openYoutubeHomeItem(item)"
+        >
+          <div class="daily-cover">
+            <img v-if="item.coverUrl" :src="item.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
+            <span v-else class="material-symbols-rounded filled">music_note</span>
+          </div>
+          <div class="daily-name">{{ item.title }}</div>
+          <div class="daily-artist">{{ item.subtitle }}</div>
+        </div>
+      </div>
+    </section>
+
     <!-- 我的歌单 -->
     <section v-if="myPlaylists.length > 0" class="section">
       <div class="section-header">
@@ -380,7 +510,7 @@ function formatNotifTime(ts: number): string {
           v-for="pl in myPlaylists"
           :key="pl.id"
           class="playlist-card"
-          @click="router.push({ name: 'netease-playlist', params: { id: pl.id } })"
+          @click="openPlatformPlaylist(pl)"
         >
           <div class="playlist-cover">
             <img v-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
@@ -486,6 +616,95 @@ function formatNotifTime(ts: number): string {
   transition: background var(--duration-short);
 
   &:hover { background: var(--md-surface-container-high); }
+}
+
+
+/* 多平台入口 */
+.platform-hubs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.platform-hub-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 14px;
+  border-radius: 20px;
+  cursor: pointer;
+  overflow: hidden;
+  position: relative;
+  background:
+    radial-gradient(circle at 18% 16%, color-mix(in srgb, var(--hub-color) 28%, transparent), transparent 38%),
+    var(--md-surface-container);
+  border: 1px solid color-mix(in srgb, var(--hub-color) 20%, var(--md-outline-variant));
+  transition: transform var(--duration-short) var(--ease-standard), background var(--duration-short);
+
+  &:hover {
+    transform: translateY(-2px);
+    background:
+      radial-gradient(circle at 18% 16%, color-mix(in srgb, var(--hub-color) 34%, transparent), transparent 42%),
+      var(--md-surface-container-high);
+  }
+
+  > .material-symbols-rounded {
+    color: color-mix(in srgb, var(--hub-color) 70%, var(--md-on-surface));
+    font-size: 20px;
+    opacity: 0.75;
+  }
+}
+
+.platform-hub-icon,
+.platform-inline-icon {
+  display: inline-block;
+  background: var(--hub-color, var(--platform-color, var(--md-primary)));
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  flex-shrink: 0;
+}
+
+.platform-hub-icon {
+  width: 28px;
+  height: 28px;
+}
+
+.platform-hub-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.platform-hub-title {
+  font-size: 13px;
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.platform-hub-subtitle {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--md-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.platform-inline-icon {
+  width: 20px;
+  height: 20px;
+  vertical-align: -4px;
+  margin-right: 6px;
+}
+
+@media (max-width: 900px) {
+  .platform-hubs { grid-template-columns: 1fr; }
 }
 
 /* 快捷卡片 */

@@ -52,7 +52,7 @@
   --duration-long: 500ms;
   --duration-extra-long: 700ms;
 
-  --font-family: 'Inter', 'Segoe UI Variable', 'Microsoft YaHei UI', system-ui, sans-serif;
+  --font-family: 'MiSans', 'Inter', 'Segoe UI Variable', 'Microsoft YaHei UI', system-ui, sans-serif;
 }
 
 *, *::before, *::after {
@@ -111,14 +111,13 @@ html, body, #app {
 
 /* NowPlaying 覆盖层过渡 — 不用 spring，改用 M3 emphasized decelerate，无弹跳 */
 .slide-up-enter-active {
-  transition: transform 550ms var(--ease-emphasized-decel),
-              opacity 250ms var(--ease-decelerate);
+  transition: opacity 180ms var(--ease-decelerate);
 }
 .slide-up-leave-active {
   transition: transform 400ms var(--ease-emphasized-accel),
               opacity 200ms var(--ease-accelerate);
 }
-.slide-up-enter-from { transform: translateY(100%); opacity: 0.5; }
+.slide-up-enter-from { opacity: 0.01; }
 .slide-up-leave-to { transform: translateY(100%); opacity: 0; }
 
 /* 按钮重置 */

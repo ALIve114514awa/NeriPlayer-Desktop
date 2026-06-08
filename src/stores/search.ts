@@ -10,13 +10,16 @@ export interface SearchResult {
   duration_ms: number
   source: string
   cover_url: string | null
+  synced_lyrics?: string | null
+  plain_lyrics?: string | null
+  translated_lyrics?: string | null
 }
 
 export const useSearchStore = defineStore('search', () => {
   const results = ref<SearchResult[]>([])
   const isSearching = ref(false)
   const query = ref('')
-  const platform = ref('all') // all | netease | bilibili | youtube
+  const platform = ref('all') // all | netease | qq | bilibili | youtube
 
   async function search(q: string, p?: string) {
     if (!q.trim()) {

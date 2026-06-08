@@ -47,7 +47,10 @@ export const useSettingsStore = defineStore('settings', () => {
   const lyricBlur = ref(loadSetting('lyric_blur', true))
   const lyricBlurAmount = ref(loadSetting('lyric_blur_amount', 1.5))
   const cloudMusicOffset = ref(loadSetting('cloud_offset', 0))
-  const qqMusicOffset = ref(loadSetting('qq_offset', 0))
+  const qqMusicOffset = ref(loadSetting('qq_offset', 500))
+
+  // 封面样式
+  const coverStyle = ref<'disc' | 'card'>(loadSetting('cover_style', 'card'))
 
   // 动效
   const advancedLyrics = ref(loadSetting('advanced_lyrics', true))
@@ -59,16 +62,39 @@ export const useSettingsStore = defineStore('settings', () => {
 
   // 音质
   const neteaseQuality = ref(loadSetting('netease_quality', 'exhigh'))
+  const qqMusicQuality = ref(loadSetting('qq_quality', 'high'))
   const youtubeQuality = ref(loadSetting('youtube_quality', 'very_high'))
   const biliQuality = ref(loadSetting('bili_quality', 'high'))
+
+  // 网络
+  const bypassProxy = ref(loadSetting('bypass_proxy', true))
+
+  // YouTube 国际化
+  const internationalizationEnabled = ref(loadSetting('intl_enabled',
+    typeof navigator !== 'undefined' && !navigator.language.startsWith('zh')))
+
+  // 个性化 — 背景图
+  const backgroundImageUri = ref(loadSetting('bg_image_uri', ''))
+  const backgroundImageBlur = ref(loadSetting('bg_image_blur', 20))
+  const backgroundImageAlpha = ref(loadSetting('bg_image_alpha', 0.3))
+
+  // 开发者模式
+  const devModeEnabled = ref(loadSetting('dev_mode', false))
 
   // 存储
   const maxCacheSize = ref(loadSetting('cache_size', 1024))
   const downloadNameTemplate = ref(loadSetting('download_template', '{artist} - {title}'))
+  const downloadDir = ref(loadSetting('download_dir', ''))
 
+  // 一起听
+  const ltServerUrl = ref(loadSetting('lt_server_url', 'https://neriplayer.hancat.work'))
+  const ltNickname = ref(loadSetting('lt_nickname', ''))
+  const ltAllowMemberControl = ref(loadSetting('lt_allow_member_control', true))
+  const ltAutoPauseOnMemberChange = ref(loadSetting('lt_auto_pause_on_change', true))
+  const ltShareAudioLinks = ref(loadSetting('lt_share_audio_links', true))
   // 自动持久化：watch 所有 ref，变化时保存
   const allSettings: Record<string, any> = {
-    dark_mode: darkMode, theme_color: themeColor,
+    dark_mode: darkMode, theme_color: themeColor, cover_style: coverStyle,
     default_screen: defaultScreen, cover_badge: showCoverBadge,
     np_title: showNowPlayingTitle, np_toolbar: showToolbarDock,
     quality_switch: showQualitySwitch, audio_codec: showAudioCodec,
@@ -84,9 +110,17 @@ export const useSettingsStore = defineStore('settings', () => {
     dynamic_bg: dynamicBackground, audio_reactive: audioReactive,
     cover_blur_bg: coverBlurBg, cover_blur_amount: coverBlurAmount,
     cover_blur_darken: coverBlurDarken,
-    netease_quality: neteaseQuality, youtube_quality: youtubeQuality,
-    bili_quality: biliQuality, cache_size: maxCacheSize,
-    download_template: downloadNameTemplate,
+    netease_quality: neteaseQuality, qq_quality: qqMusicQuality, youtube_quality: youtubeQuality,
+    bili_quality: biliQuality, bypass_proxy: bypassProxy,
+    intl_enabled: internationalizationEnabled,
+    bg_image_uri: backgroundImageUri, bg_image_blur: backgroundImageBlur,
+    bg_image_alpha: backgroundImageAlpha, dev_mode: devModeEnabled,
+    cache_size: maxCacheSize, download_template: downloadNameTemplate,
+    download_dir: downloadDir,
+    lt_server_url: ltServerUrl, lt_nickname: ltNickname,
+    lt_allow_member_control: ltAllowMemberControl,
+    lt_auto_pause_on_change: ltAutoPauseOnMemberChange,
+    lt_share_audio_links: ltShareAudioLinks,
   }
 
   for (const [key, refVal] of Object.entries(allSettings)) {
@@ -94,7 +128,7 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   return {
-    darkMode, themeColor,
+    darkMode, themeColor, coverStyle,
     defaultScreen, showCoverBadge, showNowPlayingTitle, showToolbarDock,
     showQualitySwitch, showAudioCodec, showAudioSpec, lyricFontScale,
     crossfade, normalizeVolume,
@@ -105,7 +139,11 @@ export const useSettingsStore = defineStore('settings', () => {
     cloudMusicOffset, qqMusicOffset,
     advancedLyrics, dynamicBackground, audioReactive,
     coverBlurBg, coverBlurAmount, coverBlurDarken,
-    neteaseQuality, youtubeQuality, biliQuality,
-    maxCacheSize, downloadNameTemplate,
+    neteaseQuality, qqMusicQuality, youtubeQuality, biliQuality,
+    bypassProxy, internationalizationEnabled,
+    backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
+    devModeEnabled,
+    maxCacheSize, downloadNameTemplate, downloadDir,
+    ltServerUrl, ltNickname, ltAllowMemberControl, ltAutoPauseOnMemberChange, ltShareAudioLinks,
   }
 })

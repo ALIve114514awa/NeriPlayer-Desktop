@@ -10,14 +10,14 @@ pub async fn get_recommended_playlists(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_recommended_playlists(limit.unwrap_or(30)).await
 }
 
 /// 获取网易云每日推荐歌曲（需登录）
 #[tauri::command]
 pub async fn get_recommended_songs(state: State<'_, AppState>) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_recommended_songs().await
 }
 
@@ -36,7 +36,7 @@ pub async fn get_user_playlists(
                     .and_then(|a| a.user_id)
                     .ok_or_else(|| AppError::Api("Netease not logged in".into()))?
             };
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
             client.get_user_playlists(uid, 50, 0).await
         }
         "bilibili" => {
@@ -46,7 +46,7 @@ pub async fn get_user_playlists(
                     .and_then(|a| a.mid)
                     .ok_or_else(|| AppError::Api("Bilibili not logged in".into()))?
             };
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
             client.get_user_favorites(mid).await
         }
         "youtube" => {
@@ -56,7 +56,7 @@ pub async fn get_user_playlists(
                     .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
                     .clone()
             };
-            let client = crate::api::youtube::client::YouTubeClient::new(&state.http);
+            let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
             client.get_library_playlists(&yt_auth).await
         }
         _ => Err(AppError::Api(format!("Unknown platform: {}", platform))),
@@ -71,11 +71,11 @@ pub async fn get_user_account(
 ) -> AppResult<Value> {
     match platform.as_str() {
         "netease" => {
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
             client.get_user_account().await
         }
         "bilibili" => {
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
             client.get_user_info().await
         }
         _ => Err(AppError::Api(format!("Unsupported platform: {}", platform))),
@@ -91,7 +91,7 @@ pub async fn get_home_feed(state: State<'_, AppState>) -> AppResult<Value> {
             .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
             .clone()
     };
-    let client = crate::api::youtube::client::YouTubeClient::new(&state.http);
+    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
     client.get_home_feed(&yt_auth).await
 }
 
@@ -102,7 +102,7 @@ pub async fn get_high_quality_playlists(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_high_quality_playlists(
         cat.as_deref().unwrap_or("全部"),
         limit.unwrap_or(30),
@@ -112,7 +112,7 @@ pub async fn get_high_quality_playlists(
 /// 获取精品歌单分类标签
 #[tauri::command]
 pub async fn get_high_quality_tags(state: State<'_, AppState>) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_high_quality_tags().await
 }
 
@@ -123,7 +123,7 @@ pub async fn like_song(
     like: bool,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.like_song(song_id, like).await
 }
 
@@ -136,7 +136,7 @@ pub async fn get_liked_song_ids(state: State<'_, AppState>) -> AppResult<Value> 
             .and_then(|a| a.user_id)
             .ok_or_else(|| AppError::Api("Netease not logged in".into()))?
     };
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_liked_song_ids(uid).await
 }
 
@@ -146,8 +146,18 @@ pub async fn get_album_detail(
     album_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_album_detail(album_id).await
+}
+
+/// 获取歌曲详情（网易云）
+#[tauri::command]
+pub async fn get_netease_song_detail(
+    song_id: u64,
+    state: State<'_, AppState>,
+) -> AppResult<Value> {
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    client.get_song_detail(&[song_id]).await
 }
 
 /// 获取用户收藏的专辑列表（网易云）
@@ -157,7 +167,7 @@ pub async fn get_user_stared_albums(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     client.get_user_stared_albums(offset.unwrap_or(0), limit.unwrap_or(50)).await
 }
 
@@ -167,7 +177,7 @@ pub async fn get_bili_fav_folder_info(
     media_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+    let client = crate::api::bilibili::client::BiliClient::new(&state.http());
     client.get_fav_folder_info(media_id).await
 }
 
@@ -178,7 +188,7 @@ pub async fn get_bili_favorite_items(
     page: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+    let client = crate::api::bilibili::client::BiliClient::new(&state.http());
     client.get_favorite_items(media_id, page.unwrap_or(1)).await
 }
 
@@ -188,7 +198,7 @@ pub async fn get_netease_playlist_detail(
     playlist_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
     let mut detail = client.get_playlist(playlist_id).await?;
 
     // 若 trackIds 数量 > tracks 数量，分页补全
@@ -241,7 +251,7 @@ pub async fn get_youtube_playlist_detail(
             .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
             .clone()
     };
-    let client = crate::api::youtube::client::YouTubeClient::new(&state.http);
+    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
     client.get_playlist_detail(&browse_id, &yt_auth).await
 }
 
@@ -253,14 +263,14 @@ pub async fn validate_auth(
 ) -> AppResult<bool> {
     match platform.as_str() {
         "netease" => {
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http);
+            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
             match client.get_user_account().await {
                 Ok(v) => Ok(v["profile"]["userId"].as_u64().is_some()),
                 Err(_) => Ok(false),
             }
         }
         "bilibili" => {
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http);
+            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
             client.validate_session().await
         }
         "youtube" => {
@@ -271,7 +281,7 @@ pub async fn validate_auth(
             };
             match yt_auth {
                 Some(auth) => {
-                    let client = crate::api::youtube::client::YouTubeClient::new(&state.http);
+                    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
                     match client.get_home_feed(&auth).await {
                         Ok(_) => Ok(true),
                         Err(_) => Ok(false),
