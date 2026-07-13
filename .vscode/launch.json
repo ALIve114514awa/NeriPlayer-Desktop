@@ -8,9 +8,6 @@
       "runtimeExecutable": "pnpm",
       "runtimeArgs": ["tauri", "dev"],
       "cwd": "${workspaceFolder}",
-      "env": {
-        "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
-      },
       "console": "integratedTerminal",
       "skipFiles": ["<node_internals>/**"]
     },
@@ -21,10 +18,16 @@
       "cargo": {
         "args": ["build", "--manifest-path=src-tauri/Cargo.toml", "--no-default-features"]
       },
-      "env": {
-        "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+      "preLaunchTask": "vite-dev",
+      "windows": {
+        "env": { "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}" }
       },
-      "preLaunchTask": "vite-dev"
+      "osx": {
+        "env": { "PATH": "${env:HOME}/.cargo/bin:${env:PATH}" }
+      },
+      "linux": {
+        "env": { "PATH": "${env:HOME}/.cargo/bin:${env:PATH}" }
+      }
     }
   ]
 }

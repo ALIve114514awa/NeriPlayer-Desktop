@@ -2,7 +2,14 @@
   "terminal.integrated.env.windows": {
     "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
   },
+  "terminal.integrated.env.osx": {
+    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+  },
+  "terminal.integrated.env.linux": {
+    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+  },
   "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.linkedProjects": ["src-tauri/Cargo.toml"],
   "[vue]": { "editor.defaultFormatter": "Vue.volar" },
   "[typescript]": { "editor.defaultFormatter": "Vue.volar" }
 }

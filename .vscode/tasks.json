@@ -5,11 +5,15 @@
       "label": "tauri-dev",
       "type": "shell",
       "command": "pnpm tauri dev",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
-        }
+      "options": { "cwd": "${workspaceFolder}" },
+      "windows": {
+        "options": { "env": { "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}" } }
+      },
+      "osx": {
+        "options": { "env": { "PATH": "${env:HOME}/.cargo/bin:${env:PATH}" } }
+      },
+      "linux": {
+        "options": { "env": { "PATH": "${env:HOME}/.cargo/bin:${env:PATH}" } }
       },
       "isBackground": true,
       "problemMatcher": {
