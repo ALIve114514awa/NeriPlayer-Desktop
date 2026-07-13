@@ -456,6 +456,12 @@ onMounted(() => {
   border: 1px solid color-mix(in srgb, var(--md-primary) 18%, var(--md-outline-variant));
   backdrop-filter: blur(18px);
 }
+/* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .selection-toolbar {
+    background: var(--md-surface-container-high);
+  }
+}
 
 .selection-count {
   padding: 0 8px;

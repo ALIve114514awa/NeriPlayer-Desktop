@@ -706,6 +706,12 @@ h1 {
   background: color-mix(in srgb, var(--md-surface-container-low) 94%, transparent);
   backdrop-filter: blur(16px);
 }
+/* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免滚动内容穿透 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .sticky-tools {
+    background: var(--md-surface-container-low);
+  }
+}
 
 .task-list,
 .download-list {

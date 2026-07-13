@@ -28,10 +28,22 @@ let gl: WebGLRenderingContext | null = null
 let program: WebGLProgram | null = null
 let animFrame = 0
 let startTime = 0
-let beatEnvelope = 0
+let lastFrameMs = 0
 
-// 平滑过渡状态（对齐 Android 逐帧 lerp，消除切歌闪烁）
-const LERP_SPEED = 0.032 // 每帧插值速率，过渡更柔和，切歌时更接近网易云式铺开
+// —— 音乐律动第二级非对称平滑（对齐 Android HyperBackground 帧循环）——
+// Rust analyzer.rs 已做第一级帧率无关衰减，这里补一层 attack/release，
+// 并统一换算为与帧率无关的系数，避免 120Hz(ProMotion)/30fps 上手感不同。
+const REF_FPS = 60            // 参考帧率：Android 每帧系数按 ~60fps 调校
+const LEVEL_ATTACK = 0.12     // level 上升系数（@REF_FPS 每帧）
+const LEVEL_RELEASE = 0.045   // level 下降系数
+const BEAT_ATTACK = 0.46      // beat 上升系数
+const BEAT_RELEASE = 0.12     // beat 下降系数
+const BEAT_SCALE = 0.94       // 对齐 Android targetBeat = beat * 0.94
+let smoothLevel = 0
+let smoothBeat = 0
+
+// —— 调色板过渡：基于时间的 520ms smoothStep（对齐 Android，帧率无关）——
+const PALETTE_TRANSITION_MS = 520
 const smoothColors: number[][] = [
   [0.4, 0.31, 0.64, 1],
   [0.49, 0.36, 0.75, 1],
@@ -40,9 +52,39 @@ const smoothColors: number[][] = [
 ]
 let smoothLightOffset = 0
 let smoothSaturateOffset = 0
+// 过渡起点快照 + 当前目标记录
+const transStartColors: number[][] = smoothColors.map((c) => c.slice())
+let transStartLight = 0
+let transStartSaturate = 0
+let transStartMs = 0
+let transitioning = false
+const targetColors: number[][] = smoothColors.map((c) => c.slice())
+let targetLight = 0
+let targetSaturate = 0
 
 function lerpVal(current: number, target: number, t: number): number {
   return current + (target - current) * t
+}
+
+// 将「@REF_FPS 每帧系数」换算为与帧率无关的等效系数
+function frameIndependentRate(perFrameRate: number, dt: number): number {
+  return 1 - Math.pow(1 - perFrameRate, dt * REF_FPS)
+}
+
+// 3t^2 - 2t^3，对齐 Android smoothStep01
+function smoothStep01(t: number): number {
+  const x = t < 0 ? 0 : t > 1 ? 1 : t
+  return x * x * (3 - 2 * x)
+}
+
+// 目标调色板是否变化（切歌）→ 启动一次定时过渡
+function colorsChanged(): boolean {
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      if (targetColors[i][j] !== props.colors[i][j]) return true
+    }
+  }
+  return targetLight !== props.lightOffset || targetSaturate !== props.saturateOffset
 }
 
 // Uniform locations
@@ -115,40 +157,76 @@ function initGL() {
   for (let i = 0; i < 4; i++) {
     for (let j = 0; j < 4; j++) {
       smoothColors[i][j] = props.colors[i][j]
+      targetColors[i][j] = props.colors[i][j]
     }
   }
   smoothLightOffset = props.lightOffset
   smoothSaturateOffset = props.saturateOffset
+  targetLight = props.lightOffset
+  targetSaturate = props.saturateOffset
 
   startTime = performance.now() / 1000
+  lastFrameMs = performance.now()
   render()
 }
 
 function render() {
   if (!gl || !program) return
   const c = canvas.value!
-  const dpr = Math.min(window.devicePixelRatio || 1, 1.5)  // 限制 DPR，节省 GPU
+  // mac/GPU 富余场景允许到 2.0，保证 Retina/HiDPI 清晰度；其余仍限制以省 GPU
+  const dprCap = window.devicePixelRatio >= 2 ? 2.0 : 1.5
+  const dpr = Math.min(window.devicePixelRatio || 1, dprCap)
   const w = c.clientWidth * dpr
   const h = c.clientHeight * dpr
   if (c.width !== w || c.height !== h) { c.width = w; c.height = h }
   gl.viewport(0, 0, w, h)
 
-  // 逐帧 lerp 颜色（对齐 Android 的平滑过渡，消除切歌时的画面闪烁）
-  for (let i = 0; i < 4; i++) {
-    for (let j = 0; j < 4; j++) {
-      smoothColors[i][j] = lerpVal(smoothColors[i][j], props.colors[i][j], LERP_SPEED)
+  const nowMs = performance.now()
+  const dt = Math.min((nowMs - lastFrameMs) / 1000, 0.1) // 秒，钳制避免卡顿后跳变
+  lastFrameMs = nowMs
+
+  // —— 调色板过渡：检测目标变化 → 启动 520ms 定时 smoothStep 过渡 ——
+  if (colorsChanged()) {
+    for (let i = 0; i < 4; i++) transStartColors[i] = smoothColors[i].slice()
+    transStartLight = smoothLightOffset
+    transStartSaturate = smoothSaturateOffset
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) targetColors[i][j] = props.colors[i][j]
     }
+    targetLight = props.lightOffset
+    targetSaturate = props.saturateOffset
+    transStartMs = nowMs
+    transitioning = true
   }
-  smoothLightOffset = lerpVal(smoothLightOffset, props.lightOffset, LERP_SPEED)
-  smoothSaturateOffset = lerpVal(smoothSaturateOffset, props.saturateOffset, LERP_SPEED)
+  if (transitioning) {
+    const raw = (nowMs - transStartMs) / PALETTE_TRANSITION_MS
+    const f = smoothStep01(raw)
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        smoothColors[i][j] = lerpVal(transStartColors[i][j], targetColors[i][j], f)
+      }
+    }
+    smoothLightOffset = lerpVal(transStartLight, targetLight, f)
+    smoothSaturateOffset = lerpVal(transStartSaturate, targetSaturate, f)
+    if (raw >= 1) transitioning = false
+  }
 
   const time = performance.now() / 1000 - startTime
   gl.uniform2f(uResolution, w, h)
   gl.uniform1f(uTime, time)
-  gl.uniform1f(uMusicLevel, props.musicLevel)
-  // Beat 脉冲衰减：0.92/frame @60fps → ~500ms 自然衰减，对齐 Android beatEnv * 0.92f
-  beatEnvelope = Math.max(beatEnvelope * 0.92, props.beatImpulse)
-  gl.uniform1f(uBeat, beatEnvelope)
+
+  // —— 音乐律动第二级非对称平滑（帧率无关）——
+  const targetLevel = Math.min(Math.max(props.musicLevel, 0), 1)
+  const targetBeat = Math.min(Math.max(props.beatImpulse * BEAT_SCALE, 0), 1)
+  const levelRate = frameIndependentRate(
+    targetLevel > smoothLevel ? LEVEL_ATTACK : LEVEL_RELEASE, dt)
+  const beatRate = frameIndependentRate(
+    targetBeat > smoothBeat ? BEAT_ATTACK : BEAT_RELEASE, dt)
+  smoothLevel += (targetLevel - smoothLevel) * levelRate
+  smoothBeat += (targetBeat - smoothBeat) * beatRate
+
+  gl.uniform1f(uMusicLevel, smoothLevel)
+  gl.uniform1f(uBeat, smoothBeat)
   gl.uniform4fv(uColor0, smoothColors[0])
   gl.uniform4fv(uColor1, smoothColors[1])
   gl.uniform4fv(uColor2, smoothColors[2])

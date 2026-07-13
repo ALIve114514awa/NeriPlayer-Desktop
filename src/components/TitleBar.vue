@@ -181,6 +181,12 @@ onUnmounted(() => {
   backdrop-filter: blur(14px) saturate(1.08);
   box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.04);
 }
+/* Linux WebKitGTK 无 backdrop-filter 时给更实的底色，避免标题栏近乎透明 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .title-bar.tb-transitioning {
+    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.82), rgba(14, 13, 18, 0.32));
+  }
+}
 
 .title-bar.tb-opening {
   animation: tb-shell-breathe-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
