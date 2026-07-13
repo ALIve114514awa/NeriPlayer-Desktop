@@ -1615,8 +1615,10 @@ const sliderActiveColor = computed(() => {
       </section>
     </div>
 
-    <!-- 播放队列面板 -->
-    <QueuePanel v-if="showQueue" @close="showQueue = false" />
+    <!-- 播放队列面板（Teleport 到 body，避免被全屏页开合动画的 transform 包含块限制） -->
+    <Teleport to="body">
+      <QueuePanel v-if="showQueue" @close="showQueue = false" />
+    </Teleport>
     <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="player.currentTrack" />
     <ListenTogetherPanel v-if="showLtPanel" class="np-lt-panel" @close="showLtPanel = false" />
 

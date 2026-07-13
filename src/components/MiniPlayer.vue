@@ -294,11 +294,15 @@ defineExpose({
       </div>
     </div>
 
-    <!-- 队列面板 -->
-    <QueuePanel v-if="showQueue" @close="showQueue = false" />
+    <!-- 队列面板（Teleport 到 body，避免被 .mini-player 的 backdrop-filter 包含块限制） -->
+    <Teleport to="body">
+      <QueuePanel v-if="showQueue" @close="showQueue = false" />
+    </Teleport>
 
     <!-- 一起听面板 -->
-    <ListenTogetherPanel v-if="showLtPanel" @close="showLtPanel = false" />
+    <Teleport to="body">
+      <ListenTogetherPanel v-if="showLtPanel" @close="showLtPanel = false" />
+    </Teleport>
   </div>
 </template>
 

@@ -12,6 +12,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useSyncStore } from '@/stores/sync'
 import { useDownloadStore } from '@/stores/download'
 import { useToastStore } from '@/stores/toast'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import { switchThemeWithRipple, type ThemeMode } from '@/utils/theme'
 import { THEME_COLORS, getSwatchColor, applyThemeColor, getSavedThemeColor, switchThemeColorWithRipple } from '@/utils/themeColor'
 
@@ -535,8 +536,15 @@ async function confirmClearGitHub() {
         </div>
       </div>
       <template v-if="account.auth.loggedIn">
+        <BilibiliCoverImage
+          v-if="account.key === 'bilibili' && account.auth.avatarUrl"
+          :src="account.auth.avatarUrl"
+          class="account-avatar"
+        >
+          <span class="material-symbols-rounded account-avatar account-avatar-fallback">account_circle</span>
+        </BilibiliCoverImage>
         <img
-          v-if="account.auth.avatarUrl"
+          v-else-if="account.auth.avatarUrl"
           :src="account.auth.avatarUrl"
           class="account-avatar"
           referrerpolicy="no-referrer"
@@ -1658,6 +1666,15 @@ async function confirmClearGitHub() {
   border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;
+}
+
+.account-avatar-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-surface-container-highest);
+  color: var(--md-on-surface-variant);
+  font-size: 20px;
 }
 
 .account-login-btn {

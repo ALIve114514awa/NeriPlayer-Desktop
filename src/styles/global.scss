@@ -52,7 +52,9 @@
   --duration-long: 500ms;
   --duration-extra-long: 700ms;
 
-  --font-family: 'MiSans', 'Inter', 'Segoe UI Variable', 'Microsoft YaHei UI', system-ui, sans-serif;
+  --font-family: 'MiSans', 'Inter', -apple-system, BlinkMacSystemFont,
+    'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei UI', 'Noto Sans CJK SC', 'Noto Sans', system-ui, sans-serif;
 }
 
 *, *::before, *::after {

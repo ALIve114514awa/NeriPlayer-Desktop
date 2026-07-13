@@ -10,7 +10,9 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "ogg", "wav", "m4a", "aac", "opus", "wma", "webm", "eac3",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
-const COVER_NAMES: &[&str] = &["cover", "folder", "front"];
+const COVER_NAMES: &[&str] = &["cover", "folder", "front", "albumart", "album"];
+// 大小写无关匹配的封面子目录名
+const COVER_DIR_NAMES: &[&str] = &["covers", "cover", "artwork", "scans"];
 
 #[derive(Debug, Clone, Default)]
 struct ParsedFileNameMetadata {
@@ -113,32 +115,82 @@ fn read_track_info(path: &Path, name_template: Option<&str>) -> AppResult<TrackI
 
 fn find_nearby_cover(audio_path: &Path) -> Option<PathBuf> {
     let dir = audio_path.parent()?;
-    let stem = audio_path.file_stem()?.to_str()?;
+    let stem = audio_path.file_stem()?.to_str()?.to_lowercase();
 
-    for ext in IMAGE_EXTENSIONS {
-        let candidate = dir.join(format!("{}.{}", stem, ext));
-        if candidate.is_file() {
-            return Some(candidate);
+    // 1. 同目录下与音频同名的图片（大小写无关）
+    if let Some(cover) = find_image_in_dir(dir, |name| name == stem) {
+        return Some(cover);
+    }
+
+    // 2. 大小写无关的封面子目录下与音频同名的图片
+    if let Some(sub) = find_cover_subdir(dir) {
+        if let Some(cover) = find_image_in_dir(&sub, |name| name == stem) {
+            return Some(cover);
+        }
+        // 子目录内任意常见封面名
+        if let Some(cover) =
+            find_image_in_dir(&sub, |name| COVER_NAMES.contains(&name))
+        {
+            return Some(cover);
         }
     }
 
-    let covers_dir = dir.join("Covers");
-    for ext in IMAGE_EXTENSIONS {
-        let candidate = covers_dir.join(format!("{}.{}", stem, ext));
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    // 3. 同目录下常见封面文件名（cover/folder/front/albumart...，大小写无关）
+    if let Some(cover) = find_image_in_dir(dir, |name| COVER_NAMES.contains(&name)) {
+        return Some(cover);
     }
 
-    for name in COVER_NAMES {
-        for ext in IMAGE_EXTENSIONS {
-            let candidate = dir.join(format!("{}.{}", name, ext));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    None
+}
+
+/// 在目录中查找文件名（小写、去扩展名）满足断言且扩展名为图片的文件。
+fn find_image_in_dir<F>(dir: &Path, matcher: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> bool,
+{
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        if !IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if matcher(&stem) {
+            return Some(path);
         }
     }
+    None
+}
 
+/// 大小写无关查找封面子目录（Covers/cover/artwork...）。
+fn find_cover_subdir(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if COVER_DIR_NAMES.contains(&name.as_str()) {
+            return Some(path);
+        }
+    }
     None
 }
 

@@ -26,6 +26,12 @@ const titleBarSideKey = computed(() => props.nowPlaying ? 'np' : 'brand')
 const isMaximized = ref(false)
 let unlistenResize: UnlistenFn | null = null
 
+// macOS 使用系统原生红绿灯，隐藏自绘控制并在左侧留出安全区。
+// 通过 navigator 判定平台（reqwest 层的 UA spoof 不影响 webview 的 navigator）。
+const isMac = /Mac|iPhone|iPad/.test(
+  (navigator as any).userAgentData?.platform || navigator.platform || navigator.userAgent
+)
+
 const appWindow = getCurrentWindow()
 
 async function refreshMaximized() {
@@ -69,9 +75,13 @@ onUnmounted(() => {
       'tb-transitioning': transitioning,
       'tb-opening': transitionState === 'opening',
       'tb-closing': transitionState === 'closing',
+      'tb-mac': isMac,
     }"
     data-tauri-drag-region
   >
+    <!-- macOS 原生红绿灯安全区（约 78px），避免内容压住系统交通灯 -->
+    <div v-if="isMac" class="tb-traffic-safe-area" data-tauri-drag-region></div>
+
     <div class="tb-left-slot">
       <transition name="tb-side-swap" mode="out-in">
         <!-- 普通模式：logo + 名称 -->
@@ -82,7 +92,7 @@ onUnmounted(() => {
 
         <!-- 播放器模式：折叠按钮（覆盖 logo 区域） -->
         <div v-else :key="titleBarSideKey" class="tb-np-left">
-          <button class="tb-np-btn tb-np-collapse" type="button" @click="emit('collapse')">
+          <button class="tb-np-btn tb-np-collapse" type="button" data-tauri-drag-region="false" @click="emit('collapse')">
             <span class="material-symbols-rounded">keyboard_arrow_down</span>
           </button>
         </div>
@@ -101,19 +111,20 @@ onUnmounted(() => {
 
     <!-- 拖拽占位 -->
     <div class="tb-drag" data-tauri-drag-region></div>
+    <div v-if="isMac" class="tb-drag" data-tauri-drag-region></div>
 
     <div class="tb-right-slot">
       <transition name="tb-side-swap" mode="out-in">
         <!-- 播放器模式：更多按钮 -->
-        <button v-if="nowPlaying" :key="`more:${titleBarSideKey}`" class="tb-np-btn tb-np-more" type="button" @click="emit('toggleMore')">
+        <button v-if="nowPlaying" :key="`more:${titleBarSideKey}`" class="tb-np-btn tb-np-more" type="button" data-tauri-drag-region="false" @click="emit('toggleMore')">
           <span class="material-symbols-rounded">more_vert</span>
         </button>
         <div v-else :key="`spacer:${titleBarSideKey}`" class="tb-np-more-spacer" aria-hidden="true"></div>
       </transition>
     </div>
 
-    <!-- 窗口控制 -->
-    <div class="tb-controls">
+    <!-- 窗口控制（macOS 使用系统原生红绿灯，此处隐藏） -->
+    <div v-if="!isMac" class="tb-controls">
       <button class="tb-ctrl" type="button" @click="minimize" title="最小化">
         <svg width="12" height="12" viewBox="0 0 12 12">
           <rect x="2" y="5.5" width="8" height="1" fill="currentColor" />
@@ -399,6 +410,38 @@ onUnmounted(() => {
   flex: 1;
   -webkit-app-region: drag;
   pointer-events: auto;
+}
+
+/* macOS 原生红绿灯安全区：系统交通灯位于左上 ~12px 起、宽约 78px */
+.tb-traffic-safe-area {
+  width: 78px;
+  height: 100%;
+  flex: 0 0 auto;
+  -webkit-app-region: drag;
+  pointer-events: auto;
+}
+
+/* mac 下普通模式左侧品牌区右移，避免压住系统红绿灯 */
+.tb-mac.title-bar:not(.tb-np-mode) .tb-brand {
+  padding-left: 4px;
+}
+
+/* macOS np 模式：56px 高 + padding-top 会把控制行下压，
+   与系统固定在顶部的红绿灯错位。此处将左右控制行顶部对齐，
+   使折叠/收藏/更多按钮与红绿灯同高。 */
+.tb-mac.tb-np-mode .tb-left-slot,
+.tb-mac.tb-np-mode .tb-right-slot,
+.tb-mac.tb-np-mode .tb-controls {
+  align-self: flex-start;
+}
+
+.tb-mac.tb-np-mode {
+  padding-top: 0;
+}
+
+/* np 模式下 mac 安全区跟随 56px 栏高 */
+.tb-mac.tb-np-mode .tb-traffic-safe-area {
+  height: 56px;
 }
 
 .tb-controls {

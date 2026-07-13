@@ -1,15 +1,149 @@
 // 三平台登录/登出命令
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::auth::state::{AuthInfo, AuthStatusResponse, NeteaseAuth, BiliAuth, YouTubeAuth, CookieEntry};
 use crate::auth::cookies;
 
+const BILIBILI_LOGIN_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
 // 登录检测机制：
 // 1. 打开 WebviewWindow 加载平台登录页
 // 2. 每 800ms 调用 Tauri 内置 cookies_for_url() 读取 Cookie（含 HttpOnly）
 // 3. 检测到 sentinel cookie 后关闭窗口，保存 cookie
+
+fn track_login_window_close<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+) -> Arc<AtomicBool> {
+    let close_requested = Arc::new(AtomicBool::new(false));
+    let event_close_requested = close_requested.clone();
+    window.on_window_event(move |event| {
+        match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                event_close_requested.store(true, Ordering::Release);
+            }
+            WindowEvent::Destroyed => {
+                event_close_requested.store(true, Ordering::Release);
+            }
+            _ => {}
+        }
+    });
+    close_requested
+}
+
+fn cookie_domain_matches_urls(cookie_domain: &str, cookie_urls: &[&str]) -> bool {
+    let cookie_domain = cookie_domain.trim_start_matches('.').to_ascii_lowercase();
+    if cookie_domain.is_empty() {
+        return false;
+    }
+
+    cookie_urls.iter().any(|url_str| {
+        url::Url::parse(url_str)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| {
+                host == cookie_domain || host.ends_with(&format!(".{cookie_domain}"))
+            })
+    })
+}
+
+fn insert_cookie_entry(
+    entries: &mut Vec<CookieEntry>,
+    name: String,
+    value: String,
+    domain: String,
+) {
+    if entries
+        .iter()
+        .any(|entry| entry.name == name && entry.domain == domain)
+    {
+        return;
+    }
+    entries.push(CookieEntry { name, value, domain });
+}
+
+fn read_webview_cookies<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    cookie_urls: &[&str],
+) -> Vec<CookieEntry> {
+    let mut entries = Vec::new();
+
+    if let Ok(all_cookies) = window.cookies() {
+        for cookie in all_cookies {
+            let domain = cookie.domain().unwrap_or("").to_string();
+            if !cookie_domain_matches_urls(&domain, cookie_urls) {
+                continue;
+            }
+            insert_cookie_entry(
+                &mut entries,
+                cookie.name().to_string(),
+                cookie.value().to_string(),
+                domain,
+            );
+        }
+    }
+
+    // URL 查询保留为跨平台兜底，避免全量 Cookie API 在旧版 WebView 上不可用
+    for url_str in cookie_urls {
+        let Ok(url) = url::Url::parse(url_str) else {
+            continue;
+        };
+        let Ok(cookies) = window.cookies_for_url(url) else {
+            continue;
+        };
+        for cookie in cookies {
+            insert_cookie_entry(
+                &mut entries,
+                cookie.name().to_string(),
+                cookie.value().to_string(),
+                cookie.domain().unwrap_or("").to_string(),
+            );
+        }
+    }
+
+    entries
+}
+
+fn has_login_cookie(entries: &[CookieEntry], sentinel_cookie: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.name == sentinel_cookie && !entry.value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cookie_domain_matches_urls;
+
+    const BILIBILI_URLS: &[&str] = &[
+        "https://www.bilibili.com",
+        "https://passport.bilibili.com",
+        "https://api.bilibili.com",
+    ];
+
+    #[test]
+    fn parent_cookie_domain_matches_bilibili_subdomains() {
+        assert!(cookie_domain_matches_urls(".bilibili.com", BILIBILI_URLS));
+    }
+
+    #[test]
+    fn host_cookie_domain_matches_exact_url() {
+        assert!(cookie_domain_matches_urls(
+            "passport.bilibili.com",
+            BILIBILI_URLS
+        ));
+    }
+
+    #[test]
+    fn unrelated_cookie_domain_is_rejected() {
+        assert!(!cookie_domain_matches_urls("evilbilibili.com", BILIBILI_URLS));
+    }
+}
 
 /// 从 WebView 窗口轮询提取 Cookie（使用 Tauri 内置 API 读取 HttpOnly）
 async fn poll_webview_cookies(
@@ -18,14 +152,27 @@ async fn poll_webview_cookies(
     sentinel_cookie: &str,
     cookie_urls: &[&str],
     timeout_secs: u64,
+    close_requested: &AtomicBool,
 ) -> AppResult<Vec<CookieEntry>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let poll_interval = Duration::from_millis(800);
 
     loop {
+        if close_requested.load(Ordering::Acquire) {
+            if let Some(window) = app.get_webview_window(window_label) {
+                let entries = read_webview_cookies(&window, cookie_urls);
+                let login_succeeded = has_login_cookie(&entries, sentinel_cookie);
+                let _ = window.destroy();
+                if login_succeeded {
+                    return Ok(entries);
+                }
+            }
+            return Err(AppError::Other("Login cancelled".into()));
+        }
+
         if tokio::time::Instant::now() > deadline {
             if let Some(w) = app.get_webview_window(window_label) {
-                let _ = w.close();
+                let _ = w.destroy();
             }
             return Err(AppError::Other("Login timeout".into()));
         }
@@ -36,35 +183,10 @@ async fn poll_webview_cookies(
             None => return Err(AppError::Other("Login cancelled".into())),
         };
 
-        // 通过 Tauri 内置 cookies_for_url 读取所有 Cookie（包括 HttpOnly）
-        let mut all_entries: Vec<CookieEntry> = Vec::new();
-        let mut found_sentinel = false;
+        let all_entries = read_webview_cookies(&window, cookie_urls);
 
-        for url_str in cookie_urls {
-            if let Ok(url) = url::Url::parse(url_str) {
-                // cookies_for_url 能读取 HttpOnly cookie
-                if let Ok(cookies) = window.cookies_for_url(url) {
-                    for c in &cookies {
-                        let name = c.name().to_string();
-                        let value = c.value().to_string();
-                        let domain = c.domain().unwrap_or("").to_string();
-
-                        // 检查 sentinel
-                        if name == sentinel_cookie && !value.is_empty() {
-                            found_sentinel = true;
-                        }
-
-                        // 去重
-                        if !all_entries.iter().any(|e| e.name == name && e.domain == domain) {
-                            all_entries.push(CookieEntry { name, value, domain });
-                        }
-                    }
-                }
-            }
-        }
-
-        if found_sentinel && !all_entries.is_empty() {
-            let _ = window.close();
+        if has_login_cookie(&all_entries, sentinel_cookie) {
+            let _ = window.destroy();
             return Ok(all_entries);
         }
 
@@ -76,7 +198,7 @@ async fn poll_webview_cookies(
 #[tauri::command]
 pub async fn login_netease(app: AppHandle, state: State<'_, AppState>) -> AppResult<AuthInfo> {
     let label = "netease-login";
-    let _window = WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         &app,
         label,
         WebviewUrl::External("https://music.163.com/#/login".parse().unwrap()),
@@ -86,13 +208,15 @@ pub async fn login_netease(app: AppHandle, state: State<'_, AppState>) -> AppRes
     .center()
     .build()
     .map_err(|e| AppError::Other(format!("Failed to create login window: {}", e)))?;
+    let close_requested = track_login_window_close(&window);
+    drop(window);
 
     let cookie_urls = &[
         "https://music.163.com",
         "https://interface.music.163.com",
         "https://interface3.music.163.com",
     ];
-    let mut entries = poll_webview_cookies(&app, label, "MUSIC_U", cookie_urls, 300).await?;
+    let mut entries = poll_webview_cookies(&app, label, "MUSIC_U", cookie_urls, 300, &close_requested).await?;
 
     // 补全默认 Cookie（与 Android 一致）
     if !entries.iter().any(|c| c.name == "os") {
@@ -138,7 +262,7 @@ pub async fn login_netease(app: AppHandle, state: State<'_, AppState>) -> AppRes
 #[tauri::command]
 pub async fn login_bilibili(app: AppHandle, state: State<'_, AppState>) -> AppResult<AuthInfo> {
     let label = "bilibili-login";
-    let _window = WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         &app,
         label,
         WebviewUrl::External("https://passport.bilibili.com/login".parse().unwrap()),
@@ -146,15 +270,18 @@ pub async fn login_bilibili(app: AppHandle, state: State<'_, AppState>) -> AppRe
     .title("NeriPlayer - 哔哩哔哩登录")
     .inner_size(420.0, 600.0)
     .center()
+    .user_agent(BILIBILI_LOGIN_USER_AGENT)
     .build()
     .map_err(|e| AppError::Other(format!("Failed to create login window: {}", e)))?;
+    let close_requested = track_login_window_close(&window);
+    drop(window);
 
     let cookie_urls = &[
         "https://www.bilibili.com",
         "https://passport.bilibili.com",
         "https://api.bilibili.com",
     ];
-    let mut entries = poll_webview_cookies(&app, label, "SESSDATA", cookie_urls, 300).await?;
+    let mut entries = poll_webview_cookies(&app, label, "SESSDATA", cookie_urls, 300, &close_requested).await?;
 
     // B站核心 cookie 必须关联到 .bilibili.com 域，确保 api.bilibili.com 子域名也能发送
     let bili_core_cookies = ["SESSDATA", "DedeUserID", "DedeUserID__ckMd5", "bili_jct", "sid"];
@@ -216,7 +343,7 @@ pub async fn login_youtube(app: AppHandle, state: State<'_, AppState>) -> AppRes
     let login_url = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F";
     let label = "youtube-login";
 
-    let _window = WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         &app,
         label,
         WebviewUrl::External(login_url.parse().unwrap()),
@@ -226,6 +353,8 @@ pub async fn login_youtube(app: AppHandle, state: State<'_, AppState>) -> AppRes
     .center()
     .build()
     .map_err(|e| AppError::Other(format!("Failed to create login window: {}", e)))?;
+    let close_requested = track_login_window_close(&window);
+    drop(window);
 
     // YouTube cookie 分布在多个域
     let cookie_urls = &[
@@ -237,7 +366,7 @@ pub async fn login_youtube(app: AppHandle, state: State<'_, AppState>) -> AppRes
         "https://google.com",
         "https://m.youtube.com",
     ];
-    let entries = poll_webview_cookies(&app, label, "SAPISID", cookie_urls, 300).await?;
+    let entries = poll_webview_cookies(&app, label, "SAPISID", cookie_urls, 300, &close_requested).await?;
 
     // 注入 Jar
     cookies::inject_cookies(&state.cookie_jar, &entries);

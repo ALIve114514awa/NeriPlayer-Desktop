@@ -13,6 +13,8 @@ use tauri::{Emitter, Manager};
 
 fn main() {
     // 强制 WebView2 (Chromium) 启用 GPU 硬件加速
+    // 仅 Windows 生效：WEBVIEW2_* 对 macOS 的 WKWebView、Linux 的 WebKitGTK 均为 no-op
+    #[cfg(target_os = "windows")]
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--enable-gpu --enable-gpu-rasterization --enable-zero-copy --enable-features=CanvasOopRasterization");
 
@@ -24,6 +26,14 @@ fn main() {
         .manage(AppState::new())
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // macOS 使用原生红绿灯（Overlay 标题栏）；Windows/Linux 移除原生装饰，
+            // 由前端 TitleBar.vue 自绘窗口控制。配置里 decorations 默认为 true 以
+            // 启用 macOS 的 titleBarStyle Overlay，其余平台在此运行时关闭。
+            #[cfg(not(target_os = "macos"))]
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_decorations(false);
+            }
 
             // 恢复持久化的登录 Cookie
             {
