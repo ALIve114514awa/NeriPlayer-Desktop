@@ -38,3 +38,6 @@ pnpm-debug.log*
 src-tauri/.omc/
 src-tauri/src/.omc/
 CLAUDE.md
+
+# Audit report (local only)
+.report/
