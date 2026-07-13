@@ -104,8 +104,10 @@ cross-platform sync. The "省流" (data-saver) format is ProtoBuf + GZIP + Base6
 
 ### Build-time injection
 
-`src-tauri/build.rs` injects `BUILD_UUID` and `BUILD_TIMESTAMP` env vars (surfaced via the
-`get_build_info` command). It hand-rolls UUID/date generation to avoid extra build-deps.
+`src-tauri/build.rs` injects `BUILD_UUID`, `BUILD_TIMESTAMP`, and `BUILD_VERSION` env vars
+(surfaced via the `get_build_info` command). `BUILD_VERSION` follows Android's
+`<git-short-hash>.<MMddHHmm>` format while the package version remains SemVer-compatible.
+It hand-rolls UUID/date generation to avoid extra build-deps.
 
 ## Conventions
 

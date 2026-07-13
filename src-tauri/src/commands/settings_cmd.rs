@@ -144,11 +144,10 @@ pub struct BuildInfo {
 }
 
 #[tauri::command]
-pub async fn get_build_info(app: tauri::AppHandle) -> AppResult<BuildInfo> {
-    let version = app.package_info().version.to_string();
+pub async fn get_build_info() -> AppResult<BuildInfo> {
     Ok(BuildInfo {
         build_uuid: env!("BUILD_UUID").to_string(),
         build_timestamp: env!("BUILD_TIMESTAMP").to_string(),
-        version,
+        version: env!("BUILD_VERSION").to_string(),
     })
 }

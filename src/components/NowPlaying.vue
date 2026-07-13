@@ -175,10 +175,6 @@ const lyricFillResults = ref<any[]>([])
 const isLyricFilling = ref(false)
 const lyricFillPlatform = ref<'netease' | 'lrclib' | 'qq'>('netease')
 
-function togglePlayViewMode() {
-  playViewMode.value = playViewMode.value === 'cover' ? 'lyrics' : 'cover'
-}
-
 async function parseLyricsFromSearchResult(result: any): Promise<any[] | null> {
   if (result?.synced_lyrics) {
     const parsed = await invoke<any[]>('parse_lrc_content', { content: String(result.synced_lyrics) })
@@ -1487,14 +1483,6 @@ const sliderActiveColor = computed(() => {
               <span class="volume-label">{{ Math.round(player.volume * 100) }}%</span>
             </div>
           </div>
-          <button
-            class="tool-btn tool-btn--feedback"
-            :class="{ active: playViewMode === 'lyrics' }"
-            :title="playViewMode === 'lyrics' ? t('player.view_mode_cover') : t('player.view_mode_lyrics')"
-            @click="togglePlayViewMode"
-          >
-            <span class="material-symbols-rounded">{{ playViewMode === 'lyrics' ? 'album' : 'lyrics' }}</span>
-          </button>
           <!-- 音效 (AudioFX) -->
           <div class="speed-wrap">
             <button class="tool-btn tool-btn--feedback" :class="{ active: showAudioFxPanel || player.hasActiveEffects }" @click="triggerControlFeedbackPulse(); toggleToolbarPanel('audiofx')">
@@ -3517,20 +3505,57 @@ const sliderActiveColor = computed(() => {
 
 .audiofx-slider {
   flex: 1;
+  appearance: none;
   height: 4px;
-  accent-color: var(--np-primary, var(--md-primary, #D0BCFF));
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
+  outline: none;
   cursor: pointer;
+
+  &::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--np-primary, var(--md-primary, #D0BCFF));
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  }
+
+  &::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border: none;
+    border-radius: 50%;
+    background: var(--np-primary, var(--md-primary, #D0BCFF));
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  }
 }
 
 .audiofx-select {
+  appearance: none;
   background: rgba(255,255,255,0.08);
   color: rgba(255,255,255,0.85);
   border: 1px solid color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.18)) 24%, rgba(255,255,255,0.1));
   border-radius: 8px;
-  padding: 6px 10px;
+  padding: 6px 32px 6px 10px;
   font-size: 12px;
   cursor: pointer;
   outline: none;
+  /* 自绘下拉箭头，替换原生控件外观 */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-opacity='0.6' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  transition: border-color 0.2s, background-color 0.2s;
+
+  &:hover {
+    background-color: rgba(255,255,255,0.12);
+  }
+
+  &:focus-visible {
+    border-color: var(--np-primary, var(--md-primary, #D0BCFF));
+  }
 
   option {
     background: #1e1c22;
@@ -3607,11 +3632,33 @@ const sliderActiveColor = computed(() => {
 .audiofx-eq-slider {
   writing-mode: vertical-lr;
   direction: rtl;
+  appearance: none;
   width: 4px;
   height: 80px;
-  accent-color: var(--np-primary, var(--md-primary, #D0BCFF));
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
   cursor: pointer;
-  appearance: slider-vertical;
+  outline: none;
+
+  &::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--np-primary, var(--md-primary, #D0BCFF));
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  }
+
+  &::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border: none;
+    border-radius: 50%;
+    background: var(--np-primary, var(--md-primary, #D0BCFF));
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  }
 }
 
 .audiofx-note {

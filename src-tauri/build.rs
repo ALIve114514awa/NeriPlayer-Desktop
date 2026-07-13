@@ -1,28 +1,141 @@
-use std::time::SystemTime;
+use std::env;
+use std::fs;
+use std::process::Command;
+use std::time::{Duration, SystemTime};
+
+const BUILD_EPOCH_ENV: &str = "NERI_BUILD_EPOCH";
+const BUILD_GIT_SHA_ENV: &str = "NERI_BUILD_GIT_SHA";
+const VERSION_TIMEZONE_OFFSET_SECONDS: u64 = 8 * 60 * 60;
 
 fn main() {
-    // 注入 BUILD_UUID 和 BUILD_TIMESTAMP 环境变量
+    println!("cargo:rerun-if-env-changed={BUILD_EPOCH_ENV}");
+    println!("cargo:rerun-if-env-changed={BUILD_GIT_SHA_ENV}");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../src");
+    println!("cargo:rerun-if-changed=../package.json");
+    println!("cargo:rerun-if-changed=../pnpm-lock.yaml");
+    emit_git_rerun_paths();
+
+    let build_time = resolve_build_time();
+    let git_revision = resolve_git_revision();
+    let build_version = format!("{}.{}", git_revision, format_version_timestamp(&build_time));
     let uuid = uuid_v4();
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| {
-            let secs = d.as_secs();
-            // 简单 ISO-like 格式: YYYY-MM-DD HH:MM:SS UTC
-            let days = secs / 86400;
-            let time_of_day = secs % 86400;
-            let hours = time_of_day / 3600;
-            let minutes = (time_of_day % 3600) / 60;
-            let seconds = time_of_day % 60;
-            // 简化的日期计算
-            let (year, month, day) = days_to_ymd(days);
-            format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", year, month, day, hours, minutes, seconds)
-        })
-        .unwrap_or_else(|_| "unknown".to_string());
+    let timestamp = format_build_timestamp(&build_time);
 
     println!("cargo:rustc-env=BUILD_UUID={}", uuid);
     println!("cargo:rustc-env=BUILD_TIMESTAMP={}", timestamp);
+    println!("cargo:rustc-env=BUILD_VERSION={}", build_version);
 
     tauri_build::build()
+}
+
+fn resolve_build_time() -> SystemTime {
+    for variable in [BUILD_EPOCH_ENV, "SOURCE_DATE_EPOCH"] {
+        let Ok(raw_value) = env::var(variable) else {
+            continue;
+        };
+
+        if let Ok(epoch_seconds) = raw_value.trim().parse::<u64>() {
+            if let Some(build_time) =
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(epoch_seconds))
+            {
+                return build_time;
+            }
+        }
+
+        println!("cargo:warning=Ignoring invalid {variable} value: {raw_value}");
+    }
+
+    SystemTime::now()
+}
+
+fn resolve_git_revision() -> String {
+    for variable in [BUILD_GIT_SHA_ENV, "GITHUB_SHA"] {
+        if let Ok(value) = env::var(variable) {
+            if let Some(revision) = normalize_git_revision(&value) {
+                return revision;
+            }
+            println!("cargo:warning=Ignoring invalid {variable} value: {value}");
+        }
+    }
+
+    git_output(&["rev-parse", "--short=7", "HEAD"])
+        .and_then(|value| normalize_git_revision(&value))
+        .unwrap_or_else(|| "no_commit".to_string())
+}
+
+fn normalize_git_revision(value: &str) -> Option<String> {
+    let revision = value.trim();
+    if revision.len() < 7 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    revision.get(..7).map(str::to_ascii_lowercase)
+}
+
+fn emit_git_rerun_paths() {
+    let Some(head_path) = git_output(&["rev-parse", "--git-path", "HEAD"]) else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={head_path}");
+
+    let Ok(head) = fs::read_to_string(&head_path) else {
+        return;
+    };
+    let Some(reference) = head.trim().strip_prefix("ref: ") else {
+        return;
+    };
+    if let Some(reference_path) = git_output(&["rev-parse", "--git-path", reference]) {
+        println!("cargo:rerun-if-changed={reference_path}");
+    }
+}
+
+fn git_output(arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(arguments).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn format_build_timestamp(build_time: &SystemTime) -> String {
+    let Some(seconds) = unix_seconds(build_time) else {
+        return "unknown".to_string();
+    };
+    let (year, month, day, hours, minutes, seconds) = timestamp_parts(seconds);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+fn format_version_timestamp(build_time: &SystemTime) -> String {
+    let seconds = unix_seconds(build_time)
+        .unwrap_or_default()
+        .saturating_add(VERSION_TIMEZONE_OFFSET_SECONDS);
+    let (_, month, day, hours, minutes, _) = timestamp_parts(seconds);
+    format!("{:02}{:02}{:02}{:02}", month, day, hours, minutes)
+}
+
+fn unix_seconds(build_time: &SystemTime) -> Option<u64> {
+    build_time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn timestamp_parts(seconds: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let days = seconds / 86400;
+    let time_of_day = seconds % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let (year, month, day) = days_to_ymd(days);
+    (year, month, day, hours, minutes, seconds)
 }
 
 /// 简易 UUID v4 生成（不依赖外部 crate）
@@ -41,14 +154,22 @@ fn uuid_v4() -> String {
     let h2 = hasher2.finish();
 
     let bytes = [
-        (h1 >> 56) as u8, (h1 >> 48) as u8, (h1 >> 40) as u8, (h1 >> 32) as u8,
-        (h1 >> 24) as u8, (h1 >> 16) as u8,
+        (h1 >> 56) as u8,
+        (h1 >> 48) as u8,
+        (h1 >> 40) as u8,
+        (h1 >> 32) as u8,
+        (h1 >> 24) as u8,
+        (h1 >> 16) as u8,
         ((h1 >> 8) as u8 & 0x0f) | 0x40, // version 4
         h1 as u8,
         ((h2 >> 56) as u8 & 0x3f) | 0x80, // variant 1
         (h2 >> 48) as u8,
-        (h2 >> 40) as u8, (h2 >> 32) as u8, (h2 >> 24) as u8,
-        (h2 >> 16) as u8, (h2 >> 8) as u8, h2 as u8,
+        (h2 >> 40) as u8,
+        (h2 >> 32) as u8,
+        (h2 >> 24) as u8,
+        (h2 >> 16) as u8,
+        (h2 >> 8) as u8,
+        h2 as u8,
     ];
 
     format!(
@@ -66,7 +187,9 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let mut remaining = days;
     loop {
         let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if remaining < days_in_year { break; }
+        if remaining < days_in_year {
+            break;
+        }
         remaining -= days_in_year;
         y += 1;
     }
@@ -77,7 +200,9 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     };
     let mut m = 0;
     for days_in_month in months {
-        if remaining < days_in_month { break; }
+        if remaining < days_in_month {
+            break;
+        }
         remaining -= days_in_month;
         m += 1;
     }
@@ -85,5 +210,5 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }

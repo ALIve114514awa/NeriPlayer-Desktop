@@ -381,7 +381,13 @@ function handleVersionTap() {
 }
 
 // ── 构建信息 ──
-const buildInfo = ref<{ build_uuid: string; build_timestamp: string; version: string } | null>(null)
+interface BuildInfo {
+  build_uuid: string
+  build_timestamp: string
+  version: string
+}
+
+const buildInfo = ref<BuildInfo | null>(null)
 
 async function loadBuildInfo() {
   try {
@@ -1413,7 +1419,9 @@ async function confirmClearGitHub() {
       </div>
       <div class="setting-info">
         <div class="setting-title">NeriPlayer Desktop{{ devModeEnabled ? ' (dev)' : '' }}</div>
-        <div class="setting-desc">{{ t('settings.version_info', { version: buildInfo?.version || '1.0.0' }) }}</div>
+        <div class="setting-desc">{{ t('settings.version_info', {
+          version: buildInfo?.version || 'dev',
+        }) }}</div>
       </div>
       <span class="material-symbols-rounded section-arrow" :class="{ expanded: isExpanded('about') }" style="font-size: 20px; opacity: 0.3">expand_more</span>
     </div>

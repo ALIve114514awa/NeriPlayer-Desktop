@@ -1,0 +1,79 @@
+name: Suggestion / 优化建议
+description: 提出现有功能、交互或性能方面的优化建议 / Suggest an improvement to existing behavior, UX, or performance
+title: "[Suggestion] "
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        此模板用于改进现有体验；如果你需要一项全新的能力，请使用功能请求模板
+
+        Use this form to improve existing behavior; use the feature request form for a new capability
+
+  - type: textarea
+    id: suggestion-overview
+    attributes:
+      label: 建议概述 / Suggestion overview
+      placeholder: 用简洁的语言描述希望优化的内容 / Briefly describe what should be improved
+    validations:
+      required: true
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景与痛点 / Background and pain point
+      description: 说明现有行为、使用场景以及它造成的问题 / Describe the current behavior, use case, and resulting problem
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-improvement
+    attributes:
+      label: 建议的改进方式 / Proposed improvement
+      description: 描述你期望的交互、行为或性能变化 / Describe the expected UX, behavior, or performance change
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected-result
+    attributes:
+      label: 预期效果 / Expected result
+      description: 说明改进后能够带来的实际收益 / Explain the concrete benefit of the improvement
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected-area
+    attributes:
+      label: 涉及范围 / Affected area
+      options:
+        - 界面或交互 / UI or interaction
+        - 播放体验 / Playback experience
+        - 平台内容与搜索 / Platform content and search
+        - 歌词 / Lyrics
+        - 下载与本地音乐 / Downloads and local music
+        - 同步与一起听 / Sync and Listen Together
+        - 性能或资源占用 / Performance or resource usage
+        - 安装与更新 / Installation and update
+        - 其他 / Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-materials
+    attributes:
+      label: 补充材料 / Supplementary materials
+      description: 可附截图、录屏、设计草图或参考案例 / Add screenshots, recordings, mockups, or references
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: 提交前确认 / Confirmation
+      options:
+        - label: 我已搜索 [Issue Tracker](https://github.com/cwuom/NeriPlayer-Desktop/issues)，没有发现相同或高度相似的建议 / I searched the Issue Tracker and found no duplicate suggestion
+          required: true
+        - label: 我已清楚说明当前痛点和预期改善 / I clearly described the current pain point and expected improvement
+          required: true

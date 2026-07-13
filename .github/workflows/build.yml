@@ -3,8 +3,42 @@ name: CI
 on:
   push:
     branches: [main, master]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.mdx'
+      - '**/*.rst'
+      - '**/*.adoc'
+      - 'docs/**'
+      - 'docs-private/**'
+      - '.report/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'NOTICE'
+      - 'NOTICE.*'
+      - 'CHANGELOG'
+      - 'CHANGELOG.*'
   pull_request:
     branches: [main, master]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.mdx'
+      - '**/*.rst'
+      - '**/*.adoc'
+      - 'docs/**'
+      - 'docs-private/**'
+      - '.report/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'NOTICE'
+      - 'NOTICE.*'
+      - 'CHANGELOG'
+      - 'CHANGELOG.*'
   workflow_dispatch:
 
 permissions:
