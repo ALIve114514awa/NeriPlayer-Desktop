@@ -15,6 +15,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import M3Input from '@/components/ui/M3Input.vue'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -499,7 +500,7 @@ onUnmounted(() => {
     <div v-if="activeTab === 0" class="playlist-list">
       <div class="new-playlist-row" :class="{ disabled: library.isScanning }" @click="selectAndScanLocalMusic">
         <span class="material-symbols-rounded" :class="{ spinning: library.isScanning }" style="font-size: 20px">
-          {{ library.isScanning ? 'progress_activity' : 'folder_search' }}
+          {{ library.isScanning ? 'progress_activity' : 'folder_open' }}
         </span>
         <div class="new-playlist-copy">
           <span>{{ library.isScanning ? t('library.scanning') : t('library.scan_local_music') }}</span>
@@ -686,7 +687,9 @@ onUnmounted(() => {
           @click="router.push({ name: 'bili-playlist', params: { mediaId: bpl.id } })"
         >
           <div class="pl-icon bilibili" :class="{ 'has-cover': bpl.coverUrl }">
-            <img v-if="bpl.coverUrl" :src="bpl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
+            <BilibiliCoverImage v-if="bpl.coverUrl" :src="bpl.coverUrl" class="pl-cover-img">
+              <span class="material-symbols-rounded filled" style="font-size: 22px">video_library</span>
+            </BilibiliCoverImage>
             <span v-else class="material-symbols-rounded filled" style="font-size: 22px">video_library</span>
           </div>
           <div class="pl-info">

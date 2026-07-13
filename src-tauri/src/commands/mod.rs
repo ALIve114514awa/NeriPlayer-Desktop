@@ -1,5 +1,6 @@
 pub mod auth_cmd;
 pub mod download_cmd;
+pub mod image_cmd;
 pub mod library_cmd;
 pub mod listen_together_cmd;
 pub mod lyrics_cmd;

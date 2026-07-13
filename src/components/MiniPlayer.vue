@@ -5,6 +5,7 @@ import { useListenTogetherStore } from '@/stores/listenTogether'
 import { useI18n } from 'vue-i18n'
 import QueuePanel from './QueuePanel.vue'
 import ListenTogetherPanel from './ListenTogetherPanel.vue'
+import BilibiliCoverImage from './BilibiliCoverImage.vue'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }
@@ -180,8 +181,16 @@ defineExpose({
       <div class="mp-left" @click="emit('expand')">
         <div ref="coverRef" class="mp-cover" :class="{ playing: player.isPlaying, 'mp-cover-hidden': props.coverHiddenByFlip }">
           <transition name="mp-cover-swap" mode="out-in">
+            <BilibiliCoverImage
+              v-if="player.currentTrack?.coverUrl && player.currentTrack.id.startsWith('bilibili:')"
+              :key="`cover:${miniTrackKey}`"
+              :src="player.currentTrack.coverUrl"
+              class="mp-cover-img"
+            >
+              <span class="material-symbols-rounded filled" style="font-size: 20px; opacity: 0.6">music_note</span>
+            </BilibiliCoverImage>
             <img
-              v-if="player.currentTrack?.coverUrl"
+              v-else-if="player.currentTrack?.coverUrl"
               :key="`cover:${miniTrackKey}`"
               :src="player.currentTrack.coverUrl"
               referrerpolicy="no-referrer"

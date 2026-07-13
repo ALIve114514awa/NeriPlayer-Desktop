@@ -3,7 +3,7 @@
 use neri_player_desktop::audio::media_session::{MediaAction, MediaSessionController};
 use neri_player_desktop::auth;
 use neri_player_desktop::commands::{
-    auth_cmd, download_cmd, library_cmd, listen_together_cmd, lyrics_cmd, player_cmd,
+    auth_cmd, download_cmd, image_cmd, library_cmd, listen_together_cmd, lyrics_cmd, player_cmd,
     recommend_cmd, search_cmd, settings_cmd, sync_cmd,
 };
 use neri_player_desktop::state::AppState;
@@ -248,6 +248,7 @@ fn main() {
             library_cmd::remove_tracks_from_playlist,
             library_cmd::list_favorite_playlists,
             search_cmd::search,
+            image_cmd::fetch_bilibili_cover,
             lyrics_cmd::parse_lrc_content,
             lyrics_cmd::load_lyrics_file,
             lyrics_cmd::fetch_lyrics,

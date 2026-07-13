@@ -9,8 +9,10 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { invoke } from '@tauri-apps/api/core'
 import { extractPalette, type PaletteResult } from '@/utils/paletteExtractor'
+import { normalizeBilibiliCoverUrl, resolveBilibiliCover } from '@/utils/bilibiliCover'
 import HyperBackground from './HyperBackground.vue'
 import CoverBlurBackground from './CoverBlurBackground.vue'
+import BilibiliCoverImage from './BilibiliCoverImage.vue'
 import WaveformSlider from './WaveformSlider.vue'
 import LyricsView from './LyricsView.vue'
 import QueuePanel from './QueuePanel.vue'
@@ -31,6 +33,7 @@ const router = useRouter()
 const { t } = useI18n()
 const playViewMode = ref<'cover' | 'lyrics'>('cover')
 const coverLoadError = ref(false)
+const coverUrl = ref('')
 const showVolumeSlider = ref(false)
 const showQueue = ref(false)
 const showAddToPlaylist = ref(false)
@@ -341,12 +344,33 @@ function extractColorsFromCover(url: string) {
   img.src = url
 }
 
-// 封面变化时提取颜色
-watch(() => player.currentTrack?.coverUrl, (url) => {
-  if (url) {
-    extractColorsFromCover(url)
-  }
-}, { immediate: true })
+// B站封面复用后端网络链路，避免 WebView 直连 CDN 失败
+watch(
+  () => [player.currentTrack?.coverUrl || '', player.currentTrack?.id || ''] as const,
+  async ([rawUrl, trackId], _, onCleanup) => {
+    let active = true
+    onCleanup(() => { active = false })
+
+    const isBilibiliTrack = trackId.startsWith('bilibili:')
+    const normalizedUrl = isBilibiliTrack ? normalizeBilibiliCoverUrl(rawUrl) : rawUrl.trim()
+    coverUrl.value = normalizedUrl
+    if (!normalizedUrl) return
+
+    let displayUrl = normalizedUrl
+    if (isBilibiliTrack) {
+      try {
+        displayUrl = await resolveBilibiliCover(normalizedUrl)
+      } catch {
+        // 保留标准 HTTPS 地址，让 WebView 仍有一次直接加载机会
+      }
+    }
+
+    if (!active) return
+    coverUrl.value = displayUrl
+    extractColorsFromCover(displayUrl)
+  },
+  { immediate: true },
+)
 
 function onSeek(progress: number) {
   player.seekTo(Math.round(progress * player.durationMs))
@@ -477,8 +501,6 @@ function formatSleepRemaining(seconds: number): string {
   return m > 0 ? `${m}:${s.toString().padStart(2, '0')}` : `${s}s`
 }
 
-// 封面 URL
-const coverUrl = computed(() => player.currentTrack?.coverUrl || '')
 const nowPlayingTrackKey = computed(() => player.currentTrack?.id || 'empty')
 const transitionStateClass = computed(() => props.transitionState ? `np-shell--${props.transitionState}` : '')
 const nowPlayingTimeKey = computed(() => `time:${nowPlayingTrackKey.value}`)
@@ -1882,7 +1904,8 @@ const sliderActiveColor = computed(() => {
                 :class="{ active: infoApplyCandidate === r }"
                 @click="applySearchResult(r)"
               >
-                <img v-if="r.cover_url" :src="r.cover_url" class="np-more-search-cover" referrerpolicy="no-referrer" />
+                <BilibiliCoverImage v-if="r.cover_url && r.source === 'bilibili'" :src="r.cover_url" class="np-more-search-cover" />
+                <img v-else-if="r.cover_url" :src="r.cover_url" class="np-more-search-cover" referrerpolicy="no-referrer" />
                 <div class="np-more-search-info">
                   <span class="np-more-search-title">{{ r.title }}</span>
                   <span class="np-more-search-artist">{{ r.artist }}</span>
@@ -1892,8 +1915,13 @@ const sliderActiveColor = computed(() => {
             </div>
             <div v-if="infoApplyCandidate" class="np-more-field-picker">
               <div class="np-more-candidate-preview">
+                <BilibiliCoverImage
+                  v-if="(infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl) && infoApplyCandidate.source === 'bilibili'"
+                  :src="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
+                  class="np-more-candidate-cover"
+                />
                 <img
-                  v-if="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
+                  v-else-if="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
                   :src="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
                   class="np-more-candidate-cover"
                   referrerpolicy="no-referrer"
@@ -1976,8 +2004,8 @@ const sliderActiveColor = computed(() => {
             <div class="np-track-detail-card">
               <div class="np-track-detail-hero">
                 <img
-                  v-if="player.currentTrack?.coverUrl"
-                  :src="player.currentTrack.coverUrl"
+                  v-if="coverUrl"
+                  :src="coverUrl"
                   class="np-track-detail-cover"
                   referrerpolicy="no-referrer"
                 />

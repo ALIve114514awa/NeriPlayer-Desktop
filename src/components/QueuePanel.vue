@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { usePlayerStore } from '@/stores/player'
 import { useI18n } from 'vue-i18n'
+import BilibiliCoverImage from './BilibiliCoverImage.vue'
 
 const emit = defineEmits<{ close: [] }>()
 const player = usePlayerStore()
@@ -58,7 +59,10 @@ function clearQueue() {
             <span v-else class="qi-num">{{ index + 1 }}</span>
           </div>
           <div class="qi-cover">
-            <img v-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="track.coverUrl && track.id.startsWith('bilibili:')" :src="track.coverUrl" loading="lazy">
+              <span class="material-symbols-rounded filled">music_note</span>
+            </BilibiliCoverImage>
+            <img v-else-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
             <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="qi-info">

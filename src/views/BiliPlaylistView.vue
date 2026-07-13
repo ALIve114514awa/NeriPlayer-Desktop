@@ -6,6 +6,7 @@ import { useDownloadStore } from '@/stores/download'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -216,7 +217,9 @@ onMounted(() => {
     <template v-else>
       <div class="detail-hero">
         <div class="hero-cover">
-          <img v-if="coverUrl" :src="coverUrl" referrerpolicy="no-referrer" />
+          <BilibiliCoverImage v-if="coverUrl" :src="coverUrl">
+            <span class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">video_library</span>
+          </BilibiliCoverImage>
           <span v-else class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">video_library</span>
         </div>
         <div class="hero-info">
@@ -251,7 +254,9 @@ onMounted(() => {
             <span v-else class="index-num">{{ index + 1 }}</span>
           </div>
           <div class="track-cover-wide">
-            <img v-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="track.coverUrl" :src="track.coverUrl" loading="lazy">
+              <span class="material-symbols-rounded filled">movie</span>
+            </BilibiliCoverImage>
             <span v-else class="material-symbols-rounded filled">movie</span>
           </div>
           <div class="track-info">

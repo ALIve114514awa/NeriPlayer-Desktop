@@ -12,6 +12,7 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import type { TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 
 const router = useRouter()
 const player = usePlayerStore()
@@ -70,14 +71,6 @@ const platformHubs = computed(() => [
     icon: '/icons/ic_netease.svg',
     color: '#e74c3c',
     action: () => router.push({ name: 'explore' }),
-  },
-  {
-    key: 'qq',
-    title: t('settings.qq_account'),
-    subtitle: t('explore.qq_hint'),
-    icon: '/icons/ic_qq_music.svg',
-    color: '#1fce6d',
-    action: () => router.push({ name: 'explore', query: { platform: 'qq' } }),
   },
   {
     key: 'bilibili',
@@ -513,7 +506,10 @@ function formatNotifTime(ts: number): string {
           @click="openPlatformPlaylist(pl)"
         >
           <div class="playlist-cover">
-            <img v-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
+            <BilibiliCoverImage v-if="pl.coverUrl && pl.platform === 'bilibili'" :src="pl.coverUrl" loading="lazy">
+              <span class="material-symbols-rounded filled">queue_music</span>
+            </BilibiliCoverImage>
+            <img v-else-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
             <span v-else class="material-symbols-rounded filled">queue_music</span>
           </div>
           <div class="playlist-name">{{ pl.name }}</div>
