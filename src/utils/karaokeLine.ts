@@ -84,7 +84,7 @@ export class KaraokeLine {
 
   /**
    * 浮动动画 — 对齐 AMLL initFloatAnimation
-   * 桌面端收敛处理，只保留极轻微抬升，避免歌词高光“抖”
+   * L6: 对齐 Android MaxSimpleFloatOffsetY = 4px + SimpleFloatEasing cubic(0,0,0.2,1)
    */
   private initFloatAnimations(): void {
     for (const rw of this.words) {
@@ -94,13 +94,13 @@ export class KaraokeLine {
       const anim = rw.element.animate(
         [
           { transform: 'translateY(0)' },
-          { transform: 'translateY(-1.5px)' },
+          { transform: 'translateY(-4px)' },
         ],
         {
           duration,
           delay,
           fill: 'both',
-          easing: 'ease-out',
+          easing: 'cubic-bezier(0, 0, 0.2, 1)',
           composite: 'add',
         },
       )
