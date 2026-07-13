@@ -1,0 +1,8 @@
+{
+  "terminal.integrated.env.windows": {
+    "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+  },
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "[vue]": { "editor.defaultFormatter": "Vue.volar" },
+  "[typescript]": { "editor.defaultFormatter": "Vue.volar" }
+}

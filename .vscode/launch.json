@@ -1,0 +1,30 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Tauri Dev (F5)",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["tauri", "dev"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+      },
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"]
+    },
+    {
+      "name": "Tauri Dev (Debug Rust)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--manifest-path=src-tauri/Cargo.toml", "--no-default-features"]
+      },
+      "env": {
+        "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+      },
+      "preLaunchTask": "vite-dev"
+    }
+  ]
+}

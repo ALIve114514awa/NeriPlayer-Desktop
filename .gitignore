@@ -10,7 +10,6 @@ src-tauri/gen/
 
 # IDE
 .idea/
-.vscode/
 *.swp
 *.swo
 
@@ -38,3 +37,4 @@ pnpm-debug.log*
 .spec-workflow/
 src-tauri/.omc/
 src-tauri/src/.omc/
+CLAUDE.md
