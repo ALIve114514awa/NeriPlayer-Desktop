@@ -1,0 +1,364 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+
+      - name: Check version consistency
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs'
+
+          const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          const tauriConfig = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'))
+          const cargoToml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8')
+          const cargoLock = fs.readFileSync('src-tauri/Cargo.lock', 'utf8')
+          const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1]
+          const lockPackage = cargoLock.match(
+            /\[\[package\]\]\s+name = "neri-player-desktop"\s+version = "([^"]+)"/m,
+          )?.[1]
+          const expectedTag = `v${packageJson.version}`
+
+          const errors = []
+          if (process.env.RELEASE_TAG !== expectedTag) {
+            errors.push(`tag ${process.env.RELEASE_TAG} must equal ${expectedTag}`)
+          }
+          if (cargoVersion !== packageJson.version) {
+            errors.push(`Cargo.toml version ${cargoVersion} must equal ${packageJson.version}`)
+          }
+          if (lockPackage !== packageJson.version) {
+            errors.push(`Cargo.lock version ${lockPackage} must equal ${packageJson.version}`)
+          }
+          if (tauriConfig.version !== '../package.json') {
+            errors.push('tauri.conf.json version must reference ../package.json')
+          }
+
+          if (errors.length > 0) {
+            console.error(errors.join('\n'))
+            process.exit(1)
+          }
+          NODE
+
+  build:
+    name: Build (${{ matrix.artifact_name }})
+    needs: validate
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-2025
+            os: windows
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact_name: windows-x86_64
+          - platform: macos-15
+            os: macos
+            target: aarch64-apple-darwin
+            bundles: dmg
+            deployment_target: '11.0'
+            expected_arch: arm64
+            artifact_name: macos-apple-silicon-adhoc
+          - platform: macos-15
+            os: macos
+            target: x86_64-apple-darwin
+            bundles: dmg
+            deployment_target: '10.15'
+            expected_arch: x86_64
+            artifact_name: macos-intel-adhoc
+          - platform: ubuntu-22.04
+            os: linux
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            artifact_name: linux-x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libasound2-dev \
+            rpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@eac0f66a48bc4b70a10b9acd4c4e930f835d95ff # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+          shared-key: release-${{ matrix.target }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows and Linux packages
+        if: matrix.os != 'macos'
+        run: >-
+          pnpm tauri build --ci
+          --target ${{ matrix.target }}
+          --bundles "${{ matrix.bundles }}"
+          -- --locked
+
+      - name: Build ad-hoc signed macOS package
+        if: matrix.os == 'macos'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: >-
+          pnpm tauri build --ci
+          --target ${{ matrix.target }}
+          --bundles dmg
+          --config '{"bundle":{"macOS":{"minimumSystemVersion":"${{ matrix.deployment_target }}"}}}'
+          -- --locked
+
+      - name: Verify macOS ad-hoc package
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/${{ matrix.target }}/release/bundle"
+          shopt -s nullglob
+          dmgs=("$bundle_root"/dmg/*.dmg)
+          (( ${#dmgs[@]} == 1 ))
+          dmg_path="${dmgs[0]}"
+
+          hdiutil verify "$dmg_path"
+
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet 2>/dev/null || true
+            rmdir "$mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse -readonly -quiet
+          apps=("$mount_dir"/*.app)
+          (( ${#apps[@]} == 1 ))
+          delivered_app="${apps[0]}"
+          codesign --verify --deep --strict --verbose=4 "$delivered_app"
+
+          signature_info="$(codesign -dvvv "$delivered_app" 2>&1)"
+          grep -Fq 'Signature=adhoc' <<< "$signature_info"
+          grep -Fq 'TeamIdentifier=not set' <<< "$signature_info"
+
+          executable_name="$(plutil -extract CFBundleExecutable raw "$delivered_app/Contents/Info.plist")"
+          executable="$delivered_app/Contents/MacOS/$executable_name"
+          test -x "$executable"
+
+          architectures="$(lipo -archs "$executable")"
+          [[ "$architectures" == '${{ matrix.expected_arch }}' ]]
+
+          minimum_system_version="$(plutil -extract LSMinimumSystemVersion raw "$delivered_app/Contents/Info.plist")"
+          [[ "$minimum_system_version" == '${{ matrix.deployment_target }}' ]]
+
+          macho_minimum="$(otool -l "$executable" | awk '
+            $1 == "cmd" && $2 == "LC_BUILD_VERSION" { found=1; next }
+            found && $1 == "minos" { print $2; exit }
+          ')"
+          [[ "$macho_minimum" == '${{ matrix.deployment_target }}' ]]
+
+      - name: Stage macOS artifact
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          destination="artifacts/${{ matrix.artifact_name }}"
+          mkdir -p "$destination"
+          shopt -s nullglob
+          dmgs=(src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          (( ${#dmgs[@]} == 1 ))
+          source_dmg="${dmgs[0]}"
+          dmg_name="$(basename "$source_dmg" .dmg)"
+          cp "$source_dmg" "$destination/${dmg_name}-adhoc.dmg"
+
+      - name: Stage Windows artifacts
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $bundleRoot = "src-tauri/target/${{ matrix.target }}/release/bundle"
+          $destination = "artifacts/${{ matrix.artifact_name }}"
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+
+          $packages = @(
+            Get-ChildItem "$bundleRoot/msi/*.msi" -ErrorAction SilentlyContinue
+            Get-ChildItem "$bundleRoot/nsis/*.exe" -ErrorAction SilentlyContinue
+          )
+          if ($packages.Count -eq 0) {
+            throw "No Windows installer was generated"
+          }
+          $packages | Copy-Item -Destination $destination
+
+      - name: Validate and stage Linux artifacts
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/${{ matrix.target }}/release/bundle"
+          destination="artifacts/${{ matrix.artifact_name }}"
+          mkdir -p "$destination"
+          shopt -s nullglob
+
+          deb_packages=("$bundle_root"/deb/*.deb)
+          rpm_packages=("$bundle_root"/rpm/*.rpm)
+          app_images=("$bundle_root"/appimage/*.AppImage)
+
+          (( ${#deb_packages[@]} > 0 ))
+          (( ${#rpm_packages[@]} > 0 ))
+          (( ${#app_images[@]} > 0 ))
+
+          for package in "${deb_packages[@]}"; do
+            dpkg-deb --info "$package" >/dev/null
+            cp "$package" "$destination/"
+          done
+
+          for package in "${rpm_packages[@]}"; do
+            rpm -qip "$package" >/dev/null
+            cp "$package" "$destination/"
+          done
+
+          for app_image in "${app_images[@]}"; do
+            app_image_path="$(realpath "$app_image")"
+            chmod +x "$app_image_path"
+            extract_dir="$(mktemp -d)"
+            (cd "$extract_dir" && "$app_image_path" --appimage-extract >/dev/null)
+            rm -rf "$extract_dir"
+            tar -C "$(dirname "$app_image_path")" -czf \
+              "$destination/$(basename "$app_image_path").tar.gz" \
+              "$(basename "$app_image_path")"
+          done
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: NeriPlayer-${{ matrix.artifact_name }}-${{ github.ref_name }}
+          path: artifacts/${{ matrix.artifact_name }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: NeriPlayer-*-${{ github.ref_name }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          required_patterns=(
+            '*.dmg'
+            '*.msi'
+            '*.exe'
+            '*.deb'
+            '*.rpm'
+            '*.AppImage.tar.gz'
+          )
+
+          for pattern in "${required_patterns[@]}"; do
+            matches=(release-assets/$pattern)
+            if (( ${#matches[@]} == 0 )); then
+              echo "::error title=Missing release asset::No file matched $pattern"
+              exit 1
+            fi
+          done
+
+          cat > macOS-install.txt <<'EOF'
+          NeriPlayer for macOS uses a free ad-hoc signature and is not notarized by Apple.
+
+          First launch:
+          1. Drag NeriPlayer.app into Applications
+          2. Try to open it once
+          3. Open System Settings > Privacy & Security
+          4. Click Open Anyway for NeriPlayer
+
+          Terminal fallback:
+          xattr -dr com.apple.quarantine "/Applications/NeriPlayer.app"
+          open "/Applications/NeriPlayer.app"
+          EOF
+          cp macOS-install.txt release-assets/macOS-install.txt
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            exit 0
+          fi
+
+          prerelease=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease+=(--prerelease)
+          fi
+
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --verify-tag \
+            --title "NeriPlayer ${RELEASE_TAG#v}" \
+            --notes "$(cat macOS-install.txt)" \
+            --generate-notes \
+            "${prerelease[@]}"

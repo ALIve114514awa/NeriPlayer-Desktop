@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import { createRouter, createWebHistory } from 'vue-router'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import App from './App.vue'
 import i18n from './i18n'
 import { initTheme } from './utils/theme'
@@ -34,8 +35,6 @@ app.use(i18n)
 app.mount('#app')
 
 // Vue 挂载完成后显示窗口，避免闪烁
-import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
-  getCurrentWindow().show()
-}).catch(() => {
+getCurrentWindow().show().catch(() => {
   // 非 Tauri 环境忽略
 })
