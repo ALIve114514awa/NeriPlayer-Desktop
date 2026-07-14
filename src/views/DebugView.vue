@@ -91,6 +91,14 @@ function formatSyncTime(ts: number): string {
   return new Date(ts).toLocaleString()
 }
 
+function goBack() {
+  if (window.history.length > 1) {
+    router.back()
+  } else {
+    router.push({ name: 'settings' })
+  }
+}
+
 onMounted(async () => {
   try {
     buildInfo.value = await invoke('get_build_info')
@@ -104,7 +112,7 @@ onMounted(async () => {
 <template>
   <div class="debug-view">
     <header class="debug-header">
-      <button class="debug-back-btn" @click="router.back()">
+      <button class="debug-back-btn" @click="goBack">
         <span class="material-symbols-rounded">arrow_back</span>
       </button>
       <h1 class="page-title">{{ t('settings.debug_title') }}</h1>
