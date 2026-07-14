@@ -959,8 +959,6 @@ function formatNotifTime(ts: number): string {
 /* 歌单卡片 */
 .playlist-card {
   cursor: pointer;
-  border-radius: var(--radius-md);
-  overflow: hidden;
   transition: transform var(--duration-short) var(--ease-standard);
 
   &:hover { transform: translateY(-2px); }
