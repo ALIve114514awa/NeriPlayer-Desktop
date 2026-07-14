@@ -1,18 +1,37 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { usePlayerStore } from '@/stores/player'
+import { useSyncStore } from '@/stores/sync'
 
+const router = useRouter()
 const { t } = useI18n()
 const player = usePlayerStore()
+const syncStore = useSyncStore()
 
-// API 探针状态
+const buildInfo = ref<{ uuid: string; timestamp: string } | null>(null)
+const appDataDir = ref('')
+
 const probes = ref<Record<string, 'idle' | 'testing' | 'success' | 'failed'>>({
   netease: 'idle',
   bilibili: 'idle',
   youtube: 'idle',
 })
+
+const platformName = (() => {
+  const ua = navigator.userAgent
+  if (/Mac/.test(ua)) return 'macOS'
+  if (/Win/.test(ua)) return 'Windows'
+  if (/Linux/.test(ua)) return 'Linux'
+  return navigator.platform || 'Unknown'
+})()
+
+const webviewVersion = (() => {
+  const match = navigator.userAgent.match(/Chrome\/([\d.]+)/)
+  return match ? `Chromium ${match[1]}` : navigator.userAgent.slice(0, 60)
+})()
 
 async function testNetease() {
   probes.value.netease = 'testing'
@@ -20,7 +39,6 @@ async function testNetease() {
     await invoke('get_netease_song_url', { songId: 1, quality: 'standard' })
     probes.value.netease = 'success'
   } catch {
-    // API error is expected for invalid id, but we reached the server
     probes.value.netease = 'success'
   }
 }
@@ -67,11 +85,74 @@ function probeStatusColor(status: string): string {
     default: return 'var(--md-on-surface-variant)'
   }
 }
+
+function formatSyncTime(ts: number): string {
+  if (!ts) return t('settings.debug_never')
+  return new Date(ts).toLocaleString()
+}
+
+onMounted(async () => {
+  try {
+    buildInfo.value = await invoke('get_build_info')
+  } catch { /* 命令不存在时忽略 */ }
+  try {
+    appDataDir.value = await invoke('get_app_data_dir')
+  } catch { /* 忽略 */ }
+})
 </script>
 
 <template>
   <div class="debug-view">
-    <h1 class="page-title">{{ t('settings.debug_title') }}</h1>
+    <header class="debug-header">
+      <button class="debug-back-btn" @click="router.back()">
+        <span class="material-symbols-rounded">arrow_back</span>
+      </button>
+      <h1 class="page-title">{{ t('settings.debug_title') }}</h1>
+    </header>
+
+    <!-- 构建信息 -->
+    <div v-if="buildInfo" class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">info</span>
+      <span>{{ t('settings.build_uuid').split(' ')[0] }}</span>
+    </div>
+    <div v-if="buildInfo" class="setting-card">
+      <div class="setting-info">
+        <div class="state-grid">
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.build_uuid') }}</span>
+            <span class="state-value mono">{{ buildInfo.uuid }}</span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.build_time') }}</span>
+            <span class="state-value">{{ buildInfo.timestamp }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 系统信息 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">computer</span>
+      <span>{{ t('settings.debug_system_info') }}</span>
+    </div>
+    <div class="setting-card">
+      <div class="setting-info">
+        <div class="state-grid">
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.debug_platform') }}</span>
+            <span class="state-value">{{ platformName }}</span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.debug_webview') }}</span>
+            <span class="state-value mono">{{ webviewVersion }}</span>
+          </div>
+          <div v-if="appDataDir" class="state-item full-width">
+            <span class="state-label">{{ t('settings.debug_data_dir') }}</span>
+            <span class="state-value mono">{{ appDataDir }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- API 探针 -->
     <div class="section-label">
@@ -121,15 +202,50 @@ function probeStatusColor(status: string): string {
       </div>
     </div>
 
+    <!-- 同步状态 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">sync</span>
+      <span>{{ t('settings.debug_sync_status') }}</span>
+    </div>
+    <div class="setting-card">
+      <div class="setting-info">
+        <div class="state-grid">
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.debug_github_sync') }}</span>
+            <span class="state-value" :style="{ color: syncStore.github.configured ? 'var(--md-primary)' : 'var(--md-on-surface-variant)' }">
+              {{ syncStore.github.configured
+                ? (syncStore.github.autoSync ? t('settings.debug_auto_sync_on') : t('settings.debug_auto_sync_off'))
+                : t('settings.debug_not_configured') }}
+            </span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.debug_last_sync') }} (GitHub)</span>
+            <span class="state-value">{{ formatSyncTime(syncStore.github.lastSyncTime) }}</span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.debug_webdav_sync') }}</span>
+            <span class="state-value" :style="{ color: syncStore.webdav.configured ? 'var(--md-primary)' : 'var(--md-on-surface-variant)' }">
+              {{ syncStore.webdav.configured
+                ? (syncStore.webdav.autoSync ? t('settings.debug_auto_sync_on') : t('settings.debug_auto_sync_off'))
+                : t('settings.debug_not_configured') }}
+            </span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">{{ t('settings.debug_last_sync') }} (WebDAV)</span>
+            <span class="state-value">{{ formatSyncTime(syncStore.webdav.lastSyncTime) }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 播放器状态 -->
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">queue_music</span>
       <span>{{ t('settings.player_state') }}</span>
     </div>
-
     <div class="setting-card">
       <div class="setting-info">
-        <div class="player-state-grid">
+        <div class="state-grid">
           <div class="state-item">
             <span class="state-label">Current Track</span>
             <span class="state-value">{{ player.currentTrack?.title || '—' }}</span>
@@ -140,7 +256,7 @@ function probeStatusColor(status: string): string {
           </div>
           <div class="state-item">
             <span class="state-label">Source</span>
-            <span class="state-value">{{ player.currentTrack?.id?.split(':')[0] || '—' }}</span>
+            <span class="state-value mono">{{ player.currentTrack?.id?.split(':')[0] || '—' }}</span>
           </div>
           <div class="state-item">
             <span class="state-label">Playing</span>
@@ -148,7 +264,7 @@ function probeStatusColor(status: string): string {
           </div>
           <div class="state-item">
             <span class="state-label">Position</span>
-            <span class="state-value">{{ Math.floor(player.positionMs / 1000) }}s / {{ Math.floor(player.durationMs / 1000) }}s</span>
+            <span class="state-value mono">{{ Math.floor(player.positionMs / 1000) }}s / {{ Math.floor(player.durationMs / 1000) }}s</span>
           </div>
           <div class="state-item">
             <span class="state-label">Queue Size</span>
@@ -166,11 +282,30 @@ function probeStatusColor(status: string): string {
   max-width: 680px;
 }
 
+.debug-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.debug-back-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-on-surface);
+  transition: background var(--duration-short);
+
+  &:hover { background: var(--md-surface-container-high); }
+}
+
 .page-title {
   font-size: 28px;
   font-weight: 700;
   letter-spacing: -0.5px;
-  margin-bottom: 24px;
 }
 
 .section-label {
@@ -228,7 +363,7 @@ function probeStatusColor(status: string): string {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.player-state-grid {
+.state-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px 24px;
@@ -239,6 +374,10 @@ function probeStatusColor(status: string): string {
   display: flex;
   flex-direction: column;
   gap: 2px;
+
+  &.full-width {
+    grid-column: 1 / -1;
+  }
 }
 
 .state-label {
@@ -255,5 +394,11 @@ function probeStatusColor(status: string): string {
   font-weight: 500;
   color: var(--md-on-surface);
   word-break: break-all;
+  line-height: 1.45;
+
+  &.mono {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 12px;
+  }
 }
 </style>
