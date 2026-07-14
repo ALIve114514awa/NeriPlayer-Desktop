@@ -496,6 +496,7 @@
     "debug_storage": "Storage",
     "debug_data_dir": "Data directory",
     "debug_back": "Back",
+    "debug_hide": "Hide Debug Mode",
 
     "language": "Language",
     "language_desc": "Choose display language",

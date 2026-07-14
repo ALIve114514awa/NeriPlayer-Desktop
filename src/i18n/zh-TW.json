@@ -496,6 +496,7 @@
     "debug_storage": "儲存",
     "debug_data_dir": "資料目錄",
     "debug_back": "返回",
+    "debug_hide": "隱藏偵錯模式",
 
     "language": "語言",
     "language_desc": "選擇介面顯示語言",

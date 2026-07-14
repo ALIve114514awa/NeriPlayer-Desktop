@@ -496,6 +496,7 @@
     "debug_storage": "存储",
     "debug_data_dir": "数据目录",
     "debug_back": "返回",
+    "debug_hide": "隐藏调试模式",
 
     "language": "语言",
     "language_desc": "选择界面显示语言",

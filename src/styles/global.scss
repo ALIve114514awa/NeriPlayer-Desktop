@@ -131,11 +131,10 @@ select,
               opacity 120ms var(--ease-decelerate);
 }
 .slide-up-leave-active {
-  transition: transform 400ms var(--ease-emphasized-accel),
-              opacity 200ms var(--ease-accelerate);
+  transition: transform 400ms var(--ease-emphasized-accel);
 }
 .slide-up-enter-from { transform: translateY(100%); opacity: 0; }
-.slide-up-leave-to { transform: translateY(100%); opacity: 0; }
+.slide-up-leave-to { transform: translateY(100%); }
 
 /* 按钮重置 */
 button {

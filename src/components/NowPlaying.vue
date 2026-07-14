@@ -319,28 +319,9 @@ function extractColorsFromCover(url: string) {
       const palette = extractPalette(imageData, 16)
       paletteResult.value = palette
 
-      // 归一化到 0..1 RGBA
-      const toNorm = (c: [number, number, number]): number[] => [
-        c[0] / 255,
-        c[1] / 255,
-        c[2] / 255,
-        1,
-      ]
-      const dom = toNorm(palette.dominant)
-      const lv = toNorm(palette.lightVibrant)
-      const bridge = [
-        (dom[0] + lv[0]) * 0.5,
-        (dom[1] + lv[1]) * 0.5,
-        (dom[2] + lv[2]) * 0.5,
-        1,
-      ]
-      extractedColors.value = [
-        dom,
-        lv,
-        toNorm(palette.muted),
-        toNorm(palette.darkMuted),
-        bridge,
-      ] as [number[], number[], number[], number[], number[]]
+      extractedColors.value = palette.shaderColors.map(
+        (c) => [c[0] / 255, c[1] / 255, c[2] / 255, 1]
+      ) as [number[], number[], number[], number[], number[]]
     } catch (e) {
       console.error('[NowPlaying] color extraction failed:', e)
     }

@@ -496,6 +496,7 @@
     "debug_storage": "ストレージ",
     "debug_data_dir": "データフォルダ",
     "debug_back": "戻る",
+    "debug_hide": "デバッグモードを非表示",
 
     "language": "言語",
     "language_desc": "表示言語を選択",

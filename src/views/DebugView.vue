@@ -5,11 +5,13 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { usePlayerStore } from '@/stores/player'
 import { useSyncStore } from '@/stores/sync'
+import { useSettingsStore } from '@/stores/settings'
 
 const router = useRouter()
 const { t } = useI18n()
 const player = usePlayerStore()
 const syncStore = useSyncStore()
+const settingsStore = useSettingsStore()
 
 const buildInfo = ref<{ uuid: string; timestamp: string } | null>(null)
 const appDataDir = ref('')
@@ -93,6 +95,11 @@ function formatSyncTime(ts: number): string {
 
 function goBack() {
   router.push('/')
+}
+
+function hideDebugMode() {
+  settingsStore.devModeEnabled = false
+  router.push('/settings')
 }
 
 onMounted(async () => {
@@ -277,6 +284,14 @@ onMounted(async () => {
         </div>
       </div>
     </div>
+
+    <!-- 隐藏调试模式 -->
+    <div class="hide-debug-section">
+      <button class="hide-debug-btn" @click="hideDebugMode">
+        <span class="material-symbols-rounded">visibility_off</span>
+        <span>{{ t('settings.debug_hide') }}</span>
+      </button>
+    </div>
   </div>
 </template>
 
@@ -404,6 +419,38 @@ onMounted(async () => {
   &.mono {
     font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
     font-size: 12px;
+  }
+}
+
+.hide-debug-section {
+  margin-top: 32px;
+  padding-top: 16px;
+  border-top: 1px solid var(--md-outline-variant, rgba(255,255,255,0.08));
+}
+
+.hide-debug-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-radius: 12px;
+  background: var(--md-error-container, rgba(255, 80, 80, 0.12));
+  color: var(--md-on-error-container, #ff5050);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+
+  .material-symbols-rounded {
+    font-size: 20px;
+  }
+
+  &:hover {
+    background: var(--md-error-container, rgba(255, 80, 80, 0.18));
+  }
+
+  &:active {
+    transform: scale(0.97);
   }
 }
 </style>
