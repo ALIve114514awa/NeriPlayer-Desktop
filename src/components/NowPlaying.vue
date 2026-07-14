@@ -18,6 +18,7 @@ import LyricsView from './LyricsView.vue'
 import QueuePanel from './QueuePanel.vue'
 import AddToPlaylistDialog from './AddToPlaylistDialog.vue'
 import ListenTogetherPanel from './ListenTogetherPanel.vue'
+import CustomSelect from './ui/CustomSelect.vue'
 
 const emit = defineEmits<{ collapse: [] }>()
 const props = defineProps<{
@@ -1550,12 +1551,11 @@ const sliderActiveColor = computed(() => {
                     <span class="audiofx-toggle-slider"></span>
                   </label>
                 </div>
-                <select class="audiofx-select" :value="player.equalizerPresetId"
-                  @change="player.setEqualizerPreset(($event.target as HTMLSelectElement).value)">
-                  <option v-for="pid in eqPresetIds" :key="pid" :value="pid">
-                    {{ t('player.eq_' + pid) }}
-                  </option>
-                </select>
+                <CustomSelect
+                  :model-value="player.equalizerPresetId"
+                  :options="eqPresetIds.map(pid => ({ value: pid, label: t('player.eq_' + pid) }))"
+                  @update:model-value="player.setEqualizerPreset($event)"
+                />
                 <div v-if="player.equalizerEnabled" class="audiofx-eq-bands">
                   <div v-for="(freq, i) in eqFreqLabels" :key="i" class="audiofx-eq-band">
                     <span class="audiofx-eq-val">{{ (player.equalizerBands[i] / 100).toFixed(1) }}</span>
@@ -1567,9 +1567,6 @@ const sliderActiveColor = computed(() => {
                   </div>
                 </div>
               </div>
-
-              <!-- 音调说明 -->
-              <div class="audiofx-note">{{ t('player.pitch_note') }}</div>
 
               <!-- 重置 -->
               <button class="speed-option audiofx-reset" @click="player.resetAudioEffects()">
@@ -1831,11 +1828,6 @@ const sliderActiveColor = computed(() => {
                 />
                 <span class="np-offset-value">{{ player.playbackSpeed.toFixed(2) }}x</span>
               </div>
-            </div>
-            <!-- 音调提示 -->
-            <div class="np-audio-effect-note">
-              <span class="material-symbols-rounded" style="font-size: 16px">info</span>
-              <span>{{ t('player.pitch') }}: {{ player.playbackSpeed !== 1 ? (player.playbackSpeed > 1 ? '↑' : '↓') : '—' }}</span>
             </div>
           </template>
 
@@ -2255,6 +2247,8 @@ const sliderActiveColor = computed(() => {
   // 确保完全不透明
   isolation: isolate;
   overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
   transition: transform 460ms cubic-bezier(0.22, 1, 0.36, 1), opacity 300ms ease;
 }
 
@@ -3533,36 +3527,6 @@ const sliderActiveColor = computed(() => {
   }
 }
 
-.audiofx-select {
-  appearance: none;
-  background: rgba(255,255,255,0.08);
-  color: rgba(255,255,255,0.85);
-  border: 1px solid color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.18)) 24%, rgba(255,255,255,0.1));
-  border-radius: 8px;
-  padding: 6px 32px 6px 10px;
-  font-size: 12px;
-  cursor: pointer;
-  outline: none;
-  /* 自绘下拉箭头，替换原生控件外观 */
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-opacity='0.6' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 10px center;
-  transition: border-color 0.2s, background-color 0.2s;
-
-  &:hover {
-    background-color: rgba(255,255,255,0.12);
-  }
-
-  &:focus-visible {
-    border-color: var(--np-primary, var(--md-primary, #D0BCFF));
-  }
-
-  option {
-    background: #1e1c22;
-    color: white;
-  }
-}
-
 .audiofx-toggle {
   position: relative;
   display: inline-block;
@@ -3659,14 +3623,6 @@ const sliderActiveColor = computed(() => {
     cursor: pointer;
     box-shadow: 0 1px 4px rgba(0,0,0,0.3);
   }
-}
-
-.audiofx-note {
-  font-size: 11px;
-  color: rgba(255,255,255,0.3);
-  font-style: italic;
-  text-align: center;
-  padding: 2px 0;
 }
 
 .audiofx-reset {
@@ -4438,19 +4394,6 @@ const sliderActiveColor = computed(() => {
     background: rgba(255,255,255,0.12);
     border-radius: 2px;
   }
-}
-
-// 音频效果提示
-.np-audio-effect-note {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(255,255,255,0.04);
-  color: rgba(255,255,255,0.35);
-  font-size: 12px;
-  font-weight: 500;
 }
 
 .np-more-quality-item {
