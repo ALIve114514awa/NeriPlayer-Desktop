@@ -292,11 +292,12 @@ function onSliderPreviewEnd() {
 }
 
 // 从封面提取的动态颜色（归一化 RGBA）
-const extractedColors = ref<[number[], number[], number[], number[]]>([
+const extractedColors = ref<[number[], number[], number[], number[], number[]]>([
   [0.4, 0.31, 0.64, 1],
   [0.49, 0.36, 0.75, 1],
   [0.56, 0.49, 0.69, 1],
   [0.29, 0.24, 0.43, 1],
+  [0.44, 0.40, 0.60, 1],
 ])
 const paletteResult = ref<PaletteResult | null>(null)
 
@@ -325,12 +326,21 @@ function extractColorsFromCover(url: string) {
         c[2] / 255,
         1,
       ]
+      const dom = toNorm(palette.dominant)
+      const lv = toNorm(palette.lightVibrant)
+      const bridge = [
+        (dom[0] + lv[0]) * 0.5,
+        (dom[1] + lv[1]) * 0.5,
+        (dom[2] + lv[2]) * 0.5,
+        1,
+      ]
       extractedColors.value = [
-        toNorm(palette.dominant),
-        toNorm(palette.lightVibrant),
+        dom,
+        lv,
         toNorm(palette.muted),
         toNorm(palette.darkMuted),
-      ] as [number[], number[], number[], number[]]
+        bridge,
+      ] as [number[], number[], number[], number[], number[]]
     } catch (e) {
       console.error('[NowPlaying] color extraction failed:', e)
     }

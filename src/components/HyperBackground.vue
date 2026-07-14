@@ -5,7 +5,7 @@ import { hyperBackgroundVertexShader, hyperBackgroundFragmentShader } from '@/sh
 const props = withDefaults(defineProps<{
   musicLevel?: number
   beatImpulse?: number
-  colors?: [number[], number[], number[], number[]]
+  colors?: [number[], number[], number[], number[], number[]]
   isDark?: boolean
   lightOffset?: number
   saturateOffset?: number
@@ -17,6 +17,7 @@ const props = withDefaults(defineProps<{
     [0.49, 0.36, 0.75, 1], // vibrant
     [0.56, 0.49, 0.69, 1], // muted
     [0.29, 0.24, 0.43, 1], // darkMuted
+    [0.44, 0.40, 0.60, 1], // bridge
   ],
   isDark: true,
   lightOffset: 0,
@@ -49,6 +50,7 @@ const smoothColors: number[][] = [
   [0.49, 0.36, 0.75, 1],
   [0.56, 0.49, 0.69, 1],
   [0.29, 0.24, 0.43, 1],
+  [0.44, 0.40, 0.60, 1],
 ]
 let smoothLightOffset = 0
 let smoothSaturateOffset = 0
@@ -79,7 +81,7 @@ function smoothStep01(t: number): number {
 
 // 目标调色板是否变化（切歌）→ 启动一次定时过渡
 function colorsChanged(): boolean {
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     for (let j = 0; j < 4; j++) {
       if (targetColors[i][j] !== props.colors[i][j]) return true
     }
@@ -96,6 +98,7 @@ let uColor0: WebGLUniformLocation | null = null
 let uColor1: WebGLUniformLocation | null = null
 let uColor2: WebGLUniformLocation | null = null
 let uColor3: WebGLUniformLocation | null = null
+let uColor4: WebGLUniformLocation | null = null
 let uDarkMode: WebGLUniformLocation | null = null
 let uLightOffset: WebGLUniformLocation | null = null
 let uSaturateOffset: WebGLUniformLocation | null = null
@@ -149,12 +152,13 @@ function initGL() {
   uColor1 = gl.getUniformLocation(program, 'u_color1')
   uColor2 = gl.getUniformLocation(program, 'u_color2')
   uColor3 = gl.getUniformLocation(program, 'u_color3')
+  uColor4 = gl.getUniformLocation(program, 'u_color4')
   uDarkMode = gl.getUniformLocation(program, 'u_darkMode')
   uLightOffset = gl.getUniformLocation(program, 'u_lightOffset')
   uSaturateOffset = gl.getUniformLocation(program, 'u_saturateOffset')
 
   // 初始化平滑颜色为当前 props
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     for (let j = 0; j < 4; j++) {
       smoothColors[i][j] = props.colors[i][j]
       targetColors[i][j] = props.colors[i][j]
@@ -187,10 +191,10 @@ function render() {
 
   // —— 调色板过渡：检测目标变化 → 启动 520ms 定时 smoothStep 过渡 ——
   if (colorsChanged()) {
-    for (let i = 0; i < 4; i++) transStartColors[i] = smoothColors[i].slice()
+    for (let i = 0; i < 5; i++) transStartColors[i] = smoothColors[i].slice()
     transStartLight = smoothLightOffset
     transStartSaturate = smoothSaturateOffset
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       for (let j = 0; j < 4; j++) targetColors[i][j] = props.colors[i][j]
     }
     targetLight = props.lightOffset
@@ -201,7 +205,7 @@ function render() {
   if (transitioning) {
     const raw = (nowMs - transStartMs) / PALETTE_TRANSITION_MS
     const f = smoothStep01(raw)
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       for (let j = 0; j < 4; j++) {
         smoothColors[i][j] = lerpVal(transStartColors[i][j], targetColors[i][j], f)
       }
@@ -231,6 +235,7 @@ function render() {
   gl.uniform4fv(uColor1, smoothColors[1])
   gl.uniform4fv(uColor2, smoothColors[2])
   gl.uniform4fv(uColor3, smoothColors[3])
+  gl.uniform4fv(uColor4, smoothColors[4])
   gl.uniform1f(uDarkMode, props.isDark ? 1.0 : 0.0)
   gl.uniform1f(uLightOffset, smoothLightOffset)
   gl.uniform1f(uSaturateOffset, smoothSaturateOffset)
