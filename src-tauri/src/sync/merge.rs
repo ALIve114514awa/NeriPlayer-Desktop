@@ -75,7 +75,11 @@ fn merge_playlists(local: &[SyncPlaylist], remote: &[SyncPlaylist], last_sync_ti
     }
 
     // 排序：以修改时间较新的一方的顺序为主
+    let now = chrono::Utc::now().timestamp_millis();
     order_merged_playlists(&merged, local, remote, last_sync_time)
+        .into_iter()
+        .map(|playlist| playlist.normalized_for_display_order(now))
+        .collect()
 }
 
 fn merge_single_playlist(local: &SyncPlaylist, remote: &SyncPlaylist, last_sync_time: i64, base_songs: &HashSet<String>) -> SyncPlaylist {
@@ -98,7 +102,7 @@ fn merge_single_playlist(local: &SyncPlaylist, remote: &SyncPlaylist, last_sync_
         created_at: local.created_at.min(remote.created_at),
         modified_at: local.modified_at.max(remote.modified_at),
         is_deleted: false,
-        song_order_version: local.song_order_version.max(remote.song_order_version),
+        song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
     }
 }
 

@@ -248,55 +248,133 @@ fn playlists_path() -> std::path::PathBuf {
     path
 }
 
-/// TrackInfo -> SyncSong 转换（保持与 Android 端 SyncSong 格式兼容）
-/// 公开版本，供 export_playlists 等外部调用
-pub fn track_to_sync_song_pub(track: &TrackInfo) -> SyncSong {
-    track_to_sync_song(track)
+pub fn tracks_to_sync_songs_pub(tracks: &[TrackInfo]) -> Vec<SyncSong> {
+    tracks_to_sync_songs(tracks)
+}
+
+fn tracks_to_sync_songs(tracks: &[TrackInfo]) -> Vec<SyncSong> {
+    let newest_added_at = chrono::Utc::now().timestamp_millis();
+    tracks.iter()
+        .enumerate()
+        .map(|(index, track)| {
+            let mut song = track_to_sync_song(track);
+            song.added_at = (newest_added_at - index as i64).max(1);
+            song
+        })
+        .collect()
 }
 
 /// TrackInfo -> SyncSong 转换（内部使用）
 fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
-    // 从带前缀的 id 中提取纯 ID 和 media_uri
-    let (pure_id, media_uri) = if let Some(nid) = track.id.strip_prefix("netease:") {
-        // 网易云：id = 纯数字，media_uri 为空（Android 格式）
-        (nid.to_string(), String::new())
-    } else if let Some(vid) = track.id.strip_prefix("youtube:") {
-        // YouTube：id = videoId, media_uri = "ytmusic://video/{videoId}"
-        (vid.to_string(), format!("ytmusic://video/{}", vid))
-    } else if let Some(bvid) = track.id.strip_prefix("bilibili:") {
-        // B站：id = bvid, media_uri 为空
-        (bvid.to_string(), String::new())
-    } else {
-        (track.id.clone(), String::new())
-    };
+    let platform = sync_platform_identity(track);
 
     SyncSong {
-        id: pure_id,
+        id: platform.id,
         name: track.title.clone(),
         artist: track.artist.clone(),
         album: track.album.clone(),
         album_id: String::new(),
         duration_ms: track.duration_ms as i64,
         cover_url: track.cover_url.clone().unwrap_or_default(),
-        media_uri,
+        media_uri: platform.media_uri.unwrap_or_default(),
         added_at: chrono::Utc::now().timestamp_millis(),
-        lyric: None,
-        translated_lyric: None,
-        lyric_source: None,
-        lyric_song_id: None,
-        user_lyric_offset_ms: None,
+        matched_lyric: None,
+        matched_translated_lyric: None,
+        matched_lyric_source: None,
+        matched_song_id: None,
+        user_lyric_offset_ms: 0,
         custom_cover_url: None,
         custom_name: None,
         custom_artist: None,
         original_cover_url: None,
         original_name: None,
         original_artist: None,
-        channel_id: None,
-        audio_id: None,
-        sub_audio_id: None,
+        original_lyric: None,
+        original_translated_lyric: None,
+        channel_id: platform.channel_id,
+        audio_id: platform.audio_id,
+        sub_audio_id: platform.sub_audio_id,
         playlist_context_id: None,
         sync_membership_tokens: Vec::new(),
     }
+}
+
+struct SyncPlatformIdentity {
+    id: String,
+    media_uri: Option<String>,
+    channel_id: Option<String>,
+    audio_id: Option<String>,
+    sub_audio_id: Option<String>,
+}
+
+fn sync_platform_identity(track: &TrackInfo) -> SyncPlatformIdentity {
+    if let Some(nid) = track.id.strip_prefix("netease:") {
+        return SyncPlatformIdentity {
+            id: nid.to_string(),
+            media_uri: None,
+            channel_id: Some("netease".into()),
+            audio_id: Some(nid.to_string()),
+            sub_audio_id: None,
+        };
+    }
+
+    if let Some(mid) = track.id.strip_prefix("qq:") {
+        return SyncPlatformIdentity {
+            id: stable_remote_android_id("qq", mid, "").to_string(),
+            media_uri: None,
+            channel_id: Some("qq".into()),
+            audio_id: Some(mid.to_string()),
+            sub_audio_id: None,
+        };
+    }
+
+    if let Some(vid) = track.id.strip_prefix("youtube:") {
+        return SyncPlatformIdentity {
+            id: stable_sync_identity_id(vid).to_string(),
+            media_uri: Some(build_youtube_music_media_uri(vid)),
+            channel_id: Some("youtube_music".into()),
+            audio_id: Some(vid.to_string()),
+            sub_audio_id: None,
+        };
+    }
+
+    if let Some(bili_id) = track.id.strip_prefix("bilibili:") {
+        let sub_audio_id = bilibili_cid_from_album(&track.album);
+        let sub_audio = sub_audio_id.as_deref().unwrap_or("");
+        return SyncPlatformIdentity {
+            id: stable_remote_android_id("bilibili", bili_id, sub_audio).to_string(),
+            media_uri: None,
+            channel_id: Some("bilibili".into()),
+            audio_id: Some(bili_id.to_string()),
+            sub_audio_id,
+        };
+    }
+
+    SyncPlatformIdentity {
+        id: numeric_id_or_zero(&track.id).to_string(),
+        media_uri: None,
+        channel_id: None,
+        audio_id: None,
+        sub_audio_id: None,
+    }
+}
+
+fn stable_remote_android_id(channel: &str, audio: &str, sub_audio: &str) -> i64 {
+    if channel == "netease" {
+        return audio.parse::<i64>().unwrap_or_else(|_| stable_sync_identity_id(&format!("{channel}|{audio}")));
+    }
+    stable_sync_identity_id(&format!("{channel}|{audio}|{sub_audio}"))
+}
+
+fn numeric_id_or_zero(value: &str) -> i64 {
+    value.parse::<i64>().unwrap_or(0)
+}
+
+fn bilibili_cid_from_album(album: &str) -> Option<String> {
+    album
+        .strip_prefix("Bilibili|")
+        .filter(|cid| !cid.is_empty())
+        .map(String::from)
 }
 
 /// SyncSong -> TrackInfo 转换
@@ -308,25 +386,39 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
 fn sync_song_to_track(song: &SyncSong) -> TrackInfo {
     use crate::state::TrackSource;
 
-    // 判断来源平台
-    let is_youtube = song.media_uri.starts_with("ytmusic://");
-    let is_bilibili = song.album.starts_with("Bilibili");
+    let channel = song.channel_id.as_deref().unwrap_or("").to_ascii_lowercase();
+    let is_youtube = channel == "youtube_music"
+        || channel == "youtubemusic"
+        || channel == "youtube"
+        || song.media_uri.starts_with("ytmusic://");
+    let is_bilibili = channel == "bilibili" || song.album.starts_with("Bilibili");
+    let is_qq = channel == "qq";
+    let is_netease = channel == "netease" || (!song.id.is_empty() && song.media_uri.is_empty());
 
     let (full_id, source) = if is_youtube {
         // ytmusic://video/{videoId}?playlistId=... -> 提取 videoId
-        let video_id = song.media_uri
-            .strip_prefix("ytmusic://video/")
+        let video_id = song.audio_id.as_deref()
+            .or_else(|| song.media_uri.strip_prefix("ytmusic://video/"))
             .unwrap_or(&song.id)
             .split('?')
             .next()
             .unwrap_or(&song.id);
         (format!("youtube:{}", video_id), TrackSource::Youtube)
     } else if is_bilibili {
-        // B站：album 格式 "Bilibili|{cid}"，用 song.id 作 bvid
-        (format!("bilibili:{}", song.id), TrackSource::Bilibili)
-    } else if !song.id.is_empty() {
-        // 默认网易云：纯数字 id
-        (format!("netease:{}", song.id), TrackSource::Netease)
+        let bili_id = song.audio_id.as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&song.id);
+        (format!("bilibili:{}", bili_id), TrackSource::Bilibili)
+    } else if is_qq {
+        let qq_id = song.audio_id.as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&song.id);
+        (format!("qq:{}", qq_id), TrackSource::Qq)
+    } else if is_netease {
+        let netease_id = song.audio_id.as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&song.id);
+        (format!("netease:{}", netease_id), TrackSource::Netease)
     } else {
         // 无法识别来源
         (song.id.clone(), TrackSource::Local)
@@ -352,11 +444,11 @@ fn load_local_playlists(_app: &AppHandle) -> Vec<SyncPlaylist> {
     store.playlists.iter().map(|pl| SyncPlaylist {
         id: pl.id.to_string(),
         name: pl.name.clone(),
-        songs: pl.tracks.iter().map(track_to_sync_song).collect(),
+        songs: tracks_to_sync_songs(&pl.tracks),
         created_at: pl.modified_at as i64,
         modified_at: pl.modified_at as i64,
         is_deleted: false,
-        song_order_version: 0,
+        song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
     }).collect()
 }
 

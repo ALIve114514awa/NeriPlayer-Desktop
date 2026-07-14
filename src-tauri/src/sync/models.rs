@@ -1,5 +1,6 @@
 // 同步数据模型 — 与 Android 端 SyncDataModels.kt 保持 JSON 字段兼容
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 
 /// 反序列化辅助：同时接受 string 和 number 类型，统一转为 String
 fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -35,6 +36,9 @@ where
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
             Ok(v.to_string())
         }
+
+        fn visit_none<E: de::Error>(self) -> Result<String, E> { Ok(String::new()) }
+        fn visit_unit<E: de::Error>(self) -> Result<String, E> { Ok(String::new()) }
     }
 
     deserializer.deserialize_any(StringOrNumber)
@@ -78,6 +82,183 @@ where
     deserializer.deserialize_any(OptStringOrNumber)
 }
 
+fn deserialize_i64_or_default<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    struct I64OrDefault;
+    impl<'de> de::Visitor<'de> for I64OrDefault {
+        type Value = i64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null, an integer, or an integer string")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<i64, E> { Ok(0) }
+        fn visit_unit<E: de::Error>(self) -> Result<i64, E> { Ok(0) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> { Ok(v) }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
+            i64::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i64, E> {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                Ok(0)
+            } else {
+                trimmed.parse::<i64>().map_err(E::custom)
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<i64, E> {
+            self.visit_str(&v)
+        }
+    }
+
+    deserializer.deserialize_any(I64OrDefault)
+}
+
+pub(crate) fn sync_i64_from_string(value: &str) -> i64 {
+    value.parse::<i64>().unwrap_or(0)
+}
+
+fn serialize_string_as_i64<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_i64(sync_i64_from_string(value))
+}
+
+fn serialize_opt_string_as_i64<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value.as_deref().and_then(|v| v.parse::<i64>().ok()) {
+        Some(parsed) => serializer.serialize_some(&parsed),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn option_string_is_non_numeric(value: &Option<String>) -> bool {
+    value.as_deref().and_then(|v| v.parse::<i64>().ok()).is_none()
+}
+
+const SYNC_ACTIONS: &[&str] = &[
+    "CREATE_PLAYLIST",
+    "DELETE_PLAYLIST",
+    "RENAME_PLAYLIST",
+    "ADD_SONG",
+    "REMOVE_SONG",
+    "REORDER_SONGS",
+    "PLAY_SONG",
+];
+
+fn normalize_sync_action(action: &str) -> &'static str {
+    SYNC_ACTIONS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == action)
+        .unwrap_or("CREATE_PLAYLIST")
+}
+
+fn serialize_sync_action<S>(action: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(normalize_sync_action(action))
+}
+
+pub(crate) fn sync_action_to_code(action: &str) -> i32 {
+    SYNC_ACTIONS
+        .iter()
+        .position(|candidate| *candidate == action)
+        .unwrap_or(0) as i32
+}
+
+pub(crate) fn sync_action_from_code(code: i32) -> String {
+    SYNC_ACTIONS
+        .get(code.max(0) as usize)
+        .copied()
+        .unwrap_or("CREATE_PLAYLIST")
+        .to_string()
+}
+
+const YOUTUBE_MUSIC_IDENTITY_ALBUM: &str = "youtube_music";
+pub(crate) const DISPLAY_ORDER_SONG_ORDER_VERSION: i32 = 1;
+
+pub fn stable_sync_identity_id(value: &str) -> i64 {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let result = i64::from_be_bytes(bytes);
+    if result == 0 { 1 } else { result }
+}
+
+pub fn build_youtube_music_media_uri(video_id: &str) -> String {
+    format!("ytmusic://video/{}", urlencoding::encode(video_id))
+}
+
+fn extract_youtube_music_video_id(media_uri: &str) -> Option<String> {
+    let raw = media_uri.strip_prefix("ytmusic://video/")?;
+    let encoded = raw.split(['?', '#']).next().unwrap_or_default();
+    let video_id = urlencoding::decode(encoded).ok()?.into_owned();
+    let video_id = video_id.trim();
+    if video_id.is_empty() { None } else { Some(video_id.to_string()) }
+}
+
+fn normalized_channel_id(raw_channel_id: Option<&str>, album: &str, media_uri: &str) -> Option<String> {
+    let channel = raw_channel_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "youtube" | "ytmusic" | "youtubemusic" => YOUTUBE_MUSIC_IDENTITY_ALBUM.to_string(),
+            other => other.to_string(),
+        });
+    if channel.is_some() {
+        return channel;
+    }
+
+    if extract_youtube_music_video_id(media_uri).is_some() {
+        return Some(YOUTUBE_MUSIC_IDENTITY_ALBUM.to_string());
+    }
+    if album.to_ascii_lowercase().starts_with("bilibili") {
+        return Some("bilibili".to_string());
+    }
+    if album.to_ascii_lowercase().starts_with("netease") || media_uri.trim().is_empty() {
+        return Some("netease".to_string());
+    }
+    None
+}
+
+fn normalized_sub_audio_id(channel: &str, raw_sub_audio_id: Option<&str>, album: &str) -> String {
+    if channel != "bilibili" {
+        return String::new();
+    }
+
+    raw_sub_audio_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            album
+                .split_once('|')
+                .map(|(_, value)| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn stable_remote_identity_id(channel: &str, audio: &str, sub_audio: &str) -> i64 {
+    if channel == "netease" {
+        return audio.parse::<i64>().unwrap_or_else(|_| stable_sync_identity_id(&format!("{channel}|{audio}")));
+    }
+
+    stable_sync_identity_id(&format!("{channel}|{audio}|{sub_audio}"))
+}
+
 /// 同步数据根信封
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +296,10 @@ fn default_version() -> String { "2.0".into() }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncPlaylist {
-    #[serde(deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -130,10 +314,76 @@ pub struct SyncPlaylist {
     pub song_order_version: i32,
 }
 
+impl SyncPlaylist {
+    pub(crate) fn normalized_for_display_order(&self, now: i64) -> Self {
+        let mut normalized = self.clone();
+        if self.is_deleted {
+            normalized.songs.clear();
+            normalized.song_order_version = DISPLAY_ORDER_SONG_ORDER_VERSION;
+            return normalized;
+        }
+
+        normalized.songs = if self.song_order_version >= DISPLAY_ORDER_SONG_ORDER_VERSION {
+            sorted_songs_by_added_at_for_display(&self.songs)
+        } else {
+            migrate_legacy_songs_to_display_order(&self.songs, self.modified_at, now)
+        };
+        normalized.song_order_version = DISPLAY_ORDER_SONG_ORDER_VERSION;
+        normalized
+    }
+}
+
+fn migrate_legacy_songs_to_display_order(
+    songs: &[SyncSong],
+    playlist_modified_at: i64,
+    now: i64,
+) -> Vec<SyncSong> {
+    if songs.is_empty() {
+        return Vec::new();
+    }
+
+    let newest_added_at = songs
+        .iter()
+        .map(|song| song.added_at)
+        .max()
+        .unwrap_or(0)
+        .max(now)
+        .max(playlist_modified_at);
+
+    songs.iter()
+        .rev()
+        .enumerate()
+        .map(|(index, song)| {
+            let mut normalized = song.clone();
+            normalized.added_at = (newest_added_at - index as i64).max(1);
+            normalized
+        })
+        .collect()
+}
+
+fn sorted_songs_by_added_at_for_display(songs: &[SyncSong]) -> Vec<SyncSong> {
+    if songs.len() < 2 {
+        return songs.to_vec();
+    }
+
+    let mut indexed: Vec<(usize, SyncSong)> = songs.iter().cloned().enumerate().collect();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        right
+            .added_at
+            .cmp(&left.added_at)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    indexed.into_iter().map(|(_, song)| song).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncSong {
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub id: String,
     #[serde(default)]
     pub name: String,
@@ -141,57 +391,115 @@ pub struct SyncSong {
     pub artist: String,
     #[serde(default)]
     pub album: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub album_id: String,
     #[serde(default)]
     pub duration_ms: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_number", skip_serializing_if = "String::is_empty")]
     pub cover_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_number", skip_serializing_if = "String::is_empty")]
     pub media_uri: String,
     #[serde(default)]
     pub added_at: i64,
     // 歌词相关
-    #[serde(default)]
-    pub lyric: Option<String>,
-    #[serde(default)]
-    pub translated_lyric: Option<String>,
-    #[serde(default)]
-    pub lyric_source: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
-    pub lyric_song_id: Option<String>,
-    #[serde(default)]
-    pub user_lyric_offset_ms: Option<i64>,
+    #[serde(default, rename = "matchedLyric", alias = "lyric", skip_serializing_if = "Option::is_none")]
+    pub matched_lyric: Option<String>,
+    #[serde(
+        default,
+        rename = "matchedTranslatedLyric",
+        alias = "translatedLyric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub matched_translated_lyric: Option<String>,
+    #[serde(
+        default,
+        rename = "matchedLyricSource",
+        alias = "lyricSource",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub matched_lyric_source: Option<String>,
+    #[serde(
+        default,
+        rename = "matchedSongId",
+        alias = "lyricSongId",
+        deserialize_with = "deserialize_opt_string_or_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub matched_song_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_i64_or_default")]
+    pub user_lyric_offset_ms: i64,
     // 自定义覆盖
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_cover_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_artist: Option<String>,
     // 原始元数据
-    #[serde(default)]
-    pub original_cover_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_cover_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_lyric: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_translated_lyric: Option<String>,
     // 平台相关
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_number", skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_number", skip_serializing_if = "Option::is_none")]
     pub audio_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_number", skip_serializing_if = "Option::is_none")]
     pub sub_audio_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_number", skip_serializing_if = "Option::is_none")]
     pub playlist_context_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_membership_tokens: Vec<SyncCausalToken>,
 }
 
 impl SyncSong {
     /// 歌曲唯一标识（与 Android SongIdentity 对齐）
     pub fn identity(&self) -> SongIdentity {
+        if let Some(video_id) = extract_youtube_music_video_id(&self.media_uri) {
+            return SongIdentity {
+                id: stable_sync_identity_id(&video_id).to_string(),
+                album: YOUTUBE_MUSIC_IDENTITY_ALBUM.to_string(),
+                media_uri: build_youtube_music_media_uri(&video_id),
+            };
+        }
+
+        let channel = normalized_channel_id(self.channel_id.as_deref(), &self.album, &self.media_uri);
+        let audio = self
+            .audio_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| if self.id.is_empty() || self.id == "0" { None } else { Some(self.id.clone()) });
+
+        if let (Some(channel), Some(audio)) = (channel, audio) {
+            if channel == YOUTUBE_MUSIC_IDENTITY_ALBUM {
+                return SongIdentity {
+                    id: stable_sync_identity_id(&audio).to_string(),
+                    album: YOUTUBE_MUSIC_IDENTITY_ALBUM.to_string(),
+                    media_uri: build_youtube_music_media_uri(&audio),
+                };
+            }
+
+            let sub_audio = normalized_sub_audio_id(&channel, self.sub_audio_id.as_deref(), &self.album);
+            return SongIdentity {
+                id: stable_remote_identity_id(&channel, &audio, &sub_audio).to_string(),
+                album: channel,
+                media_uri: String::new(),
+            };
+        }
+
         SongIdentity {
             id: self.id.clone(),
             album: self.album.clone(),
@@ -217,7 +525,11 @@ impl SongIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRecentPlay {
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub song_id: String,
     pub song: SyncSong,
     #[serde(default)]
@@ -229,11 +541,15 @@ pub struct SyncRecentPlay {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRecentPlayDeletion {
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub song_id: String,
     #[serde(default)]
     pub album: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_number", skip_serializing_if = "String::is_empty")]
     pub media_uri: String,
     #[serde(default)]
     pub deleted_at: i64,
@@ -254,11 +570,15 @@ impl SyncRecentPlayDeletion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncFavoritePlaylist {
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub id: String,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_number", skip_serializing_if = "String::is_empty")]
     pub cover_url: String,
     #[serde(default)]
     pub track_count: i32,
@@ -273,12 +593,12 @@ pub struct SyncFavoritePlaylist {
     #[serde(default)]
     pub is_deleted: bool,
     #[serde(default)]
-    pub sort_order: i32,
-    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browse_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
 }
 
@@ -296,13 +616,23 @@ pub struct SyncLogEntry {
     pub timestamp: i64,
     #[serde(default)]
     pub device_id: String,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sync_action")]
     pub action: String,
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
+    #[serde(
+        default,
+        skip_serializing_if = "option_string_is_non_numeric",
+        serialize_with = "serialize_opt_string_as_i64",
+        deserialize_with = "deserialize_opt_string_or_number"
+    )]
     pub playlist_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
+    #[serde(
+        default,
+        skip_serializing_if = "option_string_is_non_numeric",
+        serialize_with = "serialize_opt_string_as_i64",
+        deserialize_with = "deserialize_opt_string_or_number"
+    )]
     pub song_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
 }
 
@@ -336,15 +666,23 @@ pub struct SyncTrackStat {
     pub last_played_at: i64,
     #[serde(default)]
     pub first_played_at: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     #[serde(default)]
     pub duration_ms: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_uri: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub id: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub album_id: String,
     #[serde(default)]
     pub counter_base_listen_ms: i64,
@@ -394,15 +732,23 @@ pub struct SyncPlaybackStatBucket {
     pub last_played_at: i64,
     #[serde(default)]
     pub first_played_at: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     #[serde(default)]
     pub duration_ms: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_uri: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub id: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub album_id: String,
     #[serde(default)]
     pub counter_base_listen_ms: i64,
@@ -416,9 +762,17 @@ pub struct SyncPlaybackStatBucket {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncPlaylistSongDeletion {
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub playlist_id: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        serialize_with = "serialize_string_as_i64",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub song_id: String,
     #[serde(default)]
     pub album: String,
@@ -434,7 +788,12 @@ pub struct SyncPlaylistSongDeletion {
 
 impl SyncPlaylistSongDeletion {
     pub fn identity(&self) -> String {
-        format!("{}|{}|{}", self.playlist_id, self.song_id, self.album)
+        let song_identity = SongIdentity {
+            id: self.song_id.clone(),
+            album: self.album.clone(),
+            media_uri: self.media_uri.clone().unwrap_or_default(),
+        };
+        format!("{}|{}", self.playlist_id, song_identity.stable_key())
     }
 }
 
@@ -494,4 +853,130 @@ pub struct WebDavSyncConfig {
     pub last_sync_time: i64,
     #[serde(default)]
     pub auto_sync: bool,
+}
+
+#[cfg(test)]
+mod legacy_json_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sync_song_json_uses_android_field_contract() {
+        let song = SyncSong {
+            id: "yt-video".into(),
+            album_id: "123".into(),
+            matched_lyric: Some("matched".into()),
+            matched_translated_lyric: Some("translated".into()),
+            matched_lyric_source: Some("NETEASE".into()),
+            matched_song_id: Some("song-key".into()),
+            original_lyric: Some("original".into()),
+            original_translated_lyric: Some("original translated".into()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&song).unwrap();
+        assert_eq!(value["id"], 0);
+        assert_eq!(value["albumId"], 123);
+        assert_eq!(value["matchedLyric"], "matched");
+        assert_eq!(value["matchedTranslatedLyric"], "translated");
+        assert_eq!(value["matchedLyricSource"], "NETEASE");
+        assert_eq!(value["matchedSongId"], "song-key");
+        assert_eq!(value["originalLyric"], "original");
+        assert_eq!(value["originalTranslatedLyric"], "original translated");
+        assert_eq!(value["userLyricOffsetMs"], 0);
+        assert!(value.get("lyric").is_none());
+        assert!(value.get("coverUrl").is_none());
+
+        let decoded: SyncSong = serde_json::from_value(json!({
+            "id": 12,
+            "albumId": 34,
+            "coverUrl": null,
+            "mediaUri": null,
+            "lyric": "legacy lyric",
+            "translatedLyric": "legacy translated",
+            "lyricSource": "QQ_MUSIC",
+            "lyricSongId": 56,
+            "userLyricOffsetMs": null
+        })).unwrap();
+        assert_eq!(decoded.id, "12");
+        assert_eq!(decoded.album_id, "34");
+        assert_eq!(decoded.cover_url, "");
+        assert_eq!(decoded.media_uri, "");
+        assert_eq!(decoded.matched_lyric.as_deref(), Some("legacy lyric"));
+        assert_eq!(decoded.matched_translated_lyric.as_deref(), Some("legacy translated"));
+        assert_eq!(decoded.matched_lyric_source.as_deref(), Some("QQ_MUSIC"));
+        assert_eq!(decoded.matched_song_id.as_deref(), Some("56"));
+        assert_eq!(decoded.user_lyric_offset_ms, 0);
+    }
+
+    #[test]
+    fn sync_log_json_uses_android_action_and_numeric_ids() {
+        let entry = SyncLogEntry {
+            timestamp: 100,
+            device_id: "desktop".into(),
+            action: "REMOVE_SONG".into(),
+            playlist_id: Some("7".into()),
+            song_id: Some("not-numeric".into()),
+            details: None,
+        };
+
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["action"], "REMOVE_SONG");
+        assert_eq!(value["playlistId"], 7);
+        assert!(value.get("songId").is_none());
+    }
+
+    #[test]
+    fn legacy_playlist_order_migrates_like_android_display_order() {
+        let playlist = SyncPlaylist {
+            id: "1".into(),
+            name: "Legacy".into(),
+            songs: vec![
+                SyncSong { id: "1".into(), added_at: 1, ..Default::default() },
+                SyncSong { id: "2".into(), added_at: 2, ..Default::default() },
+                SyncSong { id: "3".into(), added_at: 3, ..Default::default() },
+            ],
+            created_at: 10,
+            modified_at: 20,
+            is_deleted: false,
+            song_order_version: 0,
+        };
+
+        let normalized = playlist.normalized_for_display_order(100);
+
+        assert_eq!(normalized.song_order_version, DISPLAY_ORDER_SONG_ORDER_VERSION);
+        assert_eq!(
+            normalized.songs.iter().map(|song| song.id.as_str()).collect::<Vec<_>>(),
+            vec!["3", "2", "1"]
+        );
+        assert_eq!(
+            normalized.songs.iter().map(|song| song.added_at).collect::<Vec<_>>(),
+            vec![100, 99, 98]
+        );
+    }
+
+    #[test]
+    fn current_playlist_order_sorts_by_added_at_stably() {
+        let playlist = SyncPlaylist {
+            id: "1".into(),
+            name: "Current".into(),
+            songs: vec![
+                SyncSong { id: "1".into(), added_at: 20, ..Default::default() },
+                SyncSong { id: "2".into(), added_at: 30, ..Default::default() },
+                SyncSong { id: "3".into(), added_at: 30, ..Default::default() },
+                SyncSong { id: "4".into(), added_at: 10, ..Default::default() },
+            ],
+            created_at: 10,
+            modified_at: 20,
+            is_deleted: false,
+            song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
+        };
+
+        let normalized = playlist.normalized_for_display_order(100);
+
+        assert_eq!(
+            normalized.songs.iter().map(|song| song.id.as_str()).collect::<Vec<_>>(),
+            vec!["2", "3", "1", "4"]
+        );
+    }
 }

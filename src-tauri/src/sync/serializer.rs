@@ -45,11 +45,27 @@ pub fn deserialize_compressed(content: &str) -> AppResult<SyncData> {
     decoder.read_to_end(&mut proto_bytes)
         .map_err(|e| AppError::Other(format!("GZIP decompress: {}", e)))?;
 
-    // ProtoBuf 解码
-    let proto = ProtoSyncData::decode(&proto_bytes[..])
-        .map_err(|e| AppError::Other(format!("ProtoBuf decode: {}", e)))?;
-
-    Ok(proto_to_sync_data(&proto))
+    let current = ProtoSyncData::decode(&proto_bytes[..]).map(|proto| proto_to_sync_data(&proto));
+    match current {
+        Ok(data) => {
+            if let Ok(legacy_proto) = LegacyProtoSyncData::decode(&proto_bytes[..]) {
+                let legacy_data = legacy_proto_to_sync_data(&legacy_proto);
+                if should_use_legacy_decode(&data, &legacy_data) {
+                    return Ok(legacy_data);
+                }
+            }
+            Ok(data)
+        }
+        Err(current_err) => {
+            let legacy_proto = LegacyProtoSyncData::decode(&proto_bytes[..]).map_err(|legacy_err| {
+                AppError::Other(format!(
+                    "ProtoBuf decode: {}; legacy decode: {}",
+                    current_err, legacy_err
+                ))
+            })?;
+            Ok(legacy_proto_to_sync_data(&legacy_proto))
+        }
+    }
 }
 
 /// 根据 data_saver 标志选择序列化方式
@@ -110,30 +126,278 @@ fn proto_to_sync_data(p: &ProtoSyncData) -> SyncData {
     }
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyProtoSyncData {
+    #[prost(string, tag = "1")]
+    version: String,
+    #[prost(string, tag = "2")]
+    device_id: String,
+    #[prost(string, tag = "3")]
+    device_name: String,
+    #[prost(int64, tag = "4")]
+    last_modified: i64,
+    #[prost(message, repeated, tag = "5")]
+    playlists: Vec<LegacyProtoSyncPlaylist>,
+    #[prost(message, repeated, tag = "6")]
+    favorite_playlists: Vec<LegacyProtoSyncFavoritePlaylist>,
+    #[prost(message, repeated, tag = "7")]
+    recent_plays: Vec<LegacyProtoSyncRecentPlay>,
+    #[prost(message, repeated, tag = "8")]
+    sync_log: Vec<LegacyProtoSyncLogEntry>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyProtoSyncPlaylist {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(message, repeated, tag = "3")]
+    songs: Vec<LegacyProtoSyncSong>,
+    #[prost(int64, tag = "4")]
+    created_at: i64,
+    #[prost(int64, tag = "5")]
+    modified_at: i64,
+    #[prost(bool, tag = "6")]
+    is_deleted: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyProtoSyncSong {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    artist: String,
+    #[prost(string, tag = "4")]
+    album: String,
+    #[prost(int64, tag = "5")]
+    album_id: i64,
+    #[prost(int64, tag = "6")]
+    duration_ms: i64,
+    #[prost(string, optional, tag = "7")]
+    cover_url: Option<String>,
+    #[prost(int64, tag = "8")]
+    added_at: i64,
+    #[prost(string, optional, tag = "9")]
+    matched_lyric: Option<String>,
+    #[prost(string, optional, tag = "10")]
+    matched_translated_lyric: Option<String>,
+    #[prost(string, optional, tag = "11")]
+    matched_lyric_source: Option<String>,
+    #[prost(string, optional, tag = "12")]
+    matched_song_id: Option<String>,
+    #[prost(int64, tag = "13")]
+    user_lyric_offset_ms: i64,
+    #[prost(string, optional, tag = "14")]
+    custom_cover_url: Option<String>,
+    #[prost(string, optional, tag = "15")]
+    custom_name: Option<String>,
+    #[prost(string, optional, tag = "16")]
+    custom_artist: Option<String>,
+    #[prost(string, optional, tag = "17")]
+    original_name: Option<String>,
+    #[prost(string, optional, tag = "18")]
+    original_artist: Option<String>,
+    #[prost(string, optional, tag = "19")]
+    original_cover_url: Option<String>,
+    #[prost(string, optional, tag = "20")]
+    original_lyric: Option<String>,
+    #[prost(string, optional, tag = "21")]
+    original_translated_lyric: Option<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyProtoSyncRecentPlay {
+    #[prost(int64, tag = "1")]
+    song_id: i64,
+    #[prost(message, optional, tag = "2")]
+    song: Option<LegacyProtoSyncSong>,
+    #[prost(int64, tag = "3")]
+    played_at: i64,
+    #[prost(string, tag = "4")]
+    device_id: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyProtoSyncFavoritePlaylist {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, optional, tag = "3")]
+    cover_url: Option<String>,
+    #[prost(int32, tag = "4")]
+    track_count: i32,
+    #[prost(string, tag = "5")]
+    source: String,
+    #[prost(message, repeated, tag = "6")]
+    songs: Vec<LegacyProtoSyncSong>,
+    #[prost(int64, tag = "7")]
+    added_time: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyProtoSyncLogEntry {
+    #[prost(int64, tag = "1")]
+    timestamp: i64,
+    #[prost(string, tag = "2")]
+    device_id: String,
+    #[prost(int32, tag = "3")]
+    action: i32,
+    #[prost(int64, optional, tag = "4")]
+    playlist_id: Option<i64>,
+    #[prost(int64, optional, tag = "5")]
+    song_id: Option<i64>,
+    #[prost(string, optional, tag = "6")]
+    details: Option<String>,
+}
+
+fn should_use_legacy_decode(current: &SyncData, legacy: &SyncData) -> bool {
+    let current_added_at = non_zero_song_added_at_count(current);
+    let legacy_added_at = non_zero_song_added_at_count(legacy);
+    legacy_added_at > 0 && current_added_at == 0
+}
+
+fn non_zero_song_added_at_count(data: &SyncData) -> usize {
+    let playlist_songs = data.playlists.iter().flat_map(|playlist| playlist.songs.iter());
+    let favorite_songs = data.favorite_playlists.iter().flat_map(|playlist| playlist.songs.iter());
+    let recent_songs = data.recent_plays.iter().map(|play| &play.song);
+    playlist_songs
+        .chain(favorite_songs)
+        .chain(recent_songs)
+        .filter(|song| song.added_at != 0)
+        .count()
+}
+
+fn legacy_proto_to_sync_data(p: &LegacyProtoSyncData) -> SyncData {
+    SyncData {
+        version: if p.version.is_empty() { "2.0".into() } else { p.version.clone() },
+        device_id: p.device_id.clone(),
+        device_name: p.device_name.clone(),
+        last_modified: p.last_modified,
+        playlists: p.playlists.iter().map(legacy_proto_to_sync_playlist).collect(),
+        favorite_playlists: p.favorite_playlists.iter().map(legacy_proto_to_fav_playlist).collect(),
+        recent_plays: p.recent_plays.iter().map(legacy_proto_to_recent_play).collect(),
+        sync_log: p.sync_log.iter().map(legacy_proto_to_log_entry).collect(),
+        recent_play_deletions: Vec::new(),
+        playback_stats: Vec::new(),
+        playback_stats_cleared_at: 0,
+        playback_stat_buckets: Vec::new(),
+        playlist_song_deletions: Vec::new(),
+    }
+}
+
+fn legacy_proto_to_sync_playlist(p: &LegacyProtoSyncPlaylist) -> SyncPlaylist {
+    SyncPlaylist {
+        id: p.id.to_string(),
+        name: p.name.clone(),
+        songs: p.songs.iter().map(legacy_proto_to_sync_song).collect(),
+        created_at: p.created_at,
+        modified_at: p.modified_at,
+        is_deleted: p.is_deleted,
+        song_order_version: 0,
+    }
+}
+
+fn legacy_proto_to_sync_song(p: &LegacyProtoSyncSong) -> SyncSong {
+    SyncSong {
+        id: p.id.to_string(),
+        name: p.name.clone(),
+        artist: p.artist.clone(),
+        album: p.album.clone(),
+        album_id: p.album_id.to_string(),
+        duration_ms: p.duration_ms,
+        cover_url: p.cover_url.clone().unwrap_or_default(),
+        media_uri: String::new(),
+        added_at: p.added_at,
+        matched_lyric: p.matched_lyric.clone(),
+        matched_translated_lyric: p.matched_translated_lyric.clone(),
+        matched_lyric_source: p.matched_lyric_source.clone(),
+        matched_song_id: p.matched_song_id.clone(),
+        user_lyric_offset_ms: p.user_lyric_offset_ms,
+        custom_cover_url: p.custom_cover_url.clone(),
+        custom_name: p.custom_name.clone(),
+        custom_artist: p.custom_artist.clone(),
+        original_name: p.original_name.clone(),
+        original_artist: p.original_artist.clone(),
+        original_cover_url: p.original_cover_url.clone(),
+        original_lyric: p.original_lyric.clone(),
+        original_translated_lyric: p.original_translated_lyric.clone(),
+        channel_id: None,
+        audio_id: None,
+        sub_audio_id: None,
+        playlist_context_id: None,
+        sync_membership_tokens: Vec::new(),
+    }
+}
+
+fn legacy_proto_to_recent_play(p: &LegacyProtoSyncRecentPlay) -> SyncRecentPlay {
+    SyncRecentPlay {
+        song_id: p.song_id.to_string(),
+        song: p.song.as_ref().map(legacy_proto_to_sync_song).unwrap_or_else(|| SyncSong {
+            id: p.song_id.to_string(),
+            ..Default::default()
+        }),
+        played_at: p.played_at,
+        device_id: p.device_id.clone(),
+    }
+}
+
+fn legacy_proto_to_fav_playlist(p: &LegacyProtoSyncFavoritePlaylist) -> SyncFavoritePlaylist {
+    SyncFavoritePlaylist {
+        id: p.id.to_string(),
+        name: p.name.clone(),
+        cover_url: p.cover_url.clone().unwrap_or_default(),
+        track_count: p.track_count,
+        source: p.source.clone(),
+        songs: p.songs.iter().map(legacy_proto_to_sync_song).collect(),
+        added_time: p.added_time,
+        modified_at: p.added_time,
+        is_deleted: false,
+        sort_order: p.added_time,
+        browse_id: None,
+        playlist_id: None,
+        subtitle: None,
+    }
+}
+
+fn legacy_proto_to_log_entry(p: &LegacyProtoSyncLogEntry) -> SyncLogEntry {
+    SyncLogEntry {
+        timestamp: p.timestamp,
+        device_id: p.device_id.clone(),
+        action: sync_action_from_code(p.action),
+        playlist_id: p.playlist_id.map(|v| v.to_string()),
+        song_id: p.song_id.map(|v| v.to_string()),
+        details: p.details.clone(),
+    }
+}
+
 fn sync_song_to_proto(s: &SyncSong) -> ProtoSyncSong {
     ProtoSyncSong {
-        id: s.id.parse::<i64>().unwrap_or(0),
+        id: sync_i64_from_string(&s.id),
         name: s.name.clone(),
         artist: s.artist.clone(),
         album: s.album.clone(),
-        album_id: s.album_id.parse::<i64>().unwrap_or(0),
+        album_id: sync_i64_from_string(&s.album_id),
         duration_ms: s.duration_ms,
         cover_url: if s.cover_url.is_empty() { None } else { Some(s.cover_url.clone()) },
         media_uri: if s.media_uri.is_empty() { None } else { Some(s.media_uri.clone()) },
         added_at: s.added_at,
-        matched_lyric: s.lyric.clone(),
-        matched_translated_lyric: s.translated_lyric.clone(),
-        matched_lyric_source: s.lyric_source.clone(),
-        matched_song_id: s.lyric_song_id.clone(),
-        user_lyric_offset_ms: s.user_lyric_offset_ms.unwrap_or(0),
+        matched_lyric: s.matched_lyric.clone(),
+        matched_translated_lyric: s.matched_translated_lyric.clone(),
+        matched_lyric_source: s.matched_lyric_source.clone(),
+        matched_song_id: s.matched_song_id.clone(),
+        user_lyric_offset_ms: s.user_lyric_offset_ms,
         custom_cover_url: s.custom_cover_url.clone(),
         custom_name: s.custom_name.clone(),
         custom_artist: s.custom_artist.clone(),
         original_name: s.original_name.clone(),
         original_artist: s.original_artist.clone(),
         original_cover_url: s.original_cover_url.clone(),
-        original_lyric: None,
-        original_translated_lyric: None,
+        original_lyric: s.original_lyric.clone(),
+        original_translated_lyric: s.original_translated_lyric.clone(),
         channel_id: s.channel_id.clone(),
         audio_id: s.audio_id.clone(),
         sub_audio_id: s.sub_audio_id.clone(),
@@ -153,17 +417,19 @@ fn proto_to_sync_song(p: &ProtoSyncSong) -> SyncSong {
         cover_url: p.cover_url.clone().unwrap_or_default(),
         media_uri: p.media_uri.clone().unwrap_or_default(),
         added_at: p.added_at,
-        lyric: p.matched_lyric.clone(),
-        translated_lyric: p.matched_translated_lyric.clone(),
-        lyric_source: p.matched_lyric_source.clone(),
-        lyric_song_id: p.matched_song_id.clone(),
-        user_lyric_offset_ms: if p.user_lyric_offset_ms != 0 { Some(p.user_lyric_offset_ms) } else { None },
+        matched_lyric: p.matched_lyric.clone(),
+        matched_translated_lyric: p.matched_translated_lyric.clone(),
+        matched_lyric_source: p.matched_lyric_source.clone(),
+        matched_song_id: p.matched_song_id.clone(),
+        user_lyric_offset_ms: p.user_lyric_offset_ms,
         custom_cover_url: p.custom_cover_url.clone(),
         custom_name: p.custom_name.clone(),
         custom_artist: p.custom_artist.clone(),
         original_cover_url: p.original_cover_url.clone(),
         original_name: p.original_name.clone(),
         original_artist: p.original_artist.clone(),
+        original_lyric: p.original_lyric.clone(),
+        original_translated_lyric: p.original_translated_lyric.clone(),
         channel_id: p.channel_id.clone(),
         audio_id: p.audio_id.clone(),
         sub_audio_id: p.sub_audio_id.clone(),
@@ -174,7 +440,7 @@ fn proto_to_sync_song(p: &ProtoSyncSong) -> SyncSong {
 
 fn sync_playlist_to_proto(p: &SyncPlaylist) -> ProtoSyncPlaylist {
     ProtoSyncPlaylist {
-        id: p.id.parse::<i64>().unwrap_or(0),
+        id: sync_i64_from_string(&p.id),
         name: p.name.clone(),
         songs: p.songs.iter().map(sync_song_to_proto).collect(),
         created_at: p.created_at,
@@ -198,7 +464,7 @@ fn proto_to_sync_playlist(p: &ProtoSyncPlaylist) -> SyncPlaylist {
 
 fn fav_playlist_to_proto(f: &SyncFavoritePlaylist) -> ProtoSyncFavoritePlaylist {
     ProtoSyncFavoritePlaylist {
-        id: f.id.parse::<i64>().unwrap_or(0),
+        id: sync_i64_from_string(&f.id),
         name: f.name.clone(),
         cover_url: if f.cover_url.is_empty() { None } else { Some(f.cover_url.clone()) },
         track_count: f.track_count,
@@ -207,7 +473,7 @@ fn fav_playlist_to_proto(f: &SyncFavoritePlaylist) -> ProtoSyncFavoritePlaylist 
         added_time: f.added_time,
         modified_at: f.modified_at,
         is_deleted: f.is_deleted,
-        sort_order: f.sort_order as i64,
+        sort_order: f.sort_order,
         browse_id: f.browse_id.clone(),
         playlist_id: f.playlist_id.clone(),
         subtitle: f.subtitle.clone(),
@@ -225,7 +491,7 @@ fn proto_to_fav_playlist(p: &ProtoSyncFavoritePlaylist) -> SyncFavoritePlaylist 
         added_time: p.added_time,
         modified_at: p.modified_at,
         is_deleted: p.is_deleted,
-        sort_order: p.sort_order as i32,
+        sort_order: p.sort_order,
         browse_id: p.browse_id.clone(),
         playlist_id: p.playlist_id.clone(),
         subtitle: p.subtitle.clone(),
@@ -234,7 +500,7 @@ fn proto_to_fav_playlist(p: &ProtoSyncFavoritePlaylist) -> SyncFavoritePlaylist 
 
 fn recent_play_to_proto(r: &SyncRecentPlay) -> ProtoSyncRecentPlay {
     ProtoSyncRecentPlay {
-        song_id: r.song_id.parse::<i64>().unwrap_or(0),
+        song_id: sync_i64_from_string(&r.song_id),
         song: Some(sync_song_to_proto(&r.song)),
         played_at: r.played_at,
         device_id: r.device_id.clone(),
@@ -257,7 +523,7 @@ fn log_entry_to_proto(e: &SyncLogEntry) -> ProtoSyncLogEntry {
     ProtoSyncLogEntry {
         timestamp: e.timestamp,
         device_id: e.device_id.clone(),
-        action: 0, // 简化：不映射 enum
+        action: sync_action_to_code(&e.action),
         playlist_id: e.playlist_id.as_ref().and_then(|s| s.parse::<i64>().ok()),
         song_id: e.song_id.as_ref().and_then(|s| s.parse::<i64>().ok()),
         details: e.details.clone(),
@@ -268,7 +534,7 @@ fn proto_to_log_entry(p: &ProtoSyncLogEntry) -> SyncLogEntry {
     SyncLogEntry {
         timestamp: p.timestamp,
         device_id: p.device_id.clone(),
-        action: String::new(),
+        action: sync_action_from_code(p.action),
         playlist_id: p.playlist_id.map(|v| v.to_string()),
         song_id: p.song_id.map(|v| v.to_string()),
         details: p.details.clone(),
@@ -277,7 +543,7 @@ fn proto_to_log_entry(p: &ProtoSyncLogEntry) -> SyncLogEntry {
 
 fn deletion_to_proto(d: &SyncRecentPlayDeletion) -> ProtoSyncRecentPlayDeletion {
     ProtoSyncRecentPlayDeletion {
-        song_id: d.song_id.parse::<i64>().unwrap_or(0),
+        song_id: sync_i64_from_string(&d.song_id),
         album: d.album.clone(),
         media_uri: if d.media_uri.is_empty() { None } else { Some(d.media_uri.clone()) },
         deleted_at: d.deleted_at,
@@ -346,8 +612,8 @@ fn track_stat_to_proto(s: &SyncTrackStat) -> ProtoSyncTrackStat {
         cover_url: s.cover_url.clone(),
         duration_ms: s.duration_ms,
         media_uri: s.media_uri.clone(),
-        id: s.id.parse::<i64>().unwrap_or(0),
-        album_id: s.album_id.parse::<i64>().unwrap_or(0),
+        id: sync_i64_from_string(&s.id),
+        album_id: sync_i64_from_string(&s.album_id),
         counter_base_listen_ms: s.counter_base_listen_ms,
         counter_base_play_count: s.counter_base_play_count,
         counter_shards: s.counter_shards.iter().map(counter_shard_to_proto).collect(),
@@ -389,8 +655,8 @@ fn stat_bucket_to_proto(b: &SyncPlaybackStatBucket) -> ProtoSyncPlaybackStatBuck
         cover_url: b.cover_url.clone(),
         duration_ms: b.duration_ms,
         media_uri: b.media_uri.clone(),
-        id: b.id.parse::<i64>().unwrap_or(0),
-        album_id: b.album_id.parse::<i64>().unwrap_or(0),
+        id: sync_i64_from_string(&b.id),
+        album_id: sync_i64_from_string(&b.album_id),
         counter_base_listen_ms: b.counter_base_listen_ms,
         counter_base_play_count: b.counter_base_play_count,
         counter_shards: b.counter_shards.iter().map(counter_shard_to_proto).collect(),
@@ -421,8 +687,8 @@ fn proto_to_stat_bucket(p: &ProtoSyncPlaybackStatBucket) -> SyncPlaybackStatBuck
 
 fn playlist_song_deletion_to_proto(d: &SyncPlaylistSongDeletion) -> ProtoSyncPlaylistSongDeletion {
     ProtoSyncPlaylistSongDeletion {
-        playlist_id: d.playlist_id.parse::<i64>().unwrap_or(0),
-        song_id: d.song_id.parse::<i64>().unwrap_or(0),
+        playlist_id: sync_i64_from_string(&d.playlist_id),
+        song_id: sync_i64_from_string(&d.song_id),
         album: d.album.clone(),
         media_uri: d.media_uri.clone(),
         deleted_at: d.deleted_at,
@@ -440,5 +706,136 @@ fn proto_to_playlist_song_deletion(p: &ProtoSyncPlaylistSongDeletion) -> SyncPla
         deleted_at: p.deleted_at,
         device_id: p.device_id.clone(),
         removed_membership_tokens: p.removed_membership_tokens.iter().map(proto_to_causal_token).collect(),
+    }
+}
+
+#[cfg(test)]
+mod compressed_contract_tests {
+    use super::*;
+
+    #[test]
+    fn compressed_roundtrip_preserves_android_only_song_fields_and_action() {
+        let song = SyncSong {
+            id: "42".into(),
+            name: "Song".into(),
+            album_id: "9".into(),
+            matched_lyric: Some("matched".into()),
+            matched_translated_lyric: Some("translated".into()),
+            matched_lyric_source: Some("NETEASE".into()),
+            matched_song_id: Some("song-key".into()),
+            original_lyric: Some("original".into()),
+            original_translated_lyric: Some("original translated".into()),
+            ..Default::default()
+        };
+        let data = SyncData {
+            version: "2.0".into(),
+            device_id: "desktop".into(),
+            device_name: "Desktop".into(),
+            playlists: vec![SyncPlaylist {
+                id: "1".into(),
+                name: "Playlist".into(),
+                songs: vec![song],
+                created_at: 10,
+                modified_at: 20,
+                is_deleted: false,
+                song_order_version: 1,
+            }],
+            sync_log: vec![SyncLogEntry {
+                timestamp: 30,
+                device_id: "desktop".into(),
+                action: "REMOVE_SONG".into(),
+                playlist_id: Some("1".into()),
+                song_id: Some("42".into()),
+                details: Some("removed".into()),
+            }],
+            ..Default::default()
+        };
+
+        let encoded = serialize_compressed(&data).unwrap();
+        let decoded = deserialize_compressed(&encoded).unwrap();
+        let decoded_song = &decoded.playlists[0].songs[0];
+
+        assert_eq!(decoded_song.matched_lyric.as_deref(), Some("matched"));
+        assert_eq!(decoded_song.matched_translated_lyric.as_deref(), Some("translated"));
+        assert_eq!(decoded_song.matched_lyric_source.as_deref(), Some("NETEASE"));
+        assert_eq!(decoded_song.matched_song_id.as_deref(), Some("song-key"));
+        assert_eq!(decoded_song.original_lyric.as_deref(), Some("original"));
+        assert_eq!(
+            decoded_song.original_translated_lyric.as_deref(),
+            Some("original translated")
+        );
+        assert_eq!(decoded.sync_log[0].action, "REMOVE_SONG");
+    }
+
+    #[test]
+    fn compressed_decode_accepts_legacy_android_song_field_numbers() {
+        let legacy = LegacyProtoSyncData {
+            version: "2.0".into(),
+            device_id: "android".into(),
+            device_name: "Android".into(),
+            last_modified: 100,
+            playlists: vec![LegacyProtoSyncPlaylist {
+                id: 7,
+                name: "Legacy".into(),
+                songs: vec![LegacyProtoSyncSong {
+                    id: 42,
+                    name: "Song".into(),
+                    artist: "Artist".into(),
+                    album: "Album".into(),
+                    album_id: 9,
+                    duration_ms: 1234,
+                    cover_url: Some("https://cover".into()),
+                    added_at: 88,
+                    matched_lyric: Some("matched".into()),
+                    matched_translated_lyric: Some("translated".into()),
+                    matched_lyric_source: Some("NETEASE".into()),
+                    matched_song_id: Some("song-key".into()),
+                    user_lyric_offset_ms: 12,
+                    custom_cover_url: Some("https://custom".into()),
+                    custom_name: Some("Custom".into()),
+                    custom_artist: Some("Custom Artist".into()),
+                    original_name: Some("Original".into()),
+                    original_artist: Some("Original Artist".into()),
+                    original_cover_url: Some("https://original".into()),
+                    original_lyric: Some("original lyric".into()),
+                    original_translated_lyric: Some("original translated".into()),
+                }],
+                created_at: 10,
+                modified_at: 20,
+                is_deleted: false,
+            }],
+            favorite_playlists: Vec::new(),
+            recent_plays: Vec::new(),
+            sync_log: vec![LegacyProtoSyncLogEntry {
+                timestamp: 30,
+                device_id: "android".into(),
+                action: sync_action_to_code("ADD_SONG"),
+                playlist_id: Some(7),
+                song_id: Some(42),
+                details: Some("legacy".into()),
+            }],
+        };
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&legacy.encode_to_vec()).unwrap();
+        let encoded = BASE64.encode(encoder.finish().unwrap());
+
+        let decoded = deserialize_compressed(&encoded).unwrap();
+        let decoded_song = &decoded.playlists[0].songs[0];
+
+        assert_eq!(decoded.playlists[0].song_order_version, 0);
+        assert_eq!(decoded_song.id, "42");
+        assert_eq!(decoded_song.added_at, 88);
+        assert_eq!(decoded_song.media_uri, "");
+        assert_eq!(decoded_song.matched_lyric.as_deref(), Some("matched"));
+        assert_eq!(decoded_song.matched_translated_lyric.as_deref(), Some("translated"));
+        assert_eq!(decoded_song.matched_lyric_source.as_deref(), Some("NETEASE"));
+        assert_eq!(decoded_song.matched_song_id.as_deref(), Some("song-key"));
+        assert_eq!(decoded_song.user_lyric_offset_ms, 12);
+        assert_eq!(decoded_song.original_lyric.as_deref(), Some("original lyric"));
+        assert_eq!(
+            decoded_song.original_translated_lyric.as_deref(),
+            Some("original translated")
+        );
+        assert_eq!(decoded.sync_log[0].action, "ADD_SONG");
     }
 }

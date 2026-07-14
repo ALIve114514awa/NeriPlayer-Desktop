@@ -377,11 +377,11 @@ pub async fn export_playlists(app: AppHandle) -> AppResult<Value> {
         crate::sync::models::SyncPlaylist {
             id: pl.id.to_string(),
             name: pl.name.clone(),
-            songs: pl.tracks.iter().map(|t| crate::sync::manager::track_to_sync_song_pub(t)).collect(),
+            songs: crate::sync::manager::tracks_to_sync_songs_pub(&pl.tracks),
             created_at: pl.modified_at as i64,
             modified_at: pl.modified_at as i64,
             is_deleted: false,
-            song_order_version: 0,
+            song_order_version: 1,
         }
     }).collect();
 
