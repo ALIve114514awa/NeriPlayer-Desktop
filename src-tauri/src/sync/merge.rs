@@ -30,6 +30,10 @@ pub fn three_way_merge(
         recent_plays: recent,
         sync_log: log,
         recent_play_deletions: deletions,
+        playback_stats: merge_playback_stats(&local.playback_stats, &remote.playback_stats),
+        playback_stats_cleared_at: local.playback_stats_cleared_at.max(remote.playback_stats_cleared_at),
+        playback_stat_buckets: merge_stat_buckets(&local.playback_stat_buckets, &remote.playback_stat_buckets),
+        playlist_song_deletions: merge_playlist_song_deletions(&local.playlist_song_deletions, &remote.playlist_song_deletions),
     }
 }
 
@@ -94,6 +98,7 @@ fn merge_single_playlist(local: &SyncPlaylist, remote: &SyncPlaylist, last_sync_
         created_at: local.created_at.min(remote.created_at),
         modified_at: local.modified_at.max(remote.modified_at),
         is_deleted: false,
+        song_order_version: local.song_order_version.max(remote.song_order_version),
     }
 }
 
@@ -364,4 +369,89 @@ pub fn has_data_changed(remote: &SyncData, merged: &SyncData) -> bool {
     }
 
     false
+}
+
+// ===== 播放统计合并 — CRDT 风格 counter-shard 策略 =====
+
+fn merge_counter_shards(local: &[SyncPlaybackCounterShard], remote: &[SyncPlaybackCounterShard]) -> Vec<SyncPlaybackCounterShard> {
+    let mut by_device: HashMap<String, SyncPlaybackCounterShard> = HashMap::new();
+
+    for shard in local.iter().chain(remote.iter()) {
+        let entry = by_device.entry(shard.device_id.clone()).or_insert_with(|| shard.clone());
+        if shard.last_played_at > entry.last_played_at {
+            *entry = shard.clone();
+        }
+    }
+
+    by_device.into_values().collect()
+}
+
+fn merge_playback_stats(local: &[SyncTrackStat], remote: &[SyncTrackStat]) -> Vec<SyncTrackStat> {
+    let mut by_key: HashMap<String, SyncTrackStat> = HashMap::new();
+
+    for stat in local.iter() {
+        by_key.insert(stat.identity_key.clone(), stat.clone());
+    }
+
+    for stat in remote.iter() {
+        if let Some(entry) = by_key.get_mut(&stat.identity_key) {
+            entry.counter_shards = merge_counter_shards(&entry.counter_shards, &stat.counter_shards);
+            entry.last_played_at = entry.last_played_at.max(stat.last_played_at);
+            entry.first_played_at = if entry.first_played_at == 0 { stat.first_played_at } else { entry.first_played_at.min(stat.first_played_at) };
+            let total: (i64, i32) = entry.counter_shards.iter().fold((0, 0), |(ms, c), s| (ms + s.total_listen_ms, c + s.play_count));
+            entry.total_listen_ms = entry.counter_base_listen_ms + total.0;
+            entry.play_count = entry.counter_base_play_count + total.1;
+        } else {
+            by_key.insert(stat.identity_key.clone(), stat.clone());
+        }
+    }
+
+    by_key.into_values().collect()
+}
+
+fn merge_stat_buckets(local: &[SyncPlaybackStatBucket], remote: &[SyncPlaybackStatBucket]) -> Vec<SyncPlaybackStatBucket> {
+    let mut by_key: HashMap<(i64, String), SyncPlaybackStatBucket> = HashMap::new();
+
+    for bucket in local.iter() {
+        by_key.insert((bucket.day_start_at, bucket.identity_key.clone()), bucket.clone());
+    }
+
+    for bucket in remote.iter() {
+        let key = (bucket.day_start_at, bucket.identity_key.clone());
+        let entry = by_key.entry(key).or_insert_with(|| bucket.clone());
+        entry.counter_shards = merge_counter_shards(&entry.counter_shards, &bucket.counter_shards);
+        entry.last_played_at = entry.last_played_at.max(bucket.last_played_at);
+        entry.first_played_at = if entry.first_played_at == 0 { bucket.first_played_at } else { entry.first_played_at.min(bucket.first_played_at) };
+        let total: (i64, i32) = entry.counter_shards.iter().fold((0, 0), |(ms, c), s| (ms + s.total_listen_ms, c + s.play_count));
+        entry.total_listen_ms = entry.counter_base_listen_ms + total.0;
+        entry.play_count = entry.counter_base_play_count + total.1;
+    }
+
+    by_key.into_values().collect()
+}
+
+fn merge_playlist_song_deletions(local: &[SyncPlaylistSongDeletion], remote: &[SyncPlaylistSongDeletion]) -> Vec<SyncPlaylistSongDeletion> {
+    let mut by_key: HashMap<String, SyncPlaylistSongDeletion> = HashMap::new();
+
+    for d in local.iter().chain(remote.iter()) {
+        let key = d.identity();
+        let entry = by_key.entry(key).or_insert_with(|| d.clone());
+        if d.deleted_at > entry.deleted_at {
+            *entry = d.clone();
+        }
+        // union membership tokens
+        let existing_tokens: HashSet<String> = entry.removed_membership_tokens.iter()
+            .map(|t| format!("{}:{}", t.device_id, t.counter)).collect();
+        for t in &d.removed_membership_tokens {
+            let tk = format!("{}:{}", t.device_id, t.counter);
+            if !existing_tokens.contains(&tk) {
+                entry.removed_membership_tokens.push(t.clone());
+            }
+        }
+    }
+
+    let mut result: Vec<SyncPlaylistSongDeletion> = by_key.into_values().collect();
+    result.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    result.truncate(MAX_DELETIONS);
+    result
 }

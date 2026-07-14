@@ -215,6 +215,10 @@ pub fn build_local_sync_data(app: &AppHandle) -> SyncData {
         recent_plays: Vec::new(),
         sync_log: Vec::new(),
         recent_play_deletions: Vec::new(),
+        playback_stats: Vec::new(),
+        playback_stats_cleared_at: 0,
+        playback_stat_buckets: Vec::new(),
+        playlist_song_deletions: Vec::new(),
     }
 }
 
@@ -291,6 +295,7 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
         audio_id: None,
         sub_audio_id: None,
         playlist_context_id: None,
+        sync_membership_tokens: Vec::new(),
     }
 }
 
@@ -348,9 +353,10 @@ fn load_local_playlists(_app: &AppHandle) -> Vec<SyncPlaylist> {
         id: pl.id.to_string(),
         name: pl.name.clone(),
         songs: pl.tracks.iter().map(track_to_sync_song).collect(),
-        created_at: pl.modified_at as i64, // 本地无 created_at，用 modified_at 代替
+        created_at: pl.modified_at as i64,
         modified_at: pl.modified_at as i64,
         is_deleted: false,
+        song_order_version: 0,
     }).collect()
 }
 

@@ -381,6 +381,7 @@ pub async fn export_playlists(app: AppHandle) -> AppResult<Value> {
             created_at: pl.modified_at as i64,
             modified_at: pl.modified_at as i64,
             is_deleted: false,
+            song_order_version: 0,
         }
     }).collect();
 

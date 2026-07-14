@@ -100,6 +100,14 @@ pub struct SyncData {
     pub sync_log: Vec<SyncLogEntry>,
     #[serde(default)]
     pub recent_play_deletions: Vec<SyncRecentPlayDeletion>,
+    #[serde(default)]
+    pub playback_stats: Vec<SyncTrackStat>,
+    #[serde(default)]
+    pub playback_stats_cleared_at: i64,
+    #[serde(default)]
+    pub playback_stat_buckets: Vec<SyncPlaybackStatBucket>,
+    #[serde(default)]
+    pub playlist_song_deletions: Vec<SyncPlaylistSongDeletion>,
 }
 
 fn default_version() -> String { "2.0".into() }
@@ -118,6 +126,8 @@ pub struct SyncPlaylist {
     pub modified_at: i64,
     #[serde(default)]
     pub is_deleted: bool,
+    #[serde(default)]
+    pub song_order_version: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -175,6 +185,8 @@ pub struct SyncSong {
     pub sub_audio_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_string_or_number")]
     pub playlist_context_id: Option<String>,
+    #[serde(default)]
+    pub sync_membership_tokens: Vec<SyncCausalToken>,
 }
 
 impl SyncSong {
@@ -292,6 +304,138 @@ pub struct SyncLogEntry {
     pub song_id: Option<String>,
     #[serde(default)]
     pub details: Option<String>,
+}
+
+/// 因果一致性令牌
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncCausalToken {
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub counter: i64,
+}
+
+/// 单曲播放统计
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncTrackStat {
+    #[serde(default)]
+    pub identity_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub total_listen_ms: i64,
+    #[serde(default)]
+    pub play_count: i32,
+    #[serde(default)]
+    pub last_played_at: i64,
+    #[serde(default)]
+    pub first_played_at: i64,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub media_uri: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    pub album_id: String,
+    #[serde(default)]
+    pub counter_base_listen_ms: i64,
+    #[serde(default)]
+    pub counter_base_play_count: i32,
+    #[serde(default)]
+    pub counter_shards: Vec<SyncPlaybackCounterShard>,
+}
+
+/// 播放计数分片
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPlaybackCounterShard {
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub epoch_started_at: i64,
+    #[serde(default)]
+    pub total_listen_ms: i64,
+    #[serde(default)]
+    pub play_count: i32,
+    #[serde(default)]
+    pub first_played_at: i64,
+    #[serde(default)]
+    pub last_played_at: i64,
+}
+
+/// 按天分桶的播放统计
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPlaybackStatBucket {
+    #[serde(default)]
+    pub day_start_at: i64,
+    #[serde(default)]
+    pub identity_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub total_listen_ms: i64,
+    #[serde(default)]
+    pub play_count: i32,
+    #[serde(default)]
+    pub last_played_at: i64,
+    #[serde(default)]
+    pub first_played_at: i64,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub media_uri: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    pub album_id: String,
+    #[serde(default)]
+    pub counter_base_listen_ms: i64,
+    #[serde(default)]
+    pub counter_base_play_count: i32,
+    #[serde(default)]
+    pub counter_shards: Vec<SyncPlaybackCounterShard>,
+}
+
+/// 歌单内歌曲删除记录
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPlaylistSongDeletion {
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    pub playlist_id: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    pub song_id: String,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub media_uri: Option<String>,
+    #[serde(default)]
+    pub deleted_at: i64,
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub removed_membership_tokens: Vec<SyncCausalToken>,
+}
+
+impl SyncPlaylistSongDeletion {
+    pub fn identity(&self) -> String {
+        format!("{}|{}|{}", self.playlist_id, self.song_id, self.album)
+    }
 }
 
 /// 同步结果
