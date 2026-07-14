@@ -16,8 +16,10 @@ type CoverSnapshot = {
 const emit = defineEmits<{ expand: [] }>()
 const props = withDefaults(defineProps<{
   coverHiddenByFlip?: boolean
+  coverFallbackSrc?: string
 }>(), {
   coverHiddenByFlip: false,
+  coverFallbackSrc: '',
 })
 const player = usePlayerStore()
 const lt = useListenTogetherStore()
@@ -124,6 +126,9 @@ const currentTimeMs = computed(() =>
 const currentTimeFormatted = computed(() => formatTime(currentTimeMs.value))
 const durationFormatted = computed(() => formatTime(player.durationMs))
 const miniTrackKey = computed(() => player.currentTrack?.id || 'empty')
+const displayCoverUrl = computed(() =>
+  props.coverFallbackSrc || player.currentTrack?.coverUrl || '',
+)
 const miniDownloadStateKey = computed(() =>
   `${miniTrackKey.value}:${player.isPlayingFromDownload ? 'download' : 'stream'}`
 )
@@ -131,7 +136,7 @@ const coverRef = ref<HTMLDivElement>()
 
 function getCoverSnapshot(): CoverSnapshot | null {
   const el = coverRef.value
-  const src = player.currentTrack?.coverUrl || ''
+  const src = displayCoverUrl.value
   if (!el || !src) return null
   const rect = el.getBoundingClientRect()
   return {
@@ -182,17 +187,17 @@ defineExpose({
         <div ref="coverRef" class="mp-cover" :class="{ playing: player.isPlaying, 'mp-cover-hidden': props.coverHiddenByFlip }">
           <transition name="mp-cover-swap" mode="out-in">
             <BilibiliCoverImage
-              v-if="player.currentTrack?.coverUrl && player.currentTrack.id.startsWith('bilibili:')"
+              v-if="displayCoverUrl && player.currentTrack?.id.startsWith('bilibili:') && !props.coverFallbackSrc"
               :key="`cover:${miniTrackKey}`"
-              :src="player.currentTrack.coverUrl"
+              :src="displayCoverUrl"
               class="mp-cover-img"
             >
               <span class="material-symbols-rounded filled" style="font-size: 20px; opacity: 0.6">music_note</span>
             </BilibiliCoverImage>
             <img
-              v-else-if="player.currentTrack?.coverUrl"
+              v-else-if="displayCoverUrl"
               :key="`cover:${miniTrackKey}`"
-              :src="player.currentTrack.coverUrl"
+              :src="displayCoverUrl"
               referrerpolicy="no-referrer"
               class="mp-cover-img"
             />
@@ -460,7 +465,7 @@ defineExpose({
 .mp-title {
   font-size: 14px;
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1.45;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -469,7 +474,7 @@ defineExpose({
 .mp-artist {
   font-size: 12px;
   color: var(--md-on-surface-variant);
-  line-height: 1.3;
+  line-height: 1.45;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -479,7 +484,7 @@ defineExpose({
   font-size: 11px;
   color: var(--md-on-surface-variant);
   opacity: 0.7;
-  line-height: 1.3;
+  line-height: 1.45;
   font-variant-numeric: tabular-nums;
   margin-top: 1px;
 }

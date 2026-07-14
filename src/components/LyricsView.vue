@@ -437,7 +437,7 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
   display: block;
   font-size: calc(18px * var(--lyric-font-scale, 1));
   font-weight: 700;
-  line-height: calc(21.24px * var(--lyric-font-scale, 1));
+  line-height: 1.35;
   letter-spacing: 0;
   color: rgba(255, 255, 255, 0.22);
   white-space: pre-wrap;
@@ -508,7 +508,7 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
   font-weight: 600;
   color: rgba(255, 255, 255, 0.4);
   margin-top: 4px;
-  line-height: calc(12.5px * var(--lyric-font-scale, 1));
+  line-height: 1.35;
   position: relative;
   z-index: 1;
 

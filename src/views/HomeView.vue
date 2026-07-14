@@ -367,8 +367,8 @@ function formatNotifTime(ts: number): string {
           @click="player.play(searchResultToTrack(song))"
         >
           <div class="song-grid-cover">
-            <img v-if="song.cover_url" :src="song.cover_url" referrerpolicy="no-referrer" loading="lazy" />
-            <span v-else class="material-symbols-rounded filled">music_note</span>
+            <span class="material-symbols-rounded filled cover-fallback">music_note</span>
+            <img v-if="song.cover_url" :src="song.cover_url" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="song-grid-info">
             <div class="song-grid-title">{{ song.title }}</div>
@@ -402,8 +402,8 @@ function formatNotifTime(ts: number): string {
           @click="player.play(searchResultToTrack(song))"
         >
           <div class="song-grid-cover">
-            <img v-if="song.cover_url" :src="song.cover_url" referrerpolicy="no-referrer" loading="lazy" />
-            <span v-else class="material-symbols-rounded filled">music_note</span>
+            <span class="material-symbols-rounded filled cover-fallback">music_note</span>
+            <img v-if="song.cover_url" :src="song.cover_url" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="song-grid-info">
             <div class="song-grid-title">{{ song.title }}</div>
@@ -430,8 +430,8 @@ function formatNotifTime(ts: number): string {
           @click="router.push({ name: 'netease-playlist', params: { id: pl.id } })"
         >
           <div class="playlist-cover">
-            <img v-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
-            <span v-else class="material-symbols-rounded filled">queue_music</span>
+            <span class="material-symbols-rounded filled cover-fallback">queue_music</span>
+            <img v-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="playlist-name">{{ pl.name }}</div>
         </div>
@@ -451,8 +451,8 @@ function formatNotifTime(ts: number): string {
           @click="playDailySong(song)"
         >
           <div class="daily-cover">
-            <img v-if="song.al?.picUrl" :src="song.al.picUrl" referrerpolicy="no-referrer" loading="lazy" />
-            <span v-else class="material-symbols-rounded filled">music_note</span>
+            <span class="material-symbols-rounded filled cover-fallback">music_note</span>
+            <img v-if="song.al?.picUrl" :src="song.al.picUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="daily-name">{{ song.name }}</div>
           <div class="daily-artist">{{ song.ar?.map((a: any) => a.name).join(', ') }}</div>
@@ -480,8 +480,8 @@ function formatNotifTime(ts: number): string {
           @click="openYoutubeHomeItem(item)"
         >
           <div class="daily-cover">
-            <img v-if="item.coverUrl" :src="item.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
-            <span v-else class="material-symbols-rounded filled">music_note</span>
+            <span class="material-symbols-rounded filled cover-fallback">music_note</span>
+            <img v-if="item.coverUrl" :src="item.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="daily-name">{{ item.title }}</div>
           <div class="daily-artist">{{ item.subtitle }}</div>
@@ -506,11 +506,11 @@ function formatNotifTime(ts: number): string {
           @click="openPlatformPlaylist(pl)"
         >
           <div class="playlist-cover">
+            <span class="material-symbols-rounded filled cover-fallback">queue_music</span>
             <BilibiliCoverImage v-if="pl.coverUrl && pl.platform === 'bilibili'" :src="pl.coverUrl" loading="lazy">
               <span class="material-symbols-rounded filled">queue_music</span>
             </BilibiliCoverImage>
-            <img v-else-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
-            <span v-else class="material-symbols-rounded filled">queue_music</span>
+            <img v-else-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="playlist-name">{{ pl.name }}</div>
         </div>
@@ -534,6 +534,7 @@ function formatNotifTime(ts: number): string {
           @click="player.play(track)"
         >
           <div class="daily-cover">
+            <span class="material-symbols-rounded filled cover-fallback">music_note</span>
             <img
               v-if="track.coverUrl"
               :src="track.coverUrl"
@@ -541,7 +542,6 @@ function formatNotifTime(ts: number): string {
               loading="lazy"
               @error="($event.target as HTMLImageElement).style.display = 'none'"
             />
-            <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="daily-name">{{ track.title }}</div>
           <div class="daily-artist">{{ track.artist }}</div>
@@ -566,6 +566,7 @@ function formatNotifTime(ts: number): string {
           @click="player.play(track)"
         >
           <div class="daily-cover">
+            <span class="material-symbols-rounded filled cover-fallback">music_note</span>
             <img
               v-if="track.coverUrl"
               :src="track.coverUrl"
@@ -573,7 +574,6 @@ function formatNotifTime(ts: number): string {
               loading="lazy"
               @error="($event.target as HTMLImageElement).style.display = 'none'"
             />
-            <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="daily-name">{{ track.title }}</div>
           <div class="daily-artist">{{ track.artist }}</div>
@@ -586,6 +586,8 @@ function formatNotifTime(ts: number): string {
 <style scoped lang="scss">
 .home-view {
   padding: 20px 28px 32px;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .home-header {
@@ -804,9 +806,10 @@ function formatNotifTime(ts: number): string {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  position: relative;
 
-  img { width: 100%; height: 100%; object-fit: cover; }
-  .material-symbols-rounded { font-size: 24px; opacity: 0.4; }
+  img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .cover-fallback { font-size: 24px; opacity: 0.4; }
 }
 
 .song-grid-info {
@@ -820,7 +823,7 @@ function formatNotifTime(ts: number): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  line-height: 1.3;
+  line-height: 1.45;
 }
 
 .song-grid-meta {
@@ -830,7 +833,7 @@ function formatNotifTime(ts: number): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  line-height: 1.3;
+  line-height: 1.45;
 }
 
 /* 分页导航箭头 */
@@ -909,9 +912,10 @@ function formatNotifTime(ts: number): string {
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
 
-  img { width: 100%; height: 100%; object-fit: cover; }
-  .material-symbols-rounded { font-size: 32px; opacity: 0.4; }
+  img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .cover-fallback { font-size: 32px; opacity: 0.4; }
 }
 
 .daily-name {
@@ -950,14 +954,17 @@ function formatNotifTime(ts: number): string {
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
 
   img {
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
     object-fit: cover;
   }
 
-  .material-symbols-rounded {
+  .cover-fallback {
     font-size: 32px;
     opacity: 0.4;
   }
