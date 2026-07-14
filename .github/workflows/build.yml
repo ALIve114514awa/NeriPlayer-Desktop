@@ -189,7 +189,7 @@ jobs:
           shared-key: build-${{ matrix.target }}
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@be2d2704b75be69b59ca78d62e19b3e14a527e2d
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
