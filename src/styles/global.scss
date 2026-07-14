@@ -72,7 +72,21 @@ html, body, #app {
   color: var(--md-on-surface);
   -webkit-font-smoothing: antialiased;
   user-select: none;
+  -webkit-user-select: none;
   line-height: 1.4;
+}
+
+img,
+svg {
+  -webkit-user-drag: none;
+}
+
+input,
+textarea,
+select,
+[contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* Material Symbols */
@@ -111,15 +125,16 @@ html, body, #app {
 .fade-enter-from { opacity: 0; transform: translateY(8px) scale(0.98); }
 .fade-leave-to { opacity: 0; transform: scale(0.99); }
 
-/* NowPlaying 覆盖层过渡 — 不用 spring，改用 M3 emphasized decelerate，无弹跳 */
+/* NowPlaying 覆盖层过渡 — emphasized decelerate 滑入，accelerate 滑出 */
 .slide-up-enter-active {
-  transition: opacity 180ms var(--ease-decelerate);
+  transition: transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 120ms var(--ease-decelerate);
 }
 .slide-up-leave-active {
   transition: transform 400ms var(--ease-emphasized-accel),
               opacity 200ms var(--ease-accelerate);
 }
-.slide-up-enter-from { opacity: 0.01; }
+.slide-up-enter-from { transform: translateY(100%); opacity: 0; }
 .slide-up-leave-to { transform: translateY(100%); opacity: 0; }
 
 /* 按钮重置 */

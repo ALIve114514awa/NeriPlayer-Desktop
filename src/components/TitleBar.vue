@@ -167,7 +167,6 @@ onUnmounted(() => {
               height 300ms var(--ease-standard),
               background 320ms var(--ease-standard),
               backdrop-filter 320ms var(--ease-standard),
-              box-shadow 320ms var(--ease-standard),
               padding 320ms var(--ease-standard);
 
   &.tb-np-mode {
@@ -179,7 +178,6 @@ onUnmounted(() => {
 .title-bar.tb-transitioning {
   background: linear-gradient(to bottom, rgba(14, 13, 18, 0.26), rgba(14, 13, 18, 0));
   backdrop-filter: blur(14px) saturate(1.08);
-  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.04);
 }
 /* Linux WebKitGTK 无 backdrop-filter 时给更实的底色，避免标题栏近乎透明 */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
@@ -303,7 +301,7 @@ onUnmounted(() => {
   opacity: 0.45;
   text-transform: uppercase;
   letter-spacing: 1px;
-  line-height: 1.2;
+  line-height: 1.4;
 }
 
 .tb-np-track {
@@ -315,7 +313,7 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 300px;
-  line-height: 1.2;
+  line-height: 1.4;
 }
 
 .tb-transitioning .tb-np-center {
@@ -443,6 +441,14 @@ onUnmounted(() => {
 
 .tb-mac.tb-np-mode {
   padding-top: 0;
+}
+
+.tb-mac.tb-np-mode .tb-np-left {
+  transform: translate(-10px, -2px);
+}
+
+.tb-mac.tb-np-mode .tb-right-slot {
+  transform: translateY(3px);
 }
 
 /* np 模式下 mac 安全区跟随 56px 栏高 */

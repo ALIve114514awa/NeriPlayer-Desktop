@@ -30,11 +30,14 @@ const flipOverlayStyle = ref<Record<string, string> | null>(null)
 const flipTransitionMode = ref<'opening' | 'closing' | null>(null)
 const isFlipAnimating = ref(false)
 const nowPlayingMotionState = ref<'opening' | 'closing' | null>(null)
+const lastCoverSnapshot = ref<{ trackId: string; src: string } | null>(null)
 
 const hasMiniPlayer = computed(() => !!player.currentTrack)
 const transitionTrackKey = computed(() => player.currentTrack?.id || 'empty')
 const hideMiniCoverForFlip = computed(() => isFlipAnimating.value)
 const isNowPlayingMotionActive = computed(() => nowPlayingMotionState.value !== null)
+const skipMiniEnter = ref(false)
+const miniTransitionName = computed(() => skipMiniEnter.value ? 'mini-none' : 'mini-enter')
 let flipAnimationFrame = 0
 let flipCleanupTimer: ReturnType<typeof setTimeout> | null = null
 let nowPlayingMotionTimer: ReturnType<typeof setTimeout> | null = null
@@ -113,18 +116,35 @@ async function openNowPlaying() {
 
 async function closeNowPlaying() {
   const from = nowPlayingRef.value?.getCoverSnapshot?.() as CoverSnapshot | null
+  if (from?.src && player.currentTrack?.id) {
+    lastCoverSnapshot.value = {
+      trackId: player.currentTrack.id,
+      src: from.src,
+    }
+  }
   resetFlipState()
   nowPlayingMotionState.value = 'closing'
   scheduleNowPlayingMotionCleanup()
-  playerTransitionPulse.value = Date.now()
+  skipMiniEnter.value = true
   isNowPlayingOpen.value = false
-  if (!from) return
+  if (!from) {
+    await nextTick()
+    requestAnimationFrame(() => { skipMiniEnter.value = false })
+    return
+  }
   await nextTick()
   await new Promise(resolve => requestAnimationFrame(() => resolve(null)))
+  skipMiniEnter.value = false
   const to = miniPlayerRef.value?.getCoverSnapshot?.() as CoverSnapshot | null
   if (!to) return
   runFlipTransition(from, to, 'closing')
 }
+
+const miniCoverFallbackSrc = computed(() => {
+  const snapshot = lastCoverSnapshot.value
+  if (!snapshot || snapshot.trackId !== player.currentTrack?.id) return ''
+  return snapshot.src
+})
 
 // 背景图片
 const bgImageStyle = computed(() => {
@@ -247,12 +267,12 @@ onUnmounted(() => {
   >
     <!-- 自定义背景图 -->
     <div v-if="bgImageStyle" class="app-bg-image" :style="bgImageStyle"></div>
-    <SideNav class="app-side-nav" />
+    <SideNav class="app-side-nav" :class="{ 'app-side-nav--dimmed': isNowPlayingOpen }" />
     <main
       class="content"
       :class="{
         'has-mini-player': hasMiniPlayer,
-        'content--np-dimmed': isNowPlayingOpen || isNowPlayingMotionActive,
+        'content--np-dimmed': isNowPlayingOpen,
       }"
     >
       <router-view v-slot="{ Component, route }">
@@ -265,11 +285,12 @@ onUnmounted(() => {
     </main>
 
     <!-- MiniPlayer 动画 -->
-    <transition name="mini-enter">
+    <transition :name="miniTransitionName">
       <MiniPlayer
         v-if="hasMiniPlayer && !isNowPlayingOpen"
         ref="miniPlayerRef"
         :cover-hidden-by-flip="hideMiniCoverForFlip"
+        :cover-fallback-src="miniCoverFallbackSrc"
         :key="`mini:${transitionTrackKey}:${playerTransitionPulse}`"
         @expand="openNowPlaying()"
       />
@@ -343,9 +364,20 @@ onUnmounted(() => {
   position: relative;
   z-index: 2;
   transition:
-    transform 420ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 300ms ease,
-    filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform 280ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 200ms ease,
+    filter 250ms cubic-bezier(0.2, 0, 0, 1);
+
+  &.app-side-nav--dimmed {
+    transition:
+      transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 320ms ease,
+      filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform: scale(0.94) translateY(12px);
+    filter: blur(6px);
+    opacity: 0.7;
+    pointer-events: none;
+  }
 }
 
 .content {
@@ -355,13 +387,27 @@ onUnmounted(() => {
   position: relative;
   z-index: 2;
   transform-origin: center top;
+  /* 恢复态用较快的 transition */
   transition:
     padding-bottom 300ms var(--ease-standard),
-    transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 320ms ease,
-    filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform 280ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 200ms ease,
+    filter 250ms cubic-bezier(0.2, 0, 0, 1);
 
   &.has-mini-player { padding-bottom: 76px; }
+
+  &.content--np-dimmed {
+    /* 进入景深用较慢的 emphasized decelerate */
+    transition:
+      padding-bottom 300ms var(--ease-standard),
+      transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 320ms ease,
+      filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform: scale(0.94) translateY(12px);
+    filter: blur(6px);
+    opacity: 0.7;
+    pointer-events: none;
+  }
 }
 
 /* MiniPlayer 入场退场 */
