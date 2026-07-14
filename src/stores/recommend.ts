@@ -44,6 +44,44 @@ export const useRecommendStore = defineStore('recommend', () => {
   const isLoading = ref(false)
   const error = ref<string | null>(null)
 
+  // --- stale-while-revalidate 缓存 ---
+  const CACHE_KEY = 'neri:recommend:cache'
+  const CACHE_MAX_AGE_MS = 30 * 60 * 1000 // 30 分钟
+
+  function loadCache() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY)
+      if (!raw) return
+      const cache = JSON.parse(raw)
+      if (cache.recommendedPlaylists?.length) recommendedPlaylists.value = cache.recommendedPlaylists
+      if (cache.userPlaylists && Object.keys(cache.userPlaylists).length) userPlaylists.value = cache.userPlaylists
+      if (cache.homeFeedShelves?.length) homeFeedShelves.value = cache.homeFeedShelves
+    } catch { /* 缓存损坏则忽略 */ }
+  }
+
+  function saveCache() {
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({
+        recommendedPlaylists: recommendedPlaylists.value,
+        userPlaylists: userPlaylists.value,
+        homeFeedShelves: homeFeedShelves.value,
+        timestamp: Date.now(),
+      }))
+    } catch { /* localStorage 已满则忽略 */ }
+  }
+
+  function isCacheFresh(): boolean {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY)
+      if (!raw) return false
+      const cache = JSON.parse(raw)
+      return Date.now() - (cache.timestamp || 0) < CACHE_MAX_AGE_MS
+    } catch { return false }
+  }
+
+  // 启动时立即加载缓存
+  loadCache()
+
   /** 获取网易云推荐歌单 */
   async function fetchRecommendedPlaylists(limit = 30) {
     isLoading.value = true
@@ -58,6 +96,7 @@ export const useRecommendStore = defineStore('recommend', () => {
         trackCount: p.trackCount || 0,
         description: p.copywriter || '',
       }))
+      saveCache()
     } catch (e: any) {
       error.value = e?.toString() || 'Failed to fetch recommendations'
       console.error('fetchRecommendedPlaylists:', e)
@@ -109,6 +148,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       }
 
       userPlaylists.value[platform] = playlists
+      saveCache()
     } catch (e) {
       console.error(`fetchUserPlaylists(${platform}):`, e)
     } finally {
@@ -122,6 +162,7 @@ export const useRecommendStore = defineStore('recommend', () => {
     try {
       const data = await invoke<any>('get_home_feed')
       homeFeedShelves.value = parseYouTubeHomeFeed(data)
+      saveCache()
     } catch (e) {
       console.error('fetchHomeFeed:', e)
     } finally {
@@ -241,7 +282,7 @@ export const useRecommendStore = defineStore('recommend', () => {
 
   return {
     recommendedPlaylists, recommendedSongs, homeFeedShelves, userPlaylists,
-    userAlbums, likedSongIds, isLoading, error,
+    userAlbums, likedSongIds, isLoading, error, isCacheFresh,
     fetchRecommendedPlaylists, fetchRecommendedSongs, fetchUserPlaylists,
     fetchHomeFeed, fetchHighQualityPlaylists, fetchHighQualityTags,
     fetchLikedSongIds, toggleLikeSong, fetchAlbumDetail, fetchUserAlbums,

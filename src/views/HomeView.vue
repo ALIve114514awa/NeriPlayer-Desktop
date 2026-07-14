@@ -25,6 +25,14 @@ const { t } = useI18n()
 
 const showNotifications = ref(false)
 
+// 首页数据全为空时显示骨架屏
+const showSkeleton = computed(() =>
+  recommend.isLoading &&
+  recommend.recommendedPlaylists.length === 0 &&
+  Object.keys(recommend.userPlaylists).length === 0 &&
+  hotSongs.value.length === 0
+)
+
 const greeting = computed(() => {
   const h = new Date().getHours()
   if (h < 6) return t('home.greeting_night')
@@ -340,6 +348,18 @@ function formatNotifTime(ts: number): string {
           <div class="platform-hub-subtitle">{{ hub.subtitle }}</div>
         </div>
         <span class="material-symbols-rounded">arrow_forward</span>
+      </div>
+    </section>
+
+    <!-- 骨架屏（首次加载且无缓存时） -->
+    <section v-if="showSkeleton" class="section">
+      <div class="skeleton-title" />
+      <div class="skeleton-grid">
+        <div v-for="n in 6" :key="n" class="skeleton-card">
+          <div class="skeleton-cover" />
+          <div class="skeleton-text" />
+          <div class="skeleton-text-short" />
+        </div>
       </div>
     </section>
 
@@ -1116,5 +1136,56 @@ function formatNotifTime(ts: number): string {
   color: var(--md-on-surface-variant);
   opacity: 0.6;
   margin-top: 3px;
+}
+
+// --- 骨架屏 ---
+.skeleton-title {
+  width: 120px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  background: var(--md-surface-container-high);
+  margin-bottom: 16px;
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+}
+
+.skeleton-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+.skeleton-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeleton-cover {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: var(--radius-md);
+  background: var(--md-surface-container-high);
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+}
+
+.skeleton-text {
+  width: 80%;
+  height: 13px;
+  border-radius: var(--radius-xs);
+  background: var(--md-surface-container-high);
+  animation: skeleton-shimmer 1.5s ease-in-out 0.1s infinite;
+}
+
+.skeleton-text-short {
+  width: 50%;
+  height: 11px;
+  border-radius: var(--radius-xs);
+  background: var(--md-surface-container-high);
+  animation: skeleton-shimmer 1.5s ease-in-out 0.2s infinite;
+}
+
+@keyframes skeleton-shimmer {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
 }
 </style>
