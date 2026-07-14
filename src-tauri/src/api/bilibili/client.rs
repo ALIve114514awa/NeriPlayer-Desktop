@@ -196,11 +196,13 @@ impl BiliClient {
         Ok(body)
     }
 
-    /// 获取用户创建的收藏夹列表
+    /// 获取用户创建的收藏夹列表（分页版，包含封面）
     pub async fn get_user_favorites(&self, mid: u64) -> AppResult<Value> {
         let mut params = BTreeMap::new();
         params.insert("up_mid".into(), mid.to_string());
-        self.wbi_get("https://api.bilibili.com/x/v3/fav/folder/created/list-all", params).await
+        params.insert("pn".into(), "1".into());
+        params.insert("ps".into(), "50".into());
+        self.wbi_get("https://api.bilibili.com/x/v3/fav/folder/created/list", params).await
     }
 
     /// 获取收藏夹内容

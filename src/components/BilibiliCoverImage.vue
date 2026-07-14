@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { normalizeBilibiliCoverUrl, resolveBilibiliCover } from '@/utils/bilibiliCover'
+import { resolveBilibiliCover } from '@/utils/bilibiliCover'
 
 defineOptions({ inheritAttrs: false })
 
@@ -12,45 +12,37 @@ const props = withDefaults(defineProps<{
   alt: '',
 })
 
-const currentSrc = ref('')
+const resolvedSrc = ref('')
 const isLoaded = ref(false)
-const proxyAttempted = ref(false)
 
-watch(() => props.src, (src) => {
-  currentSrc.value = normalizeBilibiliCoverUrl(src || '')
+watch(() => props.src, async (src) => {
+  resolvedSrc.value = ''
   isLoaded.value = false
-  proxyAttempted.value = false
+  if (!src) return
+
+  try {
+    resolvedSrc.value = await resolveBilibiliCover(src)
+  } catch {
+    resolvedSrc.value = ''
+  }
 }, { immediate: true })
 
 function handleLoad() {
   isLoaded.value = true
 }
 
-async function handleError() {
+function handleError() {
+  resolvedSrc.value = ''
   isLoaded.value = false
-  if (!props.src || proxyAttempted.value) {
-    currentSrc.value = ''
-    return
-  }
-
-  proxyAttempted.value = true
-  const failedSrc = props.src
-  try {
-    const resolvedSrc = await resolveBilibiliCover(failedSrc)
-    if (props.src === failedSrc) currentSrc.value = resolvedSrc
-  } catch {
-    if (props.src === failedSrc) currentSrc.value = ''
-  }
 }
 </script>
 
 <template>
   <img
-    v-if="currentSrc"
+    v-if="resolvedSrc"
     v-bind="$attrs"
-    :src="currentSrc"
+    :src="resolvedSrc"
     :alt="alt"
-    :style="[$attrs.style, { visibility: isLoaded ? undefined : 'hidden' }]"
     referrerpolicy="no-referrer"
     @load="handleLoad"
     @error="handleError"
