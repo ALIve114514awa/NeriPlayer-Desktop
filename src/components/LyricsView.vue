@@ -223,6 +223,21 @@ function alphaForDist(d: number): number {
   return Math.max(0.16, 0.28 - 0.04 * (d - 1))
 }
 
+// L8: 3D 倾斜效果（对齐 Android SyncedLyricsView rotationX ±9°）
+// 上方行正倾斜（向后倒），下方行负倾斜（向前倾）
+function tiltForIndex(i: number): number {
+  if (activeIndex.value < 0) return 0
+  const delta = i - activeIndex.value
+  if (delta === 0) return 0
+  const sign = delta < 0 ? 1 : -1
+  return sign * Math.min(9, Math.abs(delta) * 3)
+}
+
+// L9: 行级错开延迟（对齐 Android staggered cascade）
+function staggerForDist(d: number): number {
+  return d * 30
+}
+
 // L4: 近似 Android 逐行弹簧 spring(damping 0.95, stiffness 120-20*distance, floor 20)
 // 用距离驱动的 transition 时长模拟「越近越跟手、远行软着陆」的级联手感
 function settleDurForDist(d: number): number {
@@ -310,6 +325,8 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
           '--scale': String(scaleForDist(dist(i))),
           '--alpha': String(alphaForDist(dist(i))),
           '--settle': `${settleDurForDist(dist(i))}ms`,
+          '--tilt': `${tiltForIndex(i)}deg`,
+          '--stagger': `${staggerForDist(dist(i))}ms`,
         }"
         @click="seekToLine(line)"
       >
@@ -404,15 +421,18 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
   text-align: left;
   // L3: Android TransformOrigin(0f, 1f) 左下角锚定，缩放时基线稳定
   transform-origin: left bottom;
-  transform: scale(var(--scale, 1));
+  // L8: 3D 倾斜 + 缩放
+  perspective: 800px;
+  transform: scale(var(--scale, 1)) rotateX(var(--tilt, 0deg));
   opacity: var(--alpha, 1);
   filter: blur(var(--blur, 0px));
-  // L4: 弹簧近似——位移/缩放用带回弹的 spring easing，时长随距离（--settle）级联
+  // L4+L9: 弹簧近似 + 行级错开延迟
   transition:
     transform var(--settle, 380ms) cubic-bezier(0.34, 1.3, 0.5, 1),
     opacity 260ms ease,
     filter 260ms ease,
     letter-spacing 260ms ease;
+  transition-delay: var(--stagger, 0ms);
   cursor: pointer;
   will-change: transform, opacity, filter;
 
@@ -424,12 +444,28 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
     filter: none;
     transform-origin: left bottom;
   }
+  // L10: 活跃行磨砂玻璃背景
+  &.active::before {
+    content: '';
+    position: absolute;
+    inset: 2px -12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(16px) saturate(1.3);
+    -webkit-backdrop-filter: blur(16px) saturate(1.3);
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.6;
+    transition: opacity 300ms ease;
+  }
   &.clear-text {
     transform: none;
     opacity: 0.56;
     filter: none;
     transition: opacity 0.15s;
+    transition-delay: 0ms;
     &.active { opacity: 1; }
+    &::before { display: none; }
   }
 }
 
@@ -474,7 +510,7 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
 }
 
 .line-text-highlight {
-  color: white;
+  color: var(--lyric-accent, white);
   opacity: 0;
   pointer-events: none;
   // L5: 加色混合，让高亮字在底层文本上叠加发光，近似 BlendMode.Plus
@@ -499,7 +535,7 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
 
 :deep(.line-text--active.kw-container .kw),
 :deep(.lyric-line.active .kw-container .kw) {
-  color: white;
+  color: var(--lyric-accent, white);
 }
 
 .line-tl {
