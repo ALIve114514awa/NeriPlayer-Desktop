@@ -127,17 +127,8 @@ async function closeNowPlaying() {
   scheduleNowPlayingMotionCleanup()
   skipMiniEnter.value = true
   isNowPlayingOpen.value = false
-  if (!from) {
-    await nextTick()
-    requestAnimationFrame(() => { skipMiniEnter.value = false })
-    return
-  }
   await nextTick()
-  await new Promise(resolve => requestAnimationFrame(() => resolve(null)))
-  skipMiniEnter.value = false
-  const to = miniPlayerRef.value?.getCoverSnapshot?.() as CoverSnapshot | null
-  if (!to) return
-  runFlipTransition(from, to, 'closing')
+  requestAnimationFrame(() => { skipMiniEnter.value = false })
 }
 
 const miniCoverFallbackSrc = computed(() => {
