@@ -92,11 +92,7 @@ function formatSyncTime(ts: number): string {
 }
 
 function goBack() {
-  if (window.history.length > 1) {
-    router.back()
-  } else {
-    router.push({ name: 'settings' })
-  }
+  router.push('/')
 }
 
 onMounted(async () => {
@@ -295,6 +291,7 @@ onMounted(async () => {
   align-items: center;
   gap: 12px;
   margin-bottom: 24px;
+  padding-top: 8px;
 }
 
 .debug-back-btn {
