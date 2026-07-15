@@ -41,6 +41,24 @@ let lastSyncedTime = Number.NaN
 
 const SPLIT_WHITESPACE_RE = /(\s+)/
 const WHITESPACE_RE = /\s/g
+const ACTIVE_WORD_GLOW_CLASS = 'np-amll-word-glow'
+
+interface AmllRuntimeWord {
+  startTime: number
+  endTime: number
+  mainElement?: HTMLElement
+  subElements?: HTMLElement[]
+}
+
+interface AmllRuntimeLine {
+  splittedWords?: AmllRuntimeWord[]
+  getLine?: () => AmllLyricLine
+}
+
+interface AmllRuntimeGroup {
+  mainLine?: AmllRuntimeLine
+  bgLine?: AmllRuntimeLine
+}
 
 const offsetMs = computed(() => {
   if (typeof props.lyricOffsetMs === 'number') return props.lyricOffsetMs
@@ -53,6 +71,12 @@ const effectiveTimeMs = computed(() => {
 })
 
 const amllTimeMs = computed(() => Math.max(0, effectiveTimeMs.value + offsetMs.value))
+const shouldHideInterludeDots = computed(() => {
+  const firstLine = props.lyrics[0]
+  return !isLayoutReady.value || (!!firstLine && amllTimeMs.value < firstLine.startMs)
+})
+
+let glowingElements = new Set<HTMLElement>()
 
 function displayText(line: PlayerLyricLine): string {
   if (line.text) return line.text
@@ -236,7 +260,10 @@ function syncCurrentTime(forceSeek = false): void {
 function syncPlayState(): void {
   if (!lyricPlayer) return
   if (props.isPlaying) lyricPlayer.resume()
-  else lyricPlayer.pause()
+  else {
+    lyricPlayer.pause()
+    clearActiveWordGlow()
+  }
 }
 
 function syncLyricOptions(): void {
@@ -275,6 +302,7 @@ function startFrameLoop(): void {
     const delta = Math.min(64, now - lastFrameAt)
     lastFrameAt = now
     lyricPlayer?.update(delta)
+    applyActiveWordGlow()
     rafId = requestAnimationFrame(tick)
   })
 }
@@ -290,6 +318,54 @@ function cancelLayoutSync(): void {
   if (layoutSettleFrameId) cancelAnimationFrame(layoutSettleFrameId)
   layoutFrameId = 0
   layoutSettleFrameId = 0
+}
+
+function clearActiveWordGlow(): void {
+  for (const element of glowingElements) {
+    element.classList.remove(ACTIVE_WORD_GLOW_CLASS)
+  }
+  glowingElements = new Set()
+}
+
+function setGlowElements(nextElements: Set<HTMLElement>): void {
+  for (const element of glowingElements) {
+    if (!nextElements.has(element)) element.classList.remove(ACTIVE_WORD_GLOW_CLASS)
+  }
+  for (const element of nextElements) {
+    if (!glowingElements.has(element)) element.classList.add(ACTIVE_WORD_GLOW_CLASS)
+  }
+  glowingElements = nextElements
+}
+
+function collectGlowTargets(word: AmllRuntimeWord): HTMLElement[] {
+  const subElements = word.subElements?.filter(element => element.isConnected) || []
+  if (subElements.length > 0) return subElements
+  return word.mainElement?.isConnected ? [word.mainElement] : []
+}
+
+function applyActiveWordGlow(): void {
+  if (!lyricPlayer || !props.isPlaying || !isLayoutReady.value || props.previewTimeMs != null) {
+    clearActiveWordGlow()
+    return
+  }
+
+  const time = amllTimeMs.value
+  const groups = ((lyricPlayer as unknown as { currentLyricGroups?: AmllRuntimeGroup[] }).currentLyricGroups || [])
+  const nextElements = new Set<HTMLElement>()
+
+  for (const group of groups) {
+    for (const line of [group.mainLine, group.bgLine]) {
+      const lyricLine = line?.getLine?.()
+      if (!line || !lyricLine || time < lyricLine.startTime || time >= lyricLine.endTime) continue
+
+      for (const word of line.splittedWords || []) {
+        if (time < word.startTime || time >= word.endTime) continue
+        for (const target of collectGlowTargets(word)) nextElements.add(target)
+      }
+    }
+  }
+
+  setGlowElements(nextElements)
 }
 
 function scheduleLayoutSync(): void {
@@ -314,6 +390,7 @@ function scheduleLayoutSync(): void {
       lyricPlayer.setCurrentTime(time, false)
       syncPlayState()
       lyricPlayer.update(0)
+      applyActiveWordGlow()
       isLayoutReady.value = true
     })
   })
@@ -336,6 +413,7 @@ onMounted(() => {
 onUnmounted(() => {
   stopFrameLoop()
   cancelLayoutSync()
+  clearActiveWordGlow()
   if (!lyricPlayer) return
 
   lyricPlayer.removeEventListener('line-click', onLineClick as EventListener)
@@ -375,7 +453,10 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
   <div
     ref="hostRef"
     class="lyrics-scroll"
-    :class="{ 'lyrics-scroll--ready': isLayoutReady }"
+    :class="{
+      'lyrics-scroll--ready': isLayoutReady,
+      'lyrics-scroll--hide-interlude': shouldHideInterludeDots,
+    }"
     :style="{ '--lyric-font-scale': settings.lyricFontScale }"
   />
 </template>
@@ -416,6 +497,12 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
   pointer-events: none;
 }
 
+.lyrics-scroll--hide-interlude :deep(.amll-lyric-player [class*="interludeDots"]) {
+  visibility: hidden;
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
 :deep(.amll-lyric-player) {
   text-align: left;
   font-weight: 850;
@@ -432,9 +519,9 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
   font-weight: 650;
 }
 
-:deep(.amll-lyric-player [class*="active"] [class*="emphasize"]:not([class*="Wrapper"]) > span) {
+:deep(.np-amll-word-glow) {
   text-shadow:
-    0 0 0.18em rgba(255, 255, 255, 0.42),
-    0 0 0.38em rgba(255, 255, 255, 0.22);
+    0 0 0.13em rgba(255, 255, 255, 0.55),
+    0 0 0.32em rgba(255, 255, 255, 0.28);
 }
 </style>
