@@ -64,6 +64,12 @@ export interface SeekCommandSnapshot {
   source: PlaybackCommandSource
 }
 
+interface PendingSeekState {
+  targetMs: number
+  issuedAt: number
+  expiresAt: number
+}
+
 // ─── 均衡器预设（5频段: 60Hz, 230Hz, 910Hz, 3.6kHz, 14kHz，单位 mB） ───
 export const EQ_PRESETS: Record<string, number[]> = {
   flat:           [0, 0, 0, 0, 0],
@@ -99,6 +105,13 @@ let _interpSpeed = 1.0          // 当前播放速度快照
 let _interpIsPlaying = false    // 当前播放状态快照
 let _interpDurationMs = 0       // 当前时长快照
 let _interpLoopStarted = false  // rAF 循环是否已启动
+const SEEK_EVENT_GUARD_MS = 900
+const SEEK_SETTLE_TIMEOUT_MS = 4500
+const SEEK_BACKWARD_TOLERANCE_MS = 600
+const SEEK_FORWARD_TOLERANCE_MS = 1200
+const POSITION_BACKWARD_TOLERANCE_MS = 250
+const PAUSE_EVENT_GUARD_MS = 2500
+const PAUSE_BACKWARD_TOLERANCE_MS = 250
 
 // ─── 批次 1.2: 连续失败熔断 ───
 let consecutivePlayFailures = 0
@@ -233,8 +246,10 @@ export const usePlayerStore = defineStore('player', () => {
   let seekGuardUntil = 0
   // 记住最后 seek 的位置，用于 resume 时重新 seek（防止后端丢失 seek-while-paused）
   let lastSeekedMs: number | null = null
-  // seek 后第一次接受 position 事件时的目标位置，用于检测偏差过大的旧事件
-  let seekTargetMs: number | null = null
+  // seek 后等待后端位置收敛，防止刚开播的旧 position 把进度条拉回去
+  let pendingSeek: PendingSeekState | null = null
+  let pauseGuardUntil = 0
+  let pauseFrozenMs: number | null = null
   const lastCommandSource = ref<PlaybackCommandSource>('local')
   const lastSeekCommand = ref<SeekCommandSnapshot>({
     seq: 0,
@@ -305,8 +320,7 @@ export const usePlayerStore = defineStore('player', () => {
       }
 
       if (settings.keepProgress && typeof state.positionMs === 'number') {
-        positionMs.value = state.positionMs
-        interpolatedPositionMs.value = state.positionMs
+        setRenderedPosition(state.positionMs)
       }
 
       if (settings.keepPlaybackMode) {
@@ -453,6 +467,117 @@ export const usePlayerStore = defineStore('player', () => {
     return cached
   }
 
+  function commitBackendPosition(nextPositionMs: number, nextDurationMs?: number, forceRendered = false) {
+    const safeDurationMs = nextDurationMs || durationMs.value || currentTrack.value?.durationMs || 0
+    const safePositionMs = safeDurationMs > 0
+      ? Math.min(Math.max(0, nextPositionMs), safeDurationMs)
+      : Math.max(0, nextPositionMs)
+
+    if (typeof nextDurationMs === 'number' && nextDurationMs > 0) {
+      durationMs.value = nextDurationMs
+    }
+
+    const renderedMs = clampPlaybackPosition(_interpRenderedMs)
+    if (_interpIsPlaying && !forceRendered && safePositionMs < renderedMs - POSITION_BACKWARD_TOLERANCE_MS) {
+      positionMs.value = renderedMs
+      _interpAnchorMs = renderedMs
+      _interpAnchorTime = performance.now()
+      _interpDurationMs = Math.max(durationMs.value || _interpDurationMs, renderedMs)
+      return
+    }
+
+    positionMs.value = safePositionMs
+    _interpAnchorMs = safePositionMs
+    _interpAnchorTime = performance.now()
+    _interpDurationMs = Math.max(durationMs.value || _interpDurationMs, safePositionMs)
+    if (!_interpIsPlaying || forceRendered) {
+      _interpRenderedMs = safePositionMs
+      interpolatedPositionMs.value = safePositionMs
+    }
+  }
+
+  function clampPlaybackPosition(position: number): number {
+    const safeDurationMs = durationMs.value || currentTrack.value?.durationMs || _interpDurationMs || 0
+    const safePositionMs = Number.isFinite(position) ? Math.max(0, Math.round(position)) : 0
+    return safeDurationMs > 0 ? Math.min(safePositionMs, safeDurationMs) : safePositionMs
+  }
+
+  function clearPauseGuard(): void {
+    pauseFrozenMs = null
+    pauseGuardUntil = 0
+  }
+
+  function currentRenderedPosition(): number {
+    return clampPlaybackPosition(_interpRenderedMs || interpolatedPositionMs.value || positionMs.value)
+  }
+
+  function setRenderedPosition(position: number): number {
+    const safePositionMs = clampPlaybackPosition(position)
+    positionMs.value = safePositionMs
+    _interpAnchorMs = safePositionMs
+    _interpAnchorTime = performance.now()
+    _interpRenderedMs = safePositionMs
+    _interpDurationMs = Math.max(durationMs.value || currentTrack.value?.durationMs || _interpDurationMs, safePositionMs)
+    interpolatedPositionMs.value = safePositionMs
+    return safePositionMs
+  }
+
+  function freezeRenderedPosition(): number {
+    const frozenMs = setRenderedPosition(currentRenderedPosition())
+    pauseFrozenMs = frozenMs
+    pauseGuardUntil = Date.now() + PAUSE_EVENT_GUARD_MS
+    return frozenMs
+  }
+
+  function startInterpolationFromRenderedPosition(): void {
+    const startMs = setRenderedPosition(currentRenderedPosition())
+    _interpAnchorMs = startMs
+    _interpAnchorTime = performance.now()
+    _interpRenderedMs = startMs
+    _interpSpeed = playbackSpeed.value
+    _interpIsPlaying = true
+    clearPauseGuard()
+  }
+
+  function normalizePositionAfterPause(nextPositionMs: number): number | null {
+    if (pauseFrozenMs === null) return nextPositionMs
+
+    const now = Date.now()
+    if (now >= pauseGuardUntil) {
+      clearPauseGuard()
+      return nextPositionMs
+    }
+
+    if (nextPositionMs < pauseFrozenMs - PAUSE_BACKWARD_TOLERANCE_MS) {
+      return null
+    }
+
+    return pauseFrozenMs
+  }
+
+  function shouldAcceptPositionAfterSeek(nextPositionMs: number, nextDurationMs?: number): boolean {
+    if (!pendingSeek) return true
+
+    const now = Date.now()
+    if (now >= pendingSeek.expiresAt) {
+      pendingSeek.expiresAt = now + SEEK_SETTLE_TIMEOUT_MS
+      seekGuardUntil = 0
+    }
+
+    const elapsedMs = Math.max(0, now - pendingSeek.issuedAt)
+    const speed = _interpIsPlaying ? Math.max(0.25, playbackSpeed.value || _interpSpeed || 1) : 0
+    const durationLimit = nextDurationMs || durationMs.value || currentTrack.value?.durationMs || 0
+    const lowerBound = Math.max(0, pendingSeek.targetMs - SEEK_BACKWARD_TOLERANCE_MS)
+    const upperCandidate = pendingSeek.targetMs + elapsedMs * speed + SEEK_FORWARD_TOLERANCE_MS
+    const upperBound = durationLimit > 0 ? Math.min(durationLimit, upperCandidate) : upperCandidate
+    const accepted = nextPositionMs >= lowerBound && nextPositionMs <= upperBound
+    if (accepted) {
+      pendingSeek = null
+      seekGuardUntil = 0
+    }
+    return accepted
+  }
+
   /** 启动 rAF 插值循环（仅调用一次） */
   function _startInterpolationLoop() {
     if (_interpLoopStarted) return
@@ -462,8 +587,7 @@ export const usePlayerStore = defineStore('player', () => {
       requestAnimationFrame(tick)
 
       if (!_interpIsPlaying) {
-        // 非播放时直接使用后端值
-        interpolatedPositionMs.value = positionMs.value
+        interpolatedPositionMs.value = Math.round(_interpRenderedMs)
         return
       }
 
@@ -472,20 +596,9 @@ export const usePlayerStore = defineStore('player', () => {
       const predicted = _interpAnchorMs + elapsed
       const clamped = Math.max(0, Math.min(predicted, _interpDurationMs))
 
-      // 向后容忍 24ms（防抖动：后端偶尔报告比预测稍早的位置）
-      if (clamped < _interpRenderedMs - 24) {
-        // 后端回退过多，snap
-        _interpRenderedMs = clamped
-      } else {
+      // 普通进度同步不允许把 UI 时间轴拉回，真正回跳只走 seek
+      if (clamped >= _interpRenderedMs - 24) {
         _interpRenderedMs = Math.max(_interpRenderedMs, clamped)
-      }
-
-      // Snap 阈值：与后端差距超过 220ms 直接跳转
-      const backendPos = positionMs.value
-      if (Math.abs(_interpRenderedMs - backendPos) > 220) {
-        _interpRenderedMs = backendPos
-        _interpAnchorMs = backendPos
-        _interpAnchorTime = now
       }
 
       interpolatedPositionMs.value = Math.round(_interpRenderedMs)
@@ -503,19 +616,10 @@ export const usePlayerStore = defineStore('player', () => {
     listen<{ positionMs: number; durationMs: number }>('player:position', (e) => {
       // seek 后时间窗口内忽略旧位置事件
       if (Date.now() < seekGuardUntil) return
-      // guard 过期后，检测第一批事件是否偏离 seek 目标过远（>3s = 后端还没跳到位）
-      if (seekTargetMs !== null) {
-        const delta = Math.abs(e.payload.positionMs - seekTargetMs)
-        if (delta > 3000) return // 丢弃偏差过大的旧事件
-        seekTargetMs = null // 第一个合理事件通过后清除
-      }
-      positionMs.value = e.payload.positionMs
-      durationMs.value = e.payload.durationMs
-
-      // 更新插值锚点
-      _interpAnchorMs = e.payload.positionMs
-      _interpAnchorTime = performance.now()
-      _interpDurationMs = e.payload.durationMs
+      if (!shouldAcceptPositionAfterSeek(e.payload.positionMs, e.payload.durationMs)) return
+      const normalizedPositionMs = normalizePositionAfterPause(e.payload.positionMs)
+      if (normalizedPositionMs === null) return
+      commitBackendPosition(normalizedPositionMs, e.payload.durationMs)
 
       // 节流保存播放进度（每 15s）
       if (_interpIsPlaying) {
@@ -537,12 +641,11 @@ export const usePlayerStore = defineStore('player', () => {
     // ─── 系统媒体键事件（SMTC / MPRIS，来自 Rust 后端） ───
     listen<{ isPlaying: boolean }>('media:play-state-changed', (e) => {
       isPlaying.value = e.payload.isPlaying
-      _interpIsPlaying = e.payload.isPlaying
       if (e.payload.isPlaying) {
-        _interpAnchorMs = positionMs.value
-        _interpAnchorTime = performance.now()
-        _interpRenderedMs = positionMs.value
-        _interpSpeed = playbackSpeed.value
+        startInterpolationFromRenderedPosition()
+      } else {
+        _interpIsPlaying = false
+        freezeRenderedPosition()
       }
     })
 
@@ -555,11 +658,11 @@ export const usePlayerStore = defineStore('player', () => {
     })
 
     listen<{ positionMs: number }>('media:seeked', (e) => {
-      positionMs.value = e.payload.positionMs
-      _interpAnchorMs = e.payload.positionMs
-      _interpAnchorTime = performance.now()
-      _interpRenderedMs = e.payload.positionMs
-      interpolatedPositionMs.value = e.payload.positionMs
+      if (!shouldAcceptPositionAfterSeek(e.payload.positionMs)) return
+      clearPauseGuard()
+      commitBackendPosition(e.payload.positionMs, undefined, true)
+      _interpRenderedMs = positionMs.value
+      interpolatedPositionMs.value = positionMs.value
     })
   }
 
@@ -765,6 +868,10 @@ export const usePlayerStore = defineStore('player', () => {
       isPlaying.value = true
       isLoadingAudio.value = false
       positionMs.value = 0
+      pendingSeek = null
+      seekGuardUntil = 0
+      clearPauseGuard()
+      lastSeekedMs = null
 
       // 重置插值状态
       _interpAnchorMs = 0
@@ -848,14 +955,14 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     // 乐观更新：立即翻转 UI 状态，消除 IPC 延迟感
+    const previousPlaying = isPlaying.value
     const optimistic = !isPlaying.value
     isPlaying.value = optimistic
-    _interpIsPlaying = optimistic
     if (optimistic) {
-      _interpAnchorMs = positionMs.value
-      _interpAnchorTime = performance.now()
-      _interpRenderedMs = positionMs.value
-      _interpSpeed = playbackSpeed.value
+      startInterpolationFromRenderedPosition()
+    } else {
+      _interpIsPlaying = false
+      freezeRenderedPosition()
     }
 
     try {
@@ -863,14 +970,25 @@ export const usePlayerStore = defineStore('player', () => {
       // 后端确认：如果与乐观预测不一致则修正
       if (playing !== optimistic) {
         isPlaying.value = playing
-        _interpIsPlaying = playing
+        if (playing) {
+          startInterpolationFromRenderedPosition()
+        } else {
+          _interpIsPlaying = false
+          freezeRenderedPosition()
+        }
       }
-      // 清除 pending seek 标记（seekTo 已经 fire-and-forget 发送过了）
+      // 恢复播放成功后不再需要 pause seek 兜底
       if (playing) {
         lastSeekedMs = null
       }
     } catch {
-      isPlaying.value = !isPlaying.value
+      isPlaying.value = previousPlaying
+      if (previousPlaying) {
+        startInterpolationFromRenderedPosition()
+      } else {
+        _interpIsPlaying = false
+        freezeRenderedPosition()
+      }
     }
   }
 
@@ -879,6 +997,7 @@ export const usePlayerStore = defineStore('player', () => {
     // 乐观更新
     isPlaying.value = false
     _interpIsPlaying = false
+    freezeRenderedPosition()
     try {
       const settings = useSettingsStore()
       if (settings.fadeIn && settings.fadeOutDuration > 0) {
@@ -915,11 +1034,7 @@ export const usePlayerStore = defineStore('player', () => {
 
     // 乐观更新
     isPlaying.value = true
-    _interpAnchorMs = positionMs.value
-    _interpAnchorTime = performance.now()
-    _interpRenderedMs = positionMs.value
-    _interpIsPlaying = true
-    _interpSpeed = playbackSpeed.value
+    startInterpolationFromRenderedPosition()
     try {
       const settings = useSettingsStore()
       if (settings.fadeIn && settings.fadeInDuration > 0) {
@@ -932,7 +1047,9 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function seekTo(ms: number, commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
-    const posMs = Math.round(ms)
+    const roundedMs = Math.max(0, Math.round(ms))
+    const maxSeekMs = durationMs.value || currentTrack.value?.durationMs || 0
+    const posMs = maxSeekMs > 0 ? Math.min(roundedMs, maxSeekMs) : roundedMs
     lastSeekCommand.value = {
       seq: lastSeekCommand.value.seq + 1,
       positionMs: posMs,
@@ -940,20 +1057,29 @@ export const usePlayerStore = defineStore('player', () => {
     }
     positionMs.value = posMs
     lastSeekedMs = posMs
-    seekTargetMs = posMs
-    seekGuardUntil = Date.now() + 1500
+    clearPauseGuard()
+    const now = Date.now()
+    pendingSeek = {
+      targetMs: posMs,
+      issuedAt: now,
+      expiresAt: now + SEEK_SETTLE_TIMEOUT_MS,
+    }
+    seekGuardUntil = now + SEEK_EVENT_GUARD_MS
 
     // 立即重置插值到 seek 目标（乐观更新，用户立即看到跳转）
     _interpAnchorMs = posMs
     _interpAnchorTime = performance.now()
     _interpRenderedMs = posMs
+    _interpDurationMs = Math.max(durationMs.value || currentTrack.value?.durationMs || _interpDurationMs, posMs)
     interpolatedPositionMs.value = posMs
 
     // Fire-and-forget：不阻塞 UI，后端异步执行 seek
     invoke('seek', { positionMs: posMs }).then(() => {
       positionMs.value = posMs
-      seekGuardUntil = Date.now() + 800
+      seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
     }).catch((e) => {
+      pendingSeek = null
+      seekGuardUntil = 0
       console.error('Seek failed:', e)
     })
   }

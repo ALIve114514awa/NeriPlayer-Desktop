@@ -364,6 +364,10 @@ function onSeek(progress: number) {
   player.seekTo(Math.round(progress * player.durationMs))
 }
 
+function onLyricSeek(ms: number) {
+  player.seekTo(ms)
+}
+
 // 当前歌曲的网易云 ID（用于网易云收藏 API）
 const currentNeteaseId = computed(() => {
   const id = player.currentTrack?.id
@@ -1284,7 +1288,16 @@ const sliderActiveColor = computed(() => {
     <div class="np-body" :class="[{ 'np-body--no-header': props.hideHeader }, playViewMode === 'lyrics' ? 'np-body--lyrics-mode' : 'np-body--cover-mode']">
       <!-- 左侧 -->
       <section class="np-left" :class="{ 'np-left--beat-active': isVisualBeatActive }">
-        <div class="cover-wrap" :class="{ 'cover-wrap--switching': isTrackSwitchAnimating, 'cover-wrap--beat-active': isVisualBeatActive }" @contextmenu="openContextMenu($event, 'cover')">
+        <div
+          class="cover-wrap"
+          :class="{
+            'cover-wrap--card': settings.coverStyle === 'card',
+            'cover-wrap--disc': settings.coverStyle !== 'card',
+            'cover-wrap--switching': isTrackSwitchAnimating,
+            'cover-wrap--beat-active': isVisualBeatActive,
+          }"
+          @contextmenu="openContextMenu($event, 'cover')"
+        >
           <!-- Card 模式（圆角矩形，对齐 Android） -->
           <div v-if="settings.coverStyle === 'card'" ref="cardCoverRef" class="cover-card">
             <transition :name="coverTransitionName" mode="out-in">
@@ -1580,7 +1593,8 @@ const sliderActiveColor = computed(() => {
           :preview-time-ms="previewPositionMs"
           :is-playing="player.isPlaying"
           :lyric-offset-ms="currentLyricOffsetMs"
-          @seek="(ms) => player.seekTo(ms)"
+          :seek-seq="player.lastSeekCommand.seq"
+          @seek="onLyricSeek"
         />
         <div v-else class="lyrics-empty">
           <span class="material-symbols-rounded" style="font-size: 36px">lyrics</span>
@@ -2440,14 +2454,24 @@ const sliderActiveColor = computed(() => {
   position: relative;
   width: min(60%, 280px);
   aspect-ratio: 1;
-  filter: drop-shadow(0 16px 48px rgba(0,0,0,0.5));
   flex-shrink: 0;
   transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), filter 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
-  overflow: hidden;
+  overflow: visible;
+}
+
+.cover-wrap--card {
+  border-radius: 24px;
+}
+
+.cover-wrap--disc {
+  border-radius: 50%;
 }
 
 .cover-wrap--switching {
-  filter: drop-shadow(0 22px 54px rgba(0,0,0,0.54));
+  .cover-card,
+  .cover-disc {
+    filter: drop-shadow(0 22px 54px rgba(0,0,0,0.54));
+  }
 }
 
 .cover-wrap--beat-active {
@@ -2492,6 +2516,7 @@ const sliderActiveColor = computed(() => {
   justify-content: center;
   position: relative;
   will-change: transform;
+  filter: drop-shadow(0 16px 48px rgba(0,0,0,0.5));
 }
 
 .cover-inner {

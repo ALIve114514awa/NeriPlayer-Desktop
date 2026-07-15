@@ -3,7 +3,7 @@
     "target": "ES2021",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2021", "DOM", "DOM.Iterable"],
+    "lib": ["ES2021", "ES2022.Intl", "DOM", "DOM.Iterable"],
     "skipLibCheck": true,
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -15,7 +15,15 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
-    "paths": { "@/*": ["./src/*"] }
+    "paths": {
+      "@/*": ["./src/*"],
+      "@amll-core/*": ["./vendor/applemusic-like-lyrics/packages/core/src/*"],
+      "#interfaces": ["./vendor/applemusic-like-lyrics/packages/core/src/interfaces.ts"],
+      "#utils/*": ["./vendor/applemusic-like-lyrics/packages/core/src/utils/*"],
+      "#styles/*": ["./vendor/applemusic-like-lyrics/packages/core/src/styles/*"],
+      "#lyric/*": ["./vendor/applemusic-like-lyrics/packages/core/src/lyric-player/*"],
+      "#bg/*": ["./vendor/applemusic-like-lyrics/packages/core/src/bg-player/*"]
+    }
   },
   "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.vue"]
 }
