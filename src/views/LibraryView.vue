@@ -55,6 +55,11 @@ watch(() => route.query.tab, (tab) => {
 interface PlaylistInfo { id: number; name: string; track_count: number; modified_at: number; cover_url: string | null }
 const playlists = ref<PlaylistInfo[]>([])
 
+function isBilibiliCover(url?: string | null): boolean {
+  if (!url) return false
+  return /\.(hdslb|biliimg)\.com/i.test(url)
+}
+
 async function loadPlaylists() {
   try {
     const raw = await invoke<PlaylistInfo[]>('list_playlists')
@@ -518,7 +523,10 @@ onUnmounted(() => {
       <!-- 歌单列表 -->
       <div v-for="pl in playlists" :key="pl.id" class="playlist-item" @click="router.push({ name: 'local-playlist', params: { id: pl.id } })">
         <div class="pl-icon" :class="{ 'has-cover': pl.cover_url }">
-          <img v-if="pl.cover_url" :src="pl.cover_url" referrerpolicy="no-referrer" class="pl-cover-img" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+          <BilibiliCoverImage v-if="isBilibiliCover(pl.cover_url)" :src="pl.cover_url!" class="pl-cover-img">
+            <span class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
+          </BilibiliCoverImage>
+          <img v-else-if="pl.cover_url" :src="pl.cover_url" referrerpolicy="no-referrer" class="pl-cover-img" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           <span v-else class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
         </div>
         <div class="pl-info">

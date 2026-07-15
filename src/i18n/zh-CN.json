@@ -466,9 +466,9 @@
     "bg_blur": "背景模糊",
     "bg_opacity": "背景透明度",
 
-    "dev_mode": "开发者模式",
-    "dev_mode_toast": "已启用开发者模式",
-    "dev_mode_tap_hint": "再点击 {count} 次启用开发者模式",
+    "dev_mode": "调试模式",
+    "dev_mode_toast": "已启用调试模式",
+    "dev_mode_tap_hint": "再点击 {count} 次启用调试模式",
     "build_uuid": "构建 UUID",
     "build_time": "构建时间",
     "debug": "调试",

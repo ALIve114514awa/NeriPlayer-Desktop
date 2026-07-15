@@ -47,7 +47,41 @@ pub async fn get_user_playlists(
                     .ok_or_else(|| AppError::Api("Bilibili not logged in".into()))?
             };
             let client = crate::api::bilibili::client::BiliClient::new(&state.http());
-            client.get_user_favorites(mid).await
+            let mut resp = client.get_user_favorites(mid).await?;
+
+            // For folders with empty cover but non-zero media_count,
+            // concurrently fetch the first item's cover as fallback.
+            if let Some(list) = resp["data"]["list"].as_array() {
+                let mut futures = Vec::new();
+                for (idx, folder) in list.iter().enumerate() {
+                    let cover = folder["cover"].as_str().unwrap_or("");
+                    let media_count = folder["media_count"].as_u64().unwrap_or(0);
+                    if cover.is_empty() && media_count > 0 {
+                        if let Some(media_id) = folder["id"].as_u64() {
+                            let c = crate::api::bilibili::client::BiliClient::new(&state.http());
+                            futures.push(async move {
+                                let pic = c.get_fav_folder_info(media_id).await.ok()
+                                    .and_then(|r| r["data"]["cover"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                                (idx, pic)
+                            });
+                        }
+                    }
+                }
+
+                let results = futures_util::future::join_all(futures).await;
+                if let Some(list) = resp["data"]["list"].as_array_mut() {
+                    for (idx, cover) in results {
+                        if !cover.is_empty() {
+                            if let Some(folder) = list.get_mut(idx) {
+                                folder["cover"] = serde_json::Value::String(cover);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(resp)
         }
         "youtube" => {
             let yt_auth = {

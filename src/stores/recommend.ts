@@ -142,6 +142,24 @@ export const useRecommendStore = defineStore('recommend', () => {
           coverUrl: f.cover || '',
           trackCount: f.media_count || 0,
         }))
+
+        // For folders missing cover, fetch from folder info API
+        const needCover = playlists.filter(p => !p.coverUrl && p.trackCount > 0)
+        if (needCover.length > 0) {
+          await Promise.allSettled(
+            needCover.map(async (p) => {
+              try {
+                const info = await invoke<any>('get_bili_fav_folder_info', { mediaId: p.id })
+                const cover = info?.data?.cover || ''
+                if (cover) {
+                  p.coverUrl = cover
+                }
+              } catch (err) {
+                console.warn('[bili-cover] failed for', p.id, err)
+              }
+            })
+          )
+        }
       } else if (platform === 'youtube') {
         // YouTube browse 响应需要解析 sectionListRenderer
         playlists = parseYouTubeLibraryPlaylists(data)

@@ -34,7 +34,7 @@ impl SharedAudioLevel {
 
 /// PCM 音频分析器 — 精确对齐 Android `AudioReactive.kt`
 ///
-/// 算法流程（与 Android 完全一致）：
+/// 算法流程：
 /// 1. 计算 RMS（线性幅值，0..1）
 /// 2. 双 EMA 包络：emaFast(α=0.5) 和 emaSlow(α=0.05) 跟踪 RMS
 /// 3. 正向能量增量：delta = max(0, emaFast - emaSlow)
@@ -114,7 +114,7 @@ impl AudioAnalyzer {
             };
         }
 
-        // 1. 计算 RMS（线性幅值，0..1）— 对齐 Android rms16/rmsFloat
+        // 1. 计算 RMS（线性幅值，0..1）
         let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let rms = (sum_sq / samples.len() as f64).sqrt(); // 0..1 线性
 

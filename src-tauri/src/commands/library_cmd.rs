@@ -65,7 +65,7 @@ pub async fn list_playlists() -> AppResult<Vec<PlaylistInfo>> {
     }
 
     let mut list: Vec<PlaylistInfo> = store.playlists.iter().map(|p| {
-        let cover = p.tracks.iter().rev().find_map(|t| {
+        let cover = p.tracks.iter().find_map(|t| {
             t.cover_url
                 .as_ref()
                 .filter(|url| !url.trim().is_empty())
@@ -153,7 +153,7 @@ pub async fn add_to_playlist(app: AppHandle, playlist_id: i64, track: TrackInfo)
         .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
 
     if !pl.tracks.iter().any(|t| t.id == track.id) {
-        pl.tracks.push(track);
+        pl.tracks.insert(0, track);
         pl.modified_at = chrono::Utc::now().timestamp_millis() as u64;
     }
     store.save(&path)?;
@@ -170,11 +170,11 @@ pub async fn add_tracks_to_playlist(app: AppHandle, playlist_id: i64, tracks: Ve
         .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
 
     let mut added = 0_usize;
-    for track in tracks {
+    for track in tracks.into_iter().rev() {
         if track.id.is_empty() || pl.tracks.iter().any(|t| t.id == track.id) {
             continue;
         }
-        pl.tracks.push(track);
+        pl.tracks.insert(0, track);
         added += 1;
     }
 

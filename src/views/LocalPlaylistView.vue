@@ -8,6 +8,12 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+
+function isBilibiliCover(url?: string | null): boolean {
+  if (!url) return false
+  return /\.(hdslb|biliimg)\.com/i.test(url)
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -75,8 +81,7 @@ async function loadDetail() {
     playlistName.value = pl?.name || ''
 
     const trackList = await invoke<any[]>('get_playlist_tracks', { id })
-    // 倒序显示（对齐 Android：最新添加的在最前面）
-    tracks.value = trackList.map(normalizeTrack).reverse()
+    tracks.value = trackList.map(normalizeTrack)
   } catch (e: any) {
     error.value = e?.toString() || t('player.load_failed')
   } finally {
@@ -308,7 +313,10 @@ onMounted(() => {
       <!-- Hero 封面 + 信息（对齐 NeteasePlaylistView） -->
       <div class="detail-hero">
         <div class="hero-cover">
-          <img v-if="playlistCover" :src="playlistCover" referrerpolicy="no-referrer" />
+          <BilibiliCoverImage v-if="playlistCover && isBilibiliCover(playlistCover)" :src="playlistCover">
+            <span class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">queue_music</span>
+          </BilibiliCoverImage>
+          <img v-else-if="playlistCover" :src="playlistCover" referrerpolicy="no-referrer" />
           <span v-else class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">queue_music</span>
         </div>
         <div class="hero-info">
@@ -380,7 +388,10 @@ onMounted(() => {
             <span v-else class="index-num">{{ index + 1 }}</span>
           </div>
           <div class="track-cover">
-            <img v-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="isBilibiliCover(track.coverUrl)" :src="track.coverUrl" loading="lazy">
+              <span class="material-symbols-rounded filled">music_note</span>
+            </BilibiliCoverImage>
+            <img v-else-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
             <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="track-info">

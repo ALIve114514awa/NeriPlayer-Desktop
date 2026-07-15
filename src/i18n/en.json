@@ -466,9 +466,9 @@
     "bg_blur": "Background Blur",
     "bg_opacity": "Background Opacity",
 
-    "dev_mode": "Developer Mode",
-    "dev_mode_toast": "Developer mode enabled",
-    "dev_mode_tap_hint": "Tap {count} more times to enable developer mode",
+    "dev_mode": "Debug Mode",
+    "dev_mode_toast": "Debug mode enabled",
+    "dev_mode_tap_hint": "Tap {count} more times to enable debug mode",
     "build_uuid": "Build UUID",
     "build_time": "Build Time",
     "debug": "Debug",
