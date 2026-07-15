@@ -171,8 +171,60 @@ function normalizeWordTimings(
   }))
 }
 
-function toInternalWords(words: LyricWord[], lineStart: number, lineEnd: number): InternalWord[] {
-  return normalizeWordTimings(words, lineStart, lineEnd).map(word => ({
+function restoreWhitespaceFromLineText(words: LyricWord[], lineText: string): LyricWord[] {
+  if (!lineText || !/\s/.test(lineText) || words.some(word => /\s/.test(word.text))) return words
+
+  const compactWords = words.map(word => word.text).join('').replace(/\s+/g, '')
+  const compactLine = lineText.replace(/\s+/g, '')
+  if (compactWords !== compactLine) return words
+
+  const restored: LyricWord[] = []
+  let cursor = 0
+
+  for (const word of words) {
+    const token = word.text
+    const nextIndex = lineText.indexOf(token, cursor)
+    if (nextIndex < 0) return words
+
+    const between = lineText.slice(cursor, nextIndex)
+    if (between) {
+      if (between.trim()) return words
+      restored.push({
+        startMs: word.startMs,
+        durationMs: 0,
+        text: between,
+      })
+    }
+
+    restored.push({
+      ...word,
+      text: lineText.slice(nextIndex, nextIndex + token.length),
+    })
+    cursor = nextIndex + token.length
+  }
+
+  const tail = lineText.slice(cursor)
+  if (tail) {
+    if (tail.trim()) return words
+    const lastWord = words[words.length - 1]
+    restored.push({
+      startMs: lastWord ? lastWord.startMs + lastWord.durationMs : 0,
+      durationMs: 0,
+      text: tail,
+    })
+  }
+
+  return restored
+}
+
+function toInternalWords(
+  words: LyricWord[],
+  lineStart: number,
+  lineEnd: number,
+  lineText: string,
+): InternalWord[] {
+  const normalizedWords = normalizeWordTimings(words, lineStart, lineEnd)
+  return restoreWhitespaceFromLineText(normalizedWords, lineText).map(word => ({
     source: word,
     word: word.text,
     startTime: word.startMs,
@@ -207,7 +259,7 @@ export class KaraokeLine {
     this.disposed = false
     this.container = container
     this.lineStartTime = lineStart
-    const words = toInternalWords(lyricWords, lineStart, lineEnd)
+    const words = toInternalWords(lyricWords, lineStart, lineEnd, fallbackText)
     this.lineEndTime = Math.max(lineEnd, ...words.map(word => word.endTime))
     this.fallbackText = fallbackText || words.map(word => word.word).join('')
     container.replaceChildren()

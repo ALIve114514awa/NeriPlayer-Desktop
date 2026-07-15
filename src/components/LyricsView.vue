@@ -612,6 +612,8 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
 }
 
 .lyric-line {
+  --line-main-alpha: 0.46;
+  --line-translation-alpha: 0.34;
   position: relative;
   width: 100%;
   max-width: min(980px, 100%);
@@ -628,7 +630,24 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
   contain: layout style;
 
   &.active {
+    --line-main-alpha: 0.96;
+    --line-translation-alpha: 0.68;
     transform-origin: left bottom;
+  }
+
+  &.past {
+    --line-main-alpha: 0.42;
+    --line-translation-alpha: 0.30;
+  }
+
+  &.clear-text {
+    --line-main-alpha: 0.62;
+    --line-translation-alpha: 0.46;
+  }
+
+  &.clear-text.active {
+    --line-main-alpha: 0.94;
+    --line-translation-alpha: 0.66;
   }
 }
 
@@ -638,24 +657,21 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
   font-weight: 800;
   line-height: 1.32;
   letter-spacing: -0.015em;
-  color: rgba(255, 255, 255, 0.46);
+  color: rgba(255, 255, 255, var(--line-main-alpha));
   white-space: pre-wrap;
   text-wrap: pretty;
   overflow-wrap: anywhere;
   position: relative;
   z-index: 1;
-  .past & { color: rgba(255, 255, 255, 0.42); }
-  .clear-text & { color: rgba(255, 255, 255, 0.62); }
-  .clear-text.active & { color: rgba(255, 255, 255, 0.94); }
 }
 
 .lyric-line.active .line-text {
-  color: rgba(255, 255, 255, 0.94);
+  color: rgba(255, 255, 255, var(--line-main-alpha));
   text-shadow: none;
 }
 
 .lyric-line.active .line-text--karaoke {
-  color: rgba(255, 255, 255, 0.96);
+  color: rgba(255, 255, 255, var(--line-main-alpha));
 }
 
 .line-text--karaoke {
@@ -699,23 +715,22 @@ function interludeProgress(gap: { start: number; end: number } | null): number {
 
 :deep(.line-text--active.kw-container .kw),
 :deep(.lyric-line.active .kw-container .kw) {
-  color: rgba(255, 255, 255, 0.96);
+  color: rgba(255, 255, 255, var(--line-main-alpha));
 }
 
 .line-tl {
   display: block;
   font-size: calc(clamp(17px, 1.25vw, 24px) * var(--lyric-font-scale, 1));
   font-weight: 650;
-  color: rgba(255, 255, 255, 0.48);
+  color: rgba(255, 255, 255, var(--line-translation-alpha));
   margin-top: 6px;
   line-height: 1.35;
   position: relative;
   z-index: 1;
 
   .active & {
-    color: rgba(255, 255, 255, 0.74);
+    color: rgba(255, 255, 255, var(--line-translation-alpha));
     text-shadow: none;
   }
-  .past & { color: rgba(255, 255, 255, 0.40); }
 }
 </style>
