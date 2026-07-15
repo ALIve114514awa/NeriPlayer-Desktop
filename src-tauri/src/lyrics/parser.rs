@@ -30,6 +30,26 @@ pub fn parse_auto(content: &str) -> Vec<LyricLine> {
     }
 }
 
+fn yrc_word_times_are_relative(
+    line_start_ms: u64,
+    line_duration_ms: u64,
+    words: &[LyricWord],
+) -> bool {
+    let Some(first_word_start) = words.iter().map(|w| w.start_ms).min() else {
+        return false;
+    };
+    let Some(last_word_end) = words
+        .iter()
+        .map(|w| w.start_ms.saturating_add(w.duration_ms))
+        .max()
+    else {
+        return false;
+    };
+
+    first_word_start < line_start_ms.saturating_sub(250)
+        && last_word_end <= line_duration_ms.saturating_add(500)
+}
+
 /// 解析网易云 YRC 逐字歌词
 /// 格式：[startMs,durationMs](wordStartMs,wordDurationMs,0)文字...
 pub fn parse_yrc(content: &str) -> Vec<LyricLine> {
@@ -58,6 +78,12 @@ pub fn parse_yrc(content: &str) -> Vec<LyricLine> {
             }
 
             if full_text.trim().is_empty() { continue; }
+
+            if yrc_word_times_are_relative(start_ms, duration_ms, &words) {
+                for word in &mut words {
+                    word.start_ms = start_ms.saturating_add(word.start_ms);
+                }
+            }
 
             lines.push(LyricLine {
                 start_ms,
@@ -124,5 +150,28 @@ pub fn merge_translation(lines: &mut [LyricLine], translation_lrc: &str) {
                 line.translation = Some(tl.text.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_yrc;
+
+    #[test]
+    fn parse_yrc_normalizes_relative_word_times() {
+        let lines = parse_yrc("[10000,2000](0,500,0)你(500,500,0)好");
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].words[0].start_ms, 10000);
+        assert_eq!(lines[0].words[1].start_ms, 10500);
+    }
+
+    #[test]
+    fn parse_yrc_keeps_absolute_word_times() {
+        let lines = parse_yrc("[10000,2000](10000,500,0)你(10500,500,0)好");
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].words[0].start_ms, 10000);
+        assert_eq!(lines[0].words[1].start_ms, 10500);
     }
 }

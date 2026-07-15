@@ -1580,8 +1580,6 @@ const sliderActiveColor = computed(() => {
           :preview-time-ms="previewPositionMs"
           :is-playing="player.isPlaying"
           :lyric-offset-ms="currentLyricOffsetMs"
-          :accent-color="sliderActiveColor"
-          :accent-container-color="(dynamicColorVars as any)['--np-primary-container'] || sliderActiveColor"
           @seek="(ms) => player.seekTo(ms)"
         />
         <div v-else class="lyrics-empty">
