@@ -6,6 +6,11 @@ import { useDownloadStore } from '@/stores/download'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
+import {
+  playlistDetailCacheKey,
+  readPlaylistDetailCache,
+  writePlaylistDetailCache,
+} from '@/utils/playlistDetailCache'
 
 const route = useRoute()
 const router = useRouter()
@@ -21,6 +26,29 @@ const coverUrl = ref('')
 const searchQuery = ref('')
 
 const tracks = ref<TrackInfo[]>([])
+
+interface YouTubeDetailCache {
+  playlistName: string
+  subtitle: string
+  coverUrl: string
+  tracks: TrackInfo[]
+}
+
+function applyDetailCache(cache: YouTubeDetailCache) {
+  playlistName.value = cache.playlistName
+  subtitle.value = cache.subtitle
+  coverUrl.value = cache.coverUrl
+  tracks.value = cache.tracks
+}
+
+function saveDetailCache(cacheKey: string) {
+  writePlaylistDetailCache<YouTubeDetailCache>(cacheKey, {
+    playlistName: playlistName.value,
+    subtitle: subtitle.value,
+    coverUrl: coverUrl.value,
+    tracks: tracks.value,
+  })
+}
 
 const filteredTracks = computed(() => {
   if (!searchQuery.value) return tracks.value
@@ -119,14 +147,24 @@ async function loadDetail() {
   const browseId = route.params.browseId as string
   if (!browseId) return
 
-  isLoading.value = true
+  const cacheKey = playlistDetailCacheKey('youtube-playlist', browseId)
+  const cached = readPlaylistDetailCache<YouTubeDetailCache>(cacheKey)
+  if (cached) {
+    applyDetailCache(cached)
+    isLoading.value = false
+  } else {
+    isLoading.value = true
+  }
   error.value = null
 
   try {
     const data = await invoke<any>('get_youtube_playlist_detail', { browseId })
     tracks.value = parsePlaylistTracks(data)
+    saveDetailCache(cacheKey)
   } catch (e: any) {
-    error.value = e?.toString() || t('player.load_failed')
+    if (!cached) {
+      error.value = e?.toString() || t('player.load_failed')
+    }
   } finally {
     isLoading.value = false
   }

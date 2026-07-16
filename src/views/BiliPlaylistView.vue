@@ -7,6 +7,11 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import {
+  playlistDetailCacheKey,
+  readPlaylistDetailCache,
+  writePlaylistDetailCache,
+} from '@/utils/playlistDetailCache'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,6 +27,29 @@ const mediaCount = ref(0)
 const searchQuery = ref('')
 
 const tracks = ref<TrackInfo[]>([])
+
+interface BiliDetailCache {
+  folderName: string
+  coverUrl: string
+  mediaCount: number
+  tracks: TrackInfo[]
+}
+
+function applyDetailCache(cache: BiliDetailCache) {
+  folderName.value = cache.folderName
+  coverUrl.value = cache.coverUrl
+  mediaCount.value = cache.mediaCount
+  tracks.value = cache.tracks
+}
+
+function saveDetailCache(cacheKey: string) {
+  writePlaylistDetailCache<BiliDetailCache>(cacheKey, {
+    folderName: folderName.value,
+    coverUrl: coverUrl.value,
+    mediaCount: mediaCount.value,
+    tracks: tracks.value,
+  })
+}
 
 const filteredTracks = computed(() => {
   if (!searchQuery.value) return tracks.value
@@ -40,7 +68,14 @@ async function loadDetail() {
   const mediaId = Number(route.params.mediaId)
   if (!mediaId) return
 
-  isLoading.value = true
+  const cacheKey = playlistDetailCacheKey('bilibili-favorite', mediaId)
+  const cached = readPlaylistDetailCache<BiliDetailCache>(cacheKey)
+  if (cached) {
+    applyDetailCache(cached)
+    isLoading.value = false
+  } else {
+    isLoading.value = true
+  }
   error.value = null
 
   try {
@@ -76,8 +111,11 @@ async function loadDetail() {
         coverUrl: item.cover || '',
         audioUrl: '',
       }))
+    saveDetailCache(cacheKey)
   } catch (e: any) {
-    error.value = e?.toString() || t('player.load_failed')
+    if (!cached) {
+      error.value = e?.toString() || t('player.load_failed')
+    }
   } finally {
     isLoading.value = false
   }

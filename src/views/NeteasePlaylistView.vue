@@ -6,6 +6,11 @@ import { useDownloadStore } from '@/stores/download'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
+import {
+  playlistDetailCacheKey,
+  readPlaylistDetailCache,
+  writePlaylistDetailCache,
+} from '@/utils/playlistDetailCache'
 
 const props = defineProps<{ isAlbum?: boolean }>()
 const route = useRoute()
@@ -25,6 +30,38 @@ const creator = ref('')
 const searchQuery = ref('')
 
 const tracks = ref<TrackInfo[]>([])
+
+interface NeteaseDetailCache {
+  playlistName: string
+  coverUrl: string
+  trackCount: number
+  playCount: number
+  description: string
+  creator: string
+  tracks: TrackInfo[]
+}
+
+function applyDetailCache(cache: NeteaseDetailCache) {
+  playlistName.value = cache.playlistName
+  coverUrl.value = cache.coverUrl
+  trackCount.value = cache.trackCount
+  playCount.value = cache.playCount
+  description.value = cache.description
+  creator.value = cache.creator
+  tracks.value = cache.tracks
+}
+
+function saveDetailCache(cacheKey: string) {
+  writePlaylistDetailCache<NeteaseDetailCache>(cacheKey, {
+    playlistName: playlistName.value,
+    coverUrl: coverUrl.value,
+    trackCount: trackCount.value,
+    playCount: playCount.value,
+    description: description.value,
+    creator: creator.value,
+    tracks: tracks.value,
+  })
+}
 
 const filteredTracks = computed(() => {
   if (!searchQuery.value) return tracks.value
@@ -59,7 +96,14 @@ async function loadDetail() {
   const id = Number(route.params.id)
   if (!id) return
 
-  isLoading.value = true
+  const cacheKey = playlistDetailCacheKey(props.isAlbum ? 'netease-album' : 'netease-playlist', id)
+  const cached = readPlaylistDetailCache<NeteaseDetailCache>(cacheKey)
+  if (cached) {
+    applyDetailCache(cached)
+    isLoading.value = false
+  } else {
+    isLoading.value = true
+  }
   error.value = null
 
   try {
@@ -103,8 +147,11 @@ async function loadDetail() {
         audioUrl: '',
       }))
     }
+    saveDetailCache(cacheKey)
   } catch (e: any) {
-    error.value = e?.toString() || t('player.load_failed')
+    if (!cached) {
+      error.value = e?.toString() || t('player.load_failed')
+    }
   } finally {
     isLoading.value = false
   }
