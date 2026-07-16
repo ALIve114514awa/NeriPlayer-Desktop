@@ -253,14 +253,8 @@ pub fn tracks_to_sync_songs_pub(tracks: &[TrackInfo]) -> Vec<SyncSong> {
 }
 
 fn tracks_to_sync_songs(tracks: &[TrackInfo]) -> Vec<SyncSong> {
-    let newest_added_at = chrono::Utc::now().timestamp_millis();
     tracks.iter()
-        .enumerate()
-        .map(|(index, track)| {
-            let mut song = track_to_sync_song(track);
-            song.added_at = (newest_added_at - index as i64).max(1);
-            song
-        })
+        .map(track_to_sync_song)
         .collect()
 }
 
@@ -277,7 +271,7 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
         duration_ms: track.duration_ms as i64,
         cover_url: track.cover_url.clone().unwrap_or_default(),
         media_uri: platform.media_uri.unwrap_or_default(),
-        added_at: chrono::Utc::now().timestamp_millis(),
+        added_at: track.added_at.max(0),
         matched_lyric: None,
         matched_translated_lyric: None,
         matched_lyric_source: None,
@@ -433,6 +427,7 @@ fn sync_song_to_track(song: &SyncSong) -> TrackInfo {
         source,
         url: String::new(), // URL 在播放时动态获取
         cover_url: if song.cover_url.is_empty() { None } else { Some(song.cover_url.clone()) },
+        added_at: song.added_at.max(0),
     }
 }
 
@@ -485,20 +480,22 @@ pub fn save_synced_playlists(merged: &SyncData) {
 
     // 歌单级别去重：同名歌单只保留第一个
     let mut seen_names = std::collections::HashSet::new();
+    let now = chrono::Utc::now().timestamp_millis();
 
     for sp in &merged.playlists {
         if sp.is_deleted { continue; }
+        let playlist = sp.normalized_for_display_order(now);
 
-        let normalized_name = sp.name.trim().to_string();
+        let normalized_name = playlist.name.trim().to_string();
         if !seen_names.insert(normalized_name.clone()) {
             continue;
         }
 
-        let mut local_id = resolve_system_id(&sp.id, &sp.name);
+        let mut local_id = resolve_system_id(&playlist.id, &playlist.name);
         if local_id == 0 {
-            local_id = sp.id.parse::<i64>().ok()
+            local_id = playlist.id.parse::<i64>().ok()
                 .filter(|&id| id > 0)
-                .or_else(|| store.playlists.iter().find(|p| p.name == sp.name).map(|p| p.id))
+                .or_else(|| store.playlists.iter().find(|p| p.name == playlist.name).map(|p| p.id))
                 .unwrap_or_else(|| { max_id += 1; max_id });
         }
 
@@ -510,7 +507,7 @@ pub fn save_synced_playlists(merged: &SyncData) {
 
         // 歌曲去重
         let mut seen_tracks = std::collections::HashSet::new();
-        let tracks: Vec<TrackInfo> = sp.songs.iter()
+        let tracks: Vec<TrackInfo> = playlist.songs.iter()
             .filter_map(|song| {
                 let track = sync_song_to_track(song);
                 if track.id.is_empty() || !seen_tracks.insert(track.id.clone()) {
@@ -523,9 +520,9 @@ pub fn save_synced_playlists(merged: &SyncData) {
 
         new_playlists.push(Playlist {
             id: local_id,
-            name: sp.name.clone(),
+            name: playlist.name,
             tracks,
-            modified_at: sp.modified_at.max(0) as u64,
+            modified_at: playlist.modified_at.max(0) as u64,
         });
     }
 
@@ -612,4 +609,47 @@ fn save_base_snapshot(merged: &SyncData) {
     let path = base_snapshot_path();
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let _ = std::fs::write(&path, serde_json::to_string(&snapshot).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{TrackInfo, TrackSource};
+
+    #[test]
+    fn sync_song_conversion_preserves_playlist_added_at() {
+        let songs = tracks_to_sync_songs_pub(&[
+            track("netease:1", 123),
+            track("netease:2", 0),
+        ]);
+
+        assert_eq!(songs.iter().map(|song| song.added_at).collect::<Vec<_>>(), vec![123, 0]);
+
+        let imported = sync_song_to_track(&SyncSong {
+            id: "42".into(),
+            name: "Remote".into(),
+            album: "netease".into(),
+            added_at: 777,
+            channel_id: Some("netease".into()),
+            audio_id: Some("42".into()),
+            ..Default::default()
+        });
+        let roundtrip = tracks_to_sync_songs_pub(&[imported]);
+
+        assert_eq!(roundtrip[0].added_at, 777);
+    }
+
+    fn track(id: &str, added_at: i64) -> TrackInfo {
+        TrackInfo {
+            id: id.into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 1_000,
+            source: TrackSource::Netease,
+            url: String::new(),
+            cover_url: None,
+            added_at,
+        }
+    }
 }

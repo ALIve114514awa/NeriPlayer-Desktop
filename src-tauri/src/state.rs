@@ -84,6 +84,8 @@ pub struct TrackInfo {
     /// 本地文件路径或远程 URL
     pub url: String,
     pub cover_url: Option<String>,
+    #[serde(default, alias = "addedAt")]
+    pub added_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -153,8 +153,9 @@ pub async fn add_to_playlist(app: AppHandle, playlist_id: i64, track: TrackInfo)
         .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
 
     if !pl.tracks.iter().any(|t| t.id == track.id) {
-        pl.tracks.insert(0, track);
-        pl.modified_at = chrono::Utc::now().timestamp_millis() as u64;
+        let now = chrono::Utc::now().timestamp_millis();
+        pl.tracks.insert(0, stamp_track_for_playlist_insert(track, now));
+        pl.modified_at = now as u64;
     }
     store.save(&path)?;
     let _ = app.emit("playlists-changed", ());
@@ -169,21 +170,36 @@ pub async fn add_tracks_to_playlist(app: AppHandle, playlist_id: i64, tracks: Ve
     let pl = store.playlists.iter_mut().find(|p| p.id == playlist_id)
         .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
 
-    let mut added = 0_usize;
-    for track in tracks.into_iter().rev() {
-        if track.id.is_empty() || pl.tracks.iter().any(|t| t.id == track.id) {
+    let mut seen = std::collections::HashSet::new();
+    let mut new_tracks = Vec::new();
+    for track in tracks {
+        if track.id.is_empty()
+            || pl.tracks.iter().any(|t| t.id == track.id)
+            || !seen.insert(track.id.clone())
+        {
             continue;
         }
-        pl.tracks.insert(0, track);
-        added += 1;
+        new_tracks.push(track);
+    }
+
+    let newest_added_at = chrono::Utc::now().timestamp_millis();
+    let added = new_tracks.len();
+    for (index, track) in new_tracks.into_iter().enumerate().rev() {
+        let added_at = (newest_added_at - index as i64).max(1);
+        pl.tracks.insert(0, stamp_track_for_playlist_insert(track, added_at));
     }
 
     if added > 0 {
-        pl.modified_at = chrono::Utc::now().timestamp_millis() as u64;
+        pl.modified_at = newest_added_at as u64;
         store.save(&path)?;
         let _ = app.emit("playlists-changed", ());
     }
     Ok(added)
+}
+
+fn stamp_track_for_playlist_insert(mut track: TrackInfo, added_at: i64) -> TrackInfo {
+    track.added_at = added_at.max(1);
+    track
 }
 
 #[tauri::command]

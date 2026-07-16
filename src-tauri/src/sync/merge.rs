@@ -122,6 +122,10 @@ fn merge_songs(local: &[SyncSong], remote: &[SyncSong], _last_sync_time: i64, ba
 
     let local_keys: HashSet<String> = local.iter().map(|s| s.identity().stable_key()).collect();
     let remote_keys: HashSet<String> = remote.iter().map(|s| s.identity().stable_key()).collect();
+    let remote_by_key: HashMap<String, &SyncSong> = remote
+        .iter()
+        .map(|song| (song.identity().stable_key(), song))
+        .collect();
 
     // 计算删除集合
     // 在 base 中存在但本地不存在 -> 本地删除
@@ -142,7 +146,7 @@ fn merge_songs(local: &[SyncSong], remote: &[SyncSong], _last_sync_time: i64, ba
         if remotely_deleted.contains(&key) {
             continue;
         }
-        result.push(song.clone());
+        result.push(merge_song_metadata(song, remote_by_key.get(&key).copied()));
     }
 
     // 追加远程独有（不在本地中、且非本地删除的）
@@ -155,6 +159,25 @@ fn merge_songs(local: &[SyncSong], remote: &[SyncSong], _last_sync_time: i64, ba
     }
 
     result
+}
+
+fn merge_song_metadata(local: &SyncSong, remote: Option<&SyncSong>) -> SyncSong {
+    let Some(remote) = remote else {
+        return local.clone();
+    };
+
+    let mut merged = local.clone();
+    merged.added_at = merge_added_at(local.added_at, remote.added_at);
+    merged
+}
+
+fn merge_added_at(local: i64, remote: i64) -> i64 {
+    match (local > 0, remote > 0) {
+        (true, true) => local.min(remote),
+        (true, false) => local,
+        (false, true) => remote,
+        (false, false) => 0,
+    }
 }
 
 fn order_merged_playlists(
@@ -350,12 +373,16 @@ pub fn has_data_changed(remote: &SyncData, merged: &SyncData) -> bool {
 
     // 歌单内容比对
     for (rp, mp) in remote.playlists.iter().zip(merged.playlists.iter()) {
-        if rp.name != mp.name || rp.songs.len() != mp.songs.len() {
+        if rp.name != mp.name
+            || rp.song_order_version != mp.song_order_version
+            || rp.songs.len() != mp.songs.len()
+        {
             return true;
         }
-        let r_keys: Vec<String> = rp.songs.iter().map(|s| s.identity().stable_key()).collect();
-        let m_keys: Vec<String> = mp.songs.iter().map(|s| s.identity().stable_key()).collect();
-        if r_keys != m_keys {
+        if rp.songs.iter().zip(&mp.songs).any(|(remote_song, merged_song)| {
+            remote_song.identity().stable_key() != merged_song.identity().stable_key()
+                || remote_song.added_at != merged_song.added_at
+        }) {
             return true;
         }
     }
@@ -458,4 +485,82 @@ fn merge_playlist_song_deletions(local: &[SyncPlaylistSongDeletion], remote: &[S
     result.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
     result.truncate(MAX_DELETIONS);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_preserves_remote_added_at_when_desktop_local_lacks_it() {
+        let local_song = song("42", 0);
+        let remote_song = song("42", 500);
+        let base_key = remote_song.identity().stable_key();
+        let mut base_snapshot = HashMap::new();
+        base_snapshot.insert("1".to_string(), HashSet::from([base_key]));
+
+        let merged = three_way_merge(
+            &sync_data(vec![playlist(vec![local_song])]),
+            &sync_data(vec![playlist(vec![remote_song])]),
+            100,
+            &base_snapshot,
+        );
+
+        assert_eq!(merged.playlists[0].songs[0].added_at, 500);
+    }
+
+    #[test]
+    fn merge_keeps_existing_song_from_becoming_newer_than_remote_copy() {
+        let local_song = song("42", 10_000);
+        let remote_song = song("42", 500);
+        let base_key = remote_song.identity().stable_key();
+        let mut base_snapshot = HashMap::new();
+        base_snapshot.insert("1".to_string(), HashSet::from([base_key]));
+
+        let merged = three_way_merge(
+            &sync_data(vec![playlist(vec![local_song])]),
+            &sync_data(vec![playlist(vec![remote_song])]),
+            100,
+            &base_snapshot,
+        );
+
+        assert_eq!(merged.playlists[0].songs[0].added_at, 500);
+    }
+
+    #[test]
+    fn data_change_detection_includes_playlist_order_metadata() {
+        let remote = sync_data(vec![playlist(vec![song("42", 10_000)])]);
+        let merged = sync_data(vec![playlist(vec![song("42", 500)])]);
+
+        assert!(has_data_changed(&remote, &merged));
+    }
+
+    fn sync_data(playlists: Vec<SyncPlaylist>) -> SyncData {
+        SyncData {
+            playlists,
+            ..Default::default()
+        }
+    }
+
+    fn playlist(songs: Vec<SyncSong>) -> SyncPlaylist {
+        SyncPlaylist {
+            id: "1".into(),
+            name: "Playlist".into(),
+            songs,
+            created_at: 10,
+            modified_at: 20,
+            is_deleted: false,
+            song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
+        }
+    }
+
+    fn song(id: &str, added_at: i64) -> SyncSong {
+        SyncSong {
+            id: id.into(),
+            name: "Song".into(),
+            album: "netease".into(),
+            added_at,
+            ..Default::default()
+        }
+    }
 }

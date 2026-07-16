@@ -110,6 +110,7 @@ fn read_track_info(path: &Path, name_template: Option<&str>) -> AppResult<TrackI
         source: TrackSource::Local,
         url: path.to_string_lossy().to_string(),
         cover_url,
+        added_at: 0,
     })
 }
 
