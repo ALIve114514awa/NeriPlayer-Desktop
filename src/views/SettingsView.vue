@@ -86,6 +86,18 @@ const presetColors = THEME_COLORS.map(c => ({
 
 const activeColorKey = ref(getSavedThemeColor())
 
+// 头像地址可能短暂失效，记录具体失败地址，换地址后仍允许重新加载
+const failedAvatarUrls = ref<Record<string, string | null>>({})
+
+function isAvatarLoadFailed(platform: string, avatarUrl: string | null) {
+  return Boolean(avatarUrl && failedAvatarUrls.value[platform] === avatarUrl)
+}
+
+function handleAvatarError(platform: string, avatarUrl: string | null) {
+  if (!avatarUrl) return
+  failedAvatarUrls.value = { ...failedAvatarUrls.value, [platform]: avatarUrl }
+}
+
 function handleColorSwitch(key: string, event: MouseEvent) {
   activeColorKey.value = key
   selectedColor.value = key
@@ -582,11 +594,13 @@ async function confirmClearGitHub() {
           <span class="material-symbols-rounded account-avatar account-avatar-fallback">account_circle</span>
         </BilibiliCoverImage>
         <img
-          v-else-if="account.auth.avatarUrl"
+          v-else-if="account.auth.avatarUrl && !isAvatarLoadFailed(account.key, account.auth.avatarUrl)"
           :src="account.auth.avatarUrl"
           class="account-avatar"
           referrerpolicy="no-referrer"
+          @error="handleAvatarError(account.key, account.auth.avatarUrl)"
         />
+        <span v-else class="material-symbols-rounded account-avatar account-avatar-fallback">account_circle</span>
         <button class="account-logout-btn" @click="requestLogout(account.key, account.label)">
           <span class="material-symbols-rounded" style="font-size: 16px">logout</span>
           {{ t('settings.sign_out') }}
