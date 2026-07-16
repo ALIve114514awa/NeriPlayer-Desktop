@@ -11,6 +11,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
 import { useSyncStore } from '@/stores/sync'
 import { useDownloadStore } from '@/stores/download'
+import { usePlayerStore } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import { switchThemeWithRipple, type ThemeMode } from '@/utils/theme'
@@ -22,6 +23,7 @@ const settings = useSettingsStore()
 const auth = useAuthStore()
 const syncStore = useSyncStore()
 const downloadStore = useDownloadStore()
+const player = usePlayerStore()
 const toast = useToastStore()
 const {
   darkMode, themeColor: selectedColor, coverStyle,
@@ -158,6 +160,44 @@ const biliQualityOptions = computed(() => [
   { value: 'hires', label: t('settings.q_hires') },
   { value: 'dolby', label: t('settings.q_dolby') },
 ])
+
+type OnlineQualitySource = 'netease' | 'qq' | 'youtube' | 'bilibili'
+const qualitySwitching = ref(false)
+
+function qualityForSource(source: OnlineQualitySource): string {
+  if (source === 'netease') return neteaseQuality.value
+  if (source === 'qq') return qqMusicQuality.value
+  if (source === 'youtube') return youtubeQuality.value
+  return biliQuality.value
+}
+
+function setQualityForSource(source: OnlineQualitySource, value: string) {
+  if (source === 'netease') neteaseQuality.value = value
+  else if (source === 'qq') qqMusicQuality.value = value
+  else if (source === 'youtube') youtubeQuality.value = value
+  else biliQuality.value = value
+}
+
+async function handleQualityChange(source: OnlineQualitySource, value: string) {
+  const previous = qualityForSource(source)
+  if (previous === value || qualitySwitching.value) return
+
+  setQualityForSource(source, value)
+  const track = player.currentTrack
+  const isCurrentSource = !!track && track.id.startsWith(`${source}:`)
+  if (!track || player.isLoadingAudio || player.isPlayingFromDownload || !isCurrentSource) return
+
+  qualitySwitching.value = true
+  try {
+    await player.replayWithQuality()
+  } catch (error) {
+    setQualityForSource(source, previous)
+    const message = error instanceof Error ? error.message : String(error)
+    toast.error(message)
+  } finally {
+    qualitySwitching.value = false
+  }
+}
 
 // 折叠区段控制
 const expandedSections = ref<Set<string>>(new Set())
@@ -1152,7 +1192,7 @@ async function confirmClearGitHub() {
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.netease_quality') }}</div>
           <div class="chip-wrap">
-            <button v-for="o in neteaseQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: neteaseQuality === o.value }" @click="neteaseQuality = o.value">{{ o.label }}</button>
+            <button v-for="o in neteaseQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: neteaseQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('netease', o.value)">{{ o.label }}</button>
           </div>
         </div>
       </div>
@@ -1162,7 +1202,7 @@ async function confirmClearGitHub() {
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.qq_quality') }}</div>
           <div class="chip-wrap">
-            <button v-for="o in qqQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: qqMusicQuality === o.value }" @click="qqMusicQuality = o.value">{{ o.label }}</button>
+            <button v-for="o in qqQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: qqMusicQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('qq', o.value)">{{ o.label }}</button>
           </div>
         </div>
       </div>
@@ -1172,7 +1212,7 @@ async function confirmClearGitHub() {
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.youtube_quality') }}</div>
           <div class="chip-wrap">
-            <button v-for="o in youtubeQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: youtubeQuality === o.value }" @click="youtubeQuality = o.value">{{ o.label }}</button>
+            <button v-for="o in youtubeQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: youtubeQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('youtube', o.value)">{{ o.label }}</button>
           </div>
         </div>
       </div>
@@ -1182,7 +1222,7 @@ async function confirmClearGitHub() {
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.bili_quality') }}</div>
           <div class="chip-wrap">
-            <button v-for="o in biliQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: biliQuality === o.value }" @click="biliQuality = o.value">{{ o.label }}</button>
+            <button v-for="o in biliQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: biliQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('bilibili', o.value)">{{ o.label }}</button>
           </div>
         </div>
       </div>

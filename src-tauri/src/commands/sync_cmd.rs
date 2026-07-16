@@ -5,6 +5,7 @@ use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::sync::models::*;
 use crate::sync::manager;
+use crate::security;
 use tauri_plugin_store::StoreExt;
 
 // 同步配置存储键
@@ -12,30 +13,122 @@ const GITHUB_CONFIG_KEY: &str = "githubSync";
 const WEBDAV_CONFIG_KEY: &str = "webdavSync";
 const SYNC_STORE: &str = "sync-config.json";
 
+/// 启动时迁移旧版同步凭据，避免只有打开设置页后才清理明文
+pub fn initialize_secure_storage(app: &AppHandle) {
+    let _ = load_github_config(app);
+    let _ = load_webdav_config(app);
+}
+
 fn load_github_config(app: &AppHandle) -> GitHubSyncConfig {
-    app.store(SYNC_STORE).ok()
+    let mut config: GitHubSyncConfig = app.store(SYNC_STORE).ok()
         .and_then(|s| s.get(GITHUB_CONFIG_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let legacy_token = std::mem::take(&mut config.token);
+
+    if let Some(token) = security::get_secret(security::GITHUB_TOKEN_KEY) {
+        config.token = token;
+        if !legacy_token.is_empty() {
+            save_github_config(app, &config);
+        }
+        return config;
+    }
+
+    if legacy_token.is_empty() {
+        return config;
+    }
+
+    if security::set_secret(security::GITHUB_TOKEN_KEY, &legacy_token) {
+        config.token = legacy_token;
+        save_github_config(app, &config);
+    } else {
+        // 安全存储不可用时清除旧明文，不让凭据继续留在配置文件
+        log::error!("旧版 GitHub Token 迁移到系统钥匙串失败，已清除明文凭据");
+        config.token.clear();
+        save_github_config(app, &config);
+    }
+    config
 }
 
 fn save_github_config(app: &AppHandle, config: &GitHubSyncConfig) {
+    if config.token.is_empty() {
+        let _ = security::delete_secret(security::GITHUB_TOKEN_KEY);
+    } else if !security::set_secret(security::GITHUB_TOKEN_KEY, &config.token) {
+        log::error!("系统钥匙串不可用，GitHub Token 未持久化");
+    }
+
     if let Ok(s) = app.store(SYNC_STORE) {
-        let _ = s.set(GITHUB_CONFIG_KEY, serde_json::to_value(config).unwrap_or_default());
+        let _ = s.set(GITHUB_CONFIG_KEY, github_config_store_value(config));
+        let _ = s.save();
     }
 }
 
 fn load_webdav_config(app: &AppHandle) -> WebDavSyncConfig {
-    app.store(SYNC_STORE).ok()
+    let mut config: WebDavSyncConfig = app.store(SYNC_STORE).ok()
         .and_then(|s| s.get(WEBDAV_CONFIG_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let legacy_password = std::mem::take(&mut config.password);
+
+    if let Some(password) = security::get_secret(security::WEBDAV_PASSWORD_KEY) {
+        config.password = password;
+        if !legacy_password.is_empty() {
+            save_webdav_config(app, &config);
+        }
+        return config;
+    }
+
+    if legacy_password.is_empty() {
+        return config;
+    }
+
+    if security::set_secret(security::WEBDAV_PASSWORD_KEY, &legacy_password) {
+        config.password = legacy_password;
+        save_webdav_config(app, &config);
+    } else {
+        // 安全存储不可用时清除旧明文，不让凭据继续留在配置文件
+        log::error!("旧版 WebDAV 密码迁移到系统钥匙串失败，已清除明文凭据");
+        config.password.clear();
+        save_webdav_config(app, &config);
+    }
+    config
 }
 
 fn save_webdav_config(app: &AppHandle, config: &WebDavSyncConfig) {
-    if let Ok(s) = app.store(SYNC_STORE) {
-        let _ = s.set(WEBDAV_CONFIG_KEY, serde_json::to_value(config).unwrap_or_default());
+    if config.password.is_empty() {
+        let _ = security::delete_secret(security::WEBDAV_PASSWORD_KEY);
+    } else if !security::set_secret(security::WEBDAV_PASSWORD_KEY, &config.password) {
+        log::error!("系统钥匙串不可用，WebDAV 密码未持久化");
     }
+
+    if let Ok(s) = app.store(SYNC_STORE) {
+        let _ = s.set(WEBDAV_CONFIG_KEY, webdav_config_store_value(config));
+        let _ = s.save();
+    }
+}
+
+fn github_config_store_value(config: &GitHubSyncConfig) -> Value {
+    serde_json::json!({
+        "owner": config.owner,
+        "repo": config.repo,
+        "lastRemoteSha": config.last_remote_sha,
+        "lastSyncTime": config.last_sync_time,
+        "autoSync": config.auto_sync,
+        "dataSaver": config.data_saver,
+        "silentFailures": config.silent_failures,
+        "historyUpdateMode": config.history_update_mode,
+    })
+}
+
+fn webdav_config_store_value(config: &WebDavSyncConfig) -> Value {
+    serde_json::json!({
+        "serverUrl": config.server_url,
+        "username": config.username,
+        "basePath": config.base_path,
+        "lastRemoteFingerprint": config.last_remote_fingerprint,
+        "lastSyncTime": config.last_sync_time,
+        "autoSync": config.auto_sync,
+    })
 }
 
 /// 获取 GitHub 同步配置（不含 token 明文）
@@ -492,4 +585,40 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
 pub async fn disconnect_webdav_sync(app: AppHandle) -> AppResult<()> {
     save_webdav_config(&app, &WebDavSyncConfig::default());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{github_config_store_value, webdav_config_store_value};
+    use crate::sync::models::{GitHubSyncConfig, WebDavSyncConfig};
+
+    #[test]
+    fn github_store_value_excludes_token() {
+        let config = GitHubSyncConfig {
+            token: "secret-token".into(),
+            owner: "owner".into(),
+            repo: "repo".into(),
+            ..Default::default()
+        };
+        let value = github_config_store_value(&config);
+
+        assert!(value.get("token").is_none());
+        assert!(serde_json::to_value(&config).unwrap().get("token").is_none());
+        assert_eq!(value["owner"], "owner");
+    }
+
+    #[test]
+    fn webdav_store_value_excludes_password() {
+        let config = WebDavSyncConfig {
+            server_url: "https://dav.example.test".into(),
+            username: "user".into(),
+            password: "secret-password".into(),
+            ..Default::default()
+        };
+        let value = webdav_config_store_value(&config);
+
+        assert!(value.get("password").is_none());
+        assert!(serde_json::to_value(&config).unwrap().get("password").is_none());
+        assert_eq!(value["serverUrl"], "https://dav.example.test");
+    }
 }

@@ -120,6 +120,23 @@ fn has_login_cookie(entries: &[CookieEntry], sentinel_cookie: &str) -> bool {
         .any(|entry| entry.name == sentinel_cookie && !entry.value.is_empty())
 }
 
+fn has_completed_login(
+    entries: &[CookieEntry],
+    sentinel_cookie: &str,
+    current_url: Option<&url::Url>,
+    required_host: Option<&str>,
+) -> bool {
+    if !has_login_cookie(entries, sentinel_cookie) {
+        return false;
+    }
+
+    required_host.is_none_or(|host| {
+        current_url
+            .and_then(url::Url::host_str)
+            .is_some_and(|current_host| current_host.eq_ignore_ascii_case(host))
+    })
+}
+
 async fn fetch_youtube_profile(
     state: &AppState,
     auth: &YouTubeAuth,
@@ -161,7 +178,8 @@ fn youtube_auth_matches(left: &YouTubeAuth, right: &YouTubeAuth) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::cookie_domain_matches_urls;
+    use super::{cookie_domain_matches_urls, has_completed_login};
+    use crate::auth::state::CookieEntry;
 
     const BILIBILI_URLS: &[&str] = &[
         "https://www.bilibili.com",
@@ -186,6 +204,40 @@ mod tests {
     fn unrelated_cookie_domain_is_rejected() {
         assert!(!cookie_domain_matches_urls("evilbilibili.com", BILIBILI_URLS));
     }
+
+    #[test]
+    fn youtube_google_sapisid_does_not_finish_login_before_music_landing() {
+        let entries = vec![CookieEntry {
+            name: "SAPISID".into(),
+            value: "google-session".into(),
+            domain: "google.com".into(),
+        }];
+        let current_url = url::Url::parse("https://accounts.google.com/ServiceLogin").unwrap();
+
+        assert!(!has_completed_login(
+            &entries,
+            "SAPISID",
+            Some(&current_url),
+            Some("music.youtube.com"),
+        ));
+    }
+
+    #[test]
+    fn youtube_login_finishes_after_music_landing() {
+        let entries = vec![CookieEntry {
+            name: "SAPISID".into(),
+            value: "google-session".into(),
+            domain: "google.com".into(),
+        }];
+        let current_url = url::Url::parse("https://music.youtube.com/").unwrap();
+
+        assert!(has_completed_login(
+            &entries,
+            "SAPISID",
+            Some(&current_url),
+            Some("music.youtube.com"),
+        ));
+    }
 }
 
 /// 从 WebView 窗口轮询提取 Cookie（使用 Tauri 内置 API 读取 HttpOnly）
@@ -193,6 +245,7 @@ async fn poll_webview_cookies(
     app: &AppHandle,
     window_label: &str,
     sentinel_cookie: &str,
+    required_host: Option<&str>,
     cookie_urls: &[&str],
     timeout_secs: u64,
     close_requested: &AtomicBool,
@@ -227,8 +280,14 @@ async fn poll_webview_cookies(
         };
 
         let all_entries = read_webview_cookies(&window, cookie_urls);
+        let current_url = window.url().ok();
 
-        if has_login_cookie(&all_entries, sentinel_cookie) {
+        if has_completed_login(
+            &all_entries,
+            sentinel_cookie,
+            current_url.as_ref(),
+            required_host,
+        ) {
             let _ = window.destroy();
             return Ok(all_entries);
         }
@@ -259,7 +318,9 @@ pub async fn login_netease(app: AppHandle, state: State<'_, AppState>) -> AppRes
         "https://interface.music.163.com",
         "https://interface3.music.163.com",
     ];
-    let mut entries = poll_webview_cookies(&app, label, "MUSIC_U", cookie_urls, 300, &close_requested).await?;
+    let mut entries = poll_webview_cookies(
+        &app, label, "MUSIC_U", None, cookie_urls, 300, &close_requested,
+    ).await?;
 
     // 补全默认 Cookie（与 Android 一致）
     if !entries.iter().any(|c| c.name == "os") {
@@ -324,7 +385,9 @@ pub async fn login_bilibili(app: AppHandle, state: State<'_, AppState>) -> AppRe
         "https://passport.bilibili.com",
         "https://api.bilibili.com",
     ];
-    let mut entries = poll_webview_cookies(&app, label, "SESSDATA", cookie_urls, 300, &close_requested).await?;
+    let mut entries = poll_webview_cookies(
+        &app, label, "SESSDATA", None, cookie_urls, 300, &close_requested,
+    ).await?;
 
     // B站核心 cookie 必须关联到 .bilibili.com 域，确保 api.bilibili.com 子域名也能发送
     let bili_core_cookies = ["SESSDATA", "DedeUserID", "DedeUserID__ckMd5", "bili_jct", "sid"];
@@ -409,7 +472,9 @@ pub async fn login_youtube(app: AppHandle, state: State<'_, AppState>) -> AppRes
         "https://google.com",
         "https://m.youtube.com",
     ];
-    let entries = poll_webview_cookies(&app, label, "SAPISID", cookie_urls, 300, &close_requested).await?;
+    let entries = poll_webview_cookies(
+        &app, label, "SAPISID", Some("music.youtube.com"), cookie_urls, 300, &close_requested,
+    ).await?;
 
     // 注入 Jar
     cookies::inject_cookies(&state.cookie_jar, &entries);

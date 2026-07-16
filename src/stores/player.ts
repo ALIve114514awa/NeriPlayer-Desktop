@@ -1615,9 +1615,17 @@ export const usePlayerStore = defineStore('player', () => {
     const track = currentTrack.value
     if (!track) return
     const pos = positionMs.value
+    const wasPlaying = isPlaying.value
     clearPrefetchedPlaybackUrls(track)
     lastUrlResolveTime = 0
+    playError.value = null
     await play(track, 'local', pos)
+    if (playError.value) {
+      throw new Error(playError.value)
+    }
+    if (!wasPlaying && currentTrack.value?.id === track.id) {
+      await pause('local')
+    }
   }
 
   // ─── 初始化：恢复持久化状态 ───

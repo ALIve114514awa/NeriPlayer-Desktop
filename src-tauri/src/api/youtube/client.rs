@@ -6,8 +6,10 @@ use parking_lot::Mutex;
 
 use crate::error::{AppError, AppResult};
 
+pub use super::account::YouTubeAccountProfile;
+
 const INNERTUBE_URL: &str = "https://music.youtube.com/youtubei/v1";
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+pub(super) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
 // 默认 API key（可能随时变化，需要从页面 bootstrap 获取）
 const DEFAULT_API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
@@ -35,18 +37,6 @@ pub struct YtAudioStream {
     pub bitrate: u64,
     pub mime_type: String,
     pub content_length: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct YouTubeAccountProfile {
-    pub nickname: Option<String>,
-    pub avatar_url: Option<String>,
-}
-
-impl YouTubeAccountProfile {
-    fn has_profile(&self) -> bool {
-        self.nickname.is_some() || self.avatar_url.is_some()
-    }
 }
 
 impl YouTubeClient {
@@ -234,156 +224,7 @@ impl YouTubeClient {
         &self,
         auth: &crate::auth::state::YouTubeAuth,
     ) -> AppResult<YouTubeAccountProfile> {
-        let sapisid = auth.get_sapisid()
-            .ok_or_else(|| AppError::Api("No SAPISID for YouTube auth".into()))?;
-        let cookie_header = Self::build_cookie_header(&auth.cookies);
-        let body = json!({ "context": self.build_context() });
-
-        if let Ok(resp) = self
-            .innertube_post_auth("account/account_menu", &body, sapisid, &cookie_header)
-            .await
-        {
-            let profile = Self::parse_account_profile(&resp);
-            if profile.has_profile() {
-                return Ok(profile);
-            }
-        }
-
-        let home = self.get_home_feed(auth).await?;
-        let profile = Self::parse_account_profile(&home);
-        if profile.has_profile() {
-            Ok(profile)
-        } else {
-            Err(AppError::Api("No YouTube account profile found".into()))
-        }
-    }
-
-    fn parse_account_profile(value: &Value) -> YouTubeAccountProfile {
-        if let Some(header) = Self::find_named_object(value, "activeAccountHeaderRenderer") {
-            let profile = YouTubeAccountProfile {
-                nickname: Self::first_text_field(
-                    header,
-                    &["accountName", "displayName", "channelName", "title"],
-                ),
-                avatar_url: Self::first_thumbnail_field(
-                    header,
-                    &["accountPhoto", "avatar", "thumbnail"],
-                ),
-            };
-            if profile.has_profile() {
-                return profile;
-            }
-        }
-
-        for key in ["accountItemRenderer", "accountItem"] {
-            if let Some(item) = Self::find_named_object(value, key) {
-                let profile = YouTubeAccountProfile {
-                    nickname: Self::first_text_field(
-                        item,
-                        &["accountName", "displayName", "channelName", "title"],
-                    ),
-                    avatar_url: Self::first_thumbnail_field(
-                        item,
-                        &["accountPhoto", "avatar", "thumbnail"],
-                    ),
-                };
-                if profile.has_profile() {
-                    return profile;
-                }
-            }
-        }
-
-        YouTubeAccountProfile::default()
-    }
-
-    fn find_named_object<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-        match value {
-            Value::Object(map) => {
-                if let Some(found) = map.get(key) {
-                    return Some(found);
-                }
-                map.values().find_map(|child| Self::find_named_object(child, key))
-            }
-            Value::Array(items) => items
-                .iter()
-                .find_map(|child| Self::find_named_object(child, key)),
-            _ => None,
-        }
-    }
-
-    fn first_text_field(value: &Value, keys: &[&str]) -> Option<String> {
-        keys.iter()
-            .filter_map(|key| value.get(*key))
-            .find_map(Self::extract_text)
-    }
-
-    fn extract_text(value: &Value) -> Option<String> {
-        match value {
-            Value::String(text) => Self::clean_text(text),
-            Value::Object(map) => {
-                if let Some(text) = map.get("simpleText").and_then(Value::as_str) {
-                    return Self::clean_text(text);
-                }
-                if let Some(text) = map.get("text").and_then(Value::as_str) {
-                    return Self::clean_text(text);
-                }
-                if let Some(runs) = map.get("runs").and_then(Value::as_array) {
-                    let joined = runs
-                        .iter()
-                        .filter_map(|run| run.get("text").and_then(Value::as_str))
-                        .collect::<String>();
-                    return Self::clean_text(&joined);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn clean_text(text: &str) -> Option<String> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    }
-
-    fn first_thumbnail_field(value: &Value, keys: &[&str]) -> Option<String> {
-        keys.iter()
-            .filter_map(|key| value.get(*key))
-            .find_map(Self::extract_thumbnail_url)
-    }
-
-    fn extract_thumbnail_url(value: &Value) -> Option<String> {
-        if let Some(url) = value.as_str() {
-            return Self::normalize_thumbnail_url(url);
-        }
-
-        if let Some(thumbnails) = value.get("thumbnails").and_then(Value::as_array) {
-            return thumbnails
-                .iter()
-                .rev()
-                .filter_map(|item| item.get("url").and_then(Value::as_str))
-                .find_map(Self::normalize_thumbnail_url);
-        }
-
-        if let Some(thumbnail) = value.get("thumbnail") {
-            return Self::extract_thumbnail_url(thumbnail);
-        }
-
-        None
-    }
-
-    fn normalize_thumbnail_url(url: &str) -> Option<String> {
-        let trimmed = url.trim();
-        if trimmed.is_empty() {
-            None
-        } else if trimmed.starts_with("//") {
-            Some(format!("https:{trimmed}"))
-        } else {
-            Some(trimmed.to_string())
-        }
+        super::account::get_account_profile(&self.http, auth).await
     }
 
     /// YouTube Music 首页信息流（需登录）
@@ -436,67 +277,5 @@ impl YouTubeClient {
         });
 
         self.innertube_post_auth("browse", &body, sapisid, &cookie_header).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{YouTubeAccountProfile, YouTubeClient};
-    use serde_json::json;
-
-    #[test]
-    fn parse_active_account_header_profile() {
-        let value = json!({
-            "actions": [{
-                "openPopupAction": {
-                    "popup": {
-                        "multiPageMenuRenderer": {
-                            "header": {
-                                "activeAccountHeaderRenderer": {
-                                    "accountName": { "runs": [{ "text": "Neri User" }] },
-                                    "accountPhoto": {
-                                        "thumbnails": [
-                                            { "url": "//yt3.ggpht.com/small=s32" },
-                                            { "url": "//yt3.ggpht.com/large=s88" }
-                                        ]
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }]
-        });
-
-        assert_eq!(
-            YouTubeClient::parse_account_profile(&value),
-            YouTubeAccountProfile {
-                nickname: Some("Neri User".into()),
-                avatar_url: Some("https://yt3.ggpht.com/large=s88".into()),
-            },
-        );
-    }
-
-    #[test]
-    fn parse_account_item_profile() {
-        let value = json!({
-            "responseContext": {},
-            "contents": [{
-                "accountItem": {
-                    "accountName": { "simpleText": "Music Account" },
-                    "thumbnail": {
-                        "thumbnails": [{ "url": "https://yt3.ggpht.com/avatar=s64" }]
-                    }
-                }
-            }]
-        });
-
-        assert_eq!(
-            YouTubeClient::parse_account_profile(&value),
-            YouTubeAccountProfile {
-                nickname: Some("Music Account".into()),
-                avatar_url: Some("https://yt3.ggpht.com/avatar=s64".into()),
-            },
-        );
     }
 }

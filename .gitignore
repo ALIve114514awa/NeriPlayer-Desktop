@@ -36,6 +36,7 @@ pnpm-debug.log*
 .spec-workflow/
 src-tauri/.omc/
 src-tauri/src/.omc/
+AGENTS.md
 CLAUDE.md
 docs-private/
 

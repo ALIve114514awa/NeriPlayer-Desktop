@@ -819,6 +819,7 @@ pub struct SyncResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubSyncConfig {
+    #[serde(skip_serializing, default)]
     pub token: String,
     pub owner: String,
     pub repo: String,
@@ -844,6 +845,7 @@ fn default_history_mode() -> String { "immediate".into() }
 pub struct WebDavSyncConfig {
     pub server_url: String,
     pub username: String,
+    #[serde(skip_serializing, default)]
     pub password: String,
     #[serde(default)]
     pub base_path: String,

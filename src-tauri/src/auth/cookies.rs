@@ -1,4 +1,4 @@
-// Cookie 持久化 — tauri-plugin-store 读写 + reqwest::Jar 注入
+// Cookie 持久化 — 系统钥匙串保存凭据，tauri-plugin-store 仅负责旧数据迁移
 use std::sync::Arc;
 use reqwest::cookie::Jar;
 use reqwest::Url;
@@ -6,30 +6,90 @@ use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
 use super::state::{AuthState, CookieEntry};
+use crate::security;
 
 const STORE_FILE: &str = "auth.json";
 const STORE_KEY: &str = "auth_state";
 
-/// 将 AuthState 持久化到 tauri-plugin-store
+/// 将 AuthState 持久化到系统钥匙串
 pub fn save_auth(app: &AppHandle, auth: &AuthState) {
+    if !has_any_auth(auth) {
+        if !security::delete_secret(security::AUTH_STATE_KEY) {
+            log::error!("系统钥匙串不可用，无法清除登录凭据");
+        }
+        clear_legacy_auth(app);
+        return;
+    }
+
+    let Ok(serialized) = serde_json::to_string(auth) else {
+        log::error!("登录凭据序列化失败，已跳过持久化");
+        return;
+    };
+
+    if !security::set_secret(security::AUTH_STATE_KEY, &serialized) {
+        log::error!("系统钥匙串不可用，已跳过登录凭据持久化");
+        clear_legacy_auth(app);
+        return;
+    }
+
+    clear_legacy_auth(app);
+}
+
+/// 启动时从系统钥匙串恢复 AuthState，并迁移旧版明文数据
+pub fn load_auth(app: &AppHandle) -> AuthState {
+    if let Some(serialized) = security::get_secret(security::AUTH_STATE_KEY) {
+        clear_legacy_auth(app);
+        return match serde_json::from_str(&serialized) {
+            Ok(auth) => auth,
+            Err(_) => {
+                log::error!("系统钥匙串中的登录凭据格式无效，已清除");
+                let _ = security::delete_secret(security::AUTH_STATE_KEY);
+                AuthState::default()
+            }
+        };
+    }
+
+    let legacy = load_legacy_auth(app);
+    if !has_any_auth(&legacy) {
+        clear_legacy_auth(app);
+        return AuthState::default();
+    }
+
+    let Ok(serialized) = serde_json::to_string(&legacy) else {
+        clear_legacy_auth(app);
+        return AuthState::default();
+    };
+
+    if security::set_secret(security::AUTH_STATE_KEY, &serialized) {
+        clear_legacy_auth(app);
+        return legacy;
+    }
+
+    // 安全存储不可用时不继续使用明文凭据，避免下次启动再次暴露
+    log::error!("旧版登录凭据迁移到系统钥匙串失败，已清除明文凭据");
+    clear_legacy_auth(app);
+    AuthState::default()
+}
+
+fn load_legacy_auth(app: &AppHandle) -> AuthState {
+    let Ok(store) = app.store(STORE_FILE) else {
+        return AuthState::default();
+    };
+    store
+        .get(STORE_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn clear_legacy_auth(app: &AppHandle) {
     if let Ok(store) = app.store(STORE_FILE) {
-        let value = serde_json::to_value(auth).unwrap_or_default();
-        store.set(STORE_KEY, value);
+        let _ = store.delete(STORE_KEY);
         let _ = store.save();
     }
 }
 
-/// 启动时从 store 恢复 AuthState
-pub fn load_auth(app: &AppHandle) -> AuthState {
-    let store = match app.store(STORE_FILE) {
-        Ok(s) => s,
-        Err(_) => return AuthState::default(),
-    };
-
-    match store.get(STORE_KEY) {
-        Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
-        None => AuthState::default(),
-    }
+fn has_any_auth(auth: &AuthState) -> bool {
+    auth.netease.is_some() || auth.bilibili.is_some() || auth.youtube.is_some()
 }
 
 /// 将所有已登录平台的 Cookie 注入 Jar

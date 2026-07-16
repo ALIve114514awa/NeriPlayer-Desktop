@@ -48,3 +48,4 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 tauri-plugin-clipboard-manager = "2.3.2"
 tempfile = "3"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }

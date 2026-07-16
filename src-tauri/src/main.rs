@@ -43,6 +43,9 @@ fn main() {
                 *state.auth.lock() = saved_auth;
             }
 
+            // 启动时迁移同步 Token 和 WebDAV 密码到系统钥匙串
+            sync_cmd::initialize_secure_storage(&handle);
+
             // ── 初始化系统媒体会话 (SMTC / MPRIS) ──
             let (media_action_tx, media_action_rx) = mpsc::channel::<MediaAction>();
 
