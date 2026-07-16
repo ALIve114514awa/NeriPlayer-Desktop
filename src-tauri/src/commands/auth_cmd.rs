@@ -1,14 +1,18 @@
-// 三平台登录/登出命令
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::Duration;
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+// 三平台登录/登出命令
+use crate::api::youtube::client::YouTubeAccountProfile;
+use crate::auth::cookies;
+use crate::auth::state::{
+    AuthInfo, AuthStatusResponse, BiliAuth, CookieEntry, NeteaseAuth, YouTubeAuth,
+};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::auth::state::{AuthInfo, AuthStatusResponse, NeteaseAuth, BiliAuth, YouTubeAuth, CookieEntry};
-use crate::auth::cookies;
 
 const BILIBILI_LOGIN_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
@@ -114,6 +118,45 @@ fn has_login_cookie(entries: &[CookieEntry], sentinel_cookie: &str) -> bool {
     entries
         .iter()
         .any(|entry| entry.name == sentinel_cookie && !entry.value.is_empty())
+}
+
+async fn fetch_youtube_profile(
+    state: &AppState,
+    auth: &YouTubeAuth,
+) -> AppResult<YouTubeAccountProfile> {
+    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
+    client.get_account_profile(auth).await
+}
+
+fn apply_youtube_profile(auth: &mut YouTubeAuth, profile: YouTubeAccountProfile) {
+    if profile.nickname.is_some() {
+        auth.nickname = profile.nickname;
+    }
+    if profile.avatar_url.is_some() {
+        auth.avatar_url = profile.avatar_url;
+    }
+}
+
+async fn apply_youtube_profile_best_effort(state: &AppState, auth: &mut YouTubeAuth) {
+    match fetch_youtube_profile(state, auth).await {
+        Ok(profile) => apply_youtube_profile(auth, profile),
+        Err(e) => log::warn!("YouTube 账号资料获取失败: {}", e),
+    }
+}
+
+fn youtube_auth_info(auth: &YouTubeAuth) -> AuthInfo {
+    AuthInfo {
+        platform: "youtube".into(),
+        logged_in: auth.has_login(),
+        nickname: auth.nickname.clone(),
+        avatar_url: auth.avatar_url.clone(),
+    }
+}
+
+fn youtube_auth_matches(left: &YouTubeAuth, right: &YouTubeAuth) -> bool {
+    left.get_sapisid()
+        .zip(right.get_sapisid())
+        .is_some_and(|(left, right)| left == right)
 }
 
 #[cfg(test)]
@@ -371,19 +414,19 @@ pub async fn login_youtube(app: AppHandle, state: State<'_, AppState>) -> AppRes
     // 注入 Jar
     cookies::inject_cookies(&state.cookie_jar, &entries);
 
-    let auth = YouTubeAuth { cookies: entries, nickname: None, avatar_url: None };
+    let mut auth = YouTubeAuth {
+        cookies: entries,
+        nickname: None,
+        avatar_url: None,
+    };
+    apply_youtube_profile_best_effort(&state, &mut auth).await;
     {
         let mut auth_state = state.auth.lock();
-        auth_state.youtube = Some(auth);
+        auth_state.youtube = Some(auth.clone());
         cookies::save_auth(&app, &auth_state);
     }
 
-    Ok(AuthInfo {
-        platform: "youtube".into(),
-        logged_in: true,
-        nickname: None,
-        avatar_url: None,
-    })
+    Ok(youtube_auth_info(&auth))
 }
 
 /// Cookie 粘贴登录（对齐 Android 端）
@@ -470,17 +513,60 @@ pub async fn login_with_cookies(
                 return Err(AppError::Other("Missing required cookie: SAPISID".into()));
             }
 
-            let auth = YouTubeAuth { cookies: entries, nickname: None, avatar_url: None };
+            let mut auth = YouTubeAuth {
+                cookies: entries,
+                nickname: None,
+                avatar_url: None,
+            };
+            apply_youtube_profile_best_effort(&state, &mut auth).await;
             {
                 let mut auth_state = state.auth.lock();
-                auth_state.youtube = Some(auth);
+                auth_state.youtube = Some(auth.clone());
                 cookies::save_auth(&app, &auth_state);
             }
 
-            Ok(AuthInfo { platform: "youtube".into(), logged_in: true, nickname: None, avatar_url: None })
+            Ok(youtube_auth_info(&auth))
         }
         _ => Err(AppError::Other(format!("Unknown platform: {}", platform))),
     }
+}
+
+/// 刷新已保存的 YouTube Music 账号资料
+#[tauri::command]
+pub async fn refresh_youtube_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<AuthInfo> {
+    let current_auth = {
+        let auth_state = state.auth.lock();
+        auth_state
+            .youtube
+            .clone()
+            .filter(YouTubeAuth::has_login)
+            .ok_or_else(|| AppError::Other("YouTube not logged in".into()))?
+    };
+
+    let profile = fetch_youtube_profile(&state, &current_auth).await?;
+    let mut updated_auth = current_auth;
+    apply_youtube_profile(&mut updated_auth, profile);
+
+    {
+        let mut auth_state = state.auth.lock();
+        let Some(saved_auth) = auth_state.youtube.as_mut() else {
+            return Err(AppError::Other("YouTube not logged in".into()));
+        };
+        if !saved_auth.has_login() {
+            return Err(AppError::Other("YouTube not logged in".into()));
+        }
+        if !youtube_auth_matches(saved_auth, &updated_auth) {
+            return Ok(youtube_auth_info(saved_auth));
+        }
+
+        *saved_auth = updated_auth.clone();
+        cookies::save_auth(&app, &auth_state);
+    }
+
+    Ok(youtube_auth_info(&updated_auth))
 }
 
 /// 查询所有平台登录状态

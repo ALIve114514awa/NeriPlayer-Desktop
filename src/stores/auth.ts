@@ -34,6 +34,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   // 正在登录的平台（用于 loading 状态）
   const loggingIn = ref<string | null>(null)
+  const youtubeProfileRefreshAttempted = ref(false)
+  const youtubeProfileRefreshing = ref(false)
 
   const isAnyLoggedIn = computed(() =>
     netease.value.loggedIn || bilibili.value.loggedIn || youtube.value.loggedIn
@@ -46,8 +48,37 @@ export const useAuthStore = defineStore('auth', () => {
       netease.value = mapAuth(status.netease)
       bilibili.value = mapAuth(status.bilibili)
       youtube.value = mapAuth(status.youtube)
+      if (needsYoutubeProfileRefresh(youtube.value)) {
+        void refreshYoutubeProfile()
+      }
     } catch (e) {
       console.error('Failed to check auth status:', e)
+    }
+  }
+
+  function needsYoutubeProfileRefresh(value: PlatformAuth) {
+    return value.loggedIn && (!value.nickname || !value.avatarUrl)
+  }
+
+  async function refreshYoutubeProfile() {
+    if (
+      youtubeProfileRefreshing.value ||
+      youtubeProfileRefreshAttempted.value ||
+      !needsYoutubeProfileRefresh(youtube.value)
+    ) return
+
+    youtubeProfileRefreshing.value = true
+    youtubeProfileRefreshAttempted.value = true
+    try {
+      const info = await invoke<any>('refresh_youtube_profile')
+      const mapped = mapAuth(info)
+      if (mapped.loggedIn) {
+        youtube.value = mapped
+      }
+    } catch (e) {
+      console.warn('Failed to refresh YouTube profile:', e)
+    } finally {
+      youtubeProfileRefreshing.value = false
     }
   }
 
@@ -75,6 +106,10 @@ export const useAuthStore = defineStore('auth', () => {
       const info = await invoke<any>(command)
       const mapped = mapAuth(info)
       target.value = mapped
+      if (key === 'youtube') {
+        youtubeProfileRefreshAttempted.value = false
+        if (needsYoutubeProfileRefresh(mapped)) void refreshYoutubeProfile()
+      }
       if (mapped.loggedIn) {
         toast.success(t('settings.login_success', { platform: platformLabel(key) }))
       }
@@ -131,6 +166,10 @@ export const useAuthStore = defineStore('auth', () => {
       const info = await invoke<any>('login_with_cookies', { platform, rawCookies })
       const mapped = mapAuth(info)
       target.value = mapped
+      if (platform === 'youtube') {
+        youtubeProfileRefreshAttempted.value = false
+        if (needsYoutubeProfileRefresh(mapped)) void refreshYoutubeProfile()
+      }
       if (mapped.loggedIn) {
         toast.success(t('settings.login_success', { platform: platformLabel(platform) }))
       }
@@ -144,6 +183,6 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     netease, bilibili, youtube, loggingIn, isAnyLoggedIn,
-    checkStatus, loginNetease, loginBilibili, loginYoutube, loginWithCookies, logout,
+    checkStatus, refreshYoutubeProfile, loginNetease, loginBilibili, loginYoutube, loginWithCookies, logout,
   }
 })

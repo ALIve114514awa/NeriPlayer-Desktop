@@ -1,71 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useDownloadStore, type ActiveDownloadTask, type DownloadedTrack } from '@/stores/download'
 import { usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 
-const fallbackMessages: Record<string, string> = {
-  'common.back': '返回',
-  'common.refresh': '刷新',
-  'download.manager_title': '下载管理',
-  'download.manager_desc': '集中管理下载任务、本地文件与离线播放内容',
-  'download.active_count': '进行中',
-  'download.completed_count': '已完成',
-  'download.total_size': '本地占用',
-  'download.active_tasks_desc': '下载任务会实时更新进度，可随时取消',
-  'download.downloaded_desc': '当前显示 {count} 首本地歌曲',
-  'download.search_placeholder': '搜索歌曲、歌手、专辑或来源',
-  'download.select': '选择',
-  'download.select_all': '全选当前',
-  'download.deselect_all': '取消全选',
-  'download.delete_selected': '删除 {count} 项',
-  'download.batch_delete_confirm': '批量删除下载',
-  'download.batch_delete_msg': '确定要删除选中的 {count} 个下载文件吗？此操作不可撤销。',
-  'download.batch_deleted': '已删除 {count} 个下载',
-  'download.search_empty_title': '没有匹配的下载',
-  'download.search_empty_desc': '换个关键词试试，支持歌曲、歌手、专辑和来源',
-  'download.reveal_failed': '打开所在目录失败',
-  'download.in_use_hint': '当前歌曲正在使用本地下载文件，切歌或暂停后再操作',
-  'player.source_netease': '网易云',
-  'player.source_qq': 'QQ 音乐',
-  'player.source_bilibili': '哔哩哔哩',
-  'player.source_youtube': 'YouTube',
-  'player.source_local': '本地',
-  'download.resolving': '正在解析音频链接...',
-  'download.cancelling': '正在取消...',
-  'download.cancelled': '已取消下载',
-  'download.download_failed': '下载失败',
-  'download.already_exists': '该歌曲已下载',
-  'download.downloading': '正在下载...',
-  'download.delete_confirm': '删除下载',
-}
-
-function t(key: string, params?: Record<string, unknown>) {
-  const text = fallbackMessages[key] || key
-  if (!params) return text
-  return Object.entries(params).reduce((acc, [name, value]) => acc.replaceAll(`{${name}}`, String(value)), text)
-}const downloadStore = useDownloadStore()
+const { t } = useI18n()
+const downloadStore = useDownloadStore()
 const player = usePlayerStore()
 const toast = useToastStore()
-
-const cancelLabel = '取消'
-const deleteLabel = '删除'
-const cancelAllLabel = '取消全部'
-const downloadedItemsLabel = '已下载文件'
-const openFolderLabel = '打开所在目录'
-const redownloadLabel = '重新下载'
-const downloadsEmptyTitle = '还没有下载的歌曲'
-const downloadsEmptyDesc = '在播放页点击更多选项下载歌曲到本地'
-
-function activeDownloadTasksLabel(count: number) {
-  return `进行中任务 (${count})`
-}
-
-function deleteConfirmMsg(name: string) {
-  return `确定要删除「${name}」吗？此操作不可撤销。`
-}
 
 const searchQuery = ref('')
 const selectionMode = ref(false)
@@ -101,6 +46,17 @@ const selectedCount = computed(() => selectedIds.value.size)
 const selectableVisibleDownloads = computed(() => filteredDownloads.value.filter(item => !isTrackInUse(item)))
 const visibleSelectedCount = computed(() => selectableVisibleDownloads.value.filter(item => selectedIds.value.has(item.id)).length)
 const allVisibleSelected = computed(() => selectableVisibleDownloads.value.length > 0 && visibleSelectedCount.value === selectableVisibleDownloads.value.length)
+const summaryText = computed(() => t('download.summary', {
+  active: activeCount.value,
+  downloaded: downloadedCount.value,
+  size: formatFileSize(totalSize.value),
+}))
+const downloadedDesc = computed(() => {
+  if (searchQuery.value.trim()) {
+    return t('download.search_result_count', { count: filteredDownloads.value.length })
+  }
+  return t('download.downloaded_desc', { count: filteredDownloads.value.length })
+})
 
 watch(filteredDownloads, (items) => {
   const visible = new Set(items.map(item => item.id))
@@ -318,64 +274,36 @@ function progressWidth(task: ActiveDownloadTask) {
 
 <template>
   <div class="downloads-view">
-    <header class="downloads-hero">
-      <div class="hero-copy">
-        <button class="back-chip" @click="$router.back()">
-          <span class="material-symbols-rounded">arrow_back</span>
-          <span>{{ t('common.back') }}</span>
-        </button>
+    <header class="downloads-header">
+      <button class="back-btn" :title="t('download.back')" @click="$router.back()">
+        <span class="material-symbols-rounded">arrow_back</span>
+      </button>
+      <div class="header-copy">
         <h1>{{ t('download.manager_title') }}</h1>
-        <p>{{ t('download.manager_desc') }}</p>
+        <p>{{ summaryText }}</p>
       </div>
-      <div class="hero-actions">
-        <button class="tonal-btn" @click="refreshDownloads">
+      <div class="header-actions">
+        <button class="icon-button" :title="t('download.refresh')" @click="refreshDownloads">
           <span class="material-symbols-rounded">refresh</span>
-          <span>{{ t('common.refresh') }}</span>
         </button>
         <button
           v-if="activeCount > 0"
-          class="tonal-btn danger"
+          class="text-button danger"
           @click="downloadStore.cancelAllDownloads()"
         >
           <span class="material-symbols-rounded">close</span>
-          <span>{{ cancelAllLabel }}</span>
+          <span>{{ t('download.cancel_all') }}</span>
         </button>
       </div>
     </header>
 
-    <section class="summary-grid">
-      <div class="summary-card active">
-        <span class="material-symbols-rounded filled">downloading</span>
-        <div>
-          <strong>{{ activeCount }}</strong>
-          <small>{{ t('download.active_count') }}</small>
-        </div>
-      </div>
-      <div class="summary-card done">
-        <span class="material-symbols-rounded filled">download_done</span>
-        <div>
-          <strong>{{ downloadedCount }}</strong>
-          <small>{{ t('download.completed_count') }}</small>
-        </div>
-      </div>
-      <div class="summary-card storage">
-        <span class="material-symbols-rounded filled">hard_drive</span>
-        <div>
-          <strong>{{ formatFileSize(totalSize) }}</strong>
-          <small>{{ t('download.total_size') }}</small>
-        </div>
-      </div>
-    </section>
-
-    <section v-if="activeTasks.length > 0" class="panel active-panel">
-      <div class="panel-header">
-        <div>
-          <h2>{{ activeDownloadTasksLabel(activeTasks.length) }}</h2>
-          <p>{{ t('download.active_tasks_desc') }}</p>
-        </div>
+    <section v-if="activeTasks.length > 0" class="active-section">
+      <div class="section-heading">
+        <span class="material-symbols-rounded">downloading</span>
+        <h2>{{ t('download.active_tasks', { count: activeTasks.length }) }}</h2>
       </div>
       <div class="task-list">
-        <div v-for="task in activeTasks" :key="task.trackId" class="task-card" :class="`status-${task.status}`">
+        <div v-for="task in activeTasks" :key="task.trackId" class="task-row" :class="`status-${task.status}`">
           <div class="task-icon">
             <span class="material-symbols-rounded">{{ statusIcon(task) }}</span>
           </div>
@@ -398,6 +326,7 @@ function progressWidth(task: ActiveDownloadTask) {
           </div>
           <button
             class="icon-action danger"
+            :title="t('download.cancel_task')"
             :disabled="task.status === 'cancelling' || task.status === 'cancelled' || task.status === 'error' || task.status === 'already_exists'"
             @click="downloadStore.cancelDownload(task.trackId)"
           >
@@ -407,11 +336,11 @@ function progressWidth(task: ActiveDownloadTask) {
       </div>
     </section>
 
-    <section class="panel downloaded-panel">
-      <div class="panel-header sticky-tools">
+    <section class="downloads-section">
+      <div class="downloads-toolbar">
         <div>
-          <h2>{{ downloadedItemsLabel }}</h2>
-          <p>{{ t('download.downloaded_desc', { count: filteredDownloads.length }) }}</p>
+          <h2>{{ t('download.downloaded_items') }}</h2>
+          <p>{{ downloadedDesc }}</p>
         </div>
         <div class="toolbar-actions">
           <div class="search-box">
@@ -423,22 +352,22 @@ function progressWidth(task: ActiveDownloadTask) {
           </div>
           <button
             v-if="downloadStore.downloads.length > 0 && !selectionMode"
-            class="tonal-btn"
+            class="text-button"
             @click="enterSelectionMode()"
           >
             <span class="material-symbols-rounded">checklist</span>
             <span>{{ t('download.select') }}</span>
           </button>
           <template v-else-if="selectionMode">
-            <button class="tonal-btn" @click="toggleSelectAllVisible">
+            <button class="text-button" @click="toggleSelectAllVisible">
               <span class="material-symbols-rounded">{{ allVisibleSelected ? 'deselect' : 'select_all' }}</span>
               <span>{{ allVisibleSelected ? t('download.deselect_all') : t('download.select_all') }}</span>
             </button>
-            <button class="tonal-btn danger" :disabled="selectedCount === 0" @click="requestBatchDelete">
+            <button class="text-button danger" :disabled="selectedCount === 0" @click="requestBatchDelete">
               <span class="material-symbols-rounded">delete</span>
               <span>{{ t('download.delete_selected', { count: selectedCount }) }}</span>
             </button>
-            <button class="ghost-btn" @click="leaveSelectionMode">{{ cancelLabel }}</button>
+            <button class="ghost-button" @click="leaveSelectionMode">{{ t('common.cancel') }}</button>
           </template>
         </div>
       </div>
@@ -476,13 +405,13 @@ function progressWidth(task: ActiveDownloadTask) {
           <div class="track-date">{{ formatDate(track.downloadedAt) }}</div>
 
           <div class="row-actions" @click.stop>
-            <button class="icon-action" :title="openFolderLabel" @click="revealDownloadFile(track)">
+            <button class="icon-action" :title="t('download.open_folder')" @click="revealDownloadFile(track)">
               <span class="material-symbols-rounded">folder_open</span>
             </button>
-            <button class="icon-action" :title="redownloadLabel" :disabled="isTrackInUse(track)" @click="redownloadTrack(track)">
+            <button class="icon-action" :title="t('download.redownload')" :disabled="isTrackInUse(track)" @click="redownloadTrack(track)">
               <span class="material-symbols-rounded">refresh</span>
             </button>
-            <button class="icon-action danger" :title="deleteLabel" :disabled="isTrackInUse(track)" @click="requestDelete(track)">
+            <button class="icon-action danger" :title="t('common.delete')" :disabled="isTrackInUse(track)" @click="requestDelete(track)">
               <span class="material-symbols-rounded">delete</span>
             </button>
           </div>
@@ -490,9 +419,9 @@ function progressWidth(task: ActiveDownloadTask) {
       </div>
 
       <div v-else class="empty-state">
-        <div class="empty-orb"><span class="material-symbols-rounded filled">download</span></div>
-        <h3>{{ searchQuery ? t('download.search_empty_title') : downloadsEmptyTitle }}</h3>
-        <p>{{ searchQuery ? t('download.search_empty_desc') : downloadsEmptyDesc }}</p>
+        <span class="material-symbols-rounded">download</span>
+        <h3>{{ searchQuery ? t('download.search_empty_title') : t('download.empty_title') }}</h3>
+        <p>{{ searchQuery ? t('download.search_empty_desc') : t('download.empty_desc') }}</p>
       </div>
     </section>
 
@@ -500,14 +429,14 @@ function progressWidth(task: ActiveDownloadTask) {
       v-model:open="showDeleteDialog"
       :title="deleteTarget ? t('download.delete_confirm') : t('download.batch_delete_confirm')"
       icon="delete"
-      :confirm-text="deleteLabel"
+      :confirm-text="t('common.delete')"
       confirm-danger
       :confirm-disabled="batchDeleting"
       @confirm="confirmDelete"
     >
       <p class="dialog-msg">
         {{ deleteTarget
-          ? deleteConfirmMsg(deleteTarget.title)
+          ? t('download.delete_confirm_msg', { name: deleteTarget.title })
           : t('download.batch_delete_msg', { count: selectedCount }) }}
       </p>
     </M3Dialog>
@@ -516,86 +445,10 @@ function progressWidth(task: ActiveDownloadTask) {
 
 <style scoped lang="scss">
 .downloads-view {
-  padding: 20px 28px 36px;
+  padding: 16px 28px 36px;
   max-width: 1180px;
 }
 
-.downloads-hero {
-  min-height: 148px;
-  border-radius: 28px;
-  padding: 22px 24px;
-  margin-bottom: 16px;
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 18px;
-  position: relative;
-  overflow: hidden;
-  background:
-    radial-gradient(circle at 14% 18%, color-mix(in srgb, var(--md-primary) 30%, transparent), transparent 30%),
-    radial-gradient(circle at 86% 8%, color-mix(in srgb, var(--md-tertiary) 26%, transparent), transparent 30%),
-    linear-gradient(135deg, var(--md-surface-container-high), var(--md-surface-container-low));
-  border: 1px solid color-mix(in srgb, var(--md-outline-variant) 60%, transparent);
-
-  &::after {
-    content: '';
-    position: absolute;
-    inset: auto -80px -110px auto;
-    width: 300px;
-    height: 300px;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--md-primary) 12%, transparent);
-    pointer-events: none;
-  }
-}
-
-.hero-copy,
-.hero-actions {
-  position: relative;
-  z-index: 1;
-}
-
-.back-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 12px;
-  margin-bottom: 16px;
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--md-surface-container-highest) 80%, transparent);
-  color: var(--md-on-surface-variant);
-  font-size: 13px;
-  font-weight: 600;
-
-  .material-symbols-rounded { font-size: 18px; }
-  &:hover { background: var(--md-surface-container-highest); }
-}
-
-h1 {
-  font-size: 34px;
-  line-height: 1.05;
-  letter-spacing: -0.8px;
-  margin-bottom: 8px;
-}
-
-.hero-copy p,
-.panel-header p {
-  color: var(--md-on-surface-variant);
-  font-size: 13px;
-}
-
-.hero-actions,
-.toolbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-.tonal-btn,
-.ghost-btn,
 .icon-action {
   display: inline-flex;
   align-items: center;
@@ -609,116 +462,11 @@ h1 {
   &:disabled { opacity: 0.42; cursor: not-allowed; }
 }
 
-.tonal-btn {
-  height: 38px;
-  padding: 0 14px;
-  background: var(--md-secondary-container);
-  color: var(--md-on-secondary-container);
-  font-size: 13px;
-
-  &:hover:not(:disabled) { background: color-mix(in srgb, var(--md-secondary-container) 82%, white); }
-  &.danger {
-    background: color-mix(in srgb, var(--md-error) 14%, transparent);
-    color: var(--md-error);
-  }
-}
-
-.ghost-btn {
-  height: 38px;
-  padding: 0 12px;
-  color: var(--md-on-surface-variant);
-  font-size: 13px;
-  &:hover { background: var(--md-surface-container-high); }
-}
-
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.summary-card {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  min-height: 82px;
-  padding: 16px;
-  border-radius: 22px;
-  background: var(--md-surface-container);
-  border: 1px solid var(--md-outline-variant);
-
-  > .material-symbols-rounded {
-    width: 42px;
-    height: 42px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 15px;
-    background: var(--md-surface-container-highest);
-    color: var(--md-primary);
-  }
-
-  strong {
-    display: block;
-    font-size: 24px;
-    line-height: 1.05;
-  }
-
-  small {
-    display: block;
-    margin-top: 4px;
-    font-size: 12px;
-    color: var(--md-on-surface-variant);
-  }
-
-  &.active > .material-symbols-rounded { color: #64b5f6; }
-  &.done > .material-symbols-rounded { color: #81c784; }
-  &.storage > .material-symbols-rounded { color: var(--md-tertiary); }
-}
-
-.panel {
-  border-radius: 24px;
-  background: color-mix(in srgb, var(--md-surface-container-low) 80%, transparent);
-  border: 1px solid color-mix(in srgb, var(--md-outline-variant) 70%, transparent);
-  overflow: hidden;
-  margin-bottom: 16px;
-}
-
-.panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 18px 18px 12px;
-
-  h2 {
-    font-size: 18px;
-    letter-spacing: -0.2px;
-    margin-bottom: 2px;
-  }
-}
-
-.sticky-tools {
-  position: sticky;
-  top: -20px;
-  z-index: 5;
-  background: color-mix(in srgb, var(--md-surface-container-low) 94%, transparent);
-  backdrop-filter: blur(16px);
-}
-/* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免滚动内容穿透 */
-@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .sticky-tools {
-    background: var(--md-surface-container-low);
-  }
-}
-
 .task-list,
 .download-list {
   padding: 0 10px 10px;
 }
 
-.task-card,
 .download-row {
   display: flex;
   align-items: center;
@@ -726,13 +474,6 @@ h1 {
   border-radius: 18px;
   background: transparent;
   transition: background var(--duration-short), border-color var(--duration-short);
-}
-
-.task-card {
-  padding: 12px;
-  border: 1px solid transparent;
-
-  &:hover { background: var(--md-surface-container); }
 }
 
 .task-icon {
@@ -972,37 +713,252 @@ h1 {
   }
 }
 
-.empty-orb {
-  width: 86px;
-  height: 86px;
-  border-radius: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: radial-gradient(circle at 30% 20%, color-mix(in srgb, var(--md-primary) 28%, transparent), var(--md-surface-container));
-
-  .material-symbols-rounded { font-size: 40px; color: var(--md-primary); }
-}
-
 .dialog-msg {
   color: var(--md-on-surface-variant);
   font-size: 14px;
   line-height: 1.55;
 }
 
+.downloads-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.back-btn,
+.icon-button,
+.icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  color: var(--md-on-surface-variant);
+  transition: background var(--duration-short), color var(--duration-short), opacity var(--duration-short), transform var(--duration-short);
+
+  &:active:not(:disabled) { transform: scale(0.96); }
+  &:disabled { opacity: 0.38; cursor: not-allowed; }
+}
+
+.back-btn,
+.icon-button {
+  width: 40px;
+  height: 40px;
+
+  &:hover:not(:disabled) {
+    background: var(--md-surface-container-high);
+    color: var(--md-on-surface);
+  }
+}
+
+.header-copy {
+  flex: 1;
+  min-width: 0;
+
+  h1 {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.18;
+    letter-spacing: 0;
+    margin-bottom: 0;
+  }
+
+  p {
+    margin-top: 3px;
+    color: var(--md-on-surface-variant);
+    font-size: 13px;
+  }
+}
+
+.header-actions,
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.text-button,
+.ghost-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 38px;
+  border-radius: var(--radius-full);
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background var(--duration-short), color var(--duration-short), opacity var(--duration-short), transform var(--duration-short);
+
+  &:active:not(:disabled) { transform: scale(0.97); }
+  &:disabled { opacity: 0.42; cursor: not-allowed; }
+
+  .material-symbols-rounded { font-size: 19px; }
+}
+
+.text-button {
+  background: var(--md-surface-container);
+  color: var(--md-on-surface);
+
+  &:hover:not(:disabled) { background: var(--md-surface-container-high); }
+  &.danger { color: var(--md-error); }
+  &.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--md-error) 12%, transparent); }
+}
+
+.ghost-button {
+  color: var(--md-on-surface-variant);
+
+  &:hover { background: var(--md-surface-container); }
+}
+
+.active-section,
+.downloads-section {
+  margin-top: 18px;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px 8px;
+  color: var(--md-on-surface-variant);
+
+  h2 {
+    color: var(--md-on-surface);
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .material-symbols-rounded { font-size: 19px; }
+}
+
+.task-list,
+.download-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+}
+
+.task-row,
+.download-row {
+  border-radius: var(--radius-md);
+  transition: background var(--duration-short), border-color var(--duration-short);
+
+  &:hover { background: var(--md-surface-container); }
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+}
+
+.task-icon {
+  border-radius: var(--radius-md);
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+}
+
+.task-source,
+.track-source {
+  padding: 2px 8px;
+  background: var(--md-surface-container);
+  color: var(--md-on-surface-variant);
+  font-weight: 600;
+}
+
+.downloads-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--md-outline-variant) 55%, transparent);
+  margin-bottom: 4px;
+
+  h2 {
+    font-size: 18px;
+    font-weight: 700;
+  }
+
+  p {
+    margin-top: 2px;
+    color: var(--md-on-surface-variant);
+    font-size: 13px;
+  }
+}
+
+.search-box {
+  min-width: 280px;
+  background: var(--md-surface-container-low);
+  border: 1px solid color-mix(in srgb, var(--md-outline-variant) 80%, transparent);
+
+  button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    &:hover { background: var(--md-surface-container-high); }
+  }
+}
+
+.download-row {
+  min-height: 64px;
+  padding: 8px 10px;
+
+  &.selected { background: color-mix(in srgb, var(--md-primary) 10%, transparent); }
+  &.disabled { cursor: default; opacity: 0.68; }
+}
+
+.cover-box {
+  width: 46px;
+  height: 46px;
+  border-radius: var(--radius-sm);
+  background: var(--md-surface-container-high);
+}
+
+.track-title {
+  font-weight: 500;
+}
+
+.icon-action {
+  &:hover:not(:disabled) {
+    background: var(--md-surface-container-high);
+    color: var(--md-on-surface);
+  }
+}
+
+.empty-state {
+  > .material-symbols-rounded {
+    font-size: 38px;
+    opacity: 0.28;
+  }
+
+  h3 { margin-top: 12px; }
+}
+
 @media (max-width: 980px) {
-  .downloads-hero,
-  .panel-header {
+  .downloads-header,
+  .downloads-toolbar {
     align-items: flex-start;
     flex-direction: column;
   }
 
-  .summary-grid { grid-template-columns: 1fr; }
-  .toolbar-actions { justify-content: flex-start; width: 100%; }
-  .search-box { width: 100%; min-width: 0; }
-  .track-source,
-  .track-size,
-  .track-date { display: none; }
-  .row-actions { opacity: 1; }
+  .header-actions,
+  .toolbar-actions {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .search-box {
+    width: 100%;
+    min-width: 0;
+  }
 }
 </style>

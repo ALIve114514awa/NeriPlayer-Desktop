@@ -1,0 +1,10 @@
+# User-specific IDE state
+/workspace.xml
+/tasks.xml
+/shelf/
+
+# Local data sources and generated caches
+/dataSources/
+/dataSources.local.xml
+/httpRequests/
+/caches/

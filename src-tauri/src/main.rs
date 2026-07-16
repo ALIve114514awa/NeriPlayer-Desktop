@@ -274,6 +274,7 @@ fn main() {
             auth_cmd::login_bilibili,
             auth_cmd::login_youtube,
             auth_cmd::login_with_cookies,
+            auth_cmd::refresh_youtube_profile,
             auth_cmd::check_auth_status,
             auth_cmd::logout,
             recommend_cmd::get_recommended_playlists,

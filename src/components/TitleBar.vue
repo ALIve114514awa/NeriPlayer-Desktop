@@ -270,6 +270,15 @@ onUnmounted(() => {
     opacity: 1;
   }
 
+  &:disabled {
+    cursor: default;
+    opacity: 0.36;
+  }
+
+  &:disabled:hover {
+    background: transparent;
+  }
+
   .material-symbols-rounded {
     font-size: 24px;
   }

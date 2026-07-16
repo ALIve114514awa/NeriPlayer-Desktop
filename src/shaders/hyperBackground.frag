@@ -13,7 +13,7 @@ uniform float u_darkMode;
 uniform float u_lightOffset;
 uniform float u_saturateOffset;
 
-// --- 色彩空间工具（对齐 Android hyper_background_effect.glsl） ---
+// --- 色彩空间工具 ---
 
 vec3 rgb2hsv(vec3 c) {
   vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
@@ -30,7 +30,7 @@ vec3 hsv2rgb(vec3 c) {
   return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
 
-// 颗粒抖动（对齐 Android gradientNoise）
+// 颗粒抖动
 float gradientNoise(vec2 uv) {
   return fract(52.9829189 * fract(dot(uv, vec2(0.06711056, 0.00583715))));
 }

@@ -1,13 +1,15 @@
 use crate::audio::growing::GrowingAudioBuffer;
+use crate::audio::remote::{RemoteAudioCache, RemoteAudioSource};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
-const STREAM_START_BUFFER_BYTES: usize = 192 * 1024;
+const STREAM_START_BUFFER_BYTES: usize = 64 * 1024;
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize)]
@@ -22,9 +24,13 @@ pub struct PlayerStateDto {
 }
 
 #[tauri::command]
-pub async fn play_file(path: String, state: State<'_, AppState>) -> AppResult<u64> {
+pub async fn play_file(
+    path: String,
+    start_position_ms: Option<u64>,
+    state: State<'_, AppState>,
+) -> AppResult<u64> {
     let mut player = state.player.lock();
-    player.play_file(&path)
+    player.play_file_at(&path, start_position_ms.unwrap_or(0))
 }
 
 /// 从 URL 下载音频并播放（网易云 / B站 / YouTube 流式播放）
@@ -32,6 +38,7 @@ pub async fn play_file(path: String, state: State<'_, AppState>) -> AppResult<u6
 pub async fn play_url(
     url: String,
     duration_hint_ms: u64,
+    start_position_ms: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     eprintln!(
@@ -88,7 +95,7 @@ pub async fn play_url(
 
     let data = bytes.to_vec();
     let mut player = state.player.lock();
-    player.play_bytes(data, duration_hint_ms)
+    player.play_bytes_at(data, duration_hint_ms, start_position_ms.unwrap_or(0))
 }
 
 /// 快速播放 URL：把响应落到临时文件后按本地文件播放。
@@ -97,6 +104,7 @@ pub async fn play_url(
 pub async fn play_url_fast(
     url: String,
     duration_hint_ms: u64,
+    start_position_ms: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     eprintln!(
@@ -107,16 +115,18 @@ pub async fn play_url_fast(
     let path = download_url_to_temp_audio(&url, &state).await?;
     eprintln!("[play_url_fast] temp ready: {}", path);
     let mut player = state.player.lock();
-    let dur = player.play_file(&path)?;
+    let dur = player.play_file_at(&path, start_position_ms.unwrap_or(0))?;
     Ok(if dur > 0 { dur } else { duration_hint_ms })
 }
 
-/// 边下载边播放 URL：先缓冲一小段，随后 decoder 从增长中的内存缓冲读取。
-/// 当前优先用于网易云 MP3，避免“整首下载完成后才开始播放”的 2~3 秒首播等待。
+/// 远程 URL 播放主路径：优先 HTTP Range 按需读取，Range 不可用时再退回增长缓冲
 #[tauri::command]
 pub async fn play_url_streaming(
     url: String,
     duration_hint_ms: u64,
+    start_position_ms: Option<u64>,
+    cache_key: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     eprintln!(
@@ -124,7 +134,49 @@ pub async fn play_url_streaming(
         url.len(),
         duration_hint_ms
     );
-    let buffer = start_streaming_download(&url, &state, "play_url_streaming").await?;
+    let start_position_ms = start_position_ms.unwrap_or(0);
+    let cache = playback_cache(&app, cache_key.as_deref());
+
+    if let Some(path) = cache.as_ref().and_then(RemoteAudioCache::ready_path) {
+        eprintln!("[play_url_streaming] playback cache hit: {}", path.display());
+        let mut player = state.player.lock();
+        let dur = player.play_file_at(&path.to_string_lossy(), start_position_ms)?;
+        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+    }
+
+    match open_remote_audio_source(&url, &state, cache).await {
+        Ok(reader) => {
+            let result = {
+                let mut player = state.player.lock();
+                player.play_remote_at(reader, duration_hint_ms, start_position_ms)
+            };
+            match result {
+                Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
+                Err(err) => eprintln!("[play_url_streaming] remote playback failed: {}", err),
+            }
+        }
+        Err(err) => {
+            eprintln!("[play_url_streaming] remote source unavailable: {}", err);
+        }
+    }
+
+    play_url_streaming_fallback(&url, duration_hint_ms, start_position_ms, &state).await
+}
+
+async fn play_url_streaming_fallback(
+    url: &str,
+    duration_hint_ms: u64,
+    start_position_ms: u64,
+    state: &State<'_, AppState>,
+) -> AppResult<u64> {
+    if start_position_ms > 0 {
+        let path = download_url_to_temp_audio(url, state).await?;
+        let mut player = state.player.lock();
+        let dur = player.play_file_at(&path, start_position_ms)?;
+        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+    }
+
+    let buffer = start_streaming_download(url, state, "play_url_streaming").await?;
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
         Err(err) => {
@@ -139,7 +191,7 @@ pub async fn play_url_streaming(
 
     let reader = buffer.reader();
     let mut player = state.player.lock();
-    let dur = match player.play_stream(reader, duration_hint_ms) {
+    let dur = match player.play_stream_at(reader, duration_hint_ms, start_position_ms) {
         Ok(dur) => dur,
         Err(err) => {
             buffer.abort();
@@ -262,6 +314,8 @@ pub async fn crossfade_url_streaming(
     duration_hint_ms: u64,
     fade_out_ms: u32,
     fade_in_ms: u32,
+    cache_key: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     eprintln!(
@@ -269,7 +323,47 @@ pub async fn crossfade_url_streaming(
         url.len(),
         duration_hint_ms
     );
-    let buffer = start_streaming_download(&url, &state, "crossfade_url_streaming").await?;
+    let cache = playback_cache(&app, cache_key.as_deref());
+
+    if let Some(path) = cache.as_ref().and_then(RemoteAudioCache::ready_path) {
+        eprintln!(
+            "[crossfade_url_streaming] playback cache hit: {}",
+            path.display()
+        );
+        let mut player = state.player.lock();
+        let dur = player.crossfade_file(&path.to_string_lossy(), fade_out_ms, fade_in_ms)?;
+        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+    }
+
+    match open_remote_audio_source(&url, &state, cache).await {
+        Ok(reader) => {
+            let result = {
+                let mut player = state.player.lock();
+                player.crossfade_remote(reader, duration_hint_ms, fade_out_ms, fade_in_ms)
+            };
+            match result {
+                Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
+                Err(err) => {
+                    eprintln!("[crossfade_url_streaming] remote playback failed: {}", err)
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("[crossfade_url_streaming] remote source unavailable: {}", err);
+        }
+    }
+
+    crossfade_url_streaming_fallback(&url, duration_hint_ms, fade_out_ms, fade_in_ms, &state).await
+}
+
+async fn crossfade_url_streaming_fallback(
+    url: &str,
+    duration_hint_ms: u64,
+    fade_out_ms: u32,
+    fade_in_ms: u32,
+    state: &State<'_, AppState>,
+) -> AppResult<u64> {
+    let buffer = start_streaming_download(url, state, "crossfade_url_streaming").await?;
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
         Err(err) => {
@@ -315,6 +409,39 @@ fn playback_referer(url: &str) -> &'static str {
     } else {
         "https://music.163.com"
     }
+}
+
+async fn open_remote_audio_source(
+    url: &str,
+    state: &State<'_, AppState>,
+    cache: Option<RemoteAudioCache>,
+) -> AppResult<RemoteAudioSource> {
+    RemoteAudioSource::open(
+        state.http(),
+        url.to_string(),
+        playback_referer(url).to_string(),
+        cache,
+    )
+    .await
+}
+
+fn playback_cache(app: &AppHandle, cache_key: Option<&str>) -> Option<RemoteAudioCache> {
+    let cache_key = cache_key.map(str::trim).filter(|key| !key.is_empty())?;
+    let root = playback_cache_root(app)?;
+    match RemoteAudioCache::new(root, cache_key) {
+        Ok(cache) => Some(cache),
+        Err(err) => {
+            eprintln!("[playback_cache] unavailable: {}", err);
+            None
+        }
+    }
+}
+
+fn playback_cache_root(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_cache_dir()
+        .ok()
+        .map(|dir| dir.join("playback-audio"))
 }
 
 async fn download_url_bytes(

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="WEB_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$/..">
+      <sourceFolder url="file://$MODULE_DIR$/../src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/../src-tauri/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/../dist" />
+      <excludeFolder url="file://$MODULE_DIR$/../node_modules" />
+      <excludeFolder url="file://$MODULE_DIR$/../src-tauri/gen" />
+      <excludeFolder url="file://$MODULE_DIR$/../src-tauri/target" />
+      <excludeFolder url="file://$MODULE_DIR$/../vendor/applemusic-like-lyrics/node_modules" />
+      <excludeFolder url="file://$MODULE_DIR$/../vendor/applemusic-like-lyrics/packages/docs/node_modules" />
+      <excludeFolder url="file://$MODULE_DIR$/../vendor/applemusic-like-lyrics/packages/playground/core/node_modules" />
+      <excludeFolder url="file://$MODULE_DIR$/../vendor/applemusic-like-lyrics/packages/playground/vue/node_modules" />
+      <excludeFolder url="file://$MODULE_DIR$/../vendor/applemusic-like-lyrics/packages/vue/node_modules" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

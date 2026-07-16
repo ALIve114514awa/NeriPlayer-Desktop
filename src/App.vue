@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { usePlayerStore, displayAlbum } from '@/stores/player'
 import { useSyncStore } from '@/stores/sync'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import { HISTORY_CHANGED_EVENT } from '@/stores/history'
+import { useLikedSongsStore } from '@/stores/likedSongs'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import MiniPlayer from '@/components/MiniPlayer.vue'
@@ -21,7 +23,10 @@ type CoverSnapshot = {
 
 const player = usePlayerStore()
 const settingsStore = useSettingsStore()
+const likedSongs = useLikedSongsStore()
+const route = useRoute()
 const isNowPlayingOpen = ref(false)
+const contentRef = ref<HTMLElement | null>(null)
 const miniPlayerRef = ref<InstanceType<typeof MiniPlayer> | null>(null)
 const nowPlayingRef = ref<InstanceType<typeof NowPlaying> | null>(null)
 const playerTransitionPulse = ref(0)
@@ -210,6 +215,14 @@ function scheduleHistorySync() {
   }
 }
 
+watch(() => route.fullPath, async () => {
+  if (route.name !== 'downloads') return
+  await nextTick()
+  requestAnimationFrame(() => {
+    contentRef.value?.scrollTo({ top: 0, left: 0 })
+  })
+}, { flush: 'post' })
+
 // 启动时初始化：加载同步配置 + 检查登录状态 + 自动同步
 onMounted(async () => {
   const syncStore = useSyncStore()
@@ -219,6 +232,7 @@ onMounted(async () => {
   await Promise.allSettled([
     syncStore.loadConfigs(),
     authStore.checkStatus(),
+    likedSongs.start(),
   ])
 
   // 自动同步（配置开启且已配置），静默模式
@@ -242,6 +256,7 @@ onUnmounted(() => {
   if (nowPlayingMotionTimer) clearTimeout(nowPlayingMotionTimer)
   if (debounceSyncTimer) clearTimeout(debounceSyncTimer)
   if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
+  likedSongs.stop()
   window.removeEventListener(HISTORY_CHANGED_EVENT, scheduleHistorySync as EventListener)
   if (unlistenPlaylistChanged) unlistenPlaylistChanged()
 })
@@ -260,6 +275,7 @@ onUnmounted(() => {
     <div v-if="bgImageStyle" class="app-bg-image" :style="bgImageStyle"></div>
     <SideNav class="app-side-nav" :class="{ 'app-side-nav--dimmed': isNowPlayingOpen }" />
     <main
+      ref="contentRef"
       class="content"
       :class="{
         'has-mini-player': hasMiniPlayer,

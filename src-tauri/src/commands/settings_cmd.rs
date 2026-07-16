@@ -1,4 +1,4 @@
-use crate::api::bilibili::client::BiliClient;
+use crate::api::bilibili::client::{BiliAudioStream, BiliClient};
 use crate::api::netease::client::NeteaseClient;
 use crate::api::qq::client::QqMusicClient;
 use crate::api::youtube::client::YouTubeClient;
@@ -67,6 +67,7 @@ pub async fn get_bili_audio_url(
     bvid: String,
     avid: Option<u64>,
     cid: Option<u64>,
+    quality: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<BiliAudioResult> {
     let client = BiliClient::new(&state.http());
@@ -84,15 +85,45 @@ pub async fn get_bili_audio_url(
     };
 
     let streams = client.get_audio_url(&real_bvid, real_cid).await?;
-    let best = streams
-        .into_iter()
-        .next()
+    let best = select_bili_audio_stream(streams, quality.as_deref())
         .ok_or_else(|| AppError::Api("No audio stream found".into()))?;
     Ok(BiliAudioResult {
         url: best.url,
         bandwidth: best.bandwidth,
         codecs: best.codecs,
     })
+}
+
+fn select_bili_audio_stream(
+    mut streams: Vec<BiliAudioStream>,
+    quality: Option<&str>,
+) -> Option<BiliAudioStream> {
+    streams.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+    let fallback = streams.first().cloned();
+
+    let is_dolby = |stream: &BiliAudioStream| {
+        stream.quality_id == 30250 || stream.codecs.eq_ignore_ascii_case("ec-3")
+    };
+    let is_lossless = |stream: &BiliAudioStream| {
+        stream.quality_id == 30251 || stream.codecs.eq_ignore_ascii_case("flac")
+    };
+    let normal_streams = || streams.iter().filter(|stream| !is_dolby(stream) && !is_lossless(stream));
+
+    match quality.unwrap_or("high") {
+        "dolby" => streams.iter().find(|stream| is_dolby(stream)).cloned(),
+        "lossless" | "hires" => streams.iter().find(|stream| is_lossless(stream)).cloned(),
+        "low" => normal_streams().last().cloned(),
+        "medium" => {
+            let normal: Vec<_> = normal_streams().cloned().collect();
+            if normal.is_empty() {
+                None
+            } else {
+                normal.get((normal.len() - 1) / 2).cloned()
+            }
+        }
+        _ => normal_streams().next().cloned(),
+    }
+    .or(fallback)
 }
 
 /// 获取 YouTube 音频流 URL

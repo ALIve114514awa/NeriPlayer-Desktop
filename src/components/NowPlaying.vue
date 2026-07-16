@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { usePlayerStore, displayAlbum, type LyricLine, type TrackInfo } from '@/stores/player'
-import { useRecommendStore } from '@/stores/recommend'
+import { useLikedSongsStore } from '@/stores/likedSongs'
 import { useSettingsStore } from '@/stores/settings'
 import { useToastStore } from '@/stores/toast'
 import { useDownloadStore } from '@/stores/download'
@@ -27,7 +27,7 @@ const props = defineProps<{
   transitionState?: 'opening' | 'closing' | null
 }>()
 const player = usePlayerStore()
-const recommend = useRecommendStore()
+const likedSongs = useLikedSongsStore()
 const settings = useSettingsStore()
 const toast = useToastStore()
 const downloadStore = useDownloadStore()
@@ -396,102 +396,11 @@ function onLyricSeek(ms: number) {
   player.seekTo(ms)
 }
 
-// 当前歌曲的网易云 ID（用于网易云收藏 API）
-const currentNeteaseId = computed(() => {
-  const id = player.currentTrack?.id
-  if (id?.startsWith('netease:')) return parseInt(id.replace('netease:', ''))
-  return null
-})
-
-// 本地"我喜欢的音乐"歌单 ID
-const LIKED_PLAYLIST_NAMES = ['我喜欢的音乐', '我喜歡的音樂', 'お気に入りの曲', 'Liked Songs', 'My Favorite Music']
-const localLikedPlaylistId = ref<number | null>(null)
-const localLikedTrackIds = ref<Set<string>>(new Set())
-
-function inferTrackSource(trackId: string) {
-  if (trackId.startsWith('netease:')) return 'netease'
-  if (trackId.startsWith('qq:')) return 'qq'
-  if (trackId.startsWith('bilibili:')) return 'bilibili'
-  if (trackId.startsWith('youtube:')) return 'youtube'
-  return 'local'
-}
-
-// 加载本地"我喜欢的音乐"歌单数据
-async function loadLocalLikedPlaylist() {
-  try {
-    const playlists = await invoke<any[]>('list_playlists')
-    const liked = playlists.find(p => LIKED_PLAYLIST_NAMES.includes(p.name))
-    if (liked) {
-      localLikedPlaylistId.value = liked.id
-      const tracks = await invoke<any[]>('get_playlist_tracks', { id: liked.id })
-      localLikedTrackIds.value = new Set(tracks.map((t: any) => t.id))
-    }
-  } catch (e) {
-    console.error('loadLocalLikedPlaylist:', e)
-  }
-}
-
-// 收藏状态：检查本地"我喜欢的音乐"歌单
-const isFavorite = computed(() => {
-  const trackId = player.currentTrack?.id
-  if (!trackId) return false
-  return localLikedTrackIds.value.has(trackId)
-})
+const isFavorite = computed(() => likedSongs.isTrackLiked(player.currentTrack))
 
 async function toggleFavorite() {
-  const track = player.currentTrack
-  if (!track) return
-
-  // 网易云歌曲：同时调用 Netease API
-  const nid = currentNeteaseId.value
-  if (nid) {
-    recommend.toggleLikeSong(nid, !isFavorite.value).catch(() => {})
-  }
-
-  // 本地歌单操作
-  if (!localLikedPlaylistId.value) {
-    // 自动创建"我喜欢的音乐"歌单
-    try {
-      const created = await invoke<any>('create_playlist', { name: '我喜欢的音乐' })
-      localLikedPlaylistId.value = created.id
-    } catch (e) {
-      console.error('create liked playlist:', e)
-      return
-    }
-  }
-
-  try {
-    if (isFavorite.value) {
-      await invoke('remove_from_playlist', {
-        playlistId: localLikedPlaylistId.value,
-        trackId: track.id,
-      })
-      localLikedTrackIds.value.delete(track.id)
-    } else {
-      await invoke('add_to_playlist', {
-        playlistId: localLikedPlaylistId.value,
-        track: {
-          id: track.id,
-          title: track.title,
-          artist: track.artist,
-          album: track.album,
-          duration_ms: track.durationMs,
-          cover_url: track.coverUrl || null,
-          url: track.audioUrl || '',
-          source: inferTrackSource(track.id),
-        },
-      })
-      localLikedTrackIds.value.add(track.id)
-    }
-  } catch (e) {
-    console.error('toggleFavorite local:', e)
-  }
+  await likedSongs.toggleTrack(player.currentTrack)
 }
-
-// 曲目切换或打开时加载
-watch(() => player.currentTrack?.id, () => {
-  loadLocalLikedPlaylist()
-}, { immediate: true })
 
 // 睡眠定时器选项
 const sleepOptions = computed(() => [
@@ -1072,23 +981,66 @@ const youtubeQualities = [
   { key: 'very_high', label: 'settings.q_very_high' },
 ]
 
+const biliQualities = [
+  { key: 'low', label: 'settings.q_smooth' },
+  { key: 'medium', label: 'settings.q_standard' },
+  { key: 'high', label: 'settings.q_good' },
+  { key: 'lossless', label: 'settings.q_lossless' },
+  { key: 'hires', label: 'settings.q_hires' },
+  { key: 'dolby', label: 'settings.q_dolby' },
+]
+
+const isQualitySwitching = ref(false)
+
 async function switchQuality(key: string) {
-  if (currentSource.value === 'netease') {
-    settings.neteaseQuality = key
-  } else if (currentSource.value === 'qq') {
-    settings.qqMusicQuality = key
-  } else if (currentSource.value === 'youtube') {
-    settings.youtubeQuality = key
+  if (isQualitySwitching.value) return
+  const source = currentSource.value
+  const previousKey = currentQualityKey(source)
+  if (!previousKey || previousKey === key) {
+    showMoreSheet.value = false
+    return
   }
-  showMoreSheet.value = false
-  await player.replayWithQuality()
+
+  isQualitySwitching.value = true
+  setQualityKey(source, key)
+  try {
+    showMoreSheet.value = false
+    await player.replayWithQuality()
+  } catch (e) {
+    setQualityKey(source, previousKey)
+    toast.error(String(e))
+  } finally {
+    isQualitySwitching.value = false
+  }
 }
 
-function currentQualityKey(): string {
-  if (currentSource.value === 'netease') return settings.neteaseQuality
-  if (currentSource.value === 'qq') return settings.qqMusicQuality
-  if (currentSource.value === 'youtube') return settings.youtubeQuality
+function currentQualityKey(source = currentSource.value): string {
+  if (source === 'netease') return settings.neteaseQuality
+  if (source === 'qq') return settings.qqMusicQuality
+  if (source === 'bilibili') return settings.biliQuality
+  if (source === 'youtube') return settings.youtubeQuality
   return ''
+}
+
+function setQualityKey(source: string, key: string) {
+  if (source === 'netease') settings.neteaseQuality = key
+  else if (source === 'qq') settings.qqMusicQuality = key
+  else if (source === 'bilibili') settings.biliQuality = key
+  else if (source === 'youtube') settings.youtubeQuality = key
+}
+
+function qualityOptionsForSource(source: string) {
+  if (source === 'netease') return neteaseQualities
+  if (source === 'qq') return qqQualities
+  if (source === 'bilibili') return biliQualities
+  if (source === 'youtube') return youtubeQualities
+  return []
+}
+
+function qualityLabelFor(source: string, key?: string) {
+  if (!key || source === 'local') return ''
+  const item = qualityOptionsForSource(source).find(q => q.key === key)
+  return item ? t(item.label) : key
 }
 
 // 下载/重新下载歌曲
@@ -1168,15 +1120,59 @@ const albumName = computed(() => {
 const canViewNeteaseAlbum = computed(() => currentSource.value === 'netease' && !!albumName.value && !!currentNeteaseSongNumericId.value)
 
 // 进度条下方音质信息
-const audioInfoDisplay = computed(() => {
+const audioInfoParts = computed(() => {
   const info = player.audioInfo
-  if (!info) return ''
-  const parts: string[] = []
-  if (settings.showAudioCodec && info.codec) parts.push(info.codec)
-  if (settings.showQualitySwitch && info.bitrate) parts.push(`${info.bitrate}kbps`)
-  if (settings.showAudioSpec && info.format && info.format !== info.codec) parts.push(info.format)
-  return parts.join(' \u00B7 ')
+  if (!info) return []
+  const parts: Array<{ text: string; accent?: boolean }> = []
+  if (settings.showQualitySwitch) addAudioInfoPart(parts, currentAudioQualityLabel(), true)
+  if (settings.showAudioCodec) addAudioInfoPart(parts, normalizeAudioDisplayToken(info.codec))
+  if (settings.showAudioSpec && info.bitrate) addAudioInfoPart(parts, `${info.bitrate} kbps`)
+  if (settings.showAudioSpec) addAudioInfoPart(parts, normalizeAudioDisplayToken(info.format))
+  return parts
 })
+
+const audioInfoDisplay = computed(() => {
+  return audioInfoParts.value.map(part => part.text).join(' \u00B7 ')
+})
+
+function currentAudioQualityLabel() {
+  const info = player.audioInfo
+  const source = info?.source && info.source !== 'local' ? info.source : currentSource.value
+  return qualityLabelFor(source, info?.qualityKey || currentQualityKey(source))
+}
+
+function addAudioInfoPart(
+  parts: Array<{ text: string; accent?: boolean }>,
+  value?: string,
+  accent = false,
+) {
+  const normalized = value?.trim()
+  if (!normalized) return
+  if (parts.some(part => isSameAudioInfoToken(part.text, normalized))) return
+  parts.push({ text: normalized, accent })
+}
+
+function normalizeAudioDisplayToken(value?: string) {
+  if (!value) return ''
+  const raw = value.trim()
+  const lower = raw.toLowerCase()
+  const tokenMap: Record<string, string> = {
+    flac: 'FLAC',
+    mp3: 'MP3',
+    mpeg: 'MP3',
+    aac: 'AAC',
+    mp4a: 'AAC',
+    opus: 'Opus',
+    vorbis: 'Vorbis',
+    'ec-3': 'EC-3',
+    ac3: 'AC-3',
+  }
+  return tokenMap[lower] ?? tokenMap[lower.split('.')[0]] ?? raw
+}
+
+function isSameAudioInfoToken(left: string, right: string) {
+  return left.trim().toLowerCase() === right.trim().toLowerCase()
+}
 
 // AccentBackdrop 底色（对齐 Android：主色降饱和调暗后铺底）
 const accentBgStyle = computed(() => {
@@ -1301,17 +1297,6 @@ const sliderActiveColor = computed(() => {
           <span :key="headerAlbumKey" class="np-from-name">{{ albumName }}</span>
         </transition>
       </div>
-      <!-- 收藏 + 更多（对齐 Android 顶栏右侧） -->
-      <button
-        class="np-icon-btn fav-header-btn"
-        :class="{ active: isFavorite }"
-        :disabled="!player.currentTrack"
-        @click="toggleFavorite"
-      >
-        <transition name="np-favorite-swap" mode="out-in">
-          <span :key="favoriteVisualKey" class="material-symbols-rounded" :class="{ filled: isFavorite }">favorite</span>
-        </transition>
-      </button>
       <button class="np-icon-btn" @click="showMoreSheet = !showMoreSheet">
         <span class="material-symbols-rounded">more_vert</span>
       </button>
@@ -1412,8 +1397,14 @@ const sliderActiveColor = computed(() => {
                 <span class="material-symbols-rounded">download_done</span>
                 {{ t('player.playing_from_download') }}
               </span>
-              <span v-if="audioInfoDisplay" class="np-audio-detail" :class="{ separated: player.isPlayingFromDownload }">
-                {{ audioInfoDisplay }}
+              <span v-if="audioInfoParts.length" class="np-audio-detail" :class="{ separated: player.isPlayingFromDownload }">
+                <template v-for="(part, index) in audioInfoParts" :key="`${part.text}:${index}`">
+                  <span
+                    class="np-audio-detail-part"
+                    :class="{ 'np-audio-detail-part--accent': part.accent }"
+                  >{{ part.text }}</span>
+                  <span v-if="index < audioInfoParts.length - 1" class="np-audio-separator">·</span>
+                </template>
               </span>
             </div>
           </transition>
@@ -1469,12 +1460,26 @@ const sliderActiveColor = computed(() => {
           </button>
         </div>
 
-        <!-- 工具栏（对齐 Android 底部：Queue → Sleep → Volume → Speed → Add） -->
+        <!-- 工具栏（对齐 Android 底部：Favorite → Queue → Sleep → Volume → Speed → Add） -->
         <div
           class="np-toolbar"
           :class="{ 'np-toolbar--switching': isTrackSwitchAnimating, 'np-toolbar--beat-active': isVisualBeatActive }"
           @click.stop
         >
+          <button
+            class="tool-btn tool-btn--feedback fav-btn"
+            :class="{ active: isFavorite }"
+            :disabled="!player.currentTrack"
+            @click="toggleFavorite"
+          >
+            <transition name="np-favorite-swap" mode="out-in">
+              <span
+                :key="favoriteVisualKey"
+                class="material-symbols-rounded"
+                :class="{ filled: isFavorite }"
+              >favorite</span>
+            </transition>
+          </button>
           <button class="tool-btn tool-btn--feedback" @click="handleOpenQueue()">
             <span class="material-symbols-rounded">queue_music</span>
           </button>
@@ -2103,41 +2108,23 @@ const sliderActiveColor = computed(() => {
               </button>
               <h4 class="np-more-title">{{ t('player.quality_switch') }}</h4>
             </div>
-            <div v-if="currentSource === 'netease'" class="np-more-quality-list">
+            <div v-if="qualityOptionsForSource(currentSource).length" class="np-more-quality-list">
               <button
-                v-for="q in neteaseQualities"
+                v-for="q in qualityOptionsForSource(currentSource)"
                 :key="q.key"
                 class="np-more-quality-item"
                 :class="{ active: currentQualityKey() === q.key }"
+                :disabled="isQualitySwitching"
                 @click="switchQuality(q.key)"
               >
                 <span>{{ t(q.label) }}</span>
-                <span v-if="currentQualityKey() === q.key" class="material-symbols-rounded" style="font-size: 18px">check</span>
+                <span
+                  v-if="currentQualityKey() === q.key"
+                  class="material-symbols-rounded"
+                  style="font-size: 18px"
+                >check</span>
               </button>
-            </div>
-            <div v-else-if="currentSource === 'qq'" class="np-more-quality-list">
-              <button
-                v-for="q in qqQualities"
-                :key="q.key"
-                class="np-more-quality-item"
-                :class="{ active: currentQualityKey() === q.key }"
-                @click="switchQuality(q.key)"
-              >
-                <span>{{ t(q.label) }}</span>
-                <span v-if="currentQualityKey() === q.key" class="material-symbols-rounded" style="font-size: 18px">check</span>
-              </button>
-            </div>
-            <div v-else-if="currentSource === 'youtube'" class="np-more-quality-list">
-              <button
-                v-for="q in youtubeQualities"
-                :key="q.key"
-                class="np-more-quality-item"
-                :class="{ active: currentQualityKey() === q.key }"
-                @click="switchQuality(q.key)"
-              >
-                <span>{{ t(q.label) }}</span>
-                <span v-if="currentQualityKey() === q.key" class="material-symbols-rounded" style="font-size: 18px">check</span>
-              </button>
+              <div v-if="isQualitySwitching" class="np-more-status">{{ t('player.quality_changing') }}</div>
             </div>
             <div v-else class="np-more-status">{{ t('player.not_available') }}</div>
           </template>
@@ -2675,7 +2662,7 @@ const sliderActiveColor = computed(() => {
   font-size: 10px;
   font-weight: 600;
   color: rgba(255,255,255,0.60);
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   margin-top: 0px;
   min-height: 18px;
 }
@@ -2686,13 +2673,31 @@ const sliderActiveColor = computed(() => {
 }
 
 .np-audio-detail {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   color: rgba(255,255,255,0.60);
 
   &.separated::before {
     content: '·';
-    margin-right: 6px;
+    margin-right: 0;
     color: rgba(255,255,255,0.42);
   }
+}
+
+.np-audio-detail-part {
+  color: rgba(255,255,255,0.62);
+  transition: color 0.45s ease;
+}
+
+.np-audio-detail-part--accent {
+  color: var(--np-primary, var(--md-primary, #D0BCFF));
+  text-shadow: 0 0 18px color-mix(in srgb, var(--np-primary, #D0BCFF) 28%, transparent);
+}
+
+.np-audio-separator {
+  color: rgba(255,255,255,0.34);
 }
 
 .np-download-chip {
@@ -3297,6 +3302,8 @@ const sliderActiveColor = computed(() => {
   &:hover { background: rgba(255,255,255,0.10); color: rgba(255,255,255,0.87); }
   &.active { color: var(--np-primary, var(--md-primary-container, #E8DEF8)); }
   &.disabled { opacity: 0.38; cursor: default; }
+  &:disabled { opacity: 0.38; cursor: default; }
+  &:disabled:hover { background: transparent; color: rgba(255,255,255,0.72); }
   &:active { transform: scale(0.88); }
 }
 
@@ -3317,16 +3324,10 @@ const sliderActiveColor = computed(() => {
   transform: scale(1);
 }
 
-// 收藏按钮活跃态保持红色（对齐 Android Color.Red.copy(alpha=0.6f)）
+// 收藏按钮活跃态保持更鲜明的红色
 .fav-btn.active {
-  color: rgba(239, 83, 80, 0.6) !important;
-}
-
-// 顶栏收藏按钮（对齐 Android 顶栏右侧）
-.fav-header-btn {
-  &.active {
-    color: rgba(239, 83, 80, 0.6) !important;
-  }
+  color: #FF3B30 !important;
+  text-shadow: 0 0 18px rgba(255, 59, 48, 0.28);
 }
 
 .np-favorite-swap-enter-active,
@@ -3484,6 +3485,10 @@ const sliderActiveColor = computed(() => {
 /* 播放速度 / 音效面板 */
 .speed-wrap, .sleep-wrap {
   position: relative;
+}
+
+.sleep-wrap .tool-btn {
+  overflow: visible;
 }
 
 .speed-label {
@@ -3761,13 +3766,19 @@ const sliderActiveColor = computed(() => {
   position: absolute;
   top: -2px;
   right: -4px;
+  z-index: 2;
+  min-width: 22px;
+  height: 14px;
+  line-height: 14px;
   font-size: 9px;
   font-weight: 700;
   background: var(--md-primary, #D0BCFF);
   color: #1C1B1F;
-  padding: 1px 4px;
-  border-radius: 6px;
+  padding: 0 4px;
+  border-radius: 999px;
   font-variant-numeric: tabular-nums;
+  text-align: center;
+  pointer-events: none;
 }
 
 /* 歌词空状态 */

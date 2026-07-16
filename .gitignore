@@ -8,8 +8,7 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
-# IDE
-.idea/
+# IDE personal state is ignored inside .idea/.gitignore
 *.swp
 *.swo
 

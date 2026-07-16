@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::audio::analyzer::{AudioAnalyzer, SharedAudioLevel};
 use crate::audio::effects::{AudioEffectsParams, EqualizerSource, LoudnessSource};
 use crate::audio::growing::GrowingAudioReader;
+use crate::audio::remote::{RemoteAudioSource, SymphoniaAudioDecoder};
 use crate::error::{AppError, AppResult};
 
 /// 播放操作 recv 超时（网络音频解码可能慢）
@@ -23,10 +24,12 @@ const FAST_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 const ANALYSIS_FRAME_SIZE: usize = 2048;
 
 // 音频来源——seek 时需要重建 decoder
+#[derive(Clone)]
 enum AudioSource {
     Bytes(Vec<u8>),
     File(String),
     Growing(GrowingAudioReader, u64),
+    Remote(RemoteAudioSource, u64),
 }
 
 impl AudioSource {
@@ -34,6 +37,10 @@ impl AudioSource {
         if let AudioSource::Growing(reader, _) = self {
             reader.abort();
         }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, AudioSource::Remote(_, _))
     }
 }
 
@@ -59,15 +66,24 @@ enum AudioCmd {
     PlayBytes {
         data: Vec<u8>,
         duration_hint_ms: u64,
+        start_position_ms: u64,
         reply: mpsc::Sender<Result<u64, String>>,
     },
     PlayFile {
         path: String,
+        start_position_ms: u64,
         reply: mpsc::Sender<Result<u64, String>>,
     },
     PlayStream {
         reader: GrowingAudioReader,
         duration_hint_ms: u64,
+        start_position_ms: u64,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    PlayRemote {
+        reader: RemoteAudioSource,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
         reply: mpsc::Sender<Result<u64, String>>,
     },
     Pause,
@@ -108,6 +124,13 @@ enum AudioCmd {
     /// Crossfade 播放边下边读的音频流
     CrossfadeStream {
         reader: GrowingAudioReader,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    CrossfadeRemote {
+        reader: RemoteAudioSource,
         duration_hint_ms: u64,
         fade_out_ms: u32,
         fade_in_ms: u32,
@@ -335,6 +358,43 @@ impl PlayerEngine {
                     .unwrap_or(*duration_hint_ms);
                 Ok((Box::new(dec), dur))
             }
+            AudioSource::Remote(reader, duration_hint_ms) => {
+                let dec = SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)?;
+                let dur = dec
+                    .total_duration()
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(*duration_hint_ms);
+                Ok((Box::new(dec), dur))
+            }
+        }
+    }
+
+    fn clamp_start_position(position_ms: u64, duration_ms: u64) -> u64 {
+        if duration_ms > 0 {
+            position_ms.min(duration_ms)
+        } else {
+            position_ms
+        }
+    }
+
+    fn prepare_decoder_position(
+        mut source: Box<dyn Source<Item = i16> + Send>,
+        position_ms: u64,
+    ) -> (Box<dyn Source<Item = i16> + Send>, bool) {
+        if position_ms == 0 {
+            return (source, true);
+        }
+
+        let position = Duration::from_millis(position_ms);
+        if source.try_seek(position).is_ok() {
+            eprintln!("[audio-thread] decoder seek OK: {}ms", position_ms);
+            (source, true)
+        } else {
+            eprintln!(
+                "[audio-thread] decoder seek failed, using skip fallback: {}ms",
+                position_ms
+            );
+            (Box::new(source.skip_duration(position)), false)
         }
     }
 
@@ -471,13 +531,14 @@ impl PlayerEngine {
                 AudioCmd::PlayBytes {
                     data,
                     duration_hint_ms,
+                    start_position_ms,
                     reply,
                 } => {
                     let result = (|| -> Result<u64, String> {
                         let data_len = data.len();
                         eprintln!(
-                            "[audio-thread] PlayBytes: {} bytes, hint={}ms",
-                            data_len, duration_hint_ms
+                            "[audio-thread] PlayBytes: {} bytes, hint={}ms, start={}ms",
+                            data_len, duration_hint_ms, start_position_ms
                         );
 
                         ensure_output!();
@@ -500,6 +561,9 @@ impl PlayerEngine {
                         let source = AudioSource::Bytes(data);
                         let (dec, dur) = Self::make_decoder(&source)?;
                         let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
+                        let start_ms =
+                            Self::clamp_start_position(start_position_ms, duration_ms);
+                        let (dec, _) = Self::prepare_decoder_position(dec, start_ms);
 
                         eprintln!("[audio-thread] decoded ok, duration={}ms", duration_ms);
 
@@ -522,7 +586,11 @@ impl PlayerEngine {
                     let _ = reply.send(result);
                 }
 
-                AudioCmd::PlayFile { path, reply } => {
+                AudioCmd::PlayFile {
+                    path,
+                    start_position_ms,
+                    reply,
+                } => {
                     let result = (|| -> Result<u64, String> {
                         ensure_output!();
                         let h = handle
@@ -543,6 +611,8 @@ impl PlayerEngine {
 
                         let source = AudioSource::File(path);
                         let (dec, dur) = Self::make_decoder(&source)?;
+                        let start_ms = Self::clamp_start_position(start_position_ms, dur);
+                        let (dec, _) = Self::prepare_decoder_position(dec, start_ms);
 
                         // 音效链: Decoder → Equalizer → Loudness → Analyzer
                         let eq = EqualizerSource::new(dec, effects_params.clone());
@@ -566,10 +636,14 @@ impl PlayerEngine {
                 AudioCmd::PlayStream {
                     reader,
                     duration_hint_ms,
+                    start_position_ms,
                     reply,
                 } => {
                     let result = (|| -> Result<u64, String> {
-                        eprintln!("[audio-thread] PlayStream: hint={}ms", duration_hint_ms);
+                        eprintln!(
+                            "[audio-thread] PlayStream: hint={}ms, start={}ms",
+                            duration_hint_ms, start_position_ms
+                        );
                         ensure_output!();
                         let h = handle
                             .as_ref()
@@ -590,8 +664,72 @@ impl PlayerEngine {
                         let source = AudioSource::Growing(reader, duration_hint_ms);
                         let (dec, dur) = Self::make_decoder(&source)?;
                         let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
+                        let start_ms =
+                            Self::clamp_start_position(start_position_ms, duration_ms);
+                        let (dec, _) = Self::prepare_decoder_position(dec, start_ms);
                         eprintln!(
                             "[audio-thread] streaming decoder ok, duration={}ms",
+                            duration_ms
+                        );
+
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
+                        let loud = LoudnessSource::new(eq, effects_params.clone());
+                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
+
+                        let sink =
+                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
+                        sink.set_volume(current_volume);
+                        sink.set_speed(current_speed);
+                        sink.append(analyzing);
+
+                        current_sink = Some(sink);
+                        current_source = Some(source);
+                        current_duration_ms = duration_ms;
+                        Ok(duration_ms)
+                    })();
+                    let _ = reply.send(result);
+                }
+
+                AudioCmd::PlayRemote {
+                    reader,
+                    duration_hint_ms,
+                    start_position_ms,
+                    reply,
+                } => {
+                    let result = (|| -> Result<u64, String> {
+                        eprintln!(
+                            "[audio-thread] PlayRemote: hint={}ms, start={}ms",
+                            duration_hint_ms, start_position_ms
+                        );
+                        ensure_output!();
+                        let h = handle
+                            .as_ref()
+                            .ok_or_else(|| "No audio output available".to_string())?;
+
+                        if let Some(old_source) = current_source.take() {
+                            old_source.abort_if_stream();
+                        }
+                        if let Some(old_sink) = current_sink.take() {
+                            old_sink.stop();
+                        }
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
+
+                        let source = AudioSource::Remote(reader, duration_hint_ms);
+                        let (dec, dur) = Self::make_decoder(&source)?;
+                        let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
+                        let start_ms =
+                            Self::clamp_start_position(start_position_ms, duration_ms);
+                        let (dec, used_native_seek) =
+                            Self::prepare_decoder_position(dec, start_ms);
+                        if start_ms > 0 && !used_native_seek {
+                            return Err("Remote source is not seekable".to_string());
+                        }
+                        eprintln!(
+                            "[audio-thread] remote decoder ok, duration={}ms",
                             duration_ms
                         );
 
@@ -669,10 +807,12 @@ impl PlayerEngine {
                             eprintln!("[audio-thread] Native seek failed, falling back to rebuild");
                         }
 
-                        // 原生 seek 失败——重建 decoder + skip samples（最后手段）
+                        // 原生 seek 失败时重建 decoder；远端流必须走真正 seek，不能慢速跳样本
                         let source = current_source
                             .as_ref()
+                            .cloned()
                             .ok_or_else(|| "Nothing is playing".to_string())?;
+                        let source_is_remote = source.is_remote();
                         let h = handle
                             .as_ref()
                             .ok_or_else(|| "No audio output available".to_string())?;
@@ -681,21 +821,28 @@ impl PlayerEngine {
                             .as_ref()
                             .map(|s| s.is_paused())
                             .unwrap_or(false);
-                        if let Some(old_sink) = current_sink.take() {
-                            old_sink.stop();
-                        }
-                        stop_prev_transition(
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
 
-                        let (dec, _) = Self::make_decoder(source)?;
-                        let skip_duration = Duration::from_millis(position_ms);
-                        let skipped = dec.skip_duration(skip_duration);
+                        if source_is_remote {
+                            stop_prev_transition(
+                                &mut prev_sink,
+                                &mut prev_source,
+                                &mut prev_cleanup_deadline,
+                            );
+                            if let Some(old_sink) = current_sink.take() {
+                                old_sink.stop();
+                            }
+                            current_source = None;
+                        }
+
+                        let (dec, _) = Self::make_decoder(&source)?;
+                        let (dec, used_native_seek) =
+                            Self::prepare_decoder_position(dec, position_ms);
+                        if source_is_remote && !used_native_seek {
+                            return Err("Remote source is not seekable".to_string());
+                        }
 
                         // 音效链: Decoder → Equalizer → Loudness → Analyzer
-                        let eq = EqualizerSource::new(skipped, effects_params.clone());
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
                         let loud = LoudnessSource::new(eq, effects_params.clone());
                         let analyzing = AnalyzingSource::new(loud, shared_level.clone());
 
@@ -708,7 +855,19 @@ impl PlayerEngine {
                             sink.pause();
                         }
 
+                        if !source_is_remote {
+                            stop_prev_transition(
+                                &mut prev_sink,
+                                &mut prev_source,
+                                &mut prev_cleanup_deadline,
+                            );
+                            if let Some(old_sink) = current_sink.take() {
+                                old_sink.stop();
+                            }
+                        }
+
                         current_sink = Some(sink);
+                        current_source = Some(source);
                         eprintln!("[audio-thread] Seek via rebuild OK");
                         Ok(())
                     })();
@@ -938,17 +1097,91 @@ impl PlayerEngine {
                     })();
                     let _ = reply.send(result);
                 }
+
+                AudioCmd::CrossfadeRemote {
+                    reader,
+                    duration_hint_ms,
+                    fade_out_ms,
+                    fade_in_ms,
+                    reply,
+                } => {
+                    let result = (|| -> Result<u64, String> {
+                        eprintln!(
+                            "[audio-thread] CrossfadeRemote: hint={}ms",
+                            duration_hint_ms
+                        );
+                        ensure_output!();
+                        let h = handle
+                            .as_ref()
+                            .ok_or_else(|| "No audio output available".to_string())?;
+
+                        stop_prev_transition(
+                            &mut prev_sink,
+                            &mut prev_source,
+                            &mut prev_cleanup_deadline,
+                        );
+                        let old_source = current_source.take();
+                        let old_sink = current_sink.take();
+
+                        let source = AudioSource::Remote(reader, duration_hint_ms);
+                        let (dec, dur) = Self::make_decoder(&source)?;
+                        let duration_ms_val = if dur > 0 { dur } else { duration_hint_ms };
+
+                        let eq = EqualizerSource::new(dec, effects_params.clone());
+                        let loud = LoudnessSource::new(eq, effects_params.clone());
+                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
+
+                        let new_sink = Arc::new(
+                            Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?,
+                        );
+                        new_sink.set_volume(0.0);
+                        new_sink.set_speed(current_speed);
+                        new_sink.append(analyzing);
+
+                        current_sink = Some(new_sink.clone());
+                        current_source = Some(source);
+                        current_duration_ms = duration_ms_val;
+
+                        if let Some(ref old) = old_sink {
+                            prev_sink = Some(old.clone());
+                            prev_source = old_source;
+                            prev_cleanup_deadline = Some(
+                                Instant::now()
+                                    + Duration::from_millis(
+                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
+                                    ),
+                            );
+                        } else if let Some(old_source) = old_source {
+                            old_source.abort_if_stream();
+                        }
+                        Self::spawn_crossfade_worker(
+                            old_sink,
+                            new_sink,
+                            current_volume,
+                            fade_out_ms,
+                            fade_in_ms,
+                        );
+
+                        Ok(duration_ms_val)
+                    })();
+                    let _ = reply.send(result);
+                }
             }
         }
     }
 
     /// 播放本地文件
     pub fn play_file(&mut self, path: &str) -> AppResult<u64> {
+        self.play_file_at(path, 0)
+    }
+
+    pub fn play_file_at(&mut self, path: &str, start_position_ms: u64) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
             .send(AudioCmd::PlayFile {
                 path: path.to_string(),
+                start_position_ms,
                 reply: tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
@@ -962,19 +1195,29 @@ impl PlayerEngine {
         self.current_path = Some(path.to_string());
         self.duration_ms = duration_ms;
         self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
+        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
 
         Ok(duration_ms)
     }
 
     /// 播放内存中的音频数据
     pub fn play_bytes(&mut self, data: Vec<u8>, duration_hint_ms: u64) -> AppResult<u64> {
+        self.play_bytes_at(data, duration_hint_ms, 0)
+    }
+
+    pub fn play_bytes_at(
+        &mut self,
+        data: Vec<u8>,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+    ) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
             .send(AudioCmd::PlayBytes {
                 data,
                 duration_hint_ms,
+                start_position_ms,
                 reply: tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
@@ -988,7 +1231,7 @@ impl PlayerEngine {
         self.current_path = Some("__stream__".to_string());
         self.duration_ms = duration_ms;
         self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
+        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
 
         Ok(duration_ms)
     }
@@ -999,12 +1242,22 @@ impl PlayerEngine {
         reader: GrowingAudioReader,
         duration_hint_ms: u64,
     ) -> AppResult<u64> {
+        self.play_stream_at(reader, duration_hint_ms, 0)
+    }
+
+    pub fn play_stream_at(
+        &mut self,
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+    ) -> AppResult<u64> {
         self.ensure_alive();
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
             .send(AudioCmd::PlayStream {
                 reader,
                 duration_hint_ms,
+                start_position_ms,
                 reply: tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
@@ -1018,7 +1271,38 @@ impl PlayerEngine {
         self.current_path = Some("__streaming__".to_string());
         self.duration_ms = duration_ms;
         self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
+        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
+
+        Ok(duration_ms)
+    }
+
+    pub fn play_remote_at(
+        &mut self,
+        reader: RemoteAudioSource,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+    ) -> AppResult<u64> {
+        self.ensure_alive();
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(AudioCmd::PlayRemote {
+                reader,
+                duration_hint_ms,
+                start_position_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        let duration_ms = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
+            .map_err(|e| AppError::Audio(e))?;
+
+        self.is_playing = true;
+        self.current_path = Some("__remote__".to_string());
+        self.duration_ms = duration_ms;
+        self.play_start_time = Some(Instant::now());
+        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
 
         Ok(duration_ms)
     }
@@ -1292,6 +1576,41 @@ impl PlayerEngine {
 
         self.is_playing = true;
         self.current_path = Some("__streaming__".to_string());
+        self.duration_ms = duration_ms;
+        self.play_start_time = Some(Instant::now());
+        self.accumulated_ms = 0;
+
+        Ok(duration_ms)
+    }
+
+    pub fn crossfade_remote(
+        &mut self,
+        reader: RemoteAudioSource,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+    ) -> AppResult<u64> {
+        self.ensure_alive();
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(AudioCmd::CrossfadeRemote {
+                reader,
+                duration_hint_ms,
+                fade_out_ms,
+                fade_in_ms,
+                reply: tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        let timeout =
+            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
+        let duration_ms = rx
+            .recv_timeout(timeout)
+            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
+            .map_err(|e| AppError::Audio(e))?;
+
+        self.is_playing = true;
+        self.current_path = Some("__remote__".to_string());
         self.duration_ms = duration_ms;
         self.play_start_time = Some(Instant::now());
         self.accumulated_ms = 0;
