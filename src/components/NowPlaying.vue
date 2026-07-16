@@ -293,15 +293,16 @@ function onSliderPreviewEnd() {
 
 // 从封面提取的动态颜色（归一化 RGBA）
 const extractedColors = ref<[number[], number[], number[], number[], number[]]>([
-  [0.4, 0.31, 0.64, 1],
-  [0.49, 0.36, 0.75, 1],
-  [0.56, 0.49, 0.69, 1],
-  [0.29, 0.24, 0.43, 1],
-  [0.44, 0.40, 0.60, 1],
+  [0.07, 0.27, 0.42, 1],
+  [0.35, 0.24, 0.20, 1],
+  [0.34, 0.12, 0.26, 1],
+  [0.17, 0.14, 0.34, 1],
+  [0.18, 0.34, 0.36, 1],
 ])
 const paletteResult = ref<PaletteResult | null>(null)
+const PALETTE_COVER_DECODE_SIZE = 320
 
-// 使用 Median-Cut 调色板算法从封面提取主色
+// 使用 Android 同尺寸封面采样，避免小图把细节压成单色
 function extractColorsFromCover(url: string) {
   const img = new Image()
   img.crossOrigin = 'anonymous'
@@ -309,7 +310,7 @@ function extractColorsFromCover(url: string) {
   img.onload = () => {
     try {
       const canvas = document.createElement('canvas')
-      const size = 64
+      const size = PALETTE_COVER_DECODE_SIZE
       canvas.width = size
       canvas.height = size
       const ctx = canvas.getContext('2d', { willReadFrequently: true })!

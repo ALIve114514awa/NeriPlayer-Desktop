@@ -13,11 +13,11 @@ const props = withDefaults(defineProps<{
   musicLevel: 0,
   beatImpulse: 0,
   colors: () => [
-    [0.4, 0.31, 0.64, 1],  // dominant
-    [0.49, 0.36, 0.75, 1], // vibrant
-    [0.56, 0.49, 0.69, 1], // muted
-    [0.29, 0.24, 0.43, 1], // darkMuted
-    [0.44, 0.40, 0.60, 1], // bridge
+    [0.07, 0.27, 0.42, 1],
+    [0.35, 0.24, 0.20, 1],
+    [0.34, 0.12, 0.26, 1],
+    [0.17, 0.14, 0.34, 1],
+    [0.18, 0.34, 0.36, 1],
   ],
   isDark: true,
   lightOffset: 0,
@@ -46,11 +46,11 @@ let smoothBeat = 0
 // —— 调色板过渡：基于时间的 520ms smoothStep（对齐 Android，帧率无关）——
 const PALETTE_TRANSITION_MS = 520
 const smoothColors: number[][] = [
-  [0.4, 0.31, 0.64, 1],
-  [0.49, 0.36, 0.75, 1],
-  [0.56, 0.49, 0.69, 1],
-  [0.29, 0.24, 0.43, 1],
-  [0.44, 0.40, 0.60, 1],
+  [0.07, 0.27, 0.42, 1],
+  [0.35, 0.24, 0.20, 1],
+  [0.34, 0.12, 0.26, 1],
+  [0.17, 0.14, 0.34, 1],
+  [0.18, 0.34, 0.36, 1],
 ]
 let smoothLightOffset = 0
 let smoothSaturateOffset = 0

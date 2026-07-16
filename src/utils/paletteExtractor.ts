@@ -80,10 +80,6 @@ function hslToRgb(h: number, s: number, l: number): RGB {
   ]
 }
 
-function luminance(r: number, g: number, b: number): number {
-  return 0.299 * r + 0.587 * g + 0.114 * b
-}
-
 /** BT.709 luma（对齐 Android colorLuma） */
 function colorLuma(c: RGB): number {
   return 0.2126 * (c[0] / 255) + 0.7152 * (c[1] / 255) + 0.0722 * (c[2] / 255)
@@ -302,6 +298,48 @@ interface SwatchSet {
   darkMuted: RGB | null
 }
 
+interface ScoredSwatch {
+  color: RGB
+  h: number
+  s: number
+  l: number
+  pop: number
+}
+
+interface SwatchTarget {
+  minS: number
+  targetS: number
+  maxS: number
+  minL: number
+  targetL: number
+  maxL: number
+}
+
+const TARGET_LIGHT_VIBRANT: SwatchTarget = {
+  minS: 0.35, targetS: 1.0, maxS: 1.0,
+  minL: 0.55, targetL: 0.74, maxL: 1.0,
+}
+const TARGET_VIBRANT: SwatchTarget = {
+  minS: 0.35, targetS: 1.0, maxS: 1.0,
+  minL: 0.30, targetL: 0.50, maxL: 0.70,
+}
+const TARGET_DARK_VIBRANT: SwatchTarget = {
+  minS: 0.35, targetS: 1.0, maxS: 1.0,
+  minL: 0.0, targetL: 0.26, maxL: 0.45,
+}
+const TARGET_LIGHT_MUTED: SwatchTarget = {
+  minS: 0.0, targetS: 0.30, maxS: 0.40,
+  minL: 0.55, targetL: 0.74, maxL: 1.0,
+}
+const TARGET_MUTED: SwatchTarget = {
+  minS: 0.0, targetS: 0.30, maxS: 0.40,
+  minL: 0.30, targetL: 0.50, maxL: 0.70,
+}
+const TARGET_DARK_MUTED: SwatchTarget = {
+  minS: 0.0, targetS: 0.30, maxS: 0.40,
+  minL: 0.0, targetL: 0.26, maxL: 0.45,
+}
+
 function classifySwatches(buckets: ColorBucket[]): SwatchSet {
   if (buckets.length === 0) {
     return { dominant: null, vibrant: null, lightVibrant: null, darkVibrant: null, muted: null, lightMuted: null, darkMuted: null }
@@ -309,49 +347,54 @@ function classifySwatches(buckets: ColorBucket[]): SwatchSet {
 
   const sorted = [...buckets].sort((a, b) => b.population - a.population)
   const dominant = sorted[0].average
+  const maxPopulation = sorted[0].population
 
-  const withHsl = buckets.map(b => {
+  const withHsl: ScoredSwatch[] = buckets.map(b => {
     const [h, s, l] = rgbToHsl(b.average[0], b.average[1], b.average[2])
     return { color: b.average, h, s, l, pop: b.population }
   })
 
-  // Vibrant: 高饱和 + 中亮度（s > 0.35, 0.3 < l < 0.7）
-  const vibrantC = withHsl
-    .filter(b => b.s > 0.35 && b.l > 0.3 && b.l < 0.7)
-    .sort((a, b) => (b.s * b.pop) - (a.s * a.pop))
-  const vibrant = vibrantC[0]?.color ?? null
-
-  // LightVibrant: 高亮度 + 有饱和（l > 0.55, s > 0.2）
-  const lightVibrantC = withHsl
-    .filter(b => b.l > 0.55 && b.s > 0.2)
-    .sort((a, b) => (b.l * b.s) - (a.l * a.s))
-  const lightVibrant = lightVibrantC[0]?.color ?? null
-
-  // DarkVibrant: 低亮度 + 有饱和（l < 0.4, s > 0.2）
-  const darkVibrantC = withHsl
-    .filter(b => b.l < 0.4 && b.s > 0.2)
-    .sort((a, b) => (b.s - a.s))
-  const darkVibrant = darkVibrantC[0]?.color ?? null
-
-  // Muted: 中等饱和（s < 0.4）+ 中亮度
-  const mutedC = withHsl
-    .filter(b => b.s < 0.4 && b.l > 0.2 && b.l < 0.7)
-    .sort((a, b) => a.s - b.s)
-  const muted = mutedC[0]?.color ?? null
-
-  // LightMuted: 高亮度 + 低饱和
-  const lightMutedC = withHsl
-    .filter(b => b.l > 0.6 && b.s < 0.4)
-    .sort((a, b) => b.l - a.l)
-  const lightMuted = lightMutedC[0]?.color ?? null
-
-  // DarkMuted: 低亮度 + 低饱和
-  const darkMutedC = withHsl
-    .filter(b => b.l < 0.35 && b.s < 0.4)
-    .sort((a, b) => a.l - b.l)
-  const darkMuted = darkMutedC[0]?.color ?? null
+  const used = new Set<string>()
+  const lightVibrant = selectTargetSwatch(withHsl, TARGET_LIGHT_VIBRANT, maxPopulation, used)
+  const vibrant = selectTargetSwatch(withHsl, TARGET_VIBRANT, maxPopulation, used)
+  const darkVibrant = selectTargetSwatch(withHsl, TARGET_DARK_VIBRANT, maxPopulation, used)
+  const lightMuted = selectTargetSwatch(withHsl, TARGET_LIGHT_MUTED, maxPopulation, used)
+  const muted = selectTargetSwatch(withHsl, TARGET_MUTED, maxPopulation, used)
+  const darkMuted = selectTargetSwatch(withHsl, TARGET_DARK_MUTED, maxPopulation, used)
 
   return { dominant, vibrant, lightVibrant, darkVibrant, muted, lightMuted, darkMuted }
+}
+
+function selectTargetSwatch(
+  swatches: ScoredSwatch[],
+  target: SwatchTarget,
+  maxPopulation: number,
+  used: Set<string>,
+): RGB | null {
+  const candidates = swatches
+    .filter(s =>
+      s.s >= target.minS && s.s <= target.maxS &&
+      s.l >= target.minL && s.l <= target.maxL &&
+      !used.has(colorKey(s.color))
+    )
+    .sort((a, b) =>
+      targetScore(b, target, maxPopulation) - targetScore(a, target, maxPopulation)
+    )
+
+  const selected = candidates[0]?.color ?? null
+  if (selected) used.add(colorKey(selected))
+  return selected
+}
+
+function targetScore(swatch: ScoredSwatch, target: SwatchTarget, maxPopulation: number): number {
+  const saturationScore = 1 - Math.abs(swatch.s - target.targetS)
+  const lightnessScore = 1 - Math.abs(swatch.l - target.targetL)
+  const populationScore = maxPopulation > 0 ? swatch.pop / maxPopulation : 0
+  return 0.24 * saturationScore + 0.52 * lightnessScore + 0.24 * populationScore
+}
+
+function colorKey(c: RGB): string {
+  return `${c[0]},${c[1]},${c[2]}`
 }
 
 // --- 主入口（对齐 Android buildDynamicBackgroundPalette） ---
@@ -363,19 +406,15 @@ export function extractPalette(
 ): PaletteResult {
   const { data, width, height } = imageData
   const pixels: RGB[] = []
-  const allPixels: RGB[] = []
 
   for (let i = 0; i < width * height; i++) {
     const idx = i * 4
-    const r = data[idx], g = data[idx + 1], b = data[idx + 2]
-    allPixels.push([r, g, b])
-    const lum = luminance(r, g, b)
-    if (lum < 5 || lum > 250) continue
-    pixels.push([r, g, b])
+    const alpha = data[idx + 3] ?? 255
+    if (alpha < 8) continue
+    pixels.push([data[idx], data[idx + 1], data[idx + 2]])
   }
 
-  const effectivePixels = pixels.length >= 50 ? pixels : allPixels
-  const buckets = medianCut(effectivePixels, maxColors)
+  const buckets = medianCut(pixels, maxColors)
   const swatches = classifySwatches(buckets)
 
   // --- 对齐 Android buildDynamicBackgroundPalette 的角色选取 ---
