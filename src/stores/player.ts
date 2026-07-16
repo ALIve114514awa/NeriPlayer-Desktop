@@ -496,8 +496,10 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  function clampPlaybackPosition(position: number): number {
-    const safeDurationMs = durationMs.value || currentTrack.value?.durationMs || _interpDurationMs || 0
+  function clampPlaybackPosition(position: number, durationOverride?: number): number {
+    const safeDurationMs = durationOverride && durationOverride > 0
+      ? durationOverride
+      : durationMs.value || currentTrack.value?.durationMs || _interpDurationMs || 0
     const safePositionMs = Number.isFinite(position) ? Math.max(0, Math.round(position)) : 0
     return safeDurationMs > 0 ? Math.min(safePositionMs, safeDurationMs) : safePositionMs
   }
@@ -507,19 +509,49 @@ export const usePlayerStore = defineStore('player', () => {
     pauseGuardUntil = 0
   }
 
+  function armPendingSeek(targetMs: number): void {
+    const now = Date.now()
+    pendingSeek = {
+      targetMs,
+      issuedAt: now,
+      expiresAt: now + SEEK_SETTLE_TIMEOUT_MS,
+    }
+    seekGuardUntil = now + SEEK_EVENT_GUARD_MS
+  }
+
   function currentRenderedPosition(): number {
     return clampPlaybackPosition(_interpRenderedMs || interpolatedPositionMs.value || positionMs.value)
   }
 
-  function setRenderedPosition(position: number): number {
-    const safePositionMs = clampPlaybackPosition(position)
+  function setRenderedPosition(position: number, durationOverride?: number): number {
+    const safePositionMs = clampPlaybackPosition(position, durationOverride)
     positionMs.value = safePositionMs
     _interpAnchorMs = safePositionMs
     _interpAnchorTime = performance.now()
     _interpRenderedMs = safePositionMs
-    _interpDurationMs = Math.max(durationMs.value || currentTrack.value?.durationMs || _interpDurationMs, safePositionMs)
+    _interpDurationMs = Math.max(
+      durationOverride || durationMs.value || currentTrack.value?.durationMs || _interpDurationMs,
+      safePositionMs,
+    )
     interpolatedPositionMs.value = safePositionMs
     return safePositionMs
+  }
+
+  function markOptimisticSeek(
+    targetMs: number,
+    commandSource: PlaybackCommandSource,
+    options: { bumpSeq?: boolean; durationMs?: number } = {},
+  ): number {
+    const safeTargetMs = setRenderedPosition(targetMs, options.durationMs)
+    lastSeekCommand.value = {
+      seq: options.bumpSeq === false ? lastSeekCommand.value.seq : lastSeekCommand.value.seq + 1,
+      positionMs: safeTargetMs,
+      source: commandSource,
+    }
+    lastSeekedMs = safeTargetMs
+    clearPauseGuard()
+    armPendingSeek(safeTargetMs)
+    return safeTargetMs
   }
 
   function freezeRenderedPosition(): number {
@@ -686,6 +718,18 @@ export const usePlayerStore = defineStore('player', () => {
       ? Math.max(0, settings.fadeInDuration || DEFAULT_TRACK_SWITCH_FADE_MS)
       : settings.crossfadeInDuration
     let trackCommitted = false
+    const requestedStartMs = startPositionMs > 1000
+      ? track.durationMs > 0
+        ? clampPlaybackPosition(startPositionMs, track.durationMs)
+        : Math.max(0, Math.round(startPositionMs))
+      : 0
+
+    if (requestedStartMs > 0) {
+      markOptimisticSeek(requestedStartMs, commandSource, { durationMs: track.durationMs })
+    } else {
+      pendingSeek = null
+      seekGuardUntil = 0
+    }
 
     function commitTrack() {
       if (trackCommitted) return
@@ -865,23 +909,9 @@ export const usePlayerStore = defineStore('player', () => {
 
       commitTrack()
       durationMs.value = dur || track.durationMs
-      const startMs = startPositionMs > 1000 ? clampPlaybackPosition(startPositionMs) : 0
+      const startMs = requestedStartMs > 0 ? clampPlaybackPosition(requestedStartMs) : 0
       if (startMs > 0) {
-        lastSeekCommand.value = {
-          seq: lastSeekCommand.value.seq + 1,
-          positionMs: startMs,
-          source: commandSource,
-        }
-        setRenderedPosition(startMs)
-        lastSeekedMs = startMs
-        clearPauseGuard()
-        const now = Date.now()
-        pendingSeek = {
-          targetMs: startMs,
-          issuedAt: now,
-          expiresAt: now + SEEK_SETTLE_TIMEOUT_MS,
-        }
-        seekGuardUntil = now + SEEK_EVENT_GUARD_MS
+        markOptimisticSeek(startMs, commandSource, { bumpSeq: false })
         invoke('seek', { positionMs: startMs }).then(() => {
           if (token !== playbackRequestToken) return
           seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
@@ -930,6 +960,11 @@ export const usePlayerStore = defineStore('player', () => {
       maybePrefetchNext()
     } catch (e) {
       if (token !== playbackRequestToken) return // 竞态过期请求，静默忽略
+
+      if (requestedStartMs > 0) {
+        pendingSeek = null
+        seekGuardUntil = 0
+      }
 
       const msg = e instanceof Error ? e.message : String(e)
       console.error('Play failed:', msg)
@@ -1072,32 +1107,11 @@ export const usePlayerStore = defineStore('player', () => {
     const roundedMs = Math.max(0, Math.round(ms))
     const maxSeekMs = durationMs.value || currentTrack.value?.durationMs || 0
     const posMs = maxSeekMs > 0 ? Math.min(roundedMs, maxSeekMs) : roundedMs
-    lastSeekCommand.value = {
-      seq: lastSeekCommand.value.seq + 1,
-      positionMs: posMs,
-      source: commandSource,
-    }
-    positionMs.value = posMs
-    lastSeekedMs = posMs
-    clearPauseGuard()
-    const now = Date.now()
-    pendingSeek = {
-      targetMs: posMs,
-      issuedAt: now,
-      expiresAt: now + SEEK_SETTLE_TIMEOUT_MS,
-    }
-    seekGuardUntil = now + SEEK_EVENT_GUARD_MS
-
-    // 立即重置插值到 seek 目标（乐观更新，用户立即看到跳转）
-    _interpAnchorMs = posMs
-    _interpAnchorTime = performance.now()
-    _interpRenderedMs = posMs
-    _interpDurationMs = Math.max(durationMs.value || currentTrack.value?.durationMs || _interpDurationMs, posMs)
-    interpolatedPositionMs.value = posMs
+    const safePosMs = markOptimisticSeek(posMs, commandSource, { durationMs: maxSeekMs })
 
     // Fire-and-forget：不阻塞 UI，后端异步执行 seek
-    invoke('seek', { positionMs: posMs }).then(() => {
-      positionMs.value = posMs
+    invoke('seek', { positionMs: safePosMs }).then(() => {
+      positionMs.value = safePosMs
       seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
     }).catch((e) => {
       pendingSeek = null
