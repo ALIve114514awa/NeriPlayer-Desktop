@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { usePlayerStore, displayAlbum } from '@/stores/player'
+import { usePlayerStore, displayAlbum, type LyricLine, type TrackInfo } from '@/stores/player'
 import { useRecommendStore } from '@/stores/recommend'
 import { useSettingsStore } from '@/stores/settings'
 import { useToastStore } from '@/stores/toast'
@@ -10,6 +10,7 @@ import { useRouter } from 'vue-router'
 import { invoke } from '@tauri-apps/api/core'
 import { extractPalette, type PaletteResult } from '@/utils/paletteExtractor'
 import { normalizeBilibiliCoverUrl, resolveBilibiliCover } from '@/utils/bilibiliCover'
+import { clearCachedLyrics, getCachedLyrics, saveCachedLyrics } from '@/utils/lyricsCache'
 import HyperBackground from './HyperBackground.vue'
 import CoverBlurBackground from './CoverBlurBackground.vue'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
@@ -98,6 +99,34 @@ function platformLabel(source?: string) {
   }
 }
 
+function mapBackendLyrics(lyrics: any[]): LyricLine[] {
+  return lyrics.map(l => ({
+    startMs: l.start_ms ?? l.startMs ?? 0,
+    durationMs: l.duration_ms ?? l.durationMs ?? 0,
+    words: (l.words || []).map((w: any) => ({
+      startMs: w.start_ms ?? w.startMs ?? 0,
+      durationMs: w.duration_ms ?? w.durationMs ?? 0,
+      text: w.text || '',
+    })),
+    text: l.text || '',
+    translation: l.translation || undefined,
+  }))
+}
+
+function readCachedLyrics(track: TrackInfo) {
+  return getCachedLyrics(track)
+}
+
+function cacheLyricsForTrack(track: TrackInfo | null | undefined, lines: LyricLine[]) {
+  if (!track || lines.length === 0) return
+  saveCachedLyrics(track, lines)
+}
+
+function removeCachedLyricsForCurrentTrack() {
+  if (!player.currentTrack) return
+  clearCachedLyrics(player.currentTrack)
+}
+
 // --- 歌词编辑器 ---
 const lyricsEditorText = ref('')
 const lyricsTranslationEditorText = ref('')
@@ -133,6 +162,7 @@ async function applyLyricsFromEditor() {
   if (!text) {
     // 清除歌词
     fetchedLyrics.value = []
+    removeCachedLyricsForCurrentTrack()
     toast.success(t('player.lyrics_cleared'))
     goBackToMain()
     return
@@ -150,7 +180,7 @@ async function applyLyricsFromEditor() {
     const translationByTime = new Map(
       parsedTranslations.map(l => [Math.round(Number(l.start_ms || 0)), l.text || '']),
     )
-    fetchedLyrics.value = parsed.map((l, index) => ({
+    const nextLyrics = parsed.map((l, index) => ({
       startMs: l.start_ms,
       durationMs: l.duration_ms,
       words: (l.words || []).map((w: any) => ({
@@ -162,6 +192,8 @@ async function applyLyricsFromEditor() {
         || l.translation
         || undefined,
     }))
+    fetchedLyrics.value = nextLyrics
+    cacheLyricsForTrack(player.currentTrack, nextLyrics)
     toast.success(t('player.lyrics_applied'))
   } catch (e) {
     console.error('Parse LRC failed:', e)
@@ -176,7 +208,7 @@ const lyricFillResults = ref<any[]>([])
 const isLyricFilling = ref(false)
 const lyricFillPlatform = ref<'netease' | 'lrclib' | 'qq'>('netease')
 
-async function parseLyricsFromSearchResult(result: any): Promise<any[] | null> {
+async function parseLyricsFromSearchResult(result: any): Promise<LyricLine[] | null> {
   if (result?.synced_lyrics) {
     const parsed = await invoke<any[]>('parse_lrc_content', { content: String(result.synced_lyrics) })
     let parsedTranslations: any[] = []
@@ -240,6 +272,7 @@ async function applyLyricFill(result: any) {
     const directLyrics = await parseLyricsFromSearchResult(result)
     if (directLyrics && directLyrics.length > 0) {
       fetchedLyrics.value = directLyrics
+      cacheLyricsForTrack(player.currentTrack, directLyrics)
       toast.success(t('player.lyrics_fill_applied'))
       goBackToMain()
       return
@@ -255,15 +288,9 @@ async function applyLyricFill(result: any) {
       neteaseId: neteaseId,
       qqSongMid,
     })
-    fetchedLyrics.value = lyrics.map(l => ({
-      startMs: l.start_ms,
-      durationMs: l.duration_ms,
-      words: (l.words || []).map((w: any) => ({
-        startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-      })),
-      text: l.text,
-      translation: l.translation || undefined,
-    }))
+    const nextLyrics = mapBackendLyrics(lyrics)
+    fetchedLyrics.value = nextLyrics
+    cacheLyricsForTrack(player.currentTrack, nextLyrics)
     toast.success(t('player.lyrics_fill_applied'))
     goBackToMain()
   } catch (e) {
@@ -272,7 +299,7 @@ async function applyLyricFill(result: any) {
   }
 }
 
-const fetchedLyrics = ref<any[]>([])
+const fetchedLyrics = ref<LyricLine[]>([])
 const isFetchingLyrics = ref(false)
 
 // 歌词拖动预览状态
@@ -633,16 +660,22 @@ watch(() => player.currentTrack?.id, () => {
   }, 560)
 })
 
+let lyricFetchRequestId = 0
+
 // 当曲目切换时自动获取歌词
 watch(() => player.currentTrack?.id, async (id) => {
-  if (!id || !player.currentTrack) {
+  const requestId = ++lyricFetchRequestId
+  const track = player.currentTrack
+  if (!id || !track) {
     fetchedLyrics.value = []
+    isFetchingLyrics.value = false
     return
   }
 
+  const cachedLyrics = readCachedLyrics(track)
+  fetchedLyrics.value = cachedLyrics || []
   isFetchingLyrics.value = true
   try {
-    const track = player.currentTrack
     const neteaseId = id.startsWith('netease:') ? parseInt(id.replace('netease:', '')) : undefined
     const qqSongMid = id.startsWith('qq:') ? id.replace('qq:', '') : undefined
 
@@ -655,20 +688,23 @@ watch(() => player.currentTrack?.id, async (id) => {
       qqSongMid: qqSongMid || null,
     })
 
-    fetchedLyrics.value = lyrics.map(l => ({
-      startMs: l.start_ms,
-      durationMs: l.duration_ms,
-      words: (l.words || []).map((w: any) => ({
-        startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-      })),
-      text: l.text,
-      translation: l.translation || undefined,
-    }))
+    if (requestId !== lyricFetchRequestId) return
+    const nextLyrics = mapBackendLyrics(lyrics)
+    if (nextLyrics.length > 0) {
+      fetchedLyrics.value = nextLyrics
+      cacheLyricsForTrack(track, nextLyrics)
+    } else if (!cachedLyrics?.length) {
+      fetchedLyrics.value = []
+    }
   } catch (e) {
     console.error('Fetch lyrics failed:', e)
-    fetchedLyrics.value = []
+    if (requestId === lyricFetchRequestId && !cachedLyrics?.length) {
+      fetchedLyrics.value = []
+    }
   } finally {
-    isFetchingLyrics.value = false
+    if (requestId === lyricFetchRequestId) {
+      isFetchingLyrics.value = false
+    }
   }
 }, { immediate: true })
 
@@ -850,6 +886,7 @@ async function confirmApplySearchResult() {
       const directLyrics = await parseLyricsFromSearchResult(result)
       if (directLyrics && directLyrics.length > 0) {
         fetchedLyrics.value = directLyrics
+        cacheLyricsForTrack(player.currentTrack, directLyrics)
       } else {
         const idText = String(result.id || '')
         const neteaseId = idText.startsWith('netease:') ? parseInt(idText.replace('netease:', '')) : null
@@ -863,15 +900,9 @@ async function confirmApplySearchResult() {
           qqSongMid,
         })
         if (lyrics.length) {
-          fetchedLyrics.value = lyrics.map(l => ({
-            startMs: l.start_ms,
-            durationMs: l.duration_ms,
-            words: (l.words || []).map((w: any) => ({
-              startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-            })),
-            text: l.text,
-            translation: l.translation || undefined,
-          }))
+          const nextLyrics = mapBackendLyrics(lyrics)
+          fetchedLyrics.value = nextLyrics
+          cacheLyricsForTrack(player.currentTrack, nextLyrics)
         }
       }
     } catch (e) {
@@ -1236,6 +1267,7 @@ const sliderActiveColor = computed(() => {
       },
     ]"
     :style="dynamicColorVars"
+    @click="closeToolbarPopovers()"
   >
     <!-- AccentBackdrop 底色层（对齐 Android：主色降饱和+调暗） -->
     <div class="np-bg-solid" :style="accentBgStyle" />
@@ -1438,7 +1470,11 @@ const sliderActiveColor = computed(() => {
         </div>
 
         <!-- 工具栏（对齐 Android 底部：Queue → Sleep → Volume → Speed → Add） -->
-        <div class="np-toolbar" :class="{ 'np-toolbar--switching': isTrackSwitchAnimating, 'np-toolbar--beat-active': isVisualBeatActive }">
+        <div
+          class="np-toolbar"
+          :class="{ 'np-toolbar--switching': isTrackSwitchAnimating, 'np-toolbar--beat-active': isVisualBeatActive }"
+          @click.stop
+        >
           <button class="tool-btn tool-btn--feedback" @click="handleOpenQueue()">
             <span class="material-symbols-rounded">queue_music</span>
           </button>
@@ -1454,7 +1490,7 @@ const sliderActiveColor = computed(() => {
                 {{ formatSleepRemaining(player.sleepRemainingSeconds) }}
               </span>
             </button>
-            <div v-if="showSleepMenu" class="sleep-popover np-floating-popover np-floating-popover--menu" @mouseleave="showSleepMenu = false">
+            <div v-if="showSleepMenu" class="sleep-popover np-floating-popover np-floating-popover--menu">
               <button
                 v-for="opt in sleepOptions"
                 :key="opt.value"
@@ -1473,10 +1509,14 @@ const sliderActiveColor = computed(() => {
             </div>
           </div>
           <div class="volume-wrap">
-            <button class="tool-btn tool-btn--feedback" @click="triggerControlFeedbackPulse(); toggleToolbarPanel('volume')">
+            <button
+              class="tool-btn tool-btn--feedback"
+              :class="{ active: showVolumeSlider }"
+              @click="triggerControlFeedbackPulse(); toggleToolbarPanel('volume')"
+            >
               <span class="material-symbols-rounded">{{ player.volume === 0 ? 'volume_off' : player.volume < 0.5 ? 'volume_down' : 'volume_up' }}</span>
             </button>
-            <div v-if="showVolumeSlider" class="volume-popover np-floating-popover np-floating-popover--volume" @mouseleave="showVolumeSlider = false">
+            <div v-if="showVolumeSlider" class="volume-popover np-floating-popover np-floating-popover--volume">
               <input
                 type="range"
                 min="0"
@@ -1494,7 +1534,7 @@ const sliderActiveColor = computed(() => {
             <button class="tool-btn tool-btn--feedback" :class="{ active: showAudioFxPanel || player.hasActiveEffects }" @click="triggerControlFeedbackPulse(); toggleToolbarPanel('audiofx')">
               <span class="material-symbols-rounded">tune</span>
             </button>
-            <div v-if="showAudioFxPanel" class="audiofx-popover np-floating-popover np-floating-popover--audiofx" @mouseleave="showAudioFxPanel = false">
+            <div v-if="showAudioFxPanel" class="audiofx-popover np-floating-popover np-floating-popover--audiofx">
               <!-- 播放速度 -->
               <div class="audiofx-section">
                 <div class="audiofx-section-header">{{ t('player.speed') }}</div>
@@ -1557,6 +1597,7 @@ const sliderActiveColor = computed(() => {
                   </label>
                 </div>
                 <CustomSelect
+                  surface="dark"
                   :model-value="player.equalizerPresetId"
                   :options="eqPresetIds.map(pid => ({ value: pid, label: t('player.eq_' + pid) }))"
                   @update:model-value="player.setEqualizerPreset($event)"
@@ -1597,6 +1638,10 @@ const sliderActiveColor = computed(() => {
           :seek-seq="player.lastSeekCommand.seq"
           @seek="onLyricSeek"
         />
+        <div v-else-if="isFetchingLyrics" class="lyrics-empty">
+          <span class="material-symbols-rounded spinning" style="font-size: 36px">progress_activity</span>
+          <p>{{ t('player.loading') }}</p>
+        </div>
         <div v-else class="lyrics-empty">
           <span class="material-symbols-rounded" style="font-size: 36px">lyrics</span>
           <p>{{ t('player.no_lyrics') }}</p>
@@ -3359,7 +3404,11 @@ const sliderActiveColor = computed(() => {
   background: rgba(30, 28, 34, 0.95);
   backdrop-filter: blur(20px);
   border-radius: 14px;
-  padding: 16px 12px;
+  box-sizing: border-box;
+  width: 58px;
+  min-width: 58px;
+  max-width: 58px;
+  padding: 16px 10px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -3422,10 +3471,14 @@ const sliderActiveColor = computed(() => {
 }
 
 .volume-label {
+  display: block;
+  width: 42px;
   font-size: 11px;
   font-weight: 600;
   color: color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.7)) 56%, rgba(255,255,255,0.4));
   font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
 }
 
 /* 播放速度 / 音效面板 */
@@ -3460,6 +3513,10 @@ const sliderActiveColor = computed(() => {
 
   &::-webkit-scrollbar { width: 4px; }
   &::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+}
+
+.audiofx-section :deep(.custom-select) {
+  width: 100%;
 }
 
 .audiofx-section {
@@ -3725,6 +3782,10 @@ const sliderActiveColor = computed(() => {
   font-size: 14px;
   font-weight: 500;
   transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
+}
+
+.lyrics-empty .spinning {
+  animation: np-spin 1s linear infinite;
 }
 
 .np-right--switching {

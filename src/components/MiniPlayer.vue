@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { usePlayerStore } from '@/stores/player'
 import { useListenTogetherStore } from '@/stores/listenTogether'
 import { useI18n } from 'vue-i18n'
@@ -28,6 +28,7 @@ const { t } = useI18n()
 const showQueue = ref(false)
 const showLtPanel = ref(false)
 const showVolumeSlider = ref(false)
+const volumeWrapRef = ref<HTMLDivElement>()
 
 // 进度条拖拽
 const isDraggingProgress = ref(false)
@@ -115,6 +116,21 @@ const volumeIcon = computed(() => {
 })
 
 const volumePercent = computed(() => Math.round(player.volume * 100))
+
+function handleMiniPlayerPointerDown(e: PointerEvent) {
+  if (!showVolumeSlider.value) return
+  const target = e.target as Node | null
+  if (target && volumeWrapRef.value?.contains(target)) return
+  showVolumeSlider.value = false
+}
+
+onMounted(() => {
+  document.addEventListener('pointerdown', handleMiniPlayerPointerDown, true)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('pointerdown', handleMiniPlayerPointerDown, true)
+})
 
 /** 当前播放时间（ms），拖拽时用拖拽位置 */
 const currentTimeMs = computed(() =>
@@ -266,11 +282,11 @@ defineExpose({
 
       <!-- 右：音量 + 一起听 + 队列 + 展开 -->
       <div class="mp-right">
-        <div class="mp-volume-wrap">
-          <button class="mp-tool-btn" @click="showVolumeSlider = !showVolumeSlider">
+        <div ref="volumeWrapRef" class="mp-volume-wrap">
+          <button class="mp-tool-btn" :class="{ active: showVolumeSlider }" @click="showVolumeSlider = !showVolumeSlider">
             <span class="material-symbols-rounded">{{ volumeIcon }}</span>
           </button>
-          <div v-if="showVolumeSlider" class="mp-volume-popover" @mouseleave="showVolumeSlider = false">
+          <div v-if="showVolumeSlider" class="mp-volume-popover">
             <input
               type="range"
               min="0"
@@ -609,6 +625,10 @@ defineExpose({
   transform: translateX(-50%);
   background: var(--md-surface-container-high);
   border-radius: 12px;
+  box-sizing: border-box;
+  width: 56px;
+  min-width: 56px;
+  max-width: 56px;
   padding: 14px 10px;
   box-shadow: 0 4px 24px rgba(0,0,0,0.25);
   border: 1px solid var(--md-outline-variant);
@@ -641,11 +661,13 @@ defineExpose({
 }
 
 .mp-volume-label {
+  width: 38px;
   font-size: 11px;
   font-weight: 500;
   color: var(--md-on-surface-variant);
   margin-top: 8px;
   font-variant-numeric: tabular-nums;
+  text-align: center;
   white-space: nowrap;
 }
 

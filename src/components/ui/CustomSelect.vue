@@ -6,10 +6,13 @@ export interface SelectOption {
   label: string
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   modelValue: string
   options: SelectOption[]
-}>()
+  surface?: 'default' | 'dark'
+}>(), {
+  surface: 'default',
+})
 
 const emit = defineEmits<{
   'update:modelValue': [value: string]
@@ -17,12 +20,14 @@ const emit = defineEmits<{
 
 const isOpen = ref(false)
 const triggerRef = ref<HTMLElement | null>(null)
+const menuRef = ref<HTMLElement | null>(null)
 const menuStyle = ref<Record<string, string>>({})
 
 const selectedLabel = computed(() => {
   const opt = props.options.find(o => o.value === props.modelValue)
   return opt?.label ?? props.modelValue
 })
+const isDarkSurface = computed(() => props.surface === 'dark')
 
 function toggle() {
   if (isOpen.value) {
@@ -67,6 +72,7 @@ function handleClickOutside(e: MouseEvent) {
   if (!isOpen.value) return
   const target = e.target as HTMLElement
   if (triggerRef.value?.contains(target)) return
+  if (menuRef.value?.contains(target)) return
   isOpen.value = false
 }
 
@@ -87,7 +93,7 @@ watch(isOpen, async (open) => {
 </script>
 
 <template>
-  <div class="custom-select" ref="triggerRef">
+  <div class="custom-select" :class="{ 'custom-select--dark': isDarkSurface }" ref="triggerRef">
     <button class="custom-select-trigger" @click="toggle" type="button">
       <span class="custom-select-label">{{ selectedLabel }}</span>
       <span class="material-symbols-rounded custom-select-arrow" :class="{ open: isOpen }">expand_more</span>
@@ -95,7 +101,13 @@ watch(isOpen, async (open) => {
 
     <Teleport to="body">
       <Transition name="cs-menu">
-        <div v-if="isOpen" class="custom-select-menu" :style="menuStyle">
+        <div
+          v-if="isOpen"
+          ref="menuRef"
+          class="custom-select-menu"
+          :class="{ 'custom-select-menu--dark': isDarkSurface }"
+          :style="menuStyle"
+        >
           <button
             v-for="opt in options"
             :key="opt.value"
@@ -158,6 +170,23 @@ watch(isOpen, async (open) => {
     transform: rotate(180deg);
   }
 }
+
+.custom-select--dark {
+  .custom-select-trigger {
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.88);
+    border-color: rgba(255, 255, 255, 0.1);
+
+    &:hover {
+      background: rgba(255, 255, 255, 0.11);
+      border-color: rgba(255, 255, 255, 0.18);
+    }
+  }
+
+  .custom-select-arrow {
+    opacity: 0.68;
+  }
+}
 </style>
 
 <style lang="scss">
@@ -196,6 +225,27 @@ watch(isOpen, async (open) => {
   &.active {
     color: var(--md-primary);
     background: color-mix(in srgb, var(--md-primary) 10%, transparent);
+  }
+}
+
+.custom-select-menu--dark {
+  background: rgba(22, 21, 27, 0.98);
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.46), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  backdrop-filter: blur(20px);
+
+  .custom-select-option {
+    color: rgba(255, 255, 255, 0.78);
+
+    &:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: rgba(255, 255, 255, 0.94);
+    }
+
+    &.active {
+      color: rgba(185, 225, 255, 0.96);
+      background: rgba(120, 190, 255, 0.16);
+    }
   }
 }
 
