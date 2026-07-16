@@ -1,10 +1,14 @@
 🚧 Work in progress / 开发中
 
-## 致谢 / Credits
+## 鸣谢 / Reference
 
-- **[AMLL — applemusic-like-lyrics](https://github.com/Steve-xmh/applemusic-like-lyrics)** by Steve-xmh：
-  歌词渲染中的弹簧物理滚动、逐字扫光与长音节强调（emphasis）算法均移植 / 参考自该开源项目。
-  The spring-physics scrolling, per-word sweep highlight, and long-syllable emphasis in the lyrics
-  view are ported / adapted from this open-source project.
-- **NeriPlayer (Android)**：桌面端歌词效果对齐其 `accompanist-lyrics` 子模块（其同源上游即 AMLL）。
-  The desktop lyrics effect is aligned with its `accompanist-lyrics` module (whose upstream is AMLL).
+<table>
+<tr>
+  <td><a href="https://github.com/amll-dev/applemusic-like-lyrics">applemusic-like-lyrics</a></td>
+  <td>An Apple Music style lyric player component, with React & Vue support. 一个类 Apple Music 歌词显示组件，同时提供 React 和 Vue 绑</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/cwuom/NeriPlayer">NeriPlayer(Android)</a></td>
+  <td>A native Android audio player that combines multi-source streaming, local control, rich lyrics, and self-hosted sync. / ✨ 一个把多源在线播放、本地管理、歌词体验和自建同步做进原生 Android 的音频播放器 🎵</td>
+</tr>
+</table>
