@@ -2483,19 +2483,23 @@ const sliderActiveColor = computed(() => {
   width: 100%;
   height: 100%;
   border-radius: 24px;
-  background: linear-gradient(135deg, #2d2640 0%, #1a1724 50%, #1e1a2e 100%);
+  background: transparent;
   display: flex;
   align-items: center;
   justify-content: center;
   color: white;
   overflow: hidden;
+  clip-path: inset(0 round 24px);
   box-shadow: 0 16px 48px rgba(0,0,0,0.5);
 }
 
 .cover-card-img {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
+  border-radius: inherit;
+  transform: scale(1.01);
 }
 
 /* Disc 模式（黑胶唱片） */

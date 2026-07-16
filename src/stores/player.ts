@@ -666,7 +666,7 @@ export const usePlayerStore = defineStore('player', () => {
     })
   }
 
-  async function play(track: TrackInfo, commandSource: PlaybackCommandSource = 'local') {
+  async function play(track: TrackInfo, commandSource: PlaybackCommandSource = 'local', startPositionMs = 0) {
     initEvents()
     markCommandSource(commandSource)
     const token = ++playbackRequestToken
@@ -865,22 +865,50 @@ export const usePlayerStore = defineStore('player', () => {
 
       commitTrack()
       durationMs.value = dur || track.durationMs
+      const startMs = startPositionMs > 1000 ? clampPlaybackPosition(startPositionMs) : 0
+      if (startMs > 0) {
+        lastSeekCommand.value = {
+          seq: lastSeekCommand.value.seq + 1,
+          positionMs: startMs,
+          source: commandSource,
+        }
+        setRenderedPosition(startMs)
+        lastSeekedMs = startMs
+        clearPauseGuard()
+        const now = Date.now()
+        pendingSeek = {
+          targetMs: startMs,
+          issuedAt: now,
+          expiresAt: now + SEEK_SETTLE_TIMEOUT_MS,
+        }
+        seekGuardUntil = now + SEEK_EVENT_GUARD_MS
+        invoke('seek', { positionMs: startMs }).then(() => {
+          if (token !== playbackRequestToken) return
+          seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
+        }).catch((e) => {
+          console.warn('[player] restore seek failed after reload:', e)
+          pendingSeek = null
+          seekGuardUntil = 0
+          lastSeekedMs = null
+          setRenderedPosition(0)
+        })
+      } else {
+        setRenderedPosition(0)
+        pendingSeek = null
+        seekGuardUntil = 0
+        clearPauseGuard()
+        lastSeekedMs = null
+      }
       isPlaying.value = true
       isLoadingAudio.value = false
-      positionMs.value = 0
-      pendingSeek = null
-      seekGuardUntil = 0
-      clearPauseGuard()
-      lastSeekedMs = null
 
       // 重置插值状态
-      _interpAnchorMs = 0
+      _interpAnchorMs = startMs
       _interpAnchorTime = performance.now()
-      _interpRenderedMs = 0
+      _interpRenderedMs = startMs
       _interpSpeed = playbackSpeed.value
       _interpIsPlaying = true
       _interpDurationMs = durationMs.value
-      interpolatedPositionMs.value = 0
 
       // 重置连续失败计数
       consecutivePlayFailures = 0
@@ -947,10 +975,7 @@ export const usePlayerStore = defineStore('player', () => {
     if (!isPlaying.value && currentTrack.value && _needsReload) {
       _needsReload = false
       const savedPos = positionMs.value
-      await play(currentTrack.value, commandSource)
-      if (savedPos > 1000) {
-        setTimeout(() => seekTo(savedPos, commandSource), 300)
-      }
+      await play(currentTrack.value, commandSource, savedPos)
       return
     }
 
@@ -1016,10 +1041,7 @@ export const usePlayerStore = defineStore('player', () => {
     if (_needsReload) {
       _needsReload = false
       const savedPos = positionMs.value
-      await play(currentTrack.value, commandSource)
-      if (savedPos > 1000) {
-        setTimeout(() => seekTo(savedPos, commandSource), 300)
-      }
+      await play(currentTrack.value, commandSource, savedPos)
       return
     }
 
@@ -1028,7 +1050,7 @@ export const usePlayerStore = defineStore('player', () => {
     if (isOnlineSource && lastUrlResolveTime > 0
       && Date.now() - lastUrlResolveTime > URL_EXPIRY_MS) {
       // URL 已过期，重新解析
-      await play(currentTrack.value, commandSource)
+      await play(currentTrack.value, commandSource, currentRenderedPosition())
       return
     }
 
@@ -1495,12 +1517,7 @@ export const usePlayerStore = defineStore('player', () => {
     const track = currentTrack.value
     if (!track) return
     const pos = positionMs.value
-    const wasPlaying = isPlaying.value
-    await play(track)
-    if (pos > 1000) {
-      // 等一小段让播放开始后再 seek
-      setTimeout(() => seekTo(pos), 300)
-    }
+    await play(track, 'local', pos)
   }
 
   // ─── 初始化：恢复持久化状态 ───

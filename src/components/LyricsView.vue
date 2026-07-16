@@ -41,23 +41,18 @@ let lastSyncedTime = Number.NaN
 
 const SPLIT_WHITESPACE_RE = /(\s+)/
 const WHITESPACE_RE = /\s/g
-const ACTIVE_WORD_GLOW_CLASS = 'np-amll-word-glow'
+const AMLL_WORD_FADE_WIDTH = 0.5
 
-interface AmllRuntimeWord {
-  startTime: number
-  endTime: number
-  mainElement?: HTMLElement
-  subElements?: HTMLElement[]
+interface PlayerRubyWord {
+  startMs: number
+  durationMs: number
+  text: string
 }
 
-interface AmllRuntimeLine {
-  splittedWords?: AmllRuntimeWord[]
-  getLine?: () => AmllLyricLine
-}
-
-interface AmllRuntimeGroup {
-  mainLine?: AmllRuntimeLine
-  bgLine?: AmllRuntimeLine
+type RichPlayerLyricWord = PlayerLyricWord & {
+  romanWord?: string
+  obscene?: boolean
+  ruby?: PlayerRubyWord[]
 }
 
 const offsetMs = computed(() => {
@@ -71,12 +66,6 @@ const effectiveTimeMs = computed(() => {
 })
 
 const amllTimeMs = computed(() => Math.max(0, effectiveTimeMs.value + offsetMs.value))
-const shouldHideInterludeDots = computed(() => {
-  const firstLine = props.lyrics[0]
-  return !isLayoutReady.value || (!!firstLine && amllTimeMs.value < firstLine.startMs)
-})
-
-let glowingElements = new Set<HTMLElement>()
 
 function displayText(line: PlayerLyricLine): string {
   if (line.text) return line.text
@@ -157,10 +146,11 @@ function restoreWhitespaceFromLineText(
 }
 
 function splitWhitespaceAtoms(words: PlayerLyricWord[]): PlayerLyricWord[] {
-  const result: PlayerLyricWord[] = []
+  const result: RichPlayerLyricWord[] = []
 
   for (const word of words) {
-    if (!word.text || !/\s/.test(word.text) || !word.text.trim()) {
+    const richWord = word as RichPlayerLyricWord
+    if (!word.text || !/\s/.test(word.text) || !word.text.trim() || (richWord.ruby?.length ?? 0) > 0) {
       result.push(word)
       continue
     }
@@ -177,6 +167,7 @@ function splitWhitespaceAtoms(words: PlayerLyricWord[]): PlayerLyricWord[] {
           startMs,
           durationMs: 0,
           text: part,
+          obscene: richWord.obscene,
         })
         continue
       }
@@ -186,6 +177,8 @@ function splitWhitespaceAtoms(words: PlayerLyricWord[]): PlayerLyricWord[] {
         startMs,
         durationMs,
         text: part,
+        romanWord: richWord.romanWord,
+        obscene: richWord.obscene,
       })
       currentOffset += part.length
     }
@@ -195,13 +188,27 @@ function splitWhitespaceAtoms(words: PlayerLyricWord[]): PlayerLyricWord[] {
 }
 
 function toAmllWord(word: PlayerLyricWord): AmllLyricWord {
+  const richWord = word as RichPlayerLyricWord
   const startTime = Math.max(0, Math.round(word.startMs))
   const endTime = Math.max(startTime, Math.round(word.startMs + word.durationMs))
-  return {
+  const amllWord: AmllLyricWord = {
     word: word.text,
     startTime,
     endTime,
   }
+  if (richWord.romanWord) amllWord.romanWord = richWord.romanWord
+  if (richWord.obscene != null) amllWord.obscene = richWord.obscene
+  if (richWord.ruby?.length) {
+    amllWord.ruby = richWord.ruby.map(ruby => {
+      const rubyStartTime = Math.max(0, Math.round(ruby.startMs))
+      return {
+        word: ruby.text,
+        startTime: rubyStartTime,
+        endTime: Math.max(rubyStartTime, Math.round(ruby.startMs + ruby.durationMs)),
+      }
+    })
+  }
+  return amllWord
 }
 
 function buildTimedWords(line: PlayerLyricLine): AmllLyricWord[] {
@@ -254,22 +261,18 @@ function syncCurrentTime(forceSeek = false): void {
 
   lyricPlayer.setCurrentTime(time, forceSeek)
   lastSyncedTime = time
-  if (forceSeek) scheduleLayoutSync()
 }
 
 function syncPlayState(): void {
   if (!lyricPlayer) return
   if (props.isPlaying) lyricPlayer.resume()
-  else {
-    lyricPlayer.pause()
-    clearActiveWordGlow()
-  }
+  else lyricPlayer.pause()
 }
 
 function syncLyricOptions(): void {
   if (!lyricPlayer) return
   lyricPlayer.setEnableBlur(settings.lyricBlur)
-  lyricPlayer.setWordFadeWidth(0.5)
+  lyricPlayer.setWordFadeWidth(AMLL_WORD_FADE_WIDTH)
 }
 
 function reloadLyrics(): void {
@@ -277,6 +280,8 @@ function reloadLyrics(): void {
   isLayoutReady.value = false
   const time = Math.max(0, Math.round(amllTimeMs.value))
   lyricPlayer.setLyricLines(buildAmllLines(), time)
+  lyricPlayer.setCurrentTime(time, true)
+  lyricPlayer.update(0)
   lastSyncedTime = time
   syncLyricOptions()
   syncPlayState()
@@ -302,7 +307,6 @@ function startFrameLoop(): void {
     const delta = Math.min(64, now - lastFrameAt)
     lastFrameAt = now
     lyricPlayer?.update(delta)
-    applyActiveWordGlow()
     rafId = requestAnimationFrame(tick)
   })
 }
@@ -320,54 +324,6 @@ function cancelLayoutSync(): void {
   layoutSettleFrameId = 0
 }
 
-function clearActiveWordGlow(): void {
-  for (const element of glowingElements) {
-    element.classList.remove(ACTIVE_WORD_GLOW_CLASS)
-  }
-  glowingElements = new Set()
-}
-
-function setGlowElements(nextElements: Set<HTMLElement>): void {
-  for (const element of glowingElements) {
-    if (!nextElements.has(element)) element.classList.remove(ACTIVE_WORD_GLOW_CLASS)
-  }
-  for (const element of nextElements) {
-    if (!glowingElements.has(element)) element.classList.add(ACTIVE_WORD_GLOW_CLASS)
-  }
-  glowingElements = nextElements
-}
-
-function collectGlowTargets(word: AmllRuntimeWord): HTMLElement[] {
-  const subElements = word.subElements?.filter(element => element.isConnected) || []
-  if (subElements.length > 0) return subElements
-  return word.mainElement?.isConnected ? [word.mainElement] : []
-}
-
-function applyActiveWordGlow(): void {
-  if (!lyricPlayer || !props.isPlaying || !isLayoutReady.value || props.previewTimeMs != null) {
-    clearActiveWordGlow()
-    return
-  }
-
-  const time = amllTimeMs.value
-  const groups = ((lyricPlayer as unknown as { currentLyricGroups?: AmllRuntimeGroup[] }).currentLyricGroups || [])
-  const nextElements = new Set<HTMLElement>()
-
-  for (const group of groups) {
-    for (const line of [group.mainLine, group.bgLine]) {
-      const lyricLine = line?.getLine?.()
-      if (!line || !lyricLine || time < lyricLine.startTime || time >= lyricLine.endTime) continue
-
-      for (const word of line.splittedWords || []) {
-        if (time < word.startTime || time >= word.endTime) continue
-        for (const target of collectGlowTargets(word)) nextElements.add(target)
-      }
-    }
-  }
-
-  setGlowElements(nextElements)
-}
-
 function scheduleLayoutSync(): void {
   if (!lyricPlayer) return
   cancelLayoutSync()
@@ -380,17 +336,19 @@ function scheduleLayoutSync(): void {
     lyricPlayer.setCurrentTime(time, true)
     void lyricPlayer.calcLayout(true, true)
     lyricPlayer.update(0)
+    lastSyncedTime = time
 
     layoutSettleFrameId = requestAnimationFrame(() => {
       layoutSettleFrameId = 0
       if (!lyricPlayer) return
-      lyricPlayer.setCurrentTime(time, true)
+      const settledTime = Math.max(0, Math.round(amllTimeMs.value))
+      lyricPlayer.setCurrentTime(settledTime, true)
       void lyricPlayer.calcLayout(true, true)
       lyricPlayer.update(0)
-      lyricPlayer.setCurrentTime(time, false)
+      lyricPlayer.setCurrentTime(settledTime, false)
       syncPlayState()
       lyricPlayer.update(0)
-      applyActiveWordGlow()
+      lastSyncedTime = settledTime
       isLayoutReady.value = true
     })
   })
@@ -405,7 +363,6 @@ onMounted(() => {
     hostRef.value.appendChild(lyricPlayer.getElement())
 
     reloadLyrics()
-    syncCurrentTime(true)
     startFrameLoop()
   })
 })
@@ -413,7 +370,6 @@ onMounted(() => {
 onUnmounted(() => {
   stopFrameLoop()
   cancelLayoutSync()
-  clearActiveWordGlow()
   if (!lyricPlayer) return
 
   lyricPlayer.removeEventListener('line-click', onLineClick as EventListener)
@@ -440,7 +396,8 @@ watch(() => props.isPlaying, () => {
 watch(amllTimeMs, (time, oldTime) => {
   const isPreviewing = props.previewTimeMs != null
   const isLargeJump = oldTime !== undefined && Math.abs(time - oldTime) > 1000
-  syncCurrentTime(isPreviewing || isLargeJump)
+  const forceSeek = isPreviewing || isLargeJump
+  syncCurrentTime(forceSeek)
 })
 
 watch(() => props.seekSeq, (seq, oldSeq) => {
@@ -455,7 +412,6 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
     class="lyrics-scroll"
     :class="{
       'lyrics-scroll--ready': isLayoutReady,
-      'lyrics-scroll--hide-interlude': shouldHideInterludeDots,
     }"
     :style="{ '--lyric-font-scale': settings.lyricFontScale }"
   />
@@ -485,6 +441,10 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
   );
   --amll-lp-color: white;
   --amll-lp-font-size: calc(max(max(5vh, 2.5vw), 12px) * var(--lyric-font-scale, 1));
+  --amll-lp-emphasis-glow-opacity-boost: 3.2;
+  --amll-lp-emphasis-glow-min-opacity: 0.32;
+  --amll-lp-emphasis-glow-radius-boost: 1.6;
+  --amll-lp-emphasis-glow-min-radius: 0.11;
 }
 
 :deep(.amll-lyric-player [class*="interludeDots"]) {
@@ -497,31 +457,23 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
   pointer-events: none;
 }
 
-.lyrics-scroll--hide-interlude :deep(.amll-lyric-player [class*="interludeDots"]) {
-  visibility: hidden;
-  opacity: 0 !important;
-  pointer-events: none;
-}
-
 :deep(.amll-lyric-player) {
   text-align: left;
   font-weight: 850;
+  font-variation-settings: 'wght' 850;
   -webkit-font-smoothing: antialiased;
   --amll-lp-line-width-aspect: 0.82;
 }
 
 :deep(.amll-lyric-player [class*="lyricMainLine"]) {
   font-weight: 850;
+  font-variation-settings: 'wght' 850;
   letter-spacing: -0.025em;
 }
 
 :deep(.amll-lyric-player [class*="lyricSubLine"]) {
   font-weight: 650;
+  font-variation-settings: 'wght' 650;
 }
 
-:deep(.np-amll-word-glow) {
-  text-shadow:
-    0 0 0.13em rgba(255, 255, 255, 0.55),
-    0 0 0.32em rgba(255, 255, 255, 0.28);
-}
 </style>
