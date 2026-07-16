@@ -37,7 +37,7 @@ const {
   cloudMusicOffset, qqMusicOffset,
   advancedLyrics, dynamicBackground, audioReactive,
   coverBlurBg, coverBlurAmount, coverBlurDarken,
-  neteaseQuality, qqMusicQuality, youtubeQuality, biliQuality,
+  neteaseQuality, youtubeQuality, biliQuality,
   bypassProxy, internationalizationEnabled,
   backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
   devModeEnabled,
@@ -139,12 +139,6 @@ const neteaseQualityOptions = computed(() => [
   { value: 'jymaster', label: t('settings.q_master') },
 ])
 
-const qqQualityOptions = computed(() => [
-  { value: 'standard', label: t('settings.q_standard') },
-  { value: 'high', label: t('settings.q_high_yt') },
-  { value: 'lossless', label: t('settings.q_lossless') },
-])
-
 const youtubeQualityOptions = computed(() => [
   { value: 'low', label: t('settings.q_low') },
   { value: 'medium', label: t('settings.q_medium') },
@@ -161,19 +155,17 @@ const biliQualityOptions = computed(() => [
   { value: 'dolby', label: t('settings.q_dolby') },
 ])
 
-type OnlineQualitySource = 'netease' | 'qq' | 'youtube' | 'bilibili'
+type OnlineQualitySource = 'netease' | 'youtube' | 'bilibili'
 const qualitySwitching = ref(false)
 
 function qualityForSource(source: OnlineQualitySource): string {
   if (source === 'netease') return neteaseQuality.value
-  if (source === 'qq') return qqMusicQuality.value
   if (source === 'youtube') return youtubeQuality.value
   return biliQuality.value
 }
 
 function setQualityForSource(source: OnlineQualitySource, value: string) {
   if (source === 'netease') neteaseQuality.value = value
-  else if (source === 'qq') qqMusicQuality.value = value
   else if (source === 'youtube') youtubeQuality.value = value
   else biliQuality.value = value
 }
@@ -1193,16 +1185,6 @@ async function confirmClearGitHub() {
           <div class="setting-title">{{ t('settings.netease_quality') }}</div>
           <div class="chip-wrap">
             <button v-for="o in neteaseQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: neteaseQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('netease', o.value)">{{ o.label }}</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="setting-card quality-card">
-        <div class="setting-icon-wrap"><span class="material-symbols-rounded">music_note</span></div>
-        <div class="setting-info">
-          <div class="setting-title">{{ t('settings.qq_quality') }}</div>
-          <div class="chip-wrap">
-            <button v-for="o in qqQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: qqMusicQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('qq', o.value)">{{ o.label }}</button>
           </div>
         </div>
       </div>
