@@ -17,11 +17,13 @@
     "more": "もっと見る",
     "daily_recommend": "デイリーミックス",
     "recommended_playlists": "おすすめプレイリスト",
+    "recommended_videos": "おすすめ動画",
     "for_you": "あなたへのおすすめ",
     "login_hint": "ログインしてパーソナライズされたおすすめを取得",
     "my_playlists": "マイプレイリスト",
     "trending": "急上昇",
     "radar": "パーソナルレーダー",
+    "recommend_load_failed": "おすすめの読み込みに失敗しました",
     "notifications": "通知",
     "clear_all": "すべてクリア",
     "no_notifications": "通知なし"

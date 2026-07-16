@@ -17,11 +17,13 @@
     "more": "更多",
     "daily_recommend": "每日推薦",
     "recommended_playlists": "推薦歌單",
+    "recommended_videos": "推薦影片",
     "for_you": "為你推薦",
     "login_hint": "登入以獲取個人化推薦",
     "my_playlists": "我的歌單",
     "trending": "熱力飆升",
     "radar": "私人雷達",
+    "recommend_load_failed": "推薦載入失敗",
     "notifications": "通知",
     "clear_all": "清空",
     "no_notifications": "暫無通知"

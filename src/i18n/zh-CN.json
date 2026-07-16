@@ -17,11 +17,13 @@
     "more": "更多",
     "daily_recommend": "每日推荐",
     "recommended_playlists": "推荐歌单",
+    "recommended_videos": "推荐视频",
     "for_you": "为你推荐",
     "login_hint": "登录以获取个性化推荐",
     "my_playlists": "我的歌单",
     "trending": "热力飙升",
     "radar": "私人雷达",
+    "recommend_load_failed": "推荐加载失败",
     "notifications": "通知",
     "clear_all": "清空",
     "no_notifications": "暂无通知"

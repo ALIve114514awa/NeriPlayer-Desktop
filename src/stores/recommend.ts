@@ -24,10 +24,41 @@ export interface HomeFeedItem {
   videoId?: string
 }
 
+export interface HomeRecommendationSong {
+  id: string
+  title: string
+  artist: string
+  album: string
+  duration_ms: number
+  source: string
+  cover_url: string | null
+}
+
+export interface HomeSongSection {
+  items: HomeRecommendationSong[]
+  loading: boolean
+  error: string | null
+}
+
+type HomeSongSectionKey = 'hot' | 'radar'
+
+const HOME_SEARCH_KEYWORDS: Record<HomeSongSectionKey, string> = {
+  hot: '热歌',
+  radar: '私人雷达',
+}
+
+const emptyHomeSongSection = (): HomeSongSection => ({
+  items: [],
+  loading: false,
+  error: null,
+})
+
 export const useRecommendStore = defineStore('recommend', () => {
   // 网易云推荐歌单
   const recommendedPlaylists = ref<PlaylistInfo[]>([])
   const recommendedSongs = ref<any[]>([])
+  const homeHotSongs = ref<HomeSongSection>(emptyHomeSongSection())
+  const homeRadarSongs = ref<HomeSongSection>(emptyHomeSongSection())
 
   // YouTube 首页 shelf
   const homeFeedShelves = ref<HomeFeedShelf[]>([])
@@ -56,6 +87,8 @@ export const useRecommendStore = defineStore('recommend', () => {
       if (cache.recommendedPlaylists?.length) recommendedPlaylists.value = cache.recommendedPlaylists
       if (cache.userPlaylists && Object.keys(cache.userPlaylists).length) userPlaylists.value = cache.userPlaylists
       if (cache.homeFeedShelves?.length) homeFeedShelves.value = cache.homeFeedShelves
+      if (cache.homeHotSongs?.items?.length) homeHotSongs.value = { ...emptyHomeSongSection(), ...cache.homeHotSongs }
+      if (cache.homeRadarSongs?.items?.length) homeRadarSongs.value = { ...emptyHomeSongSection(), ...cache.homeRadarSongs }
     } catch { /* 缓存损坏则忽略 */ }
   }
 
@@ -65,6 +98,8 @@ export const useRecommendStore = defineStore('recommend', () => {
         recommendedPlaylists: recommendedPlaylists.value,
         userPlaylists: userPlaylists.value,
         homeFeedShelves: homeFeedShelves.value,
+        homeHotSongs: homeHotSongs.value,
+        homeRadarSongs: homeRadarSongs.value,
         timestamp: Date.now(),
       }))
     } catch { /* localStorage 已满则忽略 */ }
@@ -116,6 +151,49 @@ export const useRecommendStore = defineStore('recommend', () => {
     } finally {
       isLoading.value = false
     }
+  }
+
+  async function fetchHomeSearchSection(section: HomeSongSectionKey, force = false) {
+    const target = section === 'hot' ? homeHotSongs : homeRadarSongs
+    if (!force && (target.value.loading || target.value.items.length > 0)) return
+
+    target.value = { ...target.value, loading: true, error: null }
+    isLoading.value = true
+
+    try {
+      const items = await invoke<HomeRecommendationSong[]>('search', {
+        query: HOME_SEARCH_KEYWORDS[section],
+        platform: 'netease',
+      })
+      target.value = {
+        items: items.slice(0, 30),
+        loading: false,
+        error: null,
+      }
+      saveCache()
+    } catch (e: any) {
+      target.value = {
+        items: target.value.items,
+        loading: false,
+        error: e?.toString() || 'Failed to fetch home recommendations',
+      }
+      console.error(`fetchHomeSearchSection(${section}):`, e)
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  async function fetchHomeSearchRecommendations(force = false) {
+    await Promise.allSettled([
+      fetchHomeSearchSection('hot', force),
+      fetchHomeSearchSection('radar', force),
+    ])
+  }
+
+  function clearHomeSearchRecommendations() {
+    homeHotSongs.value = emptyHomeSongSection()
+    homeRadarSongs.value = emptyHomeSongSection()
+    saveCache()
   }
 
   /** 获取用户歌单 */
@@ -299,9 +377,11 @@ export const useRecommendStore = defineStore('recommend', () => {
   }
 
   return {
-    recommendedPlaylists, recommendedSongs, homeFeedShelves, userPlaylists,
+    recommendedPlaylists, recommendedSongs, homeHotSongs, homeRadarSongs,
+    homeFeedShelves, userPlaylists,
     userAlbums, likedSongIds, isLoading, error, isCacheFresh,
     fetchRecommendedPlaylists, fetchRecommendedSongs, fetchUserPlaylists,
+    fetchHomeSearchRecommendations, clearHomeSearchRecommendations,
     fetchHomeFeed, fetchHighQualityPlaylists, fetchHighQualityTags,
     fetchLikedSongIds, toggleLikeSong, fetchAlbumDetail, fetchUserAlbums,
     fetchBiliFavoriteItems, validateAuth,

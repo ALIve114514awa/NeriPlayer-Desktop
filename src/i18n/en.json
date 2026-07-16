@@ -17,11 +17,13 @@
     "more": "More",
     "daily_recommend": "Daily Mix",
     "recommended_playlists": "Recommended Playlists",
+    "recommended_videos": "Recommended Videos",
     "for_you": "For You",
     "login_hint": "Sign in for personalized recommendations",
     "my_playlists": "My Playlists",
     "trending": "Trending",
     "radar": "Personal Radar",
+    "recommend_load_failed": "Failed to load recommendations",
     "notifications": "Notifications",
     "clear_all": "Clear All",
     "no_notifications": "No notifications"

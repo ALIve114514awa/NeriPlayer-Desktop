@@ -6,10 +6,9 @@ defineOptions({ name: 'HomeView' })
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useAuthStore } from '@/stores/auth'
-import { useRecommendStore } from '@/stores/recommend'
+import { useRecommendStore, type HomeRecommendationSong } from '@/stores/recommend'
 import { useHistoryStore } from '@/stores/history'
 import { useI18n } from 'vue-i18n'
-import { invoke } from '@tauri-apps/api/core'
 import type { TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
@@ -25,12 +24,19 @@ const { t } = useI18n()
 
 const showNotifications = ref(false)
 
+const hotSection = computed(() => recommend.homeHotSongs)
+const radarSection = computed(() => recommend.homeRadarSongs)
+const hotSongs = computed(() => recommend.homeHotSongs.items)
+const radarSongs = computed(() => recommend.homeRadarSongs.items)
+const isHomeSearchLoading = computed(() => recommend.homeHotSongs.loading || recommend.homeRadarSongs.loading)
+
 // 首页数据全为空时显示骨架屏
 const showSkeleton = computed(() =>
-  recommend.isLoading &&
+  (recommend.isLoading || isHomeSearchLoading.value) &&
   recommend.recommendedPlaylists.length === 0 &&
   Object.keys(recommend.userPlaylists).length === 0 &&
-  hotSongs.value.length === 0
+  hotSongs.value.length === 0 &&
+  radarSongs.value.length === 0
 )
 
 const greeting = computed(() => {
@@ -84,7 +90,7 @@ const platformHubs = computed(() => [
     key: 'bilibili',
     title: t('settings.bilibili_account'),
     subtitle: auth.bilibili.loggedIn
-      ? t('player.video_count', { count: recommend.userPlaylists.bilibili?.length || 0 })
+      ? t('home.recommended_videos')
       : t('explore.bili_hint'),
     icon: '/icons/ic_bilibili.svg',
     color: '#00a1d6',
@@ -104,14 +110,6 @@ const platformHubs = computed(() => [
 
 const youtubeHomeItems = computed(() => recommend.homeFeedShelves.flatMap(s => s.items).slice(0, 14))
 
-// 热力飙升 / 私人雷达（通过搜索 API 获取，与 Android 行为一致）
-interface SearchResult {
-  id: string; title: string; artist: string; album: string
-  duration_ms: number; source: string; cover_url: string | null
-}
-const hotSongs = ref<SearchResult[]>([])
-const radarSongs = ref<SearchResult[]>([])
-
 // 三列网格分页（每页 3列 x 4行 = 12 项）
 const GRID_PAGE_SIZE = 12
 const hotPage = ref(0)
@@ -128,19 +126,8 @@ const radarPageItems = computed(() => {
   return radarSongs.value.slice(start, start + GRID_PAGE_SIZE)
 })
 const radarTotalPages = computed(() => Math.ceil(radarSongs.value.length / GRID_PAGE_SIZE))
-async function fetchHotSongs() {
-  try {
-    hotSongs.value = await invoke<SearchResult[]>('search', { query: '热歌', platform: 'netease' })
-  } catch { /* 非关键，静默 */ }
-}
 
-async function fetchRadarSongs() {
-  try {
-    radarSongs.value = await invoke<SearchResult[]>('search', { query: '私人雷达', platform: 'netease' })
-  } catch { /* 非关键，静默 */ }
-}
-
-function searchResultToTrack(s: SearchResult): TrackInfo {
+function searchResultToTrack(s: HomeRecommendationSong): TrackInfo {
   return {
     id: s.id,
     title: s.title,
@@ -217,13 +204,12 @@ function openYoutubeHomeItem(item: any) {
 onMounted(() => {
   if (library.tracks.length === 0) library.restoreLastScan()
   if (recommend.recommendedPlaylists.length === 0) recommend.fetchRecommendedPlaylists()
-  // 热力飙升和私人雷达（与 Android 对齐：通过搜索关键词获取）
-  fetchHotSongs()
-  fetchRadarSongs()
-  // 获取每日推荐和用户歌单
   if (auth.netease.loggedIn) {
     if (recommend.recommendedSongs.length === 0) recommend.fetchRecommendedSongs()
     if (!recommend.userPlaylists['netease']?.length) recommend.fetchUserPlaylists('netease')
+    recommend.fetchHomeSearchRecommendations()
+  } else {
+    recommend.clearHomeSearchRecommendations()
   }
   if (auth.bilibili.loggedIn && !recommend.userPlaylists.bilibili?.length) {
     recommend.fetchUserPlaylists('bilibili')
@@ -240,7 +226,18 @@ watch(() => auth.netease.loggedIn, (loggedIn) => {
     recommend.fetchRecommendedPlaylists()
     recommend.fetchRecommendedSongs()
     recommend.fetchUserPlaylists('netease')
+    recommend.fetchHomeSearchRecommendations(true)
+  } else {
+    recommend.clearHomeSearchRecommendations()
   }
+})
+
+watch(() => recommend.homeHotSongs.items.length, () => {
+  hotPage.value = 0
+})
+
+watch(() => recommend.homeRadarSongs.items.length, () => {
+  radarPage.value = 0
 })
 
 watch(() => auth.bilibili.loggedIn, (loggedIn) => {
@@ -364,7 +361,7 @@ function formatNotifTime(ts: number): string {
     </section>
 
     <!-- 热力飙升 — 三列网格 + 分页箭头 -->
-    <section v-if="hotSongs.length > 0" class="section">
+    <section v-if="auth.netease.loggedIn && (hotSongs.length > 0 || hotSection.loading || hotSection.error)" class="section">
       <div class="section-header">
         <h2 class="section-title">
           <span class="material-symbols-rounded filled" style="font-size: 22px; color: var(--md-error); vertical-align: middle; margin-right: 6px">bolt</span>
@@ -379,7 +376,15 @@ function formatNotifTime(ts: number): string {
           </button>
         </div>
       </div>
-      <div class="song-grid">
+      <div v-if="hotSection.loading && hotSongs.length === 0" class="section-state">
+        <span class="material-symbols-rounded spinning">progress_activity</span>
+        <span>{{ t('player.loading') }}</span>
+      </div>
+      <div v-else-if="hotSection.error && hotSongs.length === 0" class="section-state error">
+        <span>{{ hotSection.error || t('home.recommend_load_failed') }}</span>
+        <button class="section-state-action" @click="recommend.fetchHomeSearchRecommendations(true)">{{ t('player.retry') }}</button>
+      </div>
+      <div v-else class="song-grid">
         <div
           v-for="song in hotPageItems"
           :key="song.id"
@@ -399,7 +404,7 @@ function formatNotifTime(ts: number): string {
     </section>
 
     <!-- 私人雷达 — 三列网格 + 分页箭头 -->
-    <section v-if="radarSongs.length > 0" class="section">
+    <section v-if="auth.netease.loggedIn && (radarSongs.length > 0 || radarSection.loading || radarSection.error)" class="section">
       <div class="section-header">
         <h2 class="section-title">
           <span class="material-symbols-rounded filled" style="font-size: 22px; color: var(--md-primary); vertical-align: middle; margin-right: 6px">radar</span>
@@ -414,7 +419,15 @@ function formatNotifTime(ts: number): string {
           </button>
         </div>
       </div>
-      <div class="song-grid">
+      <div v-if="radarSection.loading && radarSongs.length === 0" class="section-state">
+        <span class="material-symbols-rounded spinning">progress_activity</span>
+        <span>{{ t('player.loading') }}</span>
+      </div>
+      <div v-else-if="radarSection.error && radarSongs.length === 0" class="section-state error">
+        <span>{{ radarSection.error || t('home.recommend_load_failed') }}</span>
+        <button class="section-state-action" @click="recommend.fetchHomeSearchRecommendations(true)">{{ t('player.retry') }}</button>
+      </div>
+      <div v-else class="song-grid">
         <div
           v-for="song in radarPageItems"
           :key="song.id"
@@ -433,10 +446,10 @@ function formatNotifTime(ts: number): string {
       </div>
     </section>
 
-    <!-- 推荐歌单（登录网易云后显示） -->
+    <!-- 为你推荐（登录网易云后显示） -->
     <section v-if="recommend.recommendedPlaylists.length > 0" class="section">
       <div class="section-header">
-        <h2 class="section-title">{{ t('home.recommended_playlists') }}</h2>
+        <h2 class="section-title">{{ t('home.for_you') }}</h2>
         <button class="section-more" @click="router.push('/explore')">
           <span>{{ t('home.more') }}</span>
           <span class="material-symbols-rounded" style="font-size: 18px">arrow_forward</span>
@@ -907,6 +920,38 @@ function formatNotifTime(ts: number): string {
   transition: background var(--duration-short);
 
   &:hover { background: color-mix(in srgb, var(--md-primary) 8%, transparent); }
+}
+
+.section-state {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--md-on-surface-variant);
+  font-size: 13px;
+
+  &.error {
+    color: var(--md-error);
+  }
+
+  .spinning {
+    font-size: 18px;
+    animation: spin 1s linear infinite;
+  }
+}
+
+.section-state-action {
+  padding: 5px 10px;
+  border-radius: var(--radius-full);
+  color: var(--md-primary);
+  background: color-mix(in srgb, var(--md-primary) 10%, transparent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 /* 网格容器（所有板块统一使用，自动换行） */
