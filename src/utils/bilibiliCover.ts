@@ -1,37 +1,56 @@
 import { invoke } from '@tauri-apps/api/core'
+import {
+  BilibiliCoverCache,
+  type ResolveBilibiliCoverOptions,
+} from './bilibiliCoverCache'
 
-const resolvedCoverCache = new Map<string, string>()
-const pendingCoverRequests = new Map<string, Promise<string>>()
-const MAX_CACHED_COVERS = 32
+export {
+  normalizeBilibiliCoverUrl,
+  normalizeCoverUrlForDisplay,
+  normalizeProxiedCoverUrl,
+} from './bilibiliCoverCache'
 
-export function normalizeBilibiliCoverUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim()
-  if (trimmed.startsWith('//')) return `https:${trimmed}`
-  if (trimmed.startsWith('http://')) return `https://${trimmed.slice('http://'.length)}`
-  return trimmed
+const COVER_DECODE_TIMEOUT_MS = 10_000
+
+const coverCache = new BilibiliCoverCache(
+  (url, forceRefresh) => invoke<string>('fetch_bilibili_cover', { url, forceRefresh }),
+  decodeBilibiliCover,
+)
+
+export function resolveCoverImage(
+  rawUrl: string,
+  options?: ResolveBilibiliCoverOptions,
+): Promise<string> {
+  return coverCache.resolve(rawUrl, options)
 }
 
-export async function resolveBilibiliCover(rawUrl: string): Promise<string> {
-  const url = normalizeBilibiliCoverUrl(rawUrl)
-  if (!url) throw new Error('Bilibili cover URL is empty')
+export const resolveBilibiliCover = resolveCoverImage
 
-  const cached = resolvedCoverCache.get(url)
-  if (cached) return cached
+function decodeBilibiliCover(dataUrl: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    let settled = false
+    let timer: ReturnType<typeof window.setTimeout> | null = null
 
-  const pending = pendingCoverRequests.get(url)
-  if (pending) return pending
+    const finish = (complete: () => void) => {
+      if (settled) return
+      settled = true
+      if (timer !== null) window.clearTimeout(timer)
+      image.onload = null
+      image.onerror = null
+      complete()
+    }
 
-  const request = invoke<string>('fetch_bilibili_cover', { url })
-    .then((dataUrl) => {
-      if (resolvedCoverCache.size >= MAX_CACHED_COVERS) {
-        const oldestUrl = resolvedCoverCache.keys().next().value
-        if (oldestUrl) resolvedCoverCache.delete(oldestUrl)
-      }
-      resolvedCoverCache.set(url, dataUrl)
-      return dataUrl
+    timer = window.setTimeout(
+      () => finish(() => reject(new Error('Bilibili cover decode timed out'))),
+      COVER_DECODE_TIMEOUT_MS,
+    )
+    image.decoding = 'async'
+    image.onload = () => finish(() => {
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) resolve()
+      else reject(new Error('Bilibili cover decoded without image dimensions'))
     })
-    .finally(() => pendingCoverRequests.delete(url))
-
-  pendingCoverRequests.set(url, request)
-  return request
+    image.onerror = () => finish(() => reject(new Error('Bilibili cover decode failed')))
+    image.src = dataUrl
+  })
 }

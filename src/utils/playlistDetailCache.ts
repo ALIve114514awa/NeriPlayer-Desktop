@@ -27,6 +27,10 @@ function normalizeTrack(track: TrackInfo): TrackInfo {
     durationMs: Number(track.durationMs || 0),
     coverUrl: String(track.coverUrl || ''),
     audioUrl: String(track.audioUrl || ''),
+    source: track.source,
+    addedAt: Number(track.addedAt || 0),
+    syncPayload: track.syncPayload,
+    playlistKey: track.playlistKey,
   }
 }
 

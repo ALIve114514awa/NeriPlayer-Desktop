@@ -276,18 +276,18 @@ export function applyThemeColorVisual(key: string, isDark?: boolean) {
 }
 
 /** 应用主题色到 CSS 变量（含持久化） */
-export function applyThemeColor(key: string, isDark?: boolean) {
+export function applyThemeColor(key: string, isDark?: boolean, persist = true) {
   applyThemeColorVisual(key, isDark)
-  localStorage.setItem('theme-color', key)
+  if (persist) localStorage.setItem('theme-color', key)
 }
 
 /**
  * 带圆形扩散动画的主题色切换
  * 参考 Android 端 pending state 模式：先切换视觉 → 异步持久化
  */
-export async function switchThemeColorWithRipple(key: string, x: number, y: number) {
+export async function switchThemeColorWithRipple(key: string, x: number, y: number, persist = true) {
   if (!(document as any).startViewTransition) {
-    applyThemeColor(key)
+    applyThemeColor(key, undefined, persist)
     return
   }
 
@@ -305,7 +305,7 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
   })
 
   // 异步持久化，不阻塞动画关键路径
-  queueMicrotask(() => localStorage.setItem('theme-color', key))
+  if (persist) queueMicrotask(() => localStorage.setItem('theme-color', key))
 
   try {
     await transition.ready

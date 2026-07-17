@@ -1,4 +1,1 @@
-declare module '@ungap/structured-clone' {
-  const structuredClone: typeof globalThis.structuredClone
-  export default structuredClone
-}
+/// <reference path="../types/ungap-structured-clone.d.ts" />

@@ -38,16 +38,16 @@ const i18n = createI18n({
 
 export default i18n
 
-export function setLocale(locale: string) {
+export function setLocale(locale: string, persist = true) {
   ;(i18n.global.locale as any).value = locale
-  localStorage.setItem('locale', locale)
+  if (persist) localStorage.setItem('locale', locale)
   document.documentElement.lang = locale
 }
 
 /** 带 View Transition 动画的语言切换 */
-export async function setLocaleWithTransition(locale: string, x?: number, y?: number) {
+export async function setLocaleWithTransition(locale: string, x?: number, y?: number, persist = true) {
   if (!(document as any).startViewTransition || !x || !y) {
-    setLocale(locale)
+    setLocale(locale, persist)
     return
   }
 
@@ -57,7 +57,7 @@ export async function setLocaleWithTransition(locale: string, x?: number, y?: nu
   )
 
   const transition = (document as any).startViewTransition(() => {
-    setLocale(locale)
+    setLocale(locale, persist)
   })
 
   try {

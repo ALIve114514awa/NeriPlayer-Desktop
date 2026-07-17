@@ -31,9 +31,9 @@ function applyThemeVisual(mode: ThemeMode) {
 }
 
 /** 无动画直接应用（含持久化，用于初始化和 fallback） */
-export function applyTheme(mode: ThemeMode) {
+export function applyTheme(mode: ThemeMode, persist = true) {
   applyThemeVisual(mode)
-  localStorage.setItem('theme-mode', mode)
+  if (persist) localStorage.setItem('theme-mode', mode)
 }
 
 /**
@@ -41,10 +41,10 @@ export function applyTheme(mode: ThemeMode) {
  * 核心优化：transition 回调内只做纯视觉 DOM 操作，
  * localStorage 写入移到 microtask 异步执行
  */
-export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: number) {
+export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: number, persist = true) {
   // 如果浏览器不支持 View Transition，直接切换
   if (!(document as any).startViewTransition) {
-    applyTheme(mode)
+    applyTheme(mode, persist)
     return
   }
 
@@ -60,7 +60,7 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
   })
 
   // 异步持久化，不阻塞动画关键路径
-  queueMicrotask(() => localStorage.setItem('theme-mode', mode))
+  if (persist) queueMicrotask(() => localStorage.setItem('theme-mode', mode))
 
   try {
     await transition.ready

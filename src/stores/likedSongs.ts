@@ -46,6 +46,9 @@ export const useLikedSongsStore = defineStore('likedSongs', () => {
       cover_url: track.coverUrl || null,
       url: track.audioUrl || '',
       source: inferTrackSource(track.id),
+      added_at: Math.max(0, Math.round(track.addedAt || 0)),
+      sync_payload: track.syncPayload ?? null,
+      playlist_key: track.playlistKey ?? null,
     }
   }
 
