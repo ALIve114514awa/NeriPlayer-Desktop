@@ -293,10 +293,9 @@ onMounted(() => {
         @click="playResult(r)"
       >
         <div class="result-cover">
-          <BilibiliCoverImage v-if="r.cover_url && r.source === 'bilibili'" :src="r.cover_url" loading="lazy">
+          <BilibiliCoverImage v-if="r.cover_url" :src="r.cover_url" loading="lazy">
             <span class="material-symbols-rounded filled">music_note</span>
           </BilibiliCoverImage>
-          <img v-else-if="r.cover_url" :src="r.cover_url" referrerpolicy="no-referrer" loading="lazy" />
           <span v-else class="material-symbols-rounded filled">music_note</span>
         </div>
         <div class="result-info">
@@ -345,7 +344,7 @@ onMounted(() => {
             @click="goToPlaylist(pl)"
           >
             <div class="playlist-cover">
-              <img v-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
+              <BilibiliCoverImage v-if="pl.coverUrl" :src="pl.coverUrl" loading="lazy" />
               <span v-else class="material-symbols-rounded filled">queue_music</span>
             </div>
             <div class="playlist-name">{{ pl.name }}</div>
@@ -408,7 +407,7 @@ onMounted(() => {
             <div class="discovery-row">
               <div v-for="item in shelf.items.slice(0, 10)" :key="item.browseId || item.videoId || item.title" class="discovery-card" @click="goToYoutubeShelfItem(item)">
                 <div class="discovery-cover">
-                  <img v-if="item.coverUrl" :src="item.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
+                  <BilibiliCoverImage v-if="item.coverUrl" :src="item.coverUrl" loading="lazy" />
                   <span v-else class="material-symbols-rounded filled">music_note</span>
                 </div>
                 <div class="discovery-title">{{ item.title }}</div>
@@ -432,7 +431,7 @@ onMounted(() => {
             <div class="discovery-row">
               <div v-for="item in shelf.items" :key="item.id" class="discovery-card" @click="playDiscoveryItem(item)">
                 <div class="discovery-cover">
-                  <img v-if="item.cover_url" :src="item.cover_url" referrerpolicy="no-referrer" loading="lazy" />
+                  <BilibiliCoverImage v-if="item.cover_url" :src="item.cover_url" loading="lazy" />
                   <span v-else class="material-symbols-rounded filled">music_note</span>
                 </div>
                 <div class="discovery-title">{{ item.title }}</div>

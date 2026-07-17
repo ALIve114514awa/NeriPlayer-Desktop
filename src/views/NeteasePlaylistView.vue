@@ -6,6 +6,15 @@ import { useDownloadStore } from '@/stores/download'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
+import TrackSelectionToolbar from '@/components/TrackSelectionToolbar.vue'
+import { useTrackSelection } from '@/composables/useTrackSelection'
+import {
+  createContextMenuItem,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+} from '@/utils/contextMenu'
 import {
   playlistDetailCacheKey,
   readPlaylistDetailCache,
@@ -70,6 +79,18 @@ const filteredTracks = computed(() => {
     t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q)
   )
 })
+
+const {
+  selectionMode,
+  selectedIds,
+  selectedItems: selectedTracks,
+  visibleSelectedCount,
+  allVisibleSelected,
+  enterSelectionMode,
+  leaveSelectionMode,
+  toggleSelected,
+  toggleSelectAllVisible,
+} = useTrackSelection(tracks, filteredTracks)
 
 // 总时长
 const totalDuration = computed(() => {
@@ -168,8 +189,22 @@ function shufflePlay() {
 }
 
 function playTrack(track: TrackInfo, index: number) {
-  player.playAll(filteredTracks.value)
-  player.play(track)
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
+  player.playAll(filteredTracks.value, track.id)
+}
+
+function playSelected() {
+  if (selectedTracks.value.length === 0) return
+  player.playAll(selectedTracks.value)
+  leaveSelectionMode()
+}
+
+function queueSelected() {
+  for (const track of selectedTracks.value) player.addToQueueEnd(track)
+  leaveSelectionMode()
 }
 
 function formatPlayCount(count: number): string {
@@ -184,27 +219,29 @@ const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | 
 })
 const showAddToPlaylist = ref(false)
 const addToPlaylistTarget = ref<TrackInfo | null>(null)
+const addToPlaylistTargets = ref<TrackInfo[]>([])
 
 function openTrackMenu(e: MouseEvent, track: TrackInfo) {
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
-  const menuWidth = 200
-  const menuHeight = 184
-  let x = rect.left - menuWidth - 4
-  let y = rect.top
+  let x = rect.left - 204
   if (x < 8) x = rect.right + 4
-  if (x + menuWidth > window.innerWidth - 8) x = window.innerWidth - menuWidth - 8
-  if (y + menuHeight > window.innerHeight - 8) y = window.innerHeight - menuHeight - 8
-  trackMenu.value = { show: true, x, y, track }
+  trackMenu.value = { show: true, x, y: rect.top, track }
 }
 
 function openTrackContextMenu(e: MouseEvent, track: TrackInfo) {
-  const menuWidth = 200
-  const menuHeight = 184
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
   trackMenu.value = {
     show: true,
-    x: Math.max(8, Math.min(e.clientX, window.innerWidth - menuWidth - 8)),
-    y: Math.max(8, Math.min(e.clientY, window.innerHeight - menuHeight - 8)),
+    x: e.clientX,
+    y: e.clientY,
     track,
   }
 }
@@ -216,7 +253,33 @@ function closeTrackMenu() {
 function openAddToPlaylist(track: TrackInfo) {
   closeTrackMenu()
   addToPlaylistTarget.value = track
+  addToPlaylistTargets.value = []
   showAddToPlaylist.value = true
+}
+
+function openBatchAddToPlaylist() {
+  if (selectedTracks.value.length === 0) return
+  closeTrackMenu()
+  addToPlaylistTarget.value = null
+  addToPlaylistTargets.value = [...selectedTracks.value]
+  leaveSelectionMode()
+  showAddToPlaylist.value = true
+}
+
+function downloadSelected() {
+  const targets = [...selectedTracks.value]
+  leaveSelectionMode()
+  for (const track of targets) void downloadStore.downloadTrack(track)
+}
+
+function addToQueueNext(track: TrackInfo) {
+  closeTrackMenu()
+  player.addToQueueNext(track)
+}
+
+function addToQueueEnd(track: TrackInfo) {
+  closeTrackMenu()
+  player.addToQueueEnd(track)
 }
 
 function downloadTaskStatusText(status?: string) {
@@ -252,6 +315,48 @@ async function handleTrackDownload(track: TrackInfo) {
     await downloadStore.redownloadTrack(track)
   } else {
     await downloadStore.downloadTrack(track)
+  }
+}
+
+const trackMenuItems = computed<ContextMenuItem[]>(() => {
+  const track = trackMenu.value.track
+  return [
+    createContextMenuItem(t('common.multi_select'), { id: 'select', icon: 'checklist' }),
+    createContextMenuItem(t('player.play_next'), { id: 'play-next', icon: 'queue_play_next' }),
+    createContextMenuItem(t('player.add_to_queue'), { id: 'add-to-queue', icon: 'add_to_queue' }),
+    createContextMenuItem(t('player.add_to_playlist'), { id: 'add-to-playlist', icon: 'playlist_add' }),
+    createContextMenuItem(
+      track ? trackDownloadLabel(track) : t('download.download'),
+      {
+        id: 'download',
+        icon: 'download',
+        disabled: !track || isTrackDownloadDisabled(track),
+      },
+    ),
+  ]
+})
+
+function handleTrackMenuClick(item: ContextMenuActionItem) {
+  const track = trackMenu.value.track
+  if (!track) return
+
+  switch (item.id) {
+    case 'select':
+      closeTrackMenu()
+      enterSelectionMode(track)
+      break
+    case 'play-next':
+      addToQueueNext(track)
+      break
+    case 'add-to-queue':
+      addToQueueEnd(track)
+      break
+    case 'add-to-playlist':
+      openAddToPlaylist(track)
+      break
+    case 'download':
+      void handleTrackDownload(track)
+      break
   }
 }
 
@@ -295,7 +400,7 @@ onMounted(() => {
       <!-- 歌单 / 专辑 信息头 -->
       <div class="detail-hero">
         <div class="hero-cover">
-          <img v-if="coverUrl" :src="coverUrl" referrerpolicy="no-referrer" />
+          <BilibiliCoverImage v-if="coverUrl" :src="coverUrl" />
           <span v-else class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">queue_music</span>
         </div>
         <div class="hero-info">
@@ -314,6 +419,9 @@ onMounted(() => {
             <button class="hero-icon-btn" :title="t('player.shuffle_play')" @click="shufflePlay">
               <span class="material-symbols-rounded">shuffle</span>
             </button>
+            <button class="hero-icon-btn" :title="t('common.multi_select')" @click="enterSelectionMode()">
+              <span class="material-symbols-rounded">checklist</span>
+            </button>
           </div>
         </div>
       </div>
@@ -322,21 +430,37 @@ onMounted(() => {
       <div v-if="filteredTracks.length === 0" class="state-center">
         <p>{{ t('player.empty_playlist') }}</p>
       </div>
-      <div v-else class="track-list">
+      <div v-else>
+        <TrackSelectionToolbar
+          v-if="selectionMode"
+          :selected-count="selectedTracks.length"
+          :visible-selected-count="visibleSelectedCount"
+          :all-visible-selected="allVisibleSelected"
+          @select-all="toggleSelectAllVisible"
+          @play="playSelected"
+          @queue="queueSelected"
+          @playlist="openBatchAddToPlaylist"
+          @download="downloadSelected"
+          @exit="leaveSelectionMode"
+        />
+        <div class="track-list">
         <div
           v-for="(track, index) in filteredTracks"
           :key="track.id"
           class="track-item"
-          :class="{ active: player.currentTrack?.id === track.id }"
+          :class="{ active: player.currentTrack?.id === track.id, selected: selectionMode && selectedIds.has(track.id), 'selection-mode': selectionMode }"
           @click="playTrack(track, index)"
           @contextmenu.prevent.stop="openTrackContextMenu($event, track)"
         >
-          <div class="track-index">
+          <button v-if="selectionMode" class="track-select" @click.stop="toggleSelected(track.id)">
+            <span class="material-symbols-rounded filled">{{ selectedIds.has(track.id) ? 'check_circle' : 'radio_button_unchecked' }}</span>
+          </button>
+          <div v-else class="track-index">
             <div v-if="player.currentTrack?.id === track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
             <span v-else class="index-num">{{ index + 1 }}</span>
           </div>
           <div class="track-cover">
-            <img v-if="track.coverUrl && !props.isAlbum" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="track.coverUrl && !props.isAlbum" :src="track.coverUrl" loading="lazy" />
             <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="track-info">
@@ -344,42 +468,24 @@ onMounted(() => {
             <div class="track-meta">{{ track.artist }}<template v-if="track.album"> · {{ track.album }}</template></div>
           </div>
           <div class="track-duration">{{ formatDuration(track.durationMs) }}</div>
-          <button class="track-more" @click.stop="openTrackMenu($event, track)">
+          <button v-if="!selectionMode" class="track-more" @click.stop="openTrackMenu($event, track)">
             <span class="material-symbols-rounded">more_vert</span>
           </button>
+        </div>
         </div>
       </div>
     </template>
 
-    <!-- 曲目右键菜单 -->
-    <Teleport to="body">
-      <div v-if="trackMenu.show" class="context-overlay" @click="closeTrackMenu" @contextmenu.prevent="closeTrackMenu">
-        <div class="context-menu" :style="{ left: trackMenu.x + 'px', top: trackMenu.y + 'px' }">
-          <button class="ctx-item" @click="player.addToQueueNext(trackMenu.track!); closeTrackMenu()">
-            <span class="material-symbols-rounded" style="font-size: 20px">queue_play_next</span>
-            <span>{{ t('player.play_next') }}</span>
-          </button>
-          <button class="ctx-item" @click="player.addToQueueEnd(trackMenu.track!); closeTrackMenu()">
-            <span class="material-symbols-rounded" style="font-size: 20px">add_to_queue</span>
-            <span>{{ t('player.add_to_queue') }}</span>
-          </button>
-          <button class="ctx-item" @click="openAddToPlaylist(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">playlist_add</span>
-            <span>{{ t('player.add_to_playlist') }}</span>
-          </button>
-          <button
-            class="ctx-item"
-            :disabled="isTrackDownloadDisabled(trackMenu.track!)"
-            @click="handleTrackDownload(trackMenu.track!)"
-          >
-            <span class="material-symbols-rounded" style="font-size: 20px">download</span>
-            <span>{{ trackDownloadLabel(trackMenu.track!) }}</span>
-          </button>
-        </div>
-      </div>
-    </Teleport>
+    <ContextMenu
+      :open="trackMenu.show"
+      :x="trackMenu.x"
+      :y="trackMenu.y"
+      :items="trackMenuItems"
+      @update:open="trackMenu.show = $event"
+      @click="handleTrackMenuClick"
+    />
 
-    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" />
+    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" :tracks="addToPlaylistTargets" />
   </div>
 </template>
 
@@ -400,52 +506,5 @@ onMounted(() => {
   .track-item:hover & { opacity: 0.6; }
   &:hover { opacity: 1 !important; background: var(--md-surface-container-high); }
   .material-symbols-rounded { font-size: 18px; }
-}
-</style>
-
-<style lang="scss">
-.context-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-}
-
-.context-menu {
-  position: fixed;
-  min-width: 200px;
-  background: var(--md-surface-container-high);
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.15);
-  border: 1px solid var(--md-outline-variant);
-  padding: 4px 0;
-  z-index: 501;
-  animation: ctx-in 120ms ease-out;
-}
-
-@keyframes ctx-in {
-  from { opacity: 0; transform: scale(0.95) translateY(-4px); }
-  to   { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-.ctx-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 10px 16px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--md-on-surface);
-  background: none;
-  border: none;
-  cursor: pointer;
-  transition: background 150ms;
-  font-family: inherit;
-
-  &:hover { background: var(--md-surface-container-highest); }
-  &.danger { color: var(--md-error); }
-  &.danger:hover { background: color-mix(in srgb, var(--md-error) 8%, transparent); }
-  &:disabled { cursor: default; opacity: 0.45; }
-  &:disabled:hover { background: transparent; }
 }
 </style>

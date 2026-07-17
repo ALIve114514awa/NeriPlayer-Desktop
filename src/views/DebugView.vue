@@ -1,20 +1,27 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { usePlayerStore } from '@/stores/player'
 import { useSyncStore } from '@/stores/sync'
 import { useSettingsStore } from '@/stores/settings'
+import { useAuthStore } from '@/stores/auth'
+import { useToastStore } from '@/stores/toast'
 
 const router = useRouter()
 const { t } = useI18n()
 const player = usePlayerStore()
 const syncStore = useSyncStore()
 const settingsStore = useSettingsStore()
+const authStore = useAuthStore()
+const toast = useToastStore()
 
 const buildInfo = ref<{ uuid: string; timestamp: string } | null>(null)
 const appDataDir = ref('')
+const debugCookieStorage = ref<{ available: boolean; stored: boolean } | null>(null)
+const clearingDebugCookies = ref(false)
+const showClearDebugCookiesConfirm = ref(false)
 
 const probes = ref<Record<string, 'idle' | 'testing' | 'success' | 'failed'>>({
   netease: 'idle',
@@ -102,6 +109,30 @@ function hideDebugMode() {
   router.push('/settings')
 }
 
+async function loadDebugCookieStorageStatus() {
+  try {
+    debugCookieStorage.value = await invoke('get_debug_cookie_storage_status')
+  } catch {
+    debugCookieStorage.value = null
+  }
+}
+
+async function clearDebugCookies() {
+  showClearDebugCookiesConfirm.value = false
+  clearingDebugCookies.value = true
+  try {
+    await invoke('clear_debug_cookie_storage')
+    await authStore.checkStatus()
+    await loadDebugCookieStorageStatus()
+    toast.success(t('settings.debug_cookie_clear_success'))
+  } catch (error) {
+    console.error('Failed to clear debug cookies:', error)
+    toast.error(t('settings.debug_cookie_clear_failed'))
+  } finally {
+    clearingDebugCookies.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     buildInfo.value = await invoke('get_build_info')
@@ -109,6 +140,7 @@ onMounted(async () => {
   try {
     appDataDir.value = await invoke('get_app_data_dir')
   } catch { /* 忽略 */ }
+  await loadDebugCookieStorageStatus()
 })
 </script>
 
@@ -164,6 +196,36 @@ onMounted(async () => {
         </div>
       </div>
     </div>
+
+    <!-- Debug Cookie 存储 -->
+    <template v-if="debugCookieStorage?.available">
+      <div class="section-label">
+        <span class="material-symbols-rounded" style="font-size: 18px">cookie</span>
+        <span>{{ t('settings.debug_cookie_storage') }}</span>
+      </div>
+      <div class="setting-card">
+        <div class="setting-icon-wrap">
+          <span class="material-symbols-rounded">delete_sweep</span>
+        </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.debug_cookie_storage') }}</div>
+          <div class="setting-desc">
+            {{ debugCookieStorage.stored
+              ? t('settings.debug_cookie_storage_present')
+              : t('settings.debug_cookie_storage_empty') }}
+          </div>
+        </div>
+        <button
+          class="debug-cookie-clear-btn"
+          :disabled="clearingDebugCookies"
+          @click="showClearDebugCookiesConfirm = true"
+        >
+          <span v-if="clearingDebugCookies" class="material-symbols-rounded spinning">progress_activity</span>
+          <span v-else class="material-symbols-rounded">delete</span>
+          {{ t('settings.debug_cookie_clear') }}
+        </button>
+      </div>
+    </template>
 
     <!-- API 探针 -->
     <div class="section-label">
@@ -284,6 +346,27 @@ onMounted(async () => {
         </div>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="showClearDebugCookiesConfirm"
+        class="debug-dialog-overlay"
+        @click.self="showClearDebugCookiesConfirm = false"
+      >
+        <div class="debug-dialog-card">
+          <h3>{{ t('settings.debug_cookie_clear_confirm_title') }}</h3>
+          <p>{{ t('settings.debug_cookie_clear_confirm_desc') }}</p>
+          <div class="debug-dialog-actions">
+            <button @click="showClearDebugCookiesConfirm = false">
+              {{ t('settings.cancel') }}
+            </button>
+            <button class="danger" @click="clearDebugCookies">
+              {{ t('settings.debug_cookie_clear') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- 隐藏调试模式 -->
     <div class="hide-debug-section">
@@ -419,6 +502,71 @@ onMounted(async () => {
   &.mono {
     font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
     font-size: 12px;
+  }
+}
+
+.debug-cookie-clear-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: var(--radius-full);
+  background: var(--md-error-container, rgba(255, 80, 80, 0.12));
+  color: var(--md-on-error-container, #ff5050);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.6;
+  }
+
+  .material-symbols-rounded { font-size: 17px; }
+}
+
+.debug-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.48);
+}
+
+.debug-dialog-card {
+  width: min(380px, 100%);
+  padding: 22px;
+  border-radius: var(--radius-xl);
+  background: var(--md-surface-container-high);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.3);
+
+  h3 { margin: 0; font-size: 18px; }
+  p {
+    margin: 12px 0 20px;
+    color: var(--md-on-surface-variant);
+    font-size: 13px;
+    line-height: 1.55;
+  }
+}
+
+.debug-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+
+  button {
+    padding: 8px 14px;
+    border-radius: var(--radius-full);
+    color: var(--md-on-surface);
+    cursor: pointer;
+  }
+
+  button.danger {
+    background: var(--md-error);
+    color: var(--md-on-error);
   }
 }
 

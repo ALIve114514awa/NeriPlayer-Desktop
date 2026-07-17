@@ -1,19 +1,32 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { SUPPORTED_LOCALES, setLocaleWithTransition } from '@/i18n'
-import { open as shellOpen } from '@tauri-apps/plugin-shell'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
-import { useSettingsStore } from '@/stores/settings'
+import {
+  MAX_MEDIA_CACHE_SIZE_MB,
+  MIN_MEDIA_CACHE_SIZE_MB,
+  useSettingsStore,
+} from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
-import { useSyncStore } from '@/stores/sync'
+import { useSyncStore, type SyncFrequency } from '@/stores/sync'
 import { useDownloadStore } from '@/stores/download'
 import { usePlayerStore } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import { DEFAULT_DOWNLOAD_NAME_TEMPLATE } from '@/stores/settings'
+import StorageManagementDialog from '@/components/StorageManagementDialog.vue'
+import EditableRangeValue from '@/components/ui/EditableRangeValue.vue'
+import {
+  clearBrowserCache,
+  mergeBrowserCacheUsage,
+  type StorageCacheClearOptions,
+  type StorageUsageSummary,
+} from '@/utils/storage'
 import { switchThemeWithRipple, type ThemeMode } from '@/utils/theme'
 import { THEME_COLORS, getSwatchColor, applyThemeColor, getSavedThemeColor, switchThemeColorWithRipple } from '@/utils/themeColor'
 
@@ -43,7 +56,15 @@ const {
   devModeEnabled,
   maxCacheSize, downloadNameTemplate, downloadDir,
   ltServerUrl, ltNickname, ltAllowMemberControl, ltAutoPauseOnMemberChange, ltShareAudioLinks,
+  locale: settingLocale,
 } = storeToRefs(settings)
+
+const syncFrequencyOptions = computed<Array<{ value: SyncFrequency; label: string }>>(() => [
+  { value: 'immediate', label: t('settings.sync_immediate') },
+  { value: 'every_10_minutes', label: t('settings.sync_every_10_minutes') },
+  { value: 'every_15_minutes', label: t('settings.sync_every_15_minutes') },
+  { value: 'every_30_minutes', label: t('settings.sync_every_30_minutes') },
+])
 
 // 折叠过渡 hooks
 function onExpandEnter(el: Element) {
@@ -84,7 +105,11 @@ const presetColors = THEME_COLORS.map(c => ({
   color: c.dark['--md-primary'],
 }))
 
-const activeColorKey = ref(getSavedThemeColor())
+const activeColorKey = ref(selectedColor.value || getSavedThemeColor())
+
+watch(selectedColor, value => {
+  activeColorKey.value = value
+})
 
 // 头像地址可能短暂失效，记录具体失败地址，换地址后仍允许重新加载
 const failedAvatarUrls = ref<Record<string, string | null>>({})
@@ -104,12 +129,15 @@ function handleColorSwitch(key: string, event: MouseEvent) {
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const x = rect.left + rect.width / 2
   const y = rect.top + rect.height / 2
-  switchThemeColorWithRipple(key, x, y)
+  switchThemeColorWithRipple(key, x, y, false)
 }
 
 function toggleSection(key: string) {
-  if (expandedSections.value.has(key)) expandedSections.value.delete(key)
-  else expandedSections.value.add(key)
+  const next = new Set(expandedSections.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedSections.value = next
+  persistSettingsUiState()
 }
 function isExpanded(key: string) { return expandedSections.value.has(key) }
 
@@ -124,14 +152,15 @@ function handleDarkModeSwitch(mode: ThemeMode, event: MouseEvent) {
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const x = rect.left + rect.width / 2
   const y = rect.top + rect.height / 2
-  switchThemeWithRipple(mode, x, y)
+  switchThemeWithRipple(mode, x, y, false)
 }
 
 function handleLocaleSwitch(code: string, event: MouseEvent) {
+  settingLocale.value = code
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const x = rect.left + rect.width / 2
   const y = rect.top + rect.height / 2
-  setLocaleWithTransition(code, x, y)
+  setLocaleWithTransition(code, x, y, false)
 }
 
 const defaultScreenOptions = computed(() => [
@@ -203,8 +232,215 @@ async function handleQualityChange(source: OnlineQualitySource, value: string) {
   }
 }
 
-// 折叠区段控制
-const expandedSections = ref<Set<string>>(new Set())
+type SettingsSectionId =
+  | 'accounts'
+  | 'personalization'
+  | 'playback'
+  | 'quality'
+  | 'motion'
+  | 'lyrics'
+  | 'network'
+  | 'storage'
+  | 'backup'
+  | 'listen_together'
+  | 'language'
+  | 'about'
+
+const SETTINGS_UI_STATE_KEY = 'neri:settings-ui-state'
+const SETTINGS_SECTION_IDS: SettingsSectionId[] = [
+  'accounts', 'playback', 'quality', 'storage', 'personalization', 'motion', 'lyrics', 'network',
+  'backup', 'listen_together', 'language', 'about',
+]
+
+type SettingsUiState = {
+  activeSection?: SettingsSectionId
+  expandedSections?: string[]
+  visitedSections?: string[]
+  scrollPositions?: Record<string, number>
+}
+
+function readSettingsUiState(): SettingsUiState {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SETTINGS_UI_STATE_KEY) || '{}') as SettingsUiState
+    return SETTINGS_SECTION_IDS.includes(parsed.activeSection as SettingsSectionId) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+const savedSettingsUiState = readSettingsUiState()
+const expandedSections = ref<Set<string>>(
+  new Set(savedSettingsUiState.expandedSections || ['personal']),
+)
+const visitedSettingsSections = ref<Set<string>>(
+  new Set(savedSettingsUiState.visitedSections || ['personalization']),
+)
+const activeSettingsSection = ref<SettingsSectionId>(
+  savedSettingsUiState.activeSection || 'personalization',
+)
+const sectionScrollPositions = ref<Record<string, number>>(savedSettingsUiState.scrollPositions || {})
+const settingsRootRef = ref<HTMLElement | null>(null)
+const settingsContentRef = ref<HTMLElement | null>(null)
+
+function settingsScrollContainer() {
+  const settingsContent = settingsContentRef.value
+  if (!settingsContent) return null
+  if (settingsContent.scrollHeight > settingsContent.clientHeight + 1) return settingsContent
+  return settingsContent.closest('.content') as HTMLElement | null
+}
+
+function persistSettingsUiState() {
+  try {
+    localStorage.setItem(SETTINGS_UI_STATE_KEY, JSON.stringify({
+      activeSection: activeSettingsSection.value,
+      expandedSections: Array.from(expandedSections.value),
+      visitedSections: Array.from(visitedSettingsSections.value),
+      scrollPositions: sectionScrollPositions.value,
+    }))
+  } catch {
+    // UI 状态保存失败不影响设置项
+  }
+}
+
+function rememberSettingsScrollPosition() {
+  const container = settingsScrollContainer()
+  if (!container) return
+  sectionScrollPositions.value = {
+    ...sectionScrollPositions.value,
+    [activeSettingsSection.value]: container.scrollTop,
+  }
+}
+
+async function restoreSettingsScrollPosition(section: SettingsSectionId) {
+  await nextTick()
+  const container = settingsScrollContainer()
+  if (!container) return
+  container.scrollTo({
+    top: Math.max(0, sectionScrollPositions.value[section] || 0),
+    behavior: 'auto',
+  })
+}
+
+const settingsNavGroups = computed(() => [
+  {
+    items: [
+      {
+        id: 'accounts' as SettingsSectionId,
+        label: t('settings.accounts'),
+        description: t('settings.nav_accounts_desc'),
+        icon: 'account_circle',
+      },
+    ],
+  },
+  {
+    items: [
+      {
+        id: 'playback' as SettingsSectionId,
+        label: t('settings.playback'),
+        description: t('settings.nav_playback_desc'),
+        icon: 'play_circle',
+      },
+      {
+        id: 'quality' as SettingsSectionId,
+        label: t('settings.audio_quality'),
+        description: t('settings.audio_quality_desc'),
+        icon: 'high_quality',
+      },
+      {
+        id: 'storage' as SettingsSectionId,
+        label: t('settings.storage'),
+        description: t('settings.nav_storage_desc'),
+        icon: 'storage',
+      },
+    ],
+  },
+  {
+    items: [
+      {
+        id: 'personalization' as SettingsSectionId,
+        label: t('settings.personalization'),
+        description: t('settings.nav_personalization_desc'),
+        icon: 'tune',
+      },
+      {
+        id: 'motion' as SettingsSectionId,
+        label: t('settings.motion'),
+        description: t('settings.motion_desc'),
+        icon: 'bolt',
+      },
+      {
+        id: 'lyrics' as SettingsSectionId,
+        label: t('settings.lyrics'),
+        description: t('settings.nav_lyrics_desc'),
+        icon: 'lyrics',
+      },
+      {
+        id: 'network' as SettingsSectionId,
+        label: t('settings.network'),
+        description: t('settings.nav_network_desc'),
+        icon: 'router',
+      },
+    ],
+  },
+  {
+    items: [
+      {
+        id: 'backup' as SettingsSectionId,
+        label: t('settings.backup'),
+        description: t('settings.nav_backup_desc'),
+        icon: 'sync',
+      },
+      {
+        id: 'listen_together' as SettingsSectionId,
+        label: t('listen_together.title'),
+        description: t('settings.nav_listen_together_desc'),
+        icon: 'cloud',
+      },
+      {
+        id: 'language' as SettingsSectionId,
+        label: t('settings.language'),
+        description: t('settings.language_desc'),
+        icon: 'translate',
+      },
+      {
+        id: 'about' as SettingsSectionId,
+        label: t('settings.about'),
+        description: t('settings.about_desc'),
+        icon: 'info',
+      },
+    ],
+  },
+])
+
+const activeSettingsItem = computed(() => settingsNavGroups.value
+  .flatMap(group => group.items)
+  .find(item => item.id === activeSettingsSection.value))
+
+function selectSettingsSection(id: SettingsSectionId) {
+  if (id === activeSettingsSection.value) return
+  rememberSettingsScrollPosition()
+  activeSettingsSection.value = id
+  if (!visitedSettingsSections.value.has(id)) {
+    const defaults: Record<SettingsSectionId, string[]> = {
+      accounts: [],
+      personalization: ['personal'],
+      playback: ['playback'],
+      quality: ['quality'],
+      motion: ['effects'],
+      lyrics: ['lyrics'],
+      network: [],
+      storage: ['storage'],
+      backup: ['backup'],
+      listen_together: ['listen_together'],
+      language: [],
+      about: [],
+    }
+    expandedSections.value = new Set([...expandedSections.value, ...defaults[id]])
+    visitedSettingsSections.value = new Set([...visitedSettingsSections.value, id])
+  }
+  persistSettingsUiState()
+  void restoreSettingsScrollPosition(id)
+}
 
 // 启动时检查登录状态
 onMounted(() => {
@@ -216,6 +452,12 @@ onMounted(() => {
   loadBuildInfo()
   // 加载默认下载目录
   loadDefaultDownloadDir()
+  void restoreSettingsScrollPosition(activeSettingsSection.value)
+})
+
+onBeforeUnmount(() => {
+  rememberSettingsScrollPosition()
+  persistSettingsUiState()
 })
 
 // ── 网络：绕过代理 ──
@@ -229,10 +471,23 @@ async function handleBypassProxyChange(val: boolean) {
 }
 
 // ── 一起听 ──
-function resetLtIdentity() {
+const showResetLtIdentityConfirm = ref(false)
+
+function confirmResetLtIdentity() {
+  showResetLtIdentityConfirm.value = false
   localStorage.removeItem('neri:lt-uuid')
-  ltNickname.value = ''
   toast.success(t('listen_together.identity_reset'))
+}
+
+const showConfigExportWarning = ref(false)
+
+async function confirmConfigExport() {
+  showConfigExportWarning.value = false
+  await syncStore.exportConfig()
+}
+
+async function importConfig() {
+  await syncStore.importConfig()
 }
 
 // ── 下载管理 ──
@@ -321,27 +576,35 @@ const showDownloadTemplateDialog = ref(false)
 const pendingTemplate = ref('')
 
 function openDownloadTemplateDialog() {
-  pendingTemplate.value = downloadNameTemplate.value || '{artist} - {title}'
+  pendingTemplate.value = downloadNameTemplate.value || DEFAULT_DOWNLOAD_NAME_TEMPLATE
   showDownloadTemplateDialog.value = true
 }
 
+function replaceTemplateToken(template: string, token: string, value: string): string {
+  return template.split(token).join(value)
+}
+
 const templatePreview = computed(() => {
-  const tpl = pendingTemplate.value || '{artist} - {title}'
-  return tpl
-    .replace('{title}', '晴天')
-    .replace('{artist}', '周杰伦')
-    .replace('{album}', '叶惠美')
-    .replace('{source}', 'netease')
+  let preview = pendingTemplate.value || DEFAULT_DOWNLOAD_NAME_TEMPLATE
+  for (const [token, value] of [
+    ['{title}', '晴天'], ['%title%', '晴天'],
+    ['{artist}', '周杰伦'], ['%artist%', '周杰伦'],
+    ['{album}', '叶惠美'], ['%album%', '叶惠美'],
+    ['{source}', 'netease'], ['%source%', 'netease'],
+  ]) {
+    preview = replaceTemplateToken(preview, token, value)
+  }
+  return preview
 })
 
 function applyDownloadTemplate() {
-  downloadNameTemplate.value = pendingTemplate.value.trim() || '{artist} - {title}'
+  downloadNameTemplate.value = pendingTemplate.value.trim() || DEFAULT_DOWNLOAD_NAME_TEMPLATE
   showDownloadTemplateDialog.value = false
 }
 
 function resetDownloadTemplate() {
-  pendingTemplate.value = '{artist} - {title}'
-  downloadNameTemplate.value = '{artist} - {title}'
+  pendingTemplate.value = DEFAULT_DOWNLOAD_NAME_TEMPLATE
+  downloadNameTemplate.value = DEFAULT_DOWNLOAD_NAME_TEMPLATE
   showDownloadTemplateDialog.value = false
 }
 
@@ -355,6 +618,56 @@ function cancelDownload(trackId: string) {
 
 function goToDownloads() {
   router.push('/downloads')
+}
+
+const showStorageManagement = ref(false)
+const storageLoading = ref(false)
+const storageClearing = ref(false)
+const storageSummary = ref<StorageUsageSummary | null>(null)
+
+async function loadStorageUsage() {
+  storageLoading.value = true
+  try {
+    const result = await invoke<StorageUsageSummary>('get_storage_usage', {
+      downloadDir: downloadDir.value || null,
+    })
+    storageSummary.value = mergeBrowserCacheUsage(result)
+  } catch (error) {
+    console.error('Failed to read storage usage:', error)
+    toast.error(t('settings.storage_load_failed'))
+  } finally {
+    storageLoading.value = false
+  }
+}
+
+async function openStorageManagement() {
+  showStorageManagement.value = true
+  await loadStorageUsage()
+}
+
+async function clearStorageCache(options: StorageCacheClearOptions) {
+  storageClearing.value = true
+  try {
+    const result = await invoke<{ clearedBytes: number; deletedFiles: number; failedCount: number }>(
+      'clear_storage_cache',
+      { options },
+    )
+    clearBrowserCache(options)
+    const mb = ((result.clearedBytes || 0) / 1024 / 1024).toFixed(1)
+    if (result.failedCount > 0) {
+      toast.show(t('settings.storage_cache_partial', { mb, count: result.failedCount }), 'info')
+    } else if (result.clearedBytes === 0) {
+      toast.show(t('settings.storage_cache_empty'), 'info')
+    } else {
+      toast.success(t('settings.storage_cache_cleared', { mb }))
+    }
+    await loadStorageUsage()
+  } catch (error) {
+    console.error('Failed to clear storage cache:', error)
+    toast.error(t('settings.storage_cache_failed'))
+  } finally {
+    storageClearing.value = false
+  }
 }
 
 // ── YouTube 国际化 ──
@@ -451,6 +764,8 @@ const githubRepoMode = ref<'create' | 'existing'>('create')
 const githubNewRepoName = ref('neriplayer-backup')
 const githubExistingRepo = ref('') // owner/repo 格式
 const githubIsSettingRepo = ref(false)
+const GITHUB_TOKEN_URL = 'https://github.com/settings/tokens/new?scopes=repo&description=NeriPlayer%20Backup'
+const PROJECT_REPOSITORY_URL = 'https://github.com/nicepkg/NeriPlayer'
 
 function openGitHubSetup() {
   githubPhase.value = 1
@@ -494,8 +809,17 @@ async function githubFinishSetup() {
   if (ok) showGitHubDialog.value = false
 }
 
-function openGitHubTokenPage() {
-  shellOpen('https://github.com/settings/tokens/new?scopes=repo&description=NeriPlayer%20Backup')
+async function openExternalUrl(url: string) {
+  try {
+    await openUrl(url)
+  } catch (error) {
+    console.error('Failed to open external URL', error)
+    toast.error(t('settings.open_external_link_failed'))
+  }
+}
+
+async function openGitHubTokenPage() {
+  await openExternalUrl(GITHUB_TOKEN_URL)
 }
 
 // WebDAV 同步对话框状态
@@ -556,17 +880,72 @@ async function confirmClearGitHub() {
   showClearGitHubConfirm.value = false
   await syncStore.disconnectGitHub()
 }
+
+// 切换省流模式前确认，避免用户误解已有云端文件格式
+const showDataSaverConfirm = ref(false)
+const pendingDataSaverValue = ref<boolean | null>(null)
+
+function requestDataSaverChange(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  if (!target || target.checked === syncStore.github.dataSaver) return
+  pendingDataSaverValue.value = target.checked
+  showDataSaverConfirm.value = true
+}
+
+function cancelDataSaverChange() {
+  pendingDataSaverValue.value = null
+  showDataSaverConfirm.value = false
+}
+
+function confirmDataSaverChange() {
+  if (pendingDataSaverValue.value !== null) {
+    syncStore.github.dataSaver = pendingDataSaverValue.value
+  }
+  cancelDataSaverChange()
+}
 </script>
 
 <template>
-  <div class="settings-view">
-    <h1 class="page-title">{{ t('settings.title') }}</h1>
+  <div ref="settingsRootRef" class="settings-view">
+    <div class="settings-layout">
+      <aside class="settings-sidebar">
+        <h1 class="page-title">{{ t('settings.title') }}</h1>
+        <nav class="settings-nav" :aria-label="t('settings.title')">
+          <div v-for="(group, groupIndex) in settingsNavGroups" :key="groupIndex" class="settings-nav-group">
+            <button
+              v-for="item in group.items"
+              :key="item.id"
+              class="settings-nav-item"
+              :class="{ active: activeSettingsSection === item.id }"
+              type="button"
+              :aria-current="activeSettingsSection === item.id ? 'page' : undefined"
+              @click="selectSettingsSection(item.id)"
+            >
+              <span class="settings-nav-icon material-symbols-rounded">{{ item.icon }}</span>
+              <span class="settings-nav-copy">
+                <strong>{{ item.label }}</strong>
+                <small>{{ item.description }}</small>
+              </span>
+              <span class="material-symbols-rounded settings-nav-arrow">chevron_right</span>
+            </button>
+          </div>
+        </nav>
+      </aside>
 
-    <!-- 账号 -->
+      <main ref="settingsContentRef" class="settings-content">
+        <header class="settings-content-header">
+          <div>
+            <h2>{{ activeSettingsItem?.label }}</h2>
+            <p>{{ activeSettingsItem?.description }}</p>
+          </div>
+        </header>
+
+        <div v-show="activeSettingsSection === 'accounts'" class="settings-section-panel">
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">account_circle</span>
       <span>{{ t('settings.accounts') }}</span>
     </div>
+    <p class="settings-section-intro">{{ t('settings.accounts_desc') }}</p>
 
     <div
       v-for="account in platformAccounts"
@@ -583,6 +962,10 @@ async function confirmClearGitHub() {
         </div>
         <div class="setting-desc" v-else-if="auth.loggingIn === account.key">
           {{ t('settings.signing_in') }}
+        </div>
+        <div class="account-status" :class="{ connected: account.auth.loggedIn }">
+          <span class="account-status-dot"></span>
+          {{ account.auth.loggedIn ? t('settings.account_connected') : t('settings.account_not_connected') }}
         </div>
       </div>
       <template v-if="account.auth.loggedIn">
@@ -617,6 +1000,9 @@ async function confirmClearGitHub() {
         </button>
       </template>
     </div>
+        </div>
+
+        <div v-show="activeSettingsSection === 'personalization'" class="settings-section-panel">
 
     <!-- YouTube 国际化 -->
     <div class="setting-card">
@@ -761,7 +1147,16 @@ async function confirmClearGitHub() {
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">format_size</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.lyric_font_size') }}</div>
-          <div class="setting-desc">{{ lyricFontScale.toFixed(1) }}x</div>
+          <EditableRangeValue
+            v-model="lyricFontScale"
+            class="setting-desc"
+            :min="0.5"
+            :max="1.5"
+            :step="0.1"
+            :display-value="`${lyricFontScale.toFixed(1)}x`"
+            input-suffix="x"
+            :aria-label="t('settings.lyric_font_size')"
+          />
         </div>
         <input type="range" class="m3-slider" v-model.number="lyricFontScale" min="0.5" max="1.5" step="0.1" />
       </div>
@@ -792,23 +1187,44 @@ async function confirmClearGitHub() {
 
       <template v-if="backgroundImageUri">
         <div class="setting-card sub-card">
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.bg_blur') }}</div>
-            <div class="setting-desc">{{ backgroundImageBlur }}px</div>
-          </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.bg_blur') }}</div>
+          <EditableRangeValue
+            v-model="backgroundImageBlur"
+            class="setting-desc"
+            :min="0"
+            :max="100"
+            :step="5"
+            :display-value="`${backgroundImageBlur}px`"
+            input-suffix="px"
+            :aria-label="t('settings.bg_blur')"
+          />
+        </div>
           <input type="range" class="m3-slider" v-model.number="backgroundImageBlur" min="0" max="100" step="5" />
         </div>
         <div class="setting-card sub-card">
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.bg_opacity') }}</div>
-            <div class="setting-desc">{{ (backgroundImageAlpha * 100).toFixed(0) }}%</div>
-          </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.bg_opacity') }}</div>
+          <EditableRangeValue
+            v-model="backgroundImageAlpha"
+            class="setting-desc"
+            :min="0"
+            :max="1"
+            :step="0.05"
+            :inputScale="100"
+            :display-value="`${(backgroundImageAlpha * 100).toFixed(0)}%`"
+            input-suffix="%"
+            :aria-label="t('settings.bg_opacity')"
+          />
+        </div>
           <input type="range" class="m3-slider" v-model.number="backgroundImageAlpha" min="0" max="1" step="0.05" />
         </div>
       </template>
     </div></Transition>
+        </div>
 
     <!-- 播放 -->
+        <div v-show="activeSettingsSection === 'playback'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('playback')">
       <span class="material-symbols-rounded" style="font-size: 18px">play_circle</span>
       <span>{{ t('settings.playback') }}</span>
@@ -845,17 +1261,35 @@ async function confirmClearGitHub() {
 
       <template v-if="fadeIn">
         <div class="setting-card sub-card">
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.fade_in_duration') }}</div>
-            <div class="setting-desc">{{ fadeInDuration }}ms</div>
-          </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.fade_in_duration') }}</div>
+          <EditableRangeValue
+            v-model="fadeInDuration"
+            class="setting-desc"
+            :min="0"
+            :max="3000"
+            :step="100"
+            :display-value="`${fadeInDuration}ms`"
+            input-suffix="ms"
+            :aria-label="t('settings.fade_in_duration')"
+          />
+        </div>
           <input type="range" class="m3-slider" v-model.number="fadeInDuration" min="0" max="3000" step="100" />
         </div>
         <div class="setting-card sub-card">
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.fade_out_duration') }}</div>
-            <div class="setting-desc">{{ fadeOutDuration }}ms</div>
-          </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.fade_out_duration') }}</div>
+          <EditableRangeValue
+            v-model="fadeOutDuration"
+            class="setting-desc"
+            :min="0"
+            :max="3000"
+            :step="100"
+            :display-value="`${fadeOutDuration}ms`"
+            input-suffix="ms"
+            :aria-label="t('settings.fade_out_duration')"
+          />
+        </div>
           <input type="range" class="m3-slider" v-model.number="fadeOutDuration" min="0" max="3000" step="100" />
         </div>
       </template>
@@ -871,17 +1305,35 @@ async function confirmClearGitHub() {
 
       <template v-if="crossfadeNext">
         <div class="setting-card sub-card">
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.crossfade_in_duration') }}</div>
-            <div class="setting-desc">{{ crossfadeInDuration }}ms</div>
-          </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.crossfade_in_duration') }}</div>
+          <EditableRangeValue
+            v-model="crossfadeInDuration"
+            class="setting-desc"
+            :min="0"
+            :max="3000"
+            :step="100"
+            :display-value="`${crossfadeInDuration}ms`"
+            input-suffix="ms"
+            :aria-label="t('settings.crossfade_in_duration')"
+          />
+        </div>
           <input type="range" class="m3-slider" v-model.number="crossfadeInDuration" min="0" max="3000" step="100" />
         </div>
         <div class="setting-card sub-card">
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.crossfade_out_duration') }}</div>
-            <div class="setting-desc">{{ crossfadeOutDuration }}ms</div>
-          </div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.crossfade_out_duration') }}</div>
+          <EditableRangeValue
+            v-model="crossfadeOutDuration"
+            class="setting-desc"
+            :min="0"
+            :max="3000"
+            :step="100"
+            :display-value="`${crossfadeOutDuration}ms`"
+            input-suffix="ms"
+            :aria-label="t('settings.crossfade_out_duration')"
+          />
+        </div>
           <input type="range" class="m3-slider" v-model.number="crossfadeOutDuration" min="0" max="3000" step="100" />
         </div>
       </template>
@@ -904,8 +1356,10 @@ async function confirmClearGitHub() {
         <label class="m3-switch"><input type="checkbox" v-model="keepPlaybackMode" /><span class="track"><span class="thumb"><span v-if="keepPlaybackMode" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
       </div>
     </div></Transition>
+        </div>
 
     <!-- 网络 -->
+        <div v-show="activeSettingsSection === 'network'" class="settings-section-panel">
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">wifi</span>
       <span>{{ t('settings.network') }}</span>
@@ -922,8 +1376,10 @@ async function confirmClearGitHub() {
         <span class="track"><span class="thumb"><span v-if="bypassProxy" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span>
       </label>
     </div>
+        </div>
 
     <!-- 一起听 -->
+        <div v-show="activeSettingsSection === 'listen_together'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('listen_together')">
       <span class="material-symbols-rounded" style="font-size: 18px">group</span>
       <span>{{ t('listen_together.title') }}</span>
@@ -1008,11 +1464,13 @@ async function confirmClearGitHub() {
           <div class="setting-title">{{ t('listen_together.reset_identity') }}</div>
           <div class="setting-desc">{{ t('listen_together.reset_identity_desc') }}</div>
         </div>
-        <button class="m3-chip sm" @click="resetLtIdentity">{{ t('listen_together.reset_btn') }}</button>
+        <button class="m3-chip sm" @click="showResetLtIdentityConfirm = true">{{ t('listen_together.reset_btn') }}</button>
       </div>
     </div></Transition>
+        </div>
 
     <!-- 下载管理 -->
+        <div v-show="activeSettingsSection === 'storage'" class="settings-section-panel">
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">download</span>
       <span>{{ t('settings.download_manage') }}</span>
@@ -1069,8 +1527,10 @@ async function confirmClearGitHub() {
       </div>
       <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
     </div>
+        </div>
 
     <!-- 歌词 -->
+        <div v-show="activeSettingsSection === 'lyrics'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('lyrics')">
       <span class="material-symbols-rounded" style="font-size: 18px">lyrics</span>
       <span>{{ t('settings.lyrics') }}</span>
@@ -1099,7 +1559,16 @@ async function confirmClearGitHub() {
       <div v-if="lyricBlur" class="setting-card sub-card">
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.blur_strength') }}</div>
-          <div class="setting-desc">{{ lyricBlurAmount.toFixed(1) }}px</div>
+          <EditableRangeValue
+            v-model="lyricBlurAmount"
+            class="setting-desc"
+            :min="0"
+            :max="8"
+            :step="0.5"
+            :display-value="`${lyricBlurAmount.toFixed(1)}px`"
+            input-suffix="px"
+            :aria-label="t('settings.blur_strength')"
+          />
         </div>
         <input type="range" class="m3-slider" v-model.number="lyricBlurAmount" min="0" max="8" step="0.5" />
       </div>
@@ -1108,7 +1577,16 @@ async function confirmClearGitHub() {
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">music_note</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.netease_offset') }}</div>
-          <div class="setting-desc">{{ cloudMusicOffset >= 0 ? '+' : '' }}{{ cloudMusicOffset }}ms</div>
+          <EditableRangeValue
+            v-model="cloudMusicOffset"
+            class="setting-desc"
+            :min="-2000"
+            :max="2000"
+            :step="50"
+            :display-value="`${cloudMusicOffset >= 0 ? '+' : ''}${cloudMusicOffset}ms`"
+            input-suffix="ms"
+            :aria-label="t('settings.netease_offset')"
+          />
         </div>
         <input type="range" class="m3-slider" v-model.number="cloudMusicOffset" min="-2000" max="2000" step="50" />
       </div>
@@ -1117,13 +1595,24 @@ async function confirmClearGitHub() {
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">music_note</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.qq_offset') }}</div>
-          <div class="setting-desc">{{ qqMusicOffset >= 0 ? '+' : '' }}{{ qqMusicOffset }}ms</div>
+          <EditableRangeValue
+            v-model="qqMusicOffset"
+            class="setting-desc"
+            :min="-2000"
+            :max="2000"
+            :step="50"
+            :display-value="`${qqMusicOffset >= 0 ? '+' : ''}${qqMusicOffset}ms`"
+            input-suffix="ms"
+            :aria-label="t('settings.qq_offset')"
+          />
         </div>
         <input type="range" class="m3-slider" v-model.number="qqMusicOffset" min="-2000" max="2000" step="50" />
       </div>
     </div></Transition>
+        </div>
 
     <!-- 动效 & 视觉 -->
+        <div v-show="activeSettingsSection === 'motion'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('effects')">
       <span class="material-symbols-rounded" style="font-size: 18px">auto_awesome</span>
       <span>{{ t('settings.effects') }}</span>
@@ -1171,24 +1660,44 @@ async function confirmClearGitHub() {
         <div class="setting-card sub-card">
           <div class="setting-info">
             <div class="setting-title">{{ t('settings.blur_amount') }}</div>
-            <div class="setting-desc">{{ coverBlurAmount.toFixed(1) }}</div>
+            <EditableRangeValue
+              v-model="coverBlurAmount"
+              class="setting-desc"
+              :min="0"
+              :max="500"
+              :step="10"
+              :display-value="coverBlurAmount.toFixed(1)"
+              :aria-label="t('settings.blur_amount')"
+            />
           </div>
           <input type="range" class="m3-slider" v-model.number="coverBlurAmount" min="0" max="500" step="10" />
         </div>
         <div class="setting-card sub-card">
           <div class="setting-info">
             <div class="setting-title">{{ t('settings.bg_darken') }}</div>
-            <div class="setting-desc">{{ (coverBlurDarken * 100).toFixed(0) }}%</div>
+            <EditableRangeValue
+              v-model="coverBlurDarken"
+              class="setting-desc"
+              :min="0"
+              :max="0.8"
+              :step="0.05"
+              :inputScale="100"
+              :display-value="`${(coverBlurDarken * 100).toFixed(0)}%`"
+              input-suffix="%"
+              :aria-label="t('settings.bg_darken')"
+            />
           </div>
           <input type="range" class="m3-slider" v-model.number="coverBlurDarken" min="0" max="0.8" step="0.05" />
         </div>
       </template>
     </div></Transition>
+        </div>
 
     <!-- 音质 -->
+        <div v-show="activeSettingsSection === 'quality'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('quality')">
       <span class="material-symbols-rounded" style="font-size: 18px">headphones</span>
-      <span>{{ t('settings.quality') }}</span>
+      <span>{{ t('settings.audio_quality') }}</span>
       <span class="material-symbols-rounded section-arrow" :class="{ expanded: isExpanded('quality') }">expand_more</span>
     </div>
 
@@ -1223,8 +1732,10 @@ async function confirmClearGitHub() {
         </div>
       </div>
     </div></Transition>
+        </div>
 
     <!-- 存储 & 缓存 -->
+        <div v-show="activeSettingsSection === 'storage'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('storage')">
       <span class="material-symbols-rounded" style="font-size: 18px">folder</span>
       <span>{{ t('settings.storage') }}</span>
@@ -1236,9 +1747,25 @@ async function confirmClearGitHub() {
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">sd_storage</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.cache_limit') }}</div>
-          <div class="setting-desc">{{ maxCacheSize >= 1024 ? (maxCacheSize / 1024).toFixed(1) + ' GB' : maxCacheSize + ' MB' }}</div>
+          <EditableRangeValue
+            v-model="maxCacheSize"
+            class="setting-desc"
+            :min="MIN_MEDIA_CACHE_SIZE_MB"
+            :max="MAX_MEDIA_CACHE_SIZE_MB"
+            :step="256"
+            :display-value="maxCacheSize >= 1024 ? `${(maxCacheSize / 1024).toFixed(1)} GB` : `${maxCacheSize} MB`"
+            input-suffix="MB"
+            :aria-label="t('settings.cache_limit')"
+          />
         </div>
-        <input type="range" class="m3-slider" v-model.number="maxCacheSize" min="256" max="10240" step="256" />
+        <input
+          v-model.number="maxCacheSize"
+          type="range"
+          class="m3-slider"
+          :min="MIN_MEDIA_CACHE_SIZE_MB"
+          :max="MAX_MEDIA_CACHE_SIZE_MB"
+          step="256"
+        />
       </div>
 
       <div class="setting-card" style="cursor: pointer" @click="openDownloadTemplateDialog">
@@ -1262,17 +1789,19 @@ async function confirmClearGitHub() {
         </div>
       </div>
 
-      <div class="setting-card" style="cursor: pointer" @click="syncStore.clearCache()">
-        <div class="setting-icon-wrap"><span class="material-symbols-rounded">delete_sweep</span></div>
+      <div class="setting-card" style="cursor: pointer" @click="openStorageManagement">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">database</span></div>
         <div class="setting-info">
-          <div class="setting-title">{{ t('settings.clear_cache') }}</div>
-          <div class="setting-desc">{{ t('settings.clear_cache_desc') }}</div>
+          <div class="setting-title">{{ t('settings.storage_usage_title') }}</div>
+          <div class="setting-desc">{{ t('settings.storage_usage_desc') }}</div>
         </div>
         <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
       </div>
     </div></Transition>
+        </div>
 
     <!-- 备份 & 恢复 -->
+        <div v-show="activeSettingsSection === 'backup'" class="settings-section-panel">
     <div class="section-label clickable" @click="toggleSection('backup')">
       <span class="material-symbols-rounded" style="font-size: 18px">cloud_sync</span>
       <span>{{ t('settings.backup') }}</span>
@@ -1280,6 +1809,25 @@ async function confirmClearGitHub() {
     </div>
 
     <Transition @enter="onExpandEnter" @after-enter="onExpandAfterEnter" @leave="onExpandLeave" @after-leave="onExpandAfterLeave"><div v-if="isExpanded('backup')">
+
+      <!-- 播放历史同步频率：与 Android 一样作为全局偏好 -->
+      <div class="setting-card sub-card sync-frequency-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">timer</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.sync_frequency') }}</div>
+          <div class="setting-desc">{{ t('settings.sync_frequency_desc') }}</div>
+          <div class="chip-wrap">
+            <button
+              v-for="option in syncFrequencyOptions"
+              :key="option.value"
+              class="m3-chip sm"
+              :class="{ active: syncStore.syncFrequency === option.value }"
+              type="button"
+              @click="syncStore.syncFrequency = option.value"
+            >{{ option.label }}</button>
+          </div>
+        </div>
+      </div>
 
       <!-- GitHub 同步 -->
       <template v-if="!syncStore.github.configured">
@@ -1335,7 +1883,7 @@ async function confirmClearGitHub() {
             <div class="setting-title">{{ t('settings.data_saver') }}</div>
             <div class="setting-desc">{{ t('settings.data_saver_desc') }}</div>
           </div>
-          <label class="m3-switch"><input type="checkbox" v-model="syncStore.github.dataSaver" /><span class="track"><span class="thumb"><span v-if="syncStore.github.dataSaver" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
+          <label class="m3-switch"><input type="checkbox" :checked="syncStore.github.dataSaver" @change="requestDataSaverChange" /><span class="track"><span class="thumb"><span v-if="syncStore.github.dataSaver" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
         </div>
 
         <!-- 静默同步失败 -->
@@ -1346,18 +1894,6 @@ async function confirmClearGitHub() {
             <div class="setting-desc">{{ t('settings.silent_failures_desc') }}</div>
           </div>
           <label class="m3-switch"><input type="checkbox" v-model="syncStore.github.silentFailures" /><span class="track"><span class="thumb"><span v-if="syncStore.github.silentFailures" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
-        </div>
-
-        <!-- 同步频率 -->
-        <div class="setting-card sub-card">
-          <div class="setting-icon-wrap"><span class="material-symbols-rounded">timer</span></div>
-          <div class="setting-info">
-            <div class="setting-title">{{ t('settings.sync_frequency') }}</div>
-            <div class="chip-wrap">
-              <button class="m3-chip sm" :class="{ active: syncStore.github.historyUpdateMode === 'immediate' }" @click="syncStore.github.historyUpdateMode = 'immediate'">{{ t('settings.sync_immediate') }}</button>
-              <button class="m3-chip sm" :class="{ active: syncStore.github.historyUpdateMode === 'batched' }" @click="syncStore.github.historyUpdateMode = 'batched'">{{ t('settings.sync_batched') }}</button>
-            </div>
-          </div>
         </div>
 
         <!-- 清除配置 -->
@@ -1389,6 +1925,15 @@ async function confirmClearGitHub() {
         <span v-else class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
       </div>
 
+      <div v-if="syncStore.webdav.configured" class="setting-card sub-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">sync</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.auto_sync') }}</div>
+          <div class="setting-desc">{{ t('settings.auto_sync_desc') }}</div>
+        </div>
+        <label class="m3-switch"><input type="checkbox" v-model="syncStore.webdav.autoSync" /><span class="track"><span class="thumb"><span v-if="syncStore.webdav.autoSync" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
+      </div>
+
       <div class="setting-card" style="cursor: pointer" @click="syncStore.exportPlaylists()">
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">upload_file</span></div>
         <div class="setting-info">
@@ -1407,7 +1952,7 @@ async function confirmClearGitHub() {
         <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
       </div>
 
-      <div class="setting-card" style="cursor: pointer" @click="syncStore.exportPlaylists()">
+      <div class="setting-card" style="cursor: pointer" @click="showConfigExportWarning = true">
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">settings_backup_restore</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.export_config') }}</div>
@@ -1416,7 +1961,7 @@ async function confirmClearGitHub() {
         <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
       </div>
 
-      <div class="setting-card" style="cursor: pointer" @click="syncStore.importPlaylists()">
+      <div class="setting-card" style="cursor: pointer" @click="importConfig">
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">restore</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.import_config') }}</div>
@@ -1425,8 +1970,10 @@ async function confirmClearGitHub() {
         <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
       </div>
     </div></Transition>
+        </div>
 
     <!-- 语言 -->
+        <div v-show="activeSettingsSection === 'language'" class="settings-section-panel">
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">language</span>
       <span>{{ t('settings.language') }}</span>
@@ -1442,8 +1989,10 @@ async function confirmClearGitHub() {
         <button v-for="loc in SUPPORTED_LOCALES" :key="loc.code" class="m3-chip" :class="{ active: locale === loc.code }" @click="handleLocaleSwitch(loc.code, $event)">{{ loc.label }}</button>
       </div>
     </div>
+        </div>
 
     <!-- 关于 -->
+        <div v-show="activeSettingsSection === 'about'" class="settings-section-panel">
     <div class="section-label">
       <span class="material-symbols-rounded" style="font-size: 18px">info</span>
       <span>{{ t('settings.about') }}</span>
@@ -1479,13 +2028,16 @@ async function confirmClearGitHub() {
       </div>
     </div></Transition>
 
-    <div class="setting-card" style="cursor: pointer" @click="shellOpen('https://github.com/nicepkg/NeriPlayer')">
+    <div class="setting-card" style="cursor: pointer" @click="openExternalUrl(PROJECT_REPOSITORY_URL)">
       <div class="setting-icon-wrap"><span class="material-symbols-rounded">code</span></div>
       <div class="setting-info">
         <div class="setting-title">{{ t('settings.github') }}</div>
         <div class="setting-desc">{{ t('settings.github_desc') }}</div>
       </div>
       <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">open_in_new</span>
+    </div>
+        </div>
+      </main>
     </div>
 
     <!-- GitHub 两阶段配置对话框 -->
@@ -1507,7 +2059,7 @@ async function confirmClearGitHub() {
                 <input v-model="githubToken" type="password" placeholder="ghp_xxxxxxxxxxxx" @keyup.enter="githubValidateToken" />
               </div>
               <p class="field-hint">{{ t('settings.github_token_hint') }}</p>
-              <button class="text-link-btn" @click="openGitHubTokenPage">
+              <button type="button" class="text-link-btn" @click="openGitHubTokenPage">
                 <span class="material-symbols-rounded" style="font-size: 16px">open_in_new</span>
                 {{ t('settings.github_create_token') }}
               </button>
@@ -1623,6 +2175,62 @@ async function confirmClearGitHub() {
       </div>
     </Teleport>
 
+    <!-- 切换省流模式确认 -->
+    <Teleport to="body">
+      <div v-if="showDataSaverConfirm" class="dialog-overlay" @click.self="cancelDataSaverChange">
+        <div class="dialog-card" style="width: 380px">
+          <div class="dialog-icon warning">
+            <span class="material-symbols-rounded">warning</span>
+          </div>
+          <h3 class="dialog-title">{{ t('settings.data_saver_warning_title') }}</h3>
+          <p class="dialog-desc">{{ t('settings.data_saver_warning_message') }}</p>
+          <div class="dialog-actions">
+            <button class="dialog-btn" @click="cancelDataSaverChange">{{ t('settings.cancel') }}</button>
+            <button class="dialog-btn primary" @click="confirmDataSaverChange">{{ t('settings.data_saver_warning_confirm') }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 一起听身份重置确认 -->
+    <Teleport to="body">
+      <div v-if="showResetLtIdentityConfirm" class="dialog-overlay" @click.self="showResetLtIdentityConfirm = false">
+        <div class="dialog-card" style="width: 380px">
+          <div class="dialog-icon warning">
+            <span class="material-symbols-rounded">restart_alt</span>
+          </div>
+          <h3 class="dialog-title">{{ t('listen_together.reset_identity_confirm_title') }}</h3>
+          <p class="dialog-desc">{{ t('listen_together.reset_identity_confirm_desc') }}</p>
+          <div class="dialog-actions">
+            <button class="dialog-btn" @click="showResetLtIdentityConfirm = false">{{ t('settings.cancel') }}</button>
+            <button class="dialog-btn danger" @click="confirmResetLtIdentity">{{ t('listen_together.reset_btn') }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 配置导出敏感信息确认 -->
+    <Teleport to="body">
+      <div v-if="showConfigExportWarning" class="dialog-overlay" @click.self="showConfigExportWarning = false">
+        <div class="dialog-card config-warning-dialog">
+          <div class="dialog-icon danger">
+            <span class="material-symbols-rounded">warning</span>
+          </div>
+          <h3 class="dialog-title">{{ t('settings.export_config_warning_title') }}</h3>
+          <p class="dialog-desc">{{ t('settings.export_config_warning_desc') }}</p>
+          <div class="warning-list">
+            <div><span class="material-symbols-rounded">key</span>{{ t('settings.export_config_warning_credentials') }}</div>
+            <div><span class="material-symbols-rounded">cloud_sync</span>{{ t('settings.export_config_warning_sync') }}</div>
+            <div><span class="material-symbols-rounded">lock</span>{{ t('settings.export_config_warning_private') }}</div>
+          </div>
+          <div class="dialog-actions">
+            <button class="dialog-btn" @click="showConfigExportWarning = false">{{ t('settings.cancel') }}</button>
+            <button class="dialog-btn danger" @click="confirmConfigExport">{{ t('settings.export_config_warning_confirm') }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
     <!-- 下载文件名格式编辑对话框 -->
     <Teleport to="body">
       <div v-if="showDownloadTemplateDialog" class="dialog-overlay" @click.self="showDownloadTemplateDialog = false">
@@ -1631,7 +2239,7 @@ async function confirmClearGitHub() {
           <p class="dialog-desc">{{ t('settings.download_format_desc') }}</p>
           <div class="dialog-field">
             <label>{{ t('settings.download_format_template') }}</label>
-            <input v-model="pendingTemplate" type="text" :placeholder="'{artist} - {title}'" />
+          <input v-model="pendingTemplate" type="text" :placeholder="DEFAULT_DOWNLOAD_NAME_TEMPLATE" />
           </div>
           <p class="field-hint">{{ t('settings.download_format_supported') }}</p>
           <div class="template-preview">
@@ -1646,20 +2254,209 @@ async function confirmClearGitHub() {
         </div>
       </div>
     </Teleport>
+
+    <StorageManagementDialog
+      v-model:open="showStorageManagement"
+      :loading="storageLoading"
+      :clearing="storageClearing"
+      :active-download-count="activeDownloadCount"
+      :summary="storageSummary"
+      @clear="clearStorageCache"
+    />
   </div>
 </template>
 
 <style scoped lang="scss">
 .settings-view {
-  padding: 20px 28px 32px;
-  max-width: 680px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 28px clamp(24px, 4vw, 64px) 0;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 280px) minmax(0, 760px);
+  justify-content: center;
+  align-items: stretch;
+  gap: clamp(28px, 5vw, 72px);
+  height: 100%;
+  min-height: 0;
+  max-width: 1160px;
+  margin: 0 auto;
+}
+
+.settings-sidebar {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding-top: 18px;
+  padding-right: 4px;
+
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-nav-group {
+  padding: 4px;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--md-surface-container) 78%, transparent);
+}
+
+.settings-nav-item {
+  width: 100%;
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--md-on-surface);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--duration-short) var(--ease-standard),
+              color var(--duration-short) var(--ease-standard);
+
+  &:hover:not(.active) { background: var(--md-surface-container-high); }
+
+  &.active {
+    background: var(--md-primary-container);
+    color: var(--md-on-primary-container);
+  }
+}
+
+.settings-nav-icon {
+  flex-shrink: 0;
+  font-size: 21px;
+  color: var(--md-primary);
+}
+
+.settings-nav-copy {
+  min-width: 0;
+  flex: 1;
+
+  strong,
+  small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  strong {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.25;
+  }
+
+  small {
+    margin-top: 3px;
+    color: var(--md-on-surface-variant);
+    font-size: 11px;
+    line-height: 1.35;
+    white-space: nowrap;
+  }
+}
+
+.settings-nav-item.active .settings-nav-icon,
+.settings-nav-item.active .settings-nav-copy small {
+  color: var(--md-on-primary-container);
+}
+
+.settings-nav-arrow {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--md-on-surface-variant);
+  font-size: 18px;
+  opacity: 0.7;
+}
+
+.settings-nav-item.active .settings-nav-arrow {
+  color: var(--md-on-primary-container);
+}
+
+.settings-content {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 760px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  padding-top: 18px;
+
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+
+:global(.content:has(.settings-view)) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  scrollbar-width: none;
+}
+
+:global(.content:has(.settings-view)::-webkit-scrollbar) {
+  display: none;
+}
+
+.settings-content-header {
+  margin: 0 4px 24px;
+
+  h2 {
+    margin: 0;
+    font-size: 28px;
+    font-weight: 650;
+    line-height: 1.2;
+  }
+
+  p {
+    margin: 8px 0 0;
+    color: var(--md-on-surface-variant);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+}
+
+.settings-section-panel {
+  min-width: 0;
+}
+
+.settings-section-intro {
+  margin: -2px 4px 14px;
+  color: var(--md-on-surface-variant);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-section-panel > .section-label:first-child {
+  margin-top: 24px;
+}
+
+.settings-content > .settings-section-panel:first-of-type > .section-label:first-child {
+  margin-top: 0;
 }
 
 .page-title {
   font-size: 28px;
   font-weight: 700;
   letter-spacing: -0.5px;
-  margin-bottom: 24px;
+  margin: 0 0 20px;
 }
 
 .section-label {
@@ -1719,6 +2516,24 @@ async function confirmClearGitHub() {
   background: var(--md-surface-container-highest);
   color: var(--md-on-surface-variant);
   font-size: 20px;
+}
+
+.account-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  color: var(--md-on-surface-variant);
+  font-size: 11px;
+}
+
+.account-status.connected { color: var(--md-primary); }
+
+.account-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .account-login-btn {
@@ -1977,6 +2792,10 @@ async function confirmClearGitHub() {
   background: var(--md-surface-container-low) !important;
 }
 
+.setting-card.sync-frequency-card {
+  margin-left: 0;
+}
+
 /* M3 Chip 选择器 */
 .chip-row, .chip-wrap {
   display: flex;
@@ -2153,6 +2972,55 @@ async function confirmClearGitHub() {
   font-size: 18px;
   font-weight: 600;
   margin-bottom: 20px;
+}
+
+.dialog-icon {
+  width: 42px;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 14px;
+  border-radius: 50%;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+
+  &.warning {
+    background: color-mix(in srgb, var(--md-tertiary, #7d5260) 16%, transparent);
+    color: var(--md-tertiary, #7d5260);
+  }
+
+  &.danger {
+    background: color-mix(in srgb, var(--md-error) 16%, transparent);
+    color: var(--md-error);
+  }
+}
+
+.config-warning-dialog {
+  width: 430px;
+}
+
+.warning-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--md-error) 7%, var(--md-surface-container));
+  color: var(--md-on-surface-variant);
+  font-size: 12px;
+
+  div {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .material-symbols-rounded {
+    color: var(--md-error);
+    font-size: 17px;
+  }
 }
 
 .dialog-field {
@@ -2372,5 +3240,105 @@ async function confirmClearGitHub() {
     color: var(--md-on-surface);
     word-break: break-all;
   }
+}
+
+@media (max-width: 960px) {
+  .settings-view { padding-inline: 24px; }
+
+  .settings-layout {
+    grid-template-columns: minmax(210px, 240px) minmax(0, 1fr);
+    gap: 24px;
+  }
+
+  .settings-content { padding-top: 10px; }
+}
+
+@media (max-width: 760px) {
+  :global(.content:has(.settings-view)) {
+    height: auto;
+    overflow-y: auto;
+  }
+
+  .settings-view {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+    padding: 20px 18px 32px;
+  }
+
+  .settings-layout {
+    display: block;
+    height: auto;
+    min-height: 0;
+    max-width: none;
+  }
+
+  .settings-sidebar {
+    position: static;
+    min-height: 0;
+    overflow: visible;
+    padding: 0;
+  }
+
+  .page-title {
+    margin-bottom: 14px;
+    font-size: 24px;
+  }
+
+  .settings-nav {
+    flex-direction: row;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 0 2px 8px;
+    scrollbar-width: none;
+
+    &::-webkit-scrollbar { display: none; }
+  }
+
+  .settings-nav-group {
+    display: contents;
+  }
+
+  .settings-nav-item {
+    flex: 0 0 210px;
+    min-height: 56px;
+  }
+
+  .settings-nav-copy small { display: none; }
+
+  .settings-content {
+    max-width: none;
+    min-height: 0;
+    overflow: visible;
+    padding-right: 0;
+    padding-top: 12px;
+  }
+
+  .settings-content-header {
+    margin-bottom: 18px;
+
+    h2 { font-size: 24px; }
+  }
+}
+
+@media (max-width: 480px) {
+  .settings-view { padding-inline: 14px; }
+
+  .settings-nav-item {
+    flex-basis: 184px;
+    padding-inline: 10px;
+  }
+
+  .setting-card {
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .setting-icon-wrap {
+    width: 36px;
+    height: 36px;
+  }
+
+  .sub-card { margin-left: 20px; }
 }
 </style>

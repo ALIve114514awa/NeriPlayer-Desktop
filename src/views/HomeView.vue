@@ -393,7 +393,7 @@ function formatNotifTime(ts: number): string {
         >
           <div class="song-grid-cover">
             <span class="material-symbols-rounded filled cover-fallback">music_note</span>
-            <img v-if="song.cover_url" :src="song.cover_url" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="song.cover_url" :src="song.cover_url" loading="lazy" />
           </div>
           <div class="song-grid-info">
             <div class="song-grid-title">{{ song.title }}</div>
@@ -436,7 +436,7 @@ function formatNotifTime(ts: number): string {
         >
           <div class="song-grid-cover">
             <span class="material-symbols-rounded filled cover-fallback">music_note</span>
-            <img v-if="song.cover_url" :src="song.cover_url" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="song.cover_url" :src="song.cover_url" loading="lazy" />
           </div>
           <div class="song-grid-info">
             <div class="song-grid-title">{{ song.title }}</div>
@@ -464,7 +464,7 @@ function formatNotifTime(ts: number): string {
         >
           <div class="playlist-cover">
             <span class="material-symbols-rounded filled cover-fallback">queue_music</span>
-            <img v-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="pl.coverUrl" :src="pl.coverUrl" loading="lazy" />
           </div>
           <div class="playlist-name">{{ pl.name }}</div>
         </div>
@@ -485,7 +485,7 @@ function formatNotifTime(ts: number): string {
         >
           <div class="daily-cover">
             <span class="material-symbols-rounded filled cover-fallback">music_note</span>
-            <img v-if="song.al?.picUrl" :src="song.al.picUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="song.al?.picUrl" :src="song.al.picUrl" loading="lazy" />
           </div>
           <div class="daily-name">{{ song.name }}</div>
           <div class="daily-artist">{{ song.ar?.map((a: any) => a.name).join(', ') }}</div>
@@ -514,7 +514,7 @@ function formatNotifTime(ts: number): string {
         >
           <div class="daily-cover">
             <span class="material-symbols-rounded filled cover-fallback">music_note</span>
-            <img v-if="item.coverUrl" :src="item.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
+            <BilibiliCoverImage v-if="item.coverUrl" :src="item.coverUrl" loading="lazy" />
           </div>
           <div class="daily-name">{{ item.title }}</div>
           <div class="daily-artist">{{ item.subtitle }}</div>
@@ -540,10 +540,9 @@ function formatNotifTime(ts: number): string {
         >
           <div class="playlist-cover">
             <span class="material-symbols-rounded filled cover-fallback">queue_music</span>
-            <BilibiliCoverImage v-if="pl.coverUrl && pl.platform === 'bilibili'" :src="pl.coverUrl" loading="lazy">
+            <BilibiliCoverImage v-if="pl.coverUrl" :src="pl.coverUrl" loading="lazy">
               <span class="material-symbols-rounded filled">queue_music</span>
             </BilibiliCoverImage>
-            <img v-else-if="pl.coverUrl" :src="pl.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
           </div>
           <div class="playlist-name">{{ pl.name }}</div>
         </div>
@@ -568,12 +567,10 @@ function formatNotifTime(ts: number): string {
         >
           <div class="daily-cover">
             <span class="material-symbols-rounded filled cover-fallback">music_note</span>
-            <img
+            <BilibiliCoverImage
               v-if="track.coverUrl"
               :src="track.coverUrl"
-              referrerpolicy="no-referrer"
               loading="lazy"
-              @error="($event.target as HTMLImageElement).style.display = 'none'"
             />
           </div>
           <div class="daily-name">{{ track.title }}</div>
@@ -600,12 +597,10 @@ function formatNotifTime(ts: number): string {
         >
           <div class="daily-cover">
             <span class="material-symbols-rounded filled cover-fallback">music_note</span>
-            <img
+            <BilibiliCoverImage
               v-if="track.coverUrl"
               :src="track.coverUrl"
-              referrerpolicy="no-referrer"
               loading="lazy"
-              @error="($event.target as HTMLImageElement).style.display = 'none'"
             />
           </div>
           <div class="daily-name">{{ track.title }}</div>

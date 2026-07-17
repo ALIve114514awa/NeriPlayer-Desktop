@@ -6,6 +6,15 @@ import { useDownloadStore, type ActiveDownloadTask, type DownloadedTrack } from 
 import { usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
+import {
+  createContextMenuItem,
+  createContextMenuSeparator,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+  type ContextMenuPosition,
+} from '@/utils/contextMenu'
 
 const { t } = useI18n()
 const downloadStore = useDownloadStore()
@@ -18,6 +27,14 @@ const selectedIds = ref<Set<string>>(new Set())
 const showDeleteDialog = ref(false)
 const deleteTarget = ref<DownloadedTrack | null>(null)
 const batchDeleting = ref(false)
+
+type DownloadContextTarget =
+  | { kind: 'downloaded'; track: DownloadedTrack }
+  | { kind: 'active'; task: ActiveDownloadTask }
+
+const downloadContextMenuOpen = ref(false)
+const downloadContextMenuPosition = ref<ContextMenuPosition>({ x: 0, y: 0 })
+const downloadContextMenuTarget = ref<DownloadContextTarget | null>(null)
 
 onMounted(() => {
   downloadStore.initEvents()
@@ -56,6 +73,46 @@ const downloadedDesc = computed(() => {
     return t('download.search_result_count', { count: filteredDownloads.value.length })
   }
   return t('download.downloaded_desc', { count: filteredDownloads.value.length })
+})
+
+const downloadContextMenuItems = computed<readonly ContextMenuItem[]>(() => {
+  const target = downloadContextMenuTarget.value
+  if (!target) return []
+
+  if (target.kind === 'active') {
+    const canCancel = target.task.status === 'resolving' || target.task.status === 'downloading'
+    return [createContextMenuItem(t('download.cancel_task'), {
+      id: 'cancel',
+      icon: 'close',
+      danger: true,
+      disabled: !canCancel,
+    })]
+  }
+
+  const isInUse = isTrackInUse(target.track)
+  return [
+    createContextMenuItem(t('common.multi_select'), {
+      id: 'select',
+      icon: 'checklist',
+    }),
+    createContextMenuSeparator('download-selection'),
+    createContextMenuItem(t('download.open_folder'), {
+      id: 'open-folder',
+      icon: 'folder_open',
+    }),
+    createContextMenuItem(t('download.redownload'), {
+      id: 'redownload',
+      icon: 'refresh',
+      disabled: isInUse,
+    }),
+    createContextMenuSeparator('download-actions'),
+    createContextMenuItem(t('common.delete'), {
+      id: 'delete',
+      icon: 'delete',
+      danger: true,
+      disabled: isInUse,
+    }),
+  ]
 })
 
 watch(filteredDownloads, (items) => {
@@ -159,6 +216,56 @@ function playDownloadedTrack(track: DownloadedTrack) {
     return
   }
   player.play(downloadToTrack(track))
+}
+
+function openDownloadContextMenu(event: MouseEvent, target: DownloadContextTarget) {
+  downloadContextMenuPosition.value = { x: event.clientX, y: event.clientY }
+  downloadContextMenuTarget.value = target
+  downloadContextMenuOpen.value = true
+}
+
+function handleDownloadedRowContextMenu(event: MouseEvent, track: DownloadedTrack) {
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
+  openDownloadContextMenu(event, { kind: 'downloaded', track })
+}
+
+function handleActiveTaskContextMenu(event: MouseEvent, task: ActiveDownloadTask) {
+  if (selectionMode.value) return
+  openDownloadContextMenu(event, { kind: 'active', task })
+}
+
+function closeDownloadContextMenu() {
+  downloadContextMenuOpen.value = false
+  downloadContextMenuTarget.value = null
+}
+
+function handleDownloadContextMenuClick(item: ContextMenuActionItem) {
+  const target = downloadContextMenuTarget.value
+  closeDownloadContextMenu()
+  if (!target) return
+
+  if (target.kind === 'active') {
+    if (item.id === 'cancel') void downloadStore.cancelDownload(target.task.trackId)
+    return
+  }
+
+  switch (item.id) {
+    case 'select':
+      if (target.kind === 'downloaded') enterSelectionMode(target.track)
+      break
+    case 'open-folder':
+      void revealDownloadFile(target.track)
+      break
+    case 'redownload':
+      void redownloadTrack(target.track)
+      break
+    case 'delete':
+      requestDelete(target.track)
+      break
+  }
 }
 
 function enterSelectionMode(track?: DownloadedTrack) {
@@ -303,7 +410,13 @@ function progressWidth(task: ActiveDownloadTask) {
         <h2>{{ t('download.active_tasks', { count: activeTasks.length }) }}</h2>
       </div>
       <div class="task-list">
-        <div v-for="task in activeTasks" :key="task.trackId" class="task-row" :class="`status-${task.status}`">
+        <div
+          v-for="task in activeTasks"
+          :key="task.trackId"
+          class="task-row"
+          :class="`status-${task.status}`"
+          @contextmenu.prevent.stop="handleActiveTaskContextMenu($event, task)"
+        >
           <div class="task-icon">
             <span class="material-symbols-rounded">{{ statusIcon(task) }}</span>
           </div>
@@ -383,14 +496,14 @@ function progressWidth(task: ActiveDownloadTask) {
             disabled: isTrackInUse(track),
           }"
           @click="playDownloadedTrack(track)"
-          @contextmenu.prevent="enterSelectionMode(track)"
+          @contextmenu.prevent.stop="handleDownloadedRowContextMenu($event, track)"
         >
           <button v-if="selectionMode" class="select-dot" :disabled="isTrackInUse(track)" @click.stop="toggleSelected(track.id)">
             <span class="material-symbols-rounded filled">{{ selectedIds.has(track.id) ? 'check_circle' : 'radio_button_unchecked' }}</span>
           </button>
 
           <div class="cover-box">
-            <img v-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" />
+            <BilibiliCoverImage v-if="track.coverUrl" :src="track.coverUrl" loading="lazy" />
             <span v-else class="material-symbols-rounded filled">music_note</span>
             <div class="play-overlay"><span class="material-symbols-rounded">play_arrow</span></div>
           </div>
@@ -424,6 +537,15 @@ function progressWidth(task: ActiveDownloadTask) {
         <p>{{ searchQuery ? t('download.search_empty_desc') : t('download.empty_desc') }}</p>
       </div>
     </section>
+
+    <ContextMenu
+      v-model:open="downloadContextMenuOpen"
+      :x="downloadContextMenuPosition.x"
+      :y="downloadContextMenuPosition.y"
+      :items="downloadContextMenuItems"
+      @click="handleDownloadContextMenuClick"
+      @close="closeDownloadContextMenu"
+    />
 
     <M3Dialog
       v-model:open="showDeleteDialog"

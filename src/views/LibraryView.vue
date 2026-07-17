@@ -15,7 +15,13 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import M3Input from '@/components/ui/M3Input.vue'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import {
+  createContextMenuItem,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+} from '@/utils/contextMenu'
 
 const router = useRouter()
 const route = useRoute()
@@ -96,6 +102,9 @@ function toBackendTrack(track: TrackInfo) {
     source: inferTrackSource(track),
     url: track.audioUrl || '',
     cover_url: track.coverUrl || null,
+    added_at: Math.max(0, Math.round(track.addedAt || 0)),
+    sync_payload: track.syncPayload ?? null,
+    playlist_key: track.playlistKey ?? null,
   }
 }
 
@@ -211,24 +220,12 @@ function displayName(pl: PlaylistInfo): string {
 }
 
 function openContextMenu(e: MouseEvent, pl: PlaylistInfo) {
-  // 基于按钮位置定位，并确保不超出视口
+  if (isProtectedPlaylist(pl)) return
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
-  const menuWidth = 200
-  const menuHeight = 100
-
-  // 默认：按钮左侧弹出
-  let x = rect.left - menuWidth - 4
-  let y = rect.top
-
-  // 左侧空间不足时改为右侧
+  let x = rect.left - 204
   if (x < 8) x = rect.right + 4
-  // 右侧仍然超出时贴左
-  if (x + menuWidth > window.innerWidth - 8) x = window.innerWidth - menuWidth - 8
-  // 底部超出时上移
-  if (y + menuHeight > window.innerHeight - 8) y = window.innerHeight - menuHeight - 8
-
-  contextMenu.value = { show: true, x, y, playlist: pl }
+  contextMenu.value = { show: true, x, y: rect.top, playlist: pl }
 }
 
 function closeContextMenu() {
@@ -269,6 +266,33 @@ function requestRename(pl: PlaylistInfo) {
   renameValue.value = pl.name
   showRenameDialog.value = true
   nextTick(() => renameInputRef.value?.focus())
+}
+
+const playlistMenuItems = computed<ContextMenuItem[]>(() => {
+  const playlist = contextMenu.value.playlist
+  return [
+    createContextMenuItem(t('library.rename_playlist'), { id: 'rename', icon: 'edit' }),
+    createContextMenuItem(t('library.delete_playlist'), {
+      id: 'delete',
+      icon: 'delete',
+      danger: true,
+      disabled: !playlist || isProtectedPlaylist(playlist),
+    }),
+  ]
+})
+
+function handlePlaylistMenuClick(item: ContextMenuActionItem) {
+  const playlist = contextMenu.value.playlist
+  if (!playlist) return
+
+  switch (item.id) {
+    case 'rename':
+      requestRename(playlist)
+      break
+    case 'delete':
+      requestDelete(playlist)
+      break
+  }
 }
 
 async function confirmRename() {
@@ -347,14 +371,9 @@ const dlContextMenu = ref<{ show: boolean; x: number; y: number; track: any | nu
 function openDlContextMenu(e: MouseEvent, track: any) {
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
-  const menuWidth = 200
-  const menuHeight = 96
-  let x = rect.left - menuWidth - 4
-  let y = rect.top
+  let x = rect.left - 204
   if (x < 8) x = rect.right + 4
-  if (x + menuWidth > window.innerWidth - 8) x = window.innerWidth - menuWidth - 8
-  if (y + menuHeight > window.innerHeight - 8) y = window.innerHeight - menuHeight - 8
-  dlContextMenu.value = { show: true, x, y, track }
+  dlContextMenu.value = { show: true, x, y: rect.top, track }
 }
 
 function closeDlContextMenu() {
@@ -450,6 +469,46 @@ async function redownloadDownloadedTrack(track: any) {
   })
 }
 
+const downloadMenuItems = computed<ContextMenuItem[]>(() => {
+  const track = dlContextMenu.value.track
+  const isInUse = track ? isDownloadedTrackInUse(track) : true
+  return [
+    createContextMenuItem(t('download.open_folder'), {
+      id: 'reveal',
+      icon: 'folder_open',
+      disabled: !track,
+    }),
+    createContextMenuItem(t('download.redownload'), {
+      id: 'redownload',
+      icon: 'refresh',
+      disabled: !track || isInUse,
+    }),
+    createContextMenuItem(t('common.delete'), {
+      id: 'delete',
+      icon: 'delete',
+      danger: true,
+      disabled: !track || isInUse,
+    }),
+  ]
+})
+
+function handleDownloadMenuClick(item: ContextMenuActionItem) {
+  const track = dlContextMenu.value.track
+  if (!track) return
+
+  switch (item.id) {
+    case 'reveal':
+      void revealDownloadFile(track)
+      break
+    case 'redownload':
+      void redownloadDownloadedTrack(track)
+      break
+    case 'delete':
+      requestDlDelete(track)
+      break
+  }
+}
+
 // 拉取云端歌单
 onMounted(() => {
   if (auth.netease.loggedIn && !neteasePlaylists.value.length) {
@@ -521,7 +580,13 @@ onUnmounted(() => {
       <p v-if="library.scanError" class="scan-error">{{ t('library.scan_failed') }}</p>
 
       <!-- 歌单列表 -->
-      <div v-for="pl in playlists" :key="pl.id" class="playlist-item" @click="router.push({ name: 'local-playlist', params: { id: pl.id } })">
+      <div
+        v-for="pl in playlists"
+        :key="pl.id"
+        class="playlist-item"
+        @click="router.push({ name: 'local-playlist', params: { id: pl.id } })"
+        @contextmenu.prevent.stop="openContextMenu($event, pl)"
+      >
         <div class="pl-icon" :class="{ 'has-cover': pl.cover_url }">
           <BilibiliCoverImage v-if="isBilibiliCover(pl.cover_url)" :src="pl.cover_url!" class="pl-cover-img">
             <span class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
@@ -628,6 +693,7 @@ onUnmounted(() => {
           :key="'dl-' + dl.id"
           class="playlist-item"
           @click="playDownloadedTrack(dl)"
+          @contextmenu.prevent.stop="openDlContextMenu($event, dl)"
         >
           <div class="pl-icon has-cover" v-if="dl.coverUrl">
             <img :src="dl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
@@ -755,7 +821,7 @@ onUnmounted(() => {
           v-for="album in recommend.userAlbums"
           :key="album.id"
           class="playlist-item"
-          @click="router.push({ path: '/netease-playlist/' + album.id, query: { isAlbum: '1', name: album.name } })"
+          @click="router.push({ name: 'netease-album', params: { id: album.id } })"
         >
           <div class="pl-icon has-cover">
             <img
@@ -781,33 +847,14 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 下载项上下文菜单 -->
-    <Teleport to="body">
-      <div v-if="dlContextMenu.show" class="context-overlay" @click="closeDlContextMenu" @contextmenu.prevent="closeDlContextMenu">
-        <div class="context-menu" :style="{ left: dlContextMenu.x + 'px', top: dlContextMenu.y + 'px' }">
-          <button class="ctx-item" @click="revealDownloadFile(dlContextMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">folder_open</span>
-            <span>{{ t('download.open_folder') }}</span>
-          </button>
-          <button
-            class="ctx-item"
-            :disabled="isDownloadedTrackInUse(dlContextMenu.track)"
-            @click="redownloadDownloadedTrack(dlContextMenu.track!)"
-          >
-            <span class="material-symbols-rounded" style="font-size: 20px">refresh</span>
-            <span>{{ t('download.redownload') }}</span>
-          </button>
-          <button
-            class="ctx-item danger"
-            :disabled="isDownloadedTrackInUse(dlContextMenu.track)"
-            @click="requestDlDelete(dlContextMenu.track!)"
-          >
-            <span class="material-symbols-rounded" style="font-size: 20px">delete</span>
-            <span>{{ t('common.delete') }}</span>
-          </button>
-        </div>
-      </div>
-    </Teleport>
+    <ContextMenu
+      :open="dlContextMenu.show"
+      :x="dlContextMenu.x"
+      :y="dlContextMenu.y"
+      :items="downloadMenuItems"
+      @update:open="dlContextMenu.show = $event"
+      @click="handleDownloadMenuClick"
+    />
 
     <!-- 删除下载确认对话框 -->
     <M3Dialog
@@ -839,21 +886,14 @@ onUnmounted(() => {
       />
     </M3Dialog>
 
-    <!-- 上下文菜单 -->
-    <Teleport to="body">
-      <div v-if="contextMenu.show" class="context-overlay" @click="closeContextMenu" @contextmenu.prevent="closeContextMenu">
-        <div class="context-menu" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }">
-          <button class="ctx-item" @click="requestRename(contextMenu.playlist!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">edit</span>
-            <span>{{ t('library.rename_playlist') }}</span>
-          </button>
-          <button v-if="!isProtectedPlaylist(contextMenu.playlist!)" class="ctx-item danger" @click="requestDelete(contextMenu.playlist!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">delete</span>
-            <span>{{ t('library.delete_playlist') }}</span>
-          </button>
-        </div>
-      </div>
-    </Teleport>
+    <ContextMenu
+      :open="contextMenu.show"
+      :x="contextMenu.x"
+      :y="contextMenu.y"
+      :items="playlistMenuItems"
+      @update:open="contextMenu.show = $event"
+      @click="handlePlaylistMenuClick"
+    />
 
     <!-- 删除确认对话框 -->
     <M3Dialog
@@ -1297,64 +1337,10 @@ onUnmounted(() => {
   opacity: 0.5;
 }
 
-/* 上下文菜单 — 样式移至 non-scoped block（Teleport to body） */
-
 /* 对话框描述文本 */
 .dialog-msg {
   font-size: 14px;
   color: var(--md-on-surface-variant);
   line-height: 1.5;
-}
-</style>
-
-<!-- 非 scoped 样式：Teleport 渲染到 body 的上下文菜单 -->
-<style lang="scss">
-.context-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-}
-
-.context-menu {
-  position: fixed;
-  min-width: 200px;
-  background: var(--md-surface-container-high);
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.15);
-  border: 1px solid var(--md-outline-variant);
-  padding: 4px 0;
-  z-index: 501;
-  animation: ctx-in 120ms ease-out;
-}
-
-@keyframes ctx-in {
-  from { opacity: 0; transform: scale(0.95) translateY(-4px); }
-  to   { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-.ctx-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 10px 16px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--md-on-surface);
-  background: none;
-  border: none;
-  cursor: pointer;
-  transition: background 150ms;
-  font-family: inherit;
-
-  &:hover { background: var(--md-surface-container-highest); }
-  &:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-    pointer-events: none;
-  }
-
-  &.danger { color: var(--md-error); }
-  &.danger:hover { background: color-mix(in srgb, var(--md-error) 8%, transparent); }
 }
 </style>

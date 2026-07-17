@@ -9,11 +9,12 @@ import { invoke } from '@tauri-apps/api/core'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
-
-function isBilibiliCover(url?: string | null): boolean {
-  if (!url) return false
-  return /\.(hdslb|biliimg)\.com/i.test(url)
-}
+import ContextMenu from '@/components/ui/ContextMenu.vue'
+import {
+  createContextMenuItem,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+} from '@/utils/contextMenu'
 
 const route = useRoute()
 const router = useRouter()
@@ -32,6 +33,10 @@ const isBatchRemoving = ref(false)
 
 const tracks = ref<TrackInfo[]>([])
 
+function trackSelectionKey(track: TrackInfo): string {
+  return track.playlistKey || `${track.id}|${track.album}`
+}
+
 const filteredTracks = computed(() => {
   if (!searchQuery.value) return tracks.value
   const q = searchQuery.value.toLowerCase()
@@ -42,9 +47,9 @@ const filteredTracks = computed(() => {
   )
 })
 
-const selectedTracks = computed(() => tracks.value.filter(t => selectedIds.value.has(t.id)))
+const selectedTracks = computed(() => tracks.value.filter(t => selectedIds.value.has(trackSelectionKey(t))))
 const selectedCount = computed(() => selectedIds.value.size)
-const visibleSelectedCount = computed(() => filteredTracks.value.filter(t => selectedIds.value.has(t.id)).length)
+const visibleSelectedCount = computed(() => filteredTracks.value.filter(t => selectedIds.value.has(trackSelectionKey(t))).length)
 const allVisibleSelected = computed(() => filteredTracks.value.length > 0 && visibleSelectedCount.value === filteredTracks.value.length)
 
 // 总时长
@@ -99,33 +104,25 @@ const addToPlaylistTargets = ref<TrackInfo[]>([])
 
 function openTrackMenu(e: MouseEvent, track: TrackInfo, index: number) {
   if (selectionMode.value) {
-    toggleSelected(track.id)
+    toggleSelected(trackSelectionKey(track))
     return
   }
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
-  const menuWidth = 200
-  const menuHeight = 184
-  let x = rect.left - menuWidth - 4
-  let y = rect.top
+  let x = rect.left - 204
   if (x < 8) x = rect.right + 4
-  if (x + menuWidth > window.innerWidth - 8) x = window.innerWidth - menuWidth - 8
-  if (y + menuHeight > window.innerHeight - 8) y = window.innerHeight - menuHeight - 8
-
-  trackMenu.value = { show: true, x, y, track, index }
+  trackMenu.value = { show: true, x, y: rect.top, track, index }
 }
 
 function openTrackContextMenu(e: MouseEvent, track: TrackInfo, index: number) {
-  if (!selectionMode.value) {
-    enterSelectionMode(track)
+  if (selectionMode.value) {
+    toggleSelected(trackSelectionKey(track))
     return
   }
-  const menuWidth = 200
-  const menuHeight = 184
   trackMenu.value = {
     show: true,
-    x: Math.max(8, Math.min(e.clientX, window.innerWidth - menuWidth - 8)),
-    y: Math.max(8, Math.min(e.clientY, window.innerHeight - menuHeight - 8)),
+    x: e.clientX,
+    y: e.clientY,
     track,
     index,
   }
@@ -177,12 +174,13 @@ async function confirmRemove() {
       isBatchRemoving.value = true
       const ids = [...selectedIds.value]
       await invoke('remove_tracks_from_playlist', { playlistId: id, trackIds: ids })
-      tracks.value = tracks.value.filter(t => !selectedIds.value.has(t.id))
+      tracks.value = tracks.value.filter(t => !selectedIds.value.has(trackSelectionKey(t)))
       toast.success(`已移除 ${ids.length} 首歌曲`)
       leaveSelectionMode()
     } else if (removeTarget.value) {
-      await invoke('remove_from_playlist', { playlistId: id, trackId: removeTarget.value.id })
-      tracks.value = tracks.value.filter(t => t.id !== removeTarget.value!.id)
+      const trackKey = trackSelectionKey(removeTarget.value)
+      await invoke('remove_from_playlist', { playlistId: id, trackId: trackKey })
+      tracks.value = tracks.value.filter(t => trackSelectionKey(t) !== trackKey)
     }
   } catch (e) {
     console.error('Remove failed:', e)
@@ -203,9 +201,45 @@ function addToQueueEnd(track: TrackInfo) {
   player.addToQueueEnd(track)
 }
 
+const trackMenuItems = computed<ContextMenuItem[]>(() => [
+  createContextMenuItem(t('common.multi_select'), { id: 'select', icon: 'checklist' }),
+  createContextMenuItem(t('player.play_next'), { id: 'play-next', icon: 'queue_play_next' }),
+  createContextMenuItem(t('player.add_to_queue'), { id: 'add-to-queue', icon: 'add_to_queue' }),
+  createContextMenuItem(t('player.add_to_playlist'), { id: 'add-to-playlist', icon: 'playlist_add' }),
+  createContextMenuItem(t('library.remove_from_playlist'), {
+    id: 'remove-from-playlist',
+    icon: 'delete',
+    danger: true,
+  }),
+])
+
+function handleTrackMenuClick(item: ContextMenuActionItem) {
+  const track = trackMenu.value.track
+  if (!track) return
+
+  switch (item.id) {
+    case 'select':
+      closeTrackMenu()
+      enterSelectionMode(track)
+      break
+    case 'play-next':
+      addToQueueNext(track)
+      break
+    case 'add-to-queue':
+      addToQueueEnd(track)
+      break
+    case 'add-to-playlist':
+      openAddToPlaylist(track)
+      break
+    case 'remove-from-playlist':
+      requestRemove(track)
+      break
+  }
+}
+
 function enterSelectionMode(track?: TrackInfo) {
   selectionMode.value = true
-  if (track) selectedIds.value = new Set(selectedIds.value).add(track.id)
+  if (track) selectedIds.value = new Set(selectedIds.value).add(trackSelectionKey(track))
 }
 
 function leaveSelectionMode() {
@@ -224,13 +258,13 @@ function toggleSelected(trackId: string) {
 function toggleSelectAllVisible() {
   if (allVisibleSelected.value) {
     const next = new Set(selectedIds.value)
-    for (const track of filteredTracks.value) next.delete(track.id)
+    for (const track of filteredTracks.value) next.delete(trackSelectionKey(track))
     selectedIds.value = next
     if (next.size === 0) selectionMode.value = false
     return
   }
   const next = new Set(selectedIds.value)
-  for (const track of filteredTracks.value) next.add(track.id)
+  for (const track of filteredTracks.value) next.add(trackSelectionKey(track))
   selectedIds.value = next
   if (next.size > 0) selectionMode.value = true
 }
@@ -261,14 +295,10 @@ function shufflePlay() {
 
 function playTrack(track: TrackInfo) {
   if (selectionMode.value) {
-    toggleSelected(track.id)
+    toggleSelected(trackSelectionKey(track))
     return
   }
-  player.clearQueue()
-  for (const t of filteredTracks.value) {
-    player.addToQueueEnd(t)
-  }
-  player.play(track)
+  player.playAll(filteredTracks.value, track.id, trackSelectionKey(track))
 }
 
 // 歌单封面：取第一首有 cover 的曲目
@@ -313,10 +343,9 @@ onMounted(() => {
       <!-- Hero 封面 + 信息（对齐 NeteasePlaylistView） -->
       <div class="detail-hero">
         <div class="hero-cover">
-          <BilibiliCoverImage v-if="playlistCover && isBilibiliCover(playlistCover)" :src="playlistCover">
+          <BilibiliCoverImage v-if="playlistCover" :src="playlistCover">
             <span class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">queue_music</span>
           </BilibiliCoverImage>
-          <img v-else-if="playlistCover" :src="playlistCover" referrerpolicy="no-referrer" />
           <span v-else class="material-symbols-rounded filled" style="font-size: 48px; opacity: 0.3">queue_music</span>
         </div>
         <div class="hero-info">
@@ -332,7 +361,7 @@ onMounted(() => {
             <button class="hero-icon-btn" :title="t('player.shuffle_play')" @click="shufflePlay">
               <span class="material-symbols-rounded">shuffle</span>
             </button>
-            <button class="hero-icon-btn" title="多选" @click="enterSelectionMode()">
+            <button class="hero-icon-btn" :title="t('common.multi_select')" @click="enterSelectionMode()">
               <span class="material-symbols-rounded">checklist</span>
             </button>
           </div>
@@ -374,24 +403,23 @@ onMounted(() => {
         <div class="track-list">
         <div
           v-for="(track, index) in filteredTracks"
-          :key="track.id"
+          :key="trackSelectionKey(track)"
           class="track-item"
-          :class="{ active: player.currentTrack?.id === track.id, selected: selectedIds.has(track.id), 'selection-mode': selectionMode }"
+          :class="{ active: player.currentTrack && trackSelectionKey(player.currentTrack) === trackSelectionKey(track), selected: selectedIds.has(trackSelectionKey(track)), 'selection-mode': selectionMode }"
           @click="playTrack(track)"
           @contextmenu.prevent.stop="openTrackContextMenu($event, track, index)"
         >
-          <button v-if="selectionMode" class="track-select" @click.stop="toggleSelected(track.id)">
-            <span class="material-symbols-rounded filled">{{ selectedIds.has(track.id) ? 'check_circle' : 'radio_button_unchecked' }}</span>
+          <button v-if="selectionMode" class="track-select" @click.stop="toggleSelected(trackSelectionKey(track))">
+            <span class="material-symbols-rounded filled">{{ selectedIds.has(trackSelectionKey(track)) ? 'check_circle' : 'radio_button_unchecked' }}</span>
           </button>
           <div v-else class="track-index">
-            <div v-if="player.currentTrack?.id === track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
+            <div v-if="player.currentTrack && trackSelectionKey(player.currentTrack) === trackSelectionKey(track) && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
             <span v-else class="index-num">{{ index + 1 }}</span>
           </div>
           <div class="track-cover">
-            <BilibiliCoverImage v-if="isBilibiliCover(track.coverUrl)" :src="track.coverUrl" loading="lazy">
+            <BilibiliCoverImage v-if="track.coverUrl" :src="track.coverUrl" loading="lazy">
               <span class="material-symbols-rounded filled">music_note</span>
             </BilibiliCoverImage>
-            <img v-else-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
             <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="track-info">
@@ -407,29 +435,14 @@ onMounted(() => {
       </template>
     </template>
 
-    <!-- 曲目右键菜单 -->
-    <Teleport to="body">
-      <div v-if="trackMenu.show" class="context-overlay" @click="closeTrackMenu" @contextmenu.prevent="closeTrackMenu">
-        <div class="context-menu" :style="{ left: trackMenu.x + 'px', top: trackMenu.y + 'px' }">
-          <button class="ctx-item" @click="addToQueueNext(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">queue_play_next</span>
-            <span>{{ t('player.play_next') }}</span>
-          </button>
-          <button class="ctx-item" @click="addToQueueEnd(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">add_to_queue</span>
-            <span>{{ t('player.add_to_queue') }}</span>
-          </button>
-          <button class="ctx-item" @click="openAddToPlaylist(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">playlist_add</span>
-            <span>{{ t('player.add_to_playlist') }}</span>
-          </button>
-          <button class="ctx-item danger" @click="requestRemove(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">delete</span>
-            <span>{{ t('library.remove_from_playlist') }}</span>
-          </button>
-        </div>
-      </div>
-    </Teleport>
+    <ContextMenu
+      :open="trackMenu.show"
+      :x="trackMenu.x"
+      :y="trackMenu.y"
+      :items="trackMenuItems"
+      @update:open="trackMenu.show = $event"
+      @click="handleTrackMenuClick"
+    />
 
     <!-- 删除确认对话框 -->
     <M3Dialog
@@ -556,53 +569,5 @@ onMounted(() => {
   font-size: 14px;
   color: var(--md-on-surface-variant);
   line-height: 1.5;
-}
-</style>
-
-<!-- Teleport 菜单样式 -->
-<style lang="scss">
-.context-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-}
-
-.context-menu {
-  position: fixed;
-  min-width: 200px;
-  background: var(--md-surface-container-high);
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.15);
-  border: 1px solid var(--md-outline-variant);
-  padding: 4px 0;
-  z-index: 501;
-  animation: ctx-in 120ms ease-out;
-}
-
-@keyframes ctx-in {
-  from { opacity: 0; transform: scale(0.95) translateY(-4px); }
-  to   { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-.ctx-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 10px 16px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--md-on-surface);
-  background: none;
-  border: none;
-  cursor: pointer;
-  transition: background 150ms;
-  font-family: inherit;
-
-  &:hover { background: var(--md-surface-container-highest); }
-  &.danger { color: var(--md-error); }
-  &.danger:hover { background: color-mix(in srgb, var(--md-error) 8%, transparent); }
-  &:disabled { cursor: default; opacity: 0.45; }
-  &:disabled:hover { background: transparent; }
 }
 </style>

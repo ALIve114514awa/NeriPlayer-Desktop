@@ -7,6 +7,14 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
+import TrackSelectionToolbar from '@/components/TrackSelectionToolbar.vue'
+import { useTrackSelection } from '@/composables/useTrackSelection'
+import {
+  createContextMenuItem,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+} from '@/utils/contextMenu'
 import {
   playlistDetailCacheKey,
   readPlaylistDetailCache,
@@ -58,6 +66,18 @@ const filteredTracks = computed(() => {
     t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q)
   )
 })
+
+const {
+  selectionMode,
+  selectedIds,
+  selectedItems: selectedTracks,
+  visibleSelectedCount,
+  allVisibleSelected,
+  enterSelectionMode,
+  leaveSelectionMode,
+  toggleSelected,
+  toggleSelectAllVisible,
+} = useTrackSelection(tracks, filteredTracks)
 
 function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000)
@@ -132,8 +152,22 @@ function shufflePlay() {
 }
 
 function playTrack(track: TrackInfo) {
-  player.playAll(filteredTracks.value)
-  player.play(track)
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
+  player.playAll(filteredTracks.value, track.id)
+}
+
+function playSelected() {
+  if (selectedTracks.value.length === 0) return
+  player.playAll(selectedTracks.value)
+  leaveSelectionMode()
+}
+
+function queueSelected() {
+  for (const track of selectedTracks.value) player.addToQueueEnd(track)
+  leaveSelectionMode()
 }
 
 const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | null }>({
@@ -141,29 +175,26 @@ const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | 
 })
 const showAddToPlaylist = ref(false)
 const addToPlaylistTarget = ref<TrackInfo | null>(null)
-
-function clampMenuPosition(x: number, y: number, menuWidth = 200, menuHeight = 184) {
-  return {
-    x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
-    y: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
-  }
-}
+const addToPlaylistTargets = ref<TrackInfo[]>([])
 
 function openTrackMenu(e: MouseEvent, track: TrackInfo) {
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
   const btn = e.currentTarget as HTMLElement
   const rect = btn.getBoundingClientRect()
-  const menuWidth = 200
-  const menuHeight = 184
-  let x = rect.left - menuWidth - 4
-  let y = rect.top
+  let x = rect.left - 204
   if (x < 8) x = rect.right + 4
-  const pos = clampMenuPosition(x, y, menuWidth, menuHeight)
-  trackMenu.value = { show: true, x: pos.x, y: pos.y, track }
+  trackMenu.value = { show: true, x, y: rect.top, track }
 }
 
 function openTrackContextMenu(e: MouseEvent, track: TrackInfo) {
-  const pos = clampMenuPosition(e.clientX, e.clientY)
-  trackMenu.value = { show: true, x: pos.x, y: pos.y, track }
+  if (selectionMode.value) {
+    toggleSelected(track.id)
+    return
+  }
+  trackMenu.value = { show: true, x: e.clientX, y: e.clientY, track }
 }
 
 function closeTrackMenu() {
@@ -173,7 +204,23 @@ function closeTrackMenu() {
 function openAddToPlaylist(track: TrackInfo) {
   closeTrackMenu()
   addToPlaylistTarget.value = track
+  addToPlaylistTargets.value = []
   showAddToPlaylist.value = true
+}
+
+function openBatchAddToPlaylist() {
+  if (selectedTracks.value.length === 0) return
+  const targets = [...selectedTracks.value]
+  leaveSelectionMode()
+  addToPlaylistTarget.value = null
+  addToPlaylistTargets.value = targets
+  showAddToPlaylist.value = true
+}
+
+function downloadSelected() {
+  const targets = [...selectedTracks.value]
+  leaveSelectionMode()
+  for (const track of targets) void downloadStore.downloadTrack(track)
 }
 
 function addToQueueNext(track: TrackInfo) {
@@ -219,6 +266,48 @@ async function handleTrackDownload(track: TrackInfo) {
     await downloadStore.redownloadTrack(track)
   } else {
     await downloadStore.downloadTrack(track)
+  }
+}
+
+const trackMenuItems = computed<ContextMenuItem[]>(() => {
+  const track = trackMenu.value.track
+  return [
+    createContextMenuItem(t('common.multi_select'), { id: 'select', icon: 'checklist' }),
+    createContextMenuItem(t('player.play_next'), { id: 'play-next', icon: 'queue_play_next' }),
+    createContextMenuItem(t('player.add_to_queue'), { id: 'add-to-queue', icon: 'add_to_queue' }),
+    createContextMenuItem(t('player.add_to_playlist'), { id: 'add-to-playlist', icon: 'playlist_add' }),
+    createContextMenuItem(
+      track ? trackDownloadLabel(track) : t('download.download'),
+      {
+        id: 'download',
+        icon: 'download',
+        disabled: !track || isTrackDownloadDisabled(track),
+      },
+    ),
+  ]
+})
+
+function handleTrackMenuClick(item: ContextMenuActionItem) {
+  const track = trackMenu.value.track
+  if (!track) return
+
+  switch (item.id) {
+    case 'select':
+      closeTrackMenu()
+      enterSelectionMode(track)
+      break
+    case 'play-next':
+      addToQueueNext(track)
+      break
+    case 'add-to-queue':
+      addToQueueEnd(track)
+      break
+    case 'add-to-playlist':
+      openAddToPlaylist(track)
+      break
+    case 'download':
+      void handleTrackDownload(track)
+      break
   }
 }
 
@@ -271,6 +360,9 @@ onMounted(() => {
             <button class="hero-icon-btn" :title="t('player.shuffle_play')" @click="shufflePlay">
               <span class="material-symbols-rounded">shuffle</span>
             </button>
+            <button class="hero-icon-btn" :title="t('common.multi_select')" @click="enterSelectionMode()">
+              <span class="material-symbols-rounded">checklist</span>
+            </button>
           </div>
         </div>
       </div>
@@ -278,65 +370,64 @@ onMounted(() => {
       <div v-if="filteredTracks.length === 0" class="state-center">
         <p>{{ t('player.empty_playlist') }}</p>
       </div>
-      <div v-else class="track-list">
-        <div
-          v-for="(track, index) in filteredTracks"
-          :key="track.id"
-          class="track-item"
-          :class="{ active: player.currentTrack?.id === track.id }"
-          @click="playTrack(track)"
-          @contextmenu.prevent.stop="openTrackContextMenu($event, track)"
-        >
-          <div class="track-index">
-            <div v-if="player.currentTrack?.id === track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
-            <span v-else class="index-num">{{ index + 1 }}</span>
+      <div v-else>
+        <TrackSelectionToolbar
+          v-if="selectionMode"
+          :selected-count="selectedTracks.length"
+          :visible-selected-count="visibleSelectedCount"
+          :all-visible-selected="allVisibleSelected"
+          @select-all="toggleSelectAllVisible"
+          @play="playSelected"
+          @queue="queueSelected"
+          @playlist="openBatchAddToPlaylist"
+          @download="downloadSelected"
+          @exit="leaveSelectionMode"
+        />
+        <div class="track-list">
+          <div
+            v-for="(track, index) in filteredTracks"
+            :key="track.id"
+            class="track-item"
+            :class="{ active: player.currentTrack?.id === track.id, selected: selectionMode && selectedIds.has(track.id), 'selection-mode': selectionMode }"
+            @click="playTrack(track)"
+            @contextmenu.prevent.stop="openTrackContextMenu($event, track)"
+          >
+            <button v-if="selectionMode" class="track-select" @click.stop="toggleSelected(track.id)">
+              <span class="material-symbols-rounded filled">{{ selectedIds.has(track.id) ? 'check_circle' : 'radio_button_unchecked' }}</span>
+            </button>
+            <div v-else class="track-index">
+              <div v-if="player.currentTrack?.id === track.id && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
+              <span v-else class="index-num">{{ index + 1 }}</span>
+            </div>
+            <div class="track-cover-wide">
+              <BilibiliCoverImage v-if="track.coverUrl" :src="track.coverUrl" loading="lazy">
+                <span class="material-symbols-rounded filled">movie</span>
+              </BilibiliCoverImage>
+              <span v-else class="material-symbols-rounded filled">movie</span>
+            </div>
+            <div class="track-info">
+              <div class="track-title">{{ track.title }}</div>
+              <div class="track-meta">{{ track.artist }}</div>
+            </div>
+            <div class="track-duration">{{ formatDuration(track.durationMs) }}</div>
+            <button v-if="!selectionMode" class="track-more" @click.stop="openTrackMenu($event, track)">
+              <span class="material-symbols-rounded">more_vert</span>
+            </button>
           </div>
-          <div class="track-cover-wide">
-            <BilibiliCoverImage v-if="track.coverUrl" :src="track.coverUrl" loading="lazy">
-              <span class="material-symbols-rounded filled">movie</span>
-            </BilibiliCoverImage>
-            <span v-else class="material-symbols-rounded filled">movie</span>
-          </div>
-          <div class="track-info">
-            <div class="track-title">{{ track.title }}</div>
-            <div class="track-meta">{{ track.artist }}</div>
-          </div>
-          <div class="track-duration">{{ formatDuration(track.durationMs) }}</div>
-          <button class="track-more" @click.stop="openTrackMenu($event, track)">
-            <span class="material-symbols-rounded">more_vert</span>
-          </button>
         </div>
       </div>
     </template>
 
-    <Teleport to="body">
-      <div v-if="trackMenu.show" class="context-overlay" @click="closeTrackMenu" @contextmenu.prevent="closeTrackMenu">
-        <div class="context-menu" :style="{ left: trackMenu.x + 'px', top: trackMenu.y + 'px' }">
-          <button class="ctx-item" @click="addToQueueNext(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">queue_play_next</span>
-            <span>{{ t('player.play_next') }}</span>
-          </button>
-          <button class="ctx-item" @click="addToQueueEnd(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">add_to_queue</span>
-            <span>{{ t('player.add_to_queue') }}</span>
-          </button>
-          <button class="ctx-item" @click="openAddToPlaylist(trackMenu.track!)">
-            <span class="material-symbols-rounded" style="font-size: 20px">playlist_add</span>
-            <span>{{ t('player.add_to_playlist') }}</span>
-          </button>
-          <button
-            class="ctx-item"
-            :disabled="isTrackDownloadDisabled(trackMenu.track!)"
-            @click="handleTrackDownload(trackMenu.track!)"
-          >
-            <span class="material-symbols-rounded" style="font-size: 20px">download</span>
-            <span>{{ trackDownloadLabel(trackMenu.track!) }}</span>
-          </button>
-        </div>
-      </div>
-    </Teleport>
+    <ContextMenu
+      :open="trackMenu.show"
+      :x="trackMenu.x"
+      :y="trackMenu.y"
+      :items="trackMenuItems"
+      @update:open="trackMenu.show = $event"
+      @click="handleTrackMenuClick"
+    />
 
-    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" />
+    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="addToPlaylistTarget" :tracks="addToPlaylistTargets" />
   </div>
 </template>
 
