@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use neri_player_desktop::audio::analyzer::SharedAudioLevel;
 use neri_player_desktop::audio::media_session::{MediaAction, MediaSessionController};
 use neri_player_desktop::auth;
 use neri_player_desktop::commands::{
     auth_cmd, download_cmd, image_cmd, library_cmd, listen_together_cmd, lyrics_cmd, player_cmd,
-    recommend_cmd, search_cmd, settings_cmd, sync_cmd,
+    recommend_cmd, search_cmd, settings_cmd, storage_cmd, sync_cmd,
 };
 use neri_player_desktop::state::AppState;
 use std::sync::mpsc;
@@ -19,7 +20,7 @@ fn main() {
         "--enable-gpu --enable-gpu-rasterization --enable-zero-copy --enable-features=CanvasOopRasterization");
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -43,7 +44,7 @@ fn main() {
                 *state.auth.lock() = saved_auth;
             }
 
-            // 启动时迁移同步 Token 和 WebDAV 密码到系统钥匙串
+            // 启动时迁移同步 Token 和 WebDAV 密码到当前构建的凭据存储
             sync_cmd::initialize_secure_storage(&handle);
 
             // ── 初始化系统媒体会话 (SMTC / MPRIS) ──
@@ -163,12 +164,12 @@ fn main() {
                     }
 
                     if snap_playing {
-                        if let Ok(audio) = shared_level.lock() {
+                        if let Some((level, beat)) = SharedAudioLevel::try_snapshot(&shared_level) {
                             let _ = handle_ticker.emit(
                                 "player:audio-level",
                                 serde_json::json!({
-                                    "level": audio.level,
-                                    "beat": audio.beat_impulse,
+                                    "level": level,
+                                    "beat": beat,
                                 }),
                             );
                         }
@@ -223,7 +224,9 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            player_cmd::begin_playback_request,
             player_cmd::play_file,
+            player_cmd::play_cached_audio,
             player_cmd::play_url,
             player_cmd::play_url_fast,
             player_cmd::play_url_streaming,
@@ -265,6 +268,8 @@ fn main() {
             lyrics_cmd::parse_lrc_content,
             lyrics_cmd::load_lyrics_file,
             lyrics_cmd::fetch_lyrics,
+            settings_cmd::get_settings,
+            settings_cmd::save_settings,
             settings_cmd::get_app_data_dir,
             settings_cmd::get_netease_song_url,
             settings_cmd::get_qq_song_url,
@@ -273,12 +278,16 @@ fn main() {
             settings_cmd::save_file_bytes,
             settings_cmd::set_bypass_proxy,
             settings_cmd::get_build_info,
+            storage_cmd::get_storage_usage,
+            storage_cmd::clear_storage_cache,
             auth_cmd::login_netease,
             auth_cmd::login_bilibili,
             auth_cmd::login_youtube,
             auth_cmd::login_with_cookies,
             auth_cmd::refresh_youtube_profile,
             auth_cmd::check_auth_status,
+            auth_cmd::get_debug_cookie_storage_status,
+            auth_cmd::clear_debug_cookie_storage,
             auth_cmd::logout,
             recommend_cmd::get_recommended_playlists,
             recommend_cmd::get_recommended_songs,
@@ -298,6 +307,7 @@ fn main() {
             recommend_cmd::get_netease_playlist_detail,
             recommend_cmd::get_youtube_playlist_detail,
             sync_cmd::get_github_sync_config,
+            sync_cmd::get_sync_preferences,
             sync_cmd::validate_github_token,
             sync_cmd::create_github_repo,
             sync_cmd::use_existing_github_repo,
@@ -305,10 +315,13 @@ fn main() {
             sync_cmd::sync_github,
             sync_cmd::disconnect_github_sync,
             sync_cmd::update_github_sync_settings,
+            sync_cmd::update_sync_preferences,
             sync_cmd::update_webdav_sync_settings,
             sync_cmd::clear_app_cache,
             sync_cmd::export_playlists,
             sync_cmd::import_playlists,
+            sync_cmd::export_config,
+            sync_cmd::import_config,
             sync_cmd::get_webdav_sync_config,
             sync_cmd::configure_webdav_sync,
             sync_cmd::sync_webdav,
