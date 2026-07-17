@@ -4,7 +4,10 @@
   "windows": ["main", "netease-login", "bilibili-login", "youtube-login"],
   "permissions": [
     "core:default",
-    "shell:allow-open",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://github.com/*" }]
+    },
     "store:default",
     "dialog:default",
     "core:window:default",

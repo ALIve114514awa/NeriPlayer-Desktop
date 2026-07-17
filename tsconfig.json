@@ -25,5 +25,5 @@
       "#bg/*": ["./vendor/applemusic-like-lyrics/packages/core/src/bg-player/*"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.vue"]
+  "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.vue", "types/**/*.d.ts"]
 }

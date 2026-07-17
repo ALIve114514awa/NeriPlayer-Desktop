@@ -8,13 +8,15 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "test:bilibili-cover-cache": "node scripts/test-bilibili-cover-cache.mjs",
+    "test:playback-source": "node scripts/test-playback-source.mjs",
     "tauri": "node scripts/run-tauri.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.0",
-    "@tauri-apps/plugin-shell": "^2.2.0",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "@tauri-apps/plugin-store": "^2.4.2",
     "@ungap/structured-clone": "^1.3.0",
     "animejs": "^4.0.2",
