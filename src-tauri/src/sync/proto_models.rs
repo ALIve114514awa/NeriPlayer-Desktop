@@ -106,6 +106,8 @@ pub struct ProtoSyncSong {
     pub playlist_context_id: Option<String>,
     #[prost(message, repeated, tag = "27")]
     pub sync_membership_tokens: Vec<ProtoSyncCausalToken>,
+    #[prost(int32, tag = "28")]
+    pub sync_metadata_version: i32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

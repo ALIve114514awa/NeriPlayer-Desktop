@@ -1,16 +1,55 @@
 use crate::audio::growing::GrowingAudioBuffer;
 use crate::audio::remote::{RemoteAudioCache, RemoteAudioSource};
 use crate::error::{AppError, AppResult};
+use crate::settings::store::{MAX_MEDIA_CACHE_SIZE_MB, MIN_MEDIA_CACHE_SIZE_MB};
 use crate::state::AppState;
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 
 const STREAM_START_BUFFER_BYTES: usize = 64 * 1024;
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
+const PLAYBACK_SUPERSEDED_ERROR: &str = "Playback request superseded";
+
+fn claim_generation(generation: &AtomicU64, request_generation: u64) -> bool {
+    generation.fetch_max(request_generation, Ordering::AcqRel) <= request_generation
+}
+
+fn is_generation_current(generation: &AtomicU64, request_generation: u64) -> bool {
+    generation.load(Ordering::Acquire) == request_generation
+}
+
+fn claim_playback_request(state: &State<'_, AppState>, request_generation: u64) -> AppResult<()> {
+    if claim_generation(&state.playback_generation, request_generation) {
+        Ok(())
+    } else {
+        Err(AppError::Audio(PLAYBACK_SUPERSEDED_ERROR.into()))
+    }
+}
+
+fn ensure_playback_request(state: &State<'_, AppState>, request_generation: u64) -> AppResult<()> {
+    if is_generation_current(&state.playback_generation, request_generation) {
+        Ok(())
+    } else {
+        Err(AppError::Audio(PLAYBACK_SUPERSEDED_ERROR.into()))
+    }
+}
+
+fn advance_playback_request(state: &State<'_, AppState>) -> u64 {
+    state.playback_generation.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+#[tauri::command]
+pub async fn begin_playback_request(
+    request_generation: u64,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    claim_playback_request(&state, request_generation)
+}
 
 #[derive(Serialize)]
 pub struct PlayerStateDto {
@@ -27,10 +66,97 @@ pub struct PlayerStateDto {
 pub async fn play_file(
     path: String,
     start_position_ms: Option<u64>,
+    duration_hint_ms: Option<u64>,
+    request_generation: u64,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     let mut player = state.player.lock();
-    player.play_file_at(&path, start_position_ms.unwrap_or(0))
+    player.play_file_at_with_hint(
+        &path,
+        duration_hint_ms.unwrap_or(0),
+        start_position_ms.unwrap_or(0),
+        request_generation,
+    )
+}
+
+/// 使用稳定缓存键直接播放已验证音频，避免命中缓存时仍等待平台 URL 解析
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAudioPlaybackRequest {
+    cache_key: String,
+    duration_hint_ms: u64,
+    start_position_ms: Option<u64>,
+    use_crossfade: bool,
+    fade_out_ms: u32,
+    fade_in_ms: u32,
+    cache_limit_bytes: Option<u64>,
+    request_generation: u64,
+}
+
+#[tauri::command]
+pub async fn play_cached_audio(
+    request: CachedAudioPlaybackRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<u64>> {
+    let CachedAudioPlaybackRequest {
+        cache_key,
+        duration_hint_ms,
+        start_position_ms,
+        use_crossfade,
+        fade_out_ms,
+        fade_in_ms,
+        cache_limit_bytes,
+        request_generation,
+    } = request;
+    claim_playback_request(&state, request_generation)?;
+    let Some(cache) = playback_cache(
+        &app,
+        Some(&cache_key),
+        cache_limit_bytes,
+        None,
+        duration_hint_ms,
+    ) else {
+        return Ok(None);
+    };
+
+    let validation_started = std::time::Instant::now();
+    let path = tokio::task::spawn_blocking(move || cache.ready_path())
+        .await
+        .map_err(|err| AppError::Other(err.to_string()))?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    ensure_playback_request(&state, request_generation)?;
+    eprintln!(
+        "[play_cached_audio] cache hit in {}ms: {}",
+        validation_started.elapsed().as_millis(),
+        path.display()
+    );
+
+    let mut player = state.player.lock();
+    let duration_ms = if use_crossfade {
+        player.crossfade_file_with_hint(
+            &path.to_string_lossy(),
+            duration_hint_ms,
+            fade_out_ms,
+            fade_in_ms,
+            request_generation,
+        )?
+    } else {
+        player.play_file_at_with_hint(
+            &path.to_string_lossy(),
+            duration_hint_ms,
+            start_position_ms.unwrap_or(0),
+            request_generation,
+        )?
+    };
+    Ok(Some(if duration_ms > 0 {
+        duration_ms
+    } else {
+        duration_hint_ms
+    }))
 }
 
 /// 从 URL 下载音频并播放（网易云 / B站 / YouTube 流式播放）
@@ -39,8 +165,10 @@ pub async fn play_url(
     url: String,
     duration_hint_ms: u64,
     start_position_ms: Option<u64>,
+    request_generation: u64,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     eprintln!(
         "[play_url] start: url_len={}, hint={}ms",
         url.len(),
@@ -93,9 +221,15 @@ pub async fn play_url(
         return Err(AppError::Audio("Empty audio data received".into()));
     }
 
+    ensure_playback_request(&state, request_generation)?;
     let data = bytes.to_vec();
     let mut player = state.player.lock();
-    player.play_bytes_at(data, duration_hint_ms, start_position_ms.unwrap_or(0))
+    player.play_bytes_at(
+        data,
+        duration_hint_ms,
+        start_position_ms.unwrap_or(0),
+        request_generation,
+    )
 }
 
 /// 快速播放 URL：把响应落到临时文件后按本地文件播放。
@@ -105,17 +239,42 @@ pub async fn play_url_fast(
     url: String,
     duration_hint_ms: u64,
     start_position_ms: Option<u64>,
+    cache_key: Option<String>,
+    cache_limit_bytes: Option<u64>,
+    expected_content_length: Option<u64>,
+    request_generation: u64,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     eprintln!(
         "[play_url_fast] start: url_len={}, hint={}ms",
         url.len(),
         duration_hint_ms
     );
-    let path = download_url_to_temp_audio(&url, &state).await?;
+    let cache = playback_cache(
+        &app,
+        cache_key.as_deref(),
+        cache_limit_bytes,
+        expected_content_length,
+        duration_hint_ms,
+    );
+    let path = match cache {
+        Some(cache) => download_url_to_playback_cache(&url, &state, cache)
+            .await?
+            .to_string_lossy()
+            .to_string(),
+        None => download_url_to_temp_audio(&url, &state).await?,
+    };
+    ensure_playback_request(&state, request_generation)?;
     eprintln!("[play_url_fast] temp ready: {}", path);
     let mut player = state.player.lock();
-    let dur = player.play_file_at(&path, start_position_ms.unwrap_or(0))?;
+    let dur = player.play_file_at_with_hint(
+        &path,
+        duration_hint_ms,
+        start_position_ms.unwrap_or(0),
+        request_generation,
+    )?;
     Ok(if dur > 0 { dur } else { duration_hint_ms })
 }
 
@@ -126,53 +285,131 @@ pub async fn play_url_streaming(
     duration_hint_ms: u64,
     start_position_ms: Option<u64>,
     cache_key: Option<String>,
+    cache_limit_bytes: Option<u64>,
+    expected_content_length: Option<u64>,
+    request_generation: u64,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     eprintln!(
         "[play_url_streaming] start: url_len={}, hint={}ms",
         url.len(),
         duration_hint_ms
     );
     let start_position_ms = start_position_ms.unwrap_or(0);
-    let cache = playback_cache(&app, cache_key.as_deref());
+    let cache = playback_cache(
+        &app,
+        cache_key.as_deref(),
+        cache_limit_bytes,
+        expected_content_length,
+        duration_hint_ms,
+    );
 
     if let Some(path) = cache.as_ref().and_then(RemoteAudioCache::ready_path) {
         eprintln!("[play_url_streaming] playback cache hit: {}", path.display());
-        let mut player = state.player.lock();
-        let dur = player.play_file_at(&path.to_string_lossy(), start_position_ms)?;
-        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+        ensure_playback_request(&state, request_generation)?;
+        let result = {
+            let mut player = state.player.lock();
+            player.play_file_at_with_hint(
+                &path.to_string_lossy(),
+                duration_hint_ms,
+                start_position_ms,
+                request_generation,
+            )
+        };
+        match result {
+            Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
+            Err(err) => {
+                ensure_playback_request(&state, request_generation)?;
+                eprintln!(
+                    "[play_url_streaming] cache playback failed, bypassing for this request: {}",
+                    err
+                );
+                if let Some(cache) = &cache {
+                    cache.bypass_ready_for_session();
+                }
+            }
+        }
     }
 
-    match open_remote_audio_source(&url, &state, cache).await {
+    let fallback_cache = cache.as_ref().and_then(|cache| match cache.fresh_staging() {
+        Ok(cache) => Some(cache),
+        Err(err) => {
+            eprintln!("[play_url_streaming] fallback cache unavailable: {}", err);
+            None
+        }
+    });
+
+    match open_remote_audio_source(&url, duration_hint_ms, &state, cache).await {
         Ok(reader) => {
+            ensure_playback_request(&state, request_generation)?;
             let result = {
                 let mut player = state.player.lock();
-                player.play_remote_at(reader, duration_hint_ms, start_position_ms)
+                player.play_remote_at(
+                    reader,
+                    duration_hint_ms,
+                    start_position_ms,
+                    request_generation,
+                )
             };
             match result {
                 Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
-                Err(err) => eprintln!("[play_url_streaming] remote playback failed: {}", err),
+                Err(err) => {
+                    ensure_playback_request(&state, request_generation)?;
+                    eprintln!("[play_url_streaming] remote playback failed: {}", err);
+                }
             }
         }
         Err(err) => {
+            ensure_playback_request(&state, request_generation)?;
             eprintln!("[play_url_streaming] remote source unavailable: {}", err);
         }
     }
 
-    play_url_streaming_fallback(&url, duration_hint_ms, start_position_ms, &state).await
+    play_url_streaming_fallback(
+        &url,
+        duration_hint_ms,
+        start_position_ms,
+        request_generation,
+        fallback_cache,
+        &state,
+    )
+    .await
 }
 
 async fn play_url_streaming_fallback(
     url: &str,
     duration_hint_ms: u64,
     start_position_ms: u64,
+    request_generation: u64,
+    cache: Option<RemoteAudioCache>,
     state: &State<'_, AppState>,
 ) -> AppResult<u64> {
+    ensure_playback_request(state, request_generation)?;
+    if let Some(cache) = cache {
+        let path = download_url_to_playback_cache(url, state, cache).await?;
+        ensure_playback_request(state, request_generation)?;
+        let mut player = state.player.lock();
+        let dur = player.play_file_at_with_hint(
+            &path.to_string_lossy(),
+            duration_hint_ms,
+            start_position_ms,
+            request_generation,
+        )?;
+        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+    }
+
     if start_position_ms > 0 {
         let path = download_url_to_temp_audio(url, state).await?;
+        ensure_playback_request(state, request_generation)?;
         let mut player = state.player.lock();
-        let dur = player.play_file_at(&path, start_position_ms)?;
+        let dur = player.play_file_at_with_hint(
+            &path,
+            duration_hint_ms,
+            start_position_ms,
+            request_generation,
+        )?;
         return Ok(if dur > 0 { dur } else { duration_hint_ms });
     }
 
@@ -190,8 +427,17 @@ async fn play_url_streaming_fallback(
     );
 
     let reader = buffer.reader();
+    if let Err(err) = ensure_playback_request(state, request_generation) {
+        buffer.abort();
+        return Err(err);
+    }
     let mut player = state.player.lock();
-    let dur = match player.play_stream_at(reader, duration_hint_ms, start_position_ms) {
+    let dur = match player.play_stream_at(
+        reader,
+        duration_hint_ms,
+        start_position_ms,
+        request_generation,
+    ) {
         Ok(dur) => dur,
         Err(err) => {
             buffer.abort();
@@ -271,14 +517,12 @@ pub async fn reset_audio_effects(state: State<'_, AppState>) -> AppResult<()> {
 
 #[tauri::command]
 pub async fn pause_with_fade(duration_ms: u32, state: State<'_, AppState>) -> AppResult<()> {
-    state.player.lock().pause_with_fade(duration_ms);
-    Ok(())
+    state.player.lock().pause_with_fade(duration_ms)
 }
 
 #[tauri::command]
 pub async fn resume_with_fade(duration_ms: u32, state: State<'_, AppState>) -> AppResult<()> {
-    state.player.lock().resume_with_fade(duration_ms);
-    Ok(())
+    state.player.lock().resume_with_fade(duration_ms)
 }
 
 #[tauri::command]
@@ -287,11 +531,20 @@ pub async fn crossfade_url(
     duration_hint_ms: u64,
     fade_out_ms: u32,
     fade_in_ms: u32,
+    request_generation: u64,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     let data = download_url_bytes(&url, &state, "crossfade_url").await?;
+    ensure_playback_request(&state, request_generation)?;
     let mut player = state.player.lock();
-    player.crossfade_bytes(data, duration_hint_ms, fade_out_ms, fade_in_ms)
+    player.crossfade_bytes(
+        data,
+        duration_hint_ms,
+        fade_out_ms,
+        fade_in_ms,
+        request_generation,
+    )
 }
 
 #[tauri::command]
@@ -300,11 +553,37 @@ pub async fn crossfade_url_fast(
     duration_hint_ms: u64,
     fade_out_ms: u32,
     fade_in_ms: u32,
+    cache_key: Option<String>,
+    cache_limit_bytes: Option<u64>,
+    expected_content_length: Option<u64>,
+    request_generation: u64,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
-    let path = download_url_to_temp_audio(&url, &state).await?;
+    claim_playback_request(&state, request_generation)?;
+    let cache = playback_cache(
+        &app,
+        cache_key.as_deref(),
+        cache_limit_bytes,
+        expected_content_length,
+        duration_hint_ms,
+    );
+    let path = match cache {
+        Some(cache) => download_url_to_playback_cache(&url, &state, cache)
+            .await?
+            .to_string_lossy()
+            .to_string(),
+        None => download_url_to_temp_audio(&url, &state).await?,
+    };
+    ensure_playback_request(&state, request_generation)?;
     let mut player = state.player.lock();
-    let dur = player.crossfade_file(&path, fade_out_ms, fade_in_ms)?;
+    let dur = player.crossfade_file_with_hint(
+        &path,
+        duration_hint_ms,
+        fade_out_ms,
+        fade_in_ms,
+        request_generation,
+    )?;
     Ok(if dur > 0 { dur } else { duration_hint_ms })
 }
 
@@ -315,45 +594,105 @@ pub async fn crossfade_url_streaming(
     fade_out_ms: u32,
     fade_in_ms: u32,
     cache_key: Option<String>,
+    cache_limit_bytes: Option<u64>,
+    expected_content_length: Option<u64>,
+    request_generation: u64,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     eprintln!(
         "[crossfade_url_streaming] start: url_len={}, hint={}ms",
         url.len(),
         duration_hint_ms
     );
-    let cache = playback_cache(&app, cache_key.as_deref());
+    let cache = playback_cache(
+        &app,
+        cache_key.as_deref(),
+        cache_limit_bytes,
+        expected_content_length,
+        duration_hint_ms,
+    );
 
     if let Some(path) = cache.as_ref().and_then(RemoteAudioCache::ready_path) {
         eprintln!(
             "[crossfade_url_streaming] playback cache hit: {}",
             path.display()
         );
-        let mut player = state.player.lock();
-        let dur = player.crossfade_file(&path.to_string_lossy(), fade_out_ms, fade_in_ms)?;
-        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+        ensure_playback_request(&state, request_generation)?;
+        let result = {
+            let mut player = state.player.lock();
+            player.crossfade_file_with_hint(
+                &path.to_string_lossy(),
+                duration_hint_ms,
+                fade_out_ms,
+                fade_in_ms,
+                request_generation,
+            )
+        };
+        match result {
+            Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
+            Err(err) => {
+                ensure_playback_request(&state, request_generation)?;
+                eprintln!(
+                    "[crossfade_url_streaming] cache playback failed, bypassing for this request: {}",
+                    err
+                );
+                if let Some(cache) = &cache {
+                    cache.bypass_ready_for_session();
+                }
+            }
+        }
     }
 
-    match open_remote_audio_source(&url, &state, cache).await {
+    let fallback_cache = cache.as_ref().and_then(|cache| match cache.fresh_staging() {
+        Ok(cache) => Some(cache),
+        Err(err) => {
+            eprintln!(
+                "[crossfade_url_streaming] fallback cache unavailable: {}",
+                err
+            );
+            None
+        }
+    });
+
+    match open_remote_audio_source(&url, duration_hint_ms, &state, cache).await {
         Ok(reader) => {
+            ensure_playback_request(&state, request_generation)?;
             let result = {
                 let mut player = state.player.lock();
-                player.crossfade_remote(reader, duration_hint_ms, fade_out_ms, fade_in_ms)
+                player.crossfade_remote(
+                    reader,
+                    duration_hint_ms,
+                    fade_out_ms,
+                    fade_in_ms,
+                    request_generation,
+                )
             };
             match result {
                 Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
                 Err(err) => {
+                    ensure_playback_request(&state, request_generation)?;
                     eprintln!("[crossfade_url_streaming] remote playback failed: {}", err)
                 }
             }
         }
         Err(err) => {
+            ensure_playback_request(&state, request_generation)?;
             eprintln!("[crossfade_url_streaming] remote source unavailable: {}", err);
         }
     }
 
-    crossfade_url_streaming_fallback(&url, duration_hint_ms, fade_out_ms, fade_in_ms, &state).await
+    crossfade_url_streaming_fallback(
+        &url,
+        duration_hint_ms,
+        fade_out_ms,
+        fade_in_ms,
+        request_generation,
+        fallback_cache,
+        &state,
+    )
+    .await
 }
 
 async fn crossfade_url_streaming_fallback(
@@ -361,8 +700,25 @@ async fn crossfade_url_streaming_fallback(
     duration_hint_ms: u64,
     fade_out_ms: u32,
     fade_in_ms: u32,
+    request_generation: u64,
+    cache: Option<RemoteAudioCache>,
     state: &State<'_, AppState>,
 ) -> AppResult<u64> {
+    ensure_playback_request(state, request_generation)?;
+    if let Some(cache) = cache {
+        let path = download_url_to_playback_cache(url, state, cache).await?;
+        ensure_playback_request(state, request_generation)?;
+        let mut player = state.player.lock();
+        let dur = player.crossfade_file_with_hint(
+            &path.to_string_lossy(),
+            duration_hint_ms,
+            fade_out_ms,
+            fade_in_ms,
+            request_generation,
+        )?;
+        return Ok(if dur > 0 { dur } else { duration_hint_ms });
+    }
+
     let buffer = start_streaming_download(url, state, "crossfade_url_streaming").await?;
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
@@ -377,8 +733,18 @@ async fn crossfade_url_streaming_fallback(
     );
 
     let reader = buffer.reader();
+    if let Err(err) = ensure_playback_request(state, request_generation) {
+        buffer.abort();
+        return Err(err);
+    }
     let mut player = state.player.lock();
-    let dur = match player.crossfade_stream(reader, duration_hint_ms, fade_out_ms, fade_in_ms) {
+    let dur = match player.crossfade_stream(
+        reader,
+        duration_hint_ms,
+        fade_out_ms,
+        fade_in_ms,
+        request_generation,
+    ) {
         Ok(dur) => dur,
         Err(err) => {
             buffer.abort();
@@ -391,12 +757,21 @@ async fn crossfade_url_streaming_fallback(
 #[tauri::command]
 pub async fn crossfade_file(
     path: String,
+    duration_hint_ms: Option<u64>,
     fade_out_ms: u32,
     fade_in_ms: u32,
+    request_generation: u64,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    claim_playback_request(&state, request_generation)?;
     let mut player = state.player.lock();
-    player.crossfade_file(&path, fade_out_ms, fade_in_ms)
+    player.crossfade_file_with_hint(
+        &path,
+        duration_hint_ms.unwrap_or(0),
+        fade_out_ms,
+        fade_in_ms,
+        request_generation,
+    )
 }
 
 fn playback_referer(url: &str) -> &'static str {
@@ -413,6 +788,7 @@ fn playback_referer(url: &str) -> &'static str {
 
 async fn open_remote_audio_source(
     url: &str,
+    duration_hint_ms: u64,
     state: &State<'_, AppState>,
     cache: Option<RemoteAudioCache>,
 ) -> AppResult<RemoteAudioSource> {
@@ -421,14 +797,32 @@ async fn open_remote_audio_source(
         url.to_string(),
         playback_referer(url).to_string(),
         cache,
+        duration_hint_ms,
     )
     .await
 }
 
-fn playback_cache(app: &AppHandle, cache_key: Option<&str>) -> Option<RemoteAudioCache> {
+fn playback_cache(
+    app: &AppHandle,
+    cache_key: Option<&str>,
+    cache_limit_bytes: Option<u64>,
+    expected_content_length: Option<u64>,
+    expected_duration_ms: u64,
+) -> Option<RemoteAudioCache> {
     let cache_key = cache_key.map(str::trim).filter(|key| !key.is_empty())?;
+    let min_cache_bytes = MIN_MEDIA_CACHE_SIZE_MB as u64 * 1024 * 1024;
+    let max_allowed_cache_bytes = MAX_MEDIA_CACHE_SIZE_MB as u64 * 1024 * 1024;
+    let max_cache_bytes = cache_limit_bytes
+        .unwrap_or(1024 * 1024 * 1024)
+        .clamp(min_cache_bytes, max_allowed_cache_bytes);
     let root = playback_cache_root(app)?;
-    match RemoteAudioCache::new(root, cache_key) {
+    match RemoteAudioCache::new(
+        root,
+        cache_key,
+        max_cache_bytes,
+        expected_content_length,
+        expected_duration_ms,
+    ) {
         Ok(cache) => Some(cache),
         Err(err) => {
             eprintln!("[playback_cache] unavailable: {}", err);
@@ -493,6 +887,17 @@ async fn download_url_to_temp_audio(url: &str, state: &State<'_, AppState>) -> A
     })
     .await
     .map_err(|e| AppError::Other(e.to_string()))?
+}
+
+async fn download_url_to_playback_cache(
+    url: &str,
+    state: &State<'_, AppState>,
+    cache: RemoteAudioCache,
+) -> AppResult<PathBuf> {
+    let data = download_url_bytes(url, state, "playback_cache_fallback").await?;
+    tokio::task::spawn_blocking(move || cache.publish_complete_bytes(&data))
+        .await
+        .map_err(|err| AppError::Other(err.to_string()))?
 }
 
 async fn start_streaming_download(
@@ -582,22 +987,24 @@ pub async fn get_player_state(state: State<'_, AppState>) -> AppResult<PlayerSta
 
 #[tauri::command]
 pub async fn next_track(state: State<'_, AppState>) -> AppResult<Option<crate::state::TrackInfo>> {
+    let request_generation = advance_playback_request(&state);
     let mut queue = state.queue.lock();
     let track = queue.next().cloned();
     if let Some(ref t) = track {
         let mut player = state.player.lock();
-        player.play_file(&t.url)?;
+        player.play_file_with_hint(&t.url, t.duration_ms, request_generation)?;
     }
     Ok(track)
 }
 
 #[tauri::command]
 pub async fn prev_track(state: State<'_, AppState>) -> AppResult<Option<crate::state::TrackInfo>> {
+    let request_generation = advance_playback_request(&state);
     let mut queue = state.queue.lock();
     let track = queue.prev().cloned();
     if let Some(ref t) = track {
         let mut player = state.player.lock();
-        player.play_file(&t.url)?;
+        player.play_file_with_hint(&t.url, t.duration_ms, request_generation)?;
     }
     Ok(track)
 }
@@ -608,11 +1015,12 @@ pub async fn set_queue(
     start_index: usize,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
+    let request_generation = advance_playback_request(&state);
     let mut queue = state.queue.lock();
     queue.set_tracks(tracks, start_index);
     if let Some(track) = queue.current().cloned() {
         let mut player = state.player.lock();
-        player.play_file(&track.url)?;
+        player.play_file_with_hint(&track.url, track.duration_ms, request_generation)?;
     }
     Ok(())
 }
@@ -628,4 +1036,41 @@ pub async fn toggle_shuffle(state: State<'_, AppState>) -> AppResult<bool> {
 pub async fn cycle_repeat(state: State<'_, AppState>) -> AppResult<crate::state::RepeatMode> {
     let mut queue = state.queue.lock();
     Ok(queue.cycle_repeat())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_generation, is_generation_current, CachedAudioPlaybackRequest};
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn playback_generation_never_moves_backwards() {
+        let generation = AtomicU64::new(10);
+
+        assert!(!claim_generation(&generation, 9));
+        assert!(is_generation_current(&generation, 10));
+        assert!(claim_generation(&generation, 10));
+        assert!(claim_generation(&generation, 11));
+        assert!(is_generation_current(&generation, 11));
+        assert!(!is_generation_current(&generation, 10));
+    }
+
+    #[test]
+    fn cached_audio_request_accepts_frontend_camel_case_fields() {
+        let request: CachedAudioPlaybackRequest = serde_json::from_value(serde_json::json!({
+            "cacheKey": "bili-BV1-high",
+            "durationHintMs": 272_000,
+            "startPositionMs": 22_720,
+            "useCrossfade": false,
+            "fadeOutMs": 0,
+            "fadeInMs": 0,
+            "cacheLimitBytes": 1024_u64 * 1024 * 1024,
+            "requestGeneration": 42,
+        }))
+        .expect("cached playback request");
+
+        assert_eq!(request.cache_key, "bili-BV1-high");
+        assert_eq!(request.start_position_ms, Some(22_720));
+        assert_eq!(request.request_generation, 42);
+    }
 }

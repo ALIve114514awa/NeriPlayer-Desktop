@@ -19,7 +19,8 @@ pub fn get_filename(data_saver: bool) -> &'static str {
 
 /// 序列化 SyncData（省流模式: ProtoBuf + GZIP + Base64）
 pub fn serialize_compressed(data: &SyncData) -> AppResult<String> {
-    let proto = sync_data_to_proto(data);
+    let normalized = data.normalized_for_sync();
+    let proto = sync_data_to_proto(&normalized);
     let proto_bytes = proto.encode_to_vec();
 
     // GZIP 压缩
@@ -51,10 +52,10 @@ pub fn deserialize_compressed(content: &str) -> AppResult<SyncData> {
             if let Ok(legacy_proto) = LegacyProtoSyncData::decode(&proto_bytes[..]) {
                 let legacy_data = legacy_proto_to_sync_data(&legacy_proto);
                 if should_use_legacy_decode(&data, &legacy_data) {
-                    return Ok(legacy_data);
+                    return Ok(legacy_data.normalized_for_sync());
                 }
             }
-            Ok(data)
+            Ok(data.normalized_for_sync())
         }
         Err(current_err) => {
             let legacy_proto = LegacyProtoSyncData::decode(&proto_bytes[..]).map_err(|legacy_err| {
@@ -63,7 +64,7 @@ pub fn deserialize_compressed(content: &str) -> AppResult<SyncData> {
                     current_err, legacy_err
                 ))
             })?;
-            Ok(legacy_proto_to_sync_data(&legacy_proto))
+            Ok(legacy_proto_to_sync_data(&legacy_proto).normalized_for_sync())
         }
     }
 }
@@ -73,7 +74,7 @@ pub fn serialize(data: &SyncData, data_saver: bool) -> AppResult<String> {
     if data_saver {
         serialize_compressed(data)
     } else {
-        serde_json::to_string_pretty(data)
+        serde_json::to_string_pretty(&data.normalized_for_sync())
             .map_err(|e| AppError::Other(format!("JSON serialize: {}", e)))
     }
 }
@@ -83,7 +84,8 @@ pub fn deserialize(content: &str, is_binary: bool) -> AppResult<SyncData> {
     if is_binary {
         deserialize_compressed(content)
     } else {
-        serde_json::from_str(content)
+        serde_json::from_str::<SyncData>(content)
+            .map(|data| data.normalized_for_sync())
             .map_err(|e| AppError::Other(format!("JSON parse: {}", e)))
     }
 }
@@ -330,6 +332,7 @@ fn legacy_proto_to_sync_song(p: &LegacyProtoSyncSong) -> SyncSong {
         sub_audio_id: None,
         playlist_context_id: None,
         sync_membership_tokens: Vec::new(),
+        sync_metadata_version: LEGACY_SYNC_METADATA_VERSION,
     }
 }
 
@@ -403,6 +406,7 @@ fn sync_song_to_proto(s: &SyncSong) -> ProtoSyncSong {
         sub_audio_id: s.sub_audio_id.clone(),
         playlist_context_id: s.playlist_context_id.clone(),
         sync_membership_tokens: s.sync_membership_tokens.iter().map(causal_token_to_proto).collect(),
+        sync_metadata_version: s.sync_metadata_version,
     }
 }
 
@@ -435,6 +439,7 @@ fn proto_to_sync_song(p: &ProtoSyncSong) -> SyncSong {
         sub_audio_id: p.sub_audio_id.clone(),
         playlist_context_id: p.playlist_context_id.clone(),
         sync_membership_tokens: p.sync_membership_tokens.iter().map(proto_to_causal_token).collect(),
+        sync_metadata_version: p.sync_metadata_version,
     }
 }
 
@@ -725,6 +730,7 @@ mod compressed_contract_tests {
             matched_song_id: Some("song-key".into()),
             original_lyric: Some("original".into()),
             original_translated_lyric: Some("original translated".into()),
+            sync_metadata_version: CURRENT_SYNC_METADATA_VERSION,
             ..Default::default()
         };
         let data = SyncData {
@@ -763,6 +769,10 @@ mod compressed_contract_tests {
         assert_eq!(
             decoded_song.original_translated_lyric.as_deref(),
             Some("original translated")
+        );
+        assert_eq!(
+            decoded_song.sync_metadata_version,
+            CURRENT_SYNC_METADATA_VERSION
         );
         assert_eq!(decoded.sync_log[0].action, "REMOVE_SONG");
     }
@@ -831,6 +841,10 @@ mod compressed_contract_tests {
         assert_eq!(decoded_song.matched_lyric_source.as_deref(), Some("NETEASE"));
         assert_eq!(decoded_song.matched_song_id.as_deref(), Some("song-key"));
         assert_eq!(decoded_song.user_lyric_offset_ms, 12);
+        assert_eq!(
+            decoded_song.sync_metadata_version,
+            LEGACY_SYNC_METADATA_VERSION
+        );
         assert_eq!(decoded_song.original_lyric.as_deref(), Some("original lyric"));
         assert_eq!(
             decoded_song.original_translated_lyric.as_deref(),

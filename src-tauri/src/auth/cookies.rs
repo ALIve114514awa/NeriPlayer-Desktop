@@ -1,4 +1,5 @@
-// Cookie 持久化 — 系统钥匙串保存凭据，tauri-plugin-store 仅负责旧数据迁移
+// Cookie 持久化 — Release 使用系统钥匙串，Debug 使用随机路径明文文件
+// tauri-plugin-store 仅负责旧数据迁移
 use std::sync::Arc;
 use reqwest::cookie::Jar;
 use reqwest::Url;
@@ -11,13 +12,12 @@ use crate::security;
 const STORE_FILE: &str = "auth.json";
 const STORE_KEY: &str = "auth_state";
 
-/// 将 AuthState 持久化到系统钥匙串
+/// 持久化 AuthState
 pub fn save_auth(app: &AppHandle, auth: &AuthState) {
     if !has_any_auth(auth) {
-        if !security::delete_secret(security::AUTH_STATE_KEY) {
-            log::error!("系统钥匙串不可用，无法清除登录凭据");
+        if !delete_persisted_auth(app) {
+            log::error!("登录凭据存储不可用，无法清除登录凭据");
         }
-        clear_legacy_auth(app);
         return;
     }
 
@@ -27,7 +27,7 @@ pub fn save_auth(app: &AppHandle, auth: &AuthState) {
     };
 
     if !security::set_secret(security::AUTH_STATE_KEY, &serialized) {
-        log::error!("系统钥匙串不可用，已跳过登录凭据持久化");
+        log::error!("登录凭据存储不可用，已跳过登录凭据持久化");
         clear_legacy_auth(app);
         return;
     }
@@ -35,14 +35,14 @@ pub fn save_auth(app: &AppHandle, auth: &AuthState) {
     clear_legacy_auth(app);
 }
 
-/// 启动时从系统钥匙串恢复 AuthState，并迁移旧版明文数据
+/// 启动时恢复 AuthState，并迁移旧版明文数据
 pub fn load_auth(app: &AppHandle) -> AuthState {
     if let Some(serialized) = security::get_secret(security::AUTH_STATE_KEY) {
         clear_legacy_auth(app);
         return match serde_json::from_str(&serialized) {
             Ok(auth) => auth,
             Err(_) => {
-                log::error!("系统钥匙串中的登录凭据格式无效，已清除");
+                log::error!("登录凭据格式无效，已清除");
                 let _ = security::delete_secret(security::AUTH_STATE_KEY);
                 AuthState::default()
             }
@@ -65,10 +65,17 @@ pub fn load_auth(app: &AppHandle) -> AuthState {
         return legacy;
     }
 
-    // 安全存储不可用时不继续使用明文凭据，避免下次启动再次暴露
-    log::error!("旧版登录凭据迁移到系统钥匙串失败，已清除明文凭据");
+    // 目标存储不可用时不继续使用旧明文凭据，避免下次启动再次暴露
+    log::error!("旧版登录凭据迁移失败，已清除明文凭据");
     clear_legacy_auth(app);
     AuthState::default()
+}
+
+/// 删除所有持久化登录凭据，包括旧版明文数据
+pub fn delete_persisted_auth(app: &AppHandle) -> bool {
+    let deleted = security::delete_secret(security::AUTH_STATE_KEY);
+    clear_legacy_auth(app);
+    deleted
 }
 
 fn load_legacy_auth(app: &AppHandle) -> AuthState {
@@ -175,7 +182,7 @@ pub fn parse_raw_cookie_text(raw: &str, platform: &str) -> Vec<CookieEntry> {
 
     let mut entries = Vec::new();
     // 按 ; \r \n 分割
-    for segment in raw.split(|c: char| c == ';' || c == '\r' || c == '\n') {
+    for segment in raw.split([';', '\r', '\n']) {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
@@ -209,4 +216,17 @@ pub fn parse_raw_cookie_text(raw: &str, platform: &str) -> Vec<CookieEntry> {
 fn domain_to_url(domain: &str) -> String {
     let d = domain.trim_start_matches('.');
     format!("https://{}", d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_raw_cookie_text;
+
+    #[test]
+    fn raw_cookie_parser_accepts_all_supported_separators() {
+        let entries = parse_raw_cookie_text("first=1;second=2\rthird=3\nfourth=4", "netease");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+
+        assert_eq!(names, ["first", "second", "third", "fourth"]);
+    }
 }

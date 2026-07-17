@@ -8,4 +8,5 @@ pub mod player_cmd;
 pub mod recommend_cmd;
 pub mod search_cmd;
 pub mod settings_cmd;
+pub mod storage_cmd;
 pub mod sync_cmd;

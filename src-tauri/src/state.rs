@@ -1,9 +1,11 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+
+use crate::sync::models::SyncSong;
 
 use crate::audio::player::PlayerEngine;
 use crate::audio::queue::PlayQueue;
@@ -20,6 +22,7 @@ pub struct DownloadTaskControl {
 /// 全局应用状态，通过 tauri::State 注入
 pub struct AppState {
     pub player: Mutex<PlayerEngine>,
+    pub playback_generation: Arc<AtomicU64>,
     pub queue: Mutex<PlayQueue>,
     pub http: parking_lot::RwLock<reqwest::Client>,
     /// 共享 Cookie Jar — 允许外部注入持久化登录 Cookie
@@ -42,8 +45,12 @@ impl AppState {
             .build()
             .expect("Failed to create HTTP client");
 
+        let playback_generation = Arc::new(AtomicU64::new(0));
         Self {
-            player: Mutex::new(PlayerEngine::new()),
+            player: Mutex::new(PlayerEngine::with_playback_generation(
+                playback_generation.clone(),
+            )),
+            playback_generation,
             queue: Mutex::new(PlayQueue::new()),
             http: parking_lot::RwLock::new(http),
             cookie_jar: jar,
@@ -86,6 +93,10 @@ pub struct TrackInfo {
     pub cover_url: Option<String>,
     #[serde(default, alias = "addedAt")]
     pub added_at: i64,
+    #[serde(default, alias = "syncPayload", skip_serializing_if = "Option::is_none")]
+    pub sync_payload: Option<SyncSong>,
+    #[serde(default, alias = "playlistKey", skip_serializing_if = "Option::is_none")]
+    pub playlist_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

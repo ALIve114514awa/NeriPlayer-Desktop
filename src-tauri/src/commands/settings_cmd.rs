@@ -1,11 +1,22 @@
 use crate::api::bilibili::client::{BiliAudioStream, BiliClient};
-use crate::api::netease::client::NeteaseClient;
+use crate::api::netease::client::{NeteaseClient, NeteasePlaybackUnavailableReason};
 use crate::api::qq::client::QqMusicClient;
 use crate::api::youtube::client::YouTubeClient;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
+use crate::settings::store::{self, AppSettings, SettingsLoadResult};
 use serde::Serialize;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
+
+#[tauri::command]
+pub async fn get_settings(app: AppHandle) -> AppResult<SettingsLoadResult> {
+    store::load_settings(&app)
+}
+
+#[tauri::command]
+pub async fn save_settings(app: AppHandle, settings: AppSettings) -> AppResult<AppSettings> {
+    store::save_settings(&app, settings)
+}
 
 #[tauri::command]
 pub async fn get_app_data_dir(app: tauri::AppHandle) -> AppResult<String> {
@@ -22,6 +33,9 @@ pub struct SongUrlResult {
     pub url: Option<String>,
     pub bitrate: u64,
     pub format: String,
+    pub expected_content_length: Option<u64>,
+    pub is_preview: bool,
+    pub unavailable_reason: Option<NeteasePlaybackUnavailableReason>,
 }
 
 #[tauri::command]
@@ -36,6 +50,9 @@ pub async fn get_netease_song_url(
         url: result.url,
         bitrate: result.br,
         format: result.r#type,
+        expected_content_length: (result.size > 0).then_some(result.size),
+        is_preview: result.is_preview,
+        unavailable_reason: result.unavailable_reason,
     })
 }
 
@@ -51,6 +68,9 @@ pub async fn get_qq_song_url(
         url: result.url,
         bitrate: result.bitrate,
         format: result.format,
+        expected_content_length: None,
+        is_preview: false,
+        unavailable_reason: None,
     })
 }
 
@@ -60,6 +80,22 @@ pub struct BiliAudioResult {
     pub url: String,
     pub bandwidth: u64,
     pub codecs: String,
+    pub candidates: Vec<BiliAudioCandidate>,
+}
+
+#[derive(Serialize)]
+pub struct BiliAudioCandidate {
+    pub url: String,
+    pub bandwidth: u64,
+    pub codecs: String,
+}
+
+const LEGACY_BILI_ID_MULTIPLIER: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyBiliSongId {
+    avid: u64,
+    page: u64,
 }
 
 #[tauri::command]
@@ -74,10 +110,7 @@ pub async fn get_bili_audio_url(
 
     // 确定 bvid 和 cid
     let (real_bvid, real_cid) = if let Some(aid) = avid {
-        // 通过 avid 获取视频信息（同步歌曲场景）
-        let info = client.get_video_info_by_avid(aid).await?;
-        let c = cid.unwrap_or(info.cid);
-        (info.bvid, c)
+        resolve_bili_numeric_source(&client, aid, cid).await?
     } else {
         let info = client.get_video_info(&bvid).await?;
         let c = cid.unwrap_or(info.cid);
@@ -85,13 +118,47 @@ pub async fn get_bili_audio_url(
     };
 
     let streams = client.get_audio_url(&real_bvid, real_cid).await?;
+    let candidates = build_bili_audio_candidates(&streams);
     let best = select_bili_audio_stream(streams, quality.as_deref())
         .ok_or_else(|| AppError::Api("No audio stream found".into()))?;
     Ok(BiliAudioResult {
         url: best.url,
         bandwidth: best.bandwidth,
         codecs: best.codecs,
+        candidates,
     })
+}
+
+async fn resolve_bili_numeric_source(
+    client: &BiliClient,
+    aid: u64,
+    cid: Option<u64>,
+) -> AppResult<(String, u64)> {
+    match client.get_video_info_by_avid(aid).await {
+        Ok(info) => Ok((info.bvid, cid.unwrap_or(info.cid))),
+        Err(direct_error) => {
+            let Some(legacy) = split_legacy_bili_song_id(aid) else {
+                return Err(direct_error);
+            };
+            let Ok(info) = client.get_video_info_by_avid(legacy.avid).await else {
+                return Err(direct_error);
+            };
+            let resolved_cid = match cid {
+                Some(value) => value,
+                None => match client.get_video_page_cid(&info.bvid, legacy.page).await {
+                    Ok(Some(value)) => value,
+                    _ => return Err(direct_error),
+                },
+            };
+            Ok((info.bvid, resolved_cid))
+        }
+    }
+}
+
+fn split_legacy_bili_song_id(id: u64) -> Option<LegacyBiliSongId> {
+    let avid = id / LEGACY_BILI_ID_MULTIPLIER;
+    let page = id % LEGACY_BILI_ID_MULTIPLIER;
+    (avid > 0 && page > 0).then_some(LegacyBiliSongId { avid, page })
 }
 
 fn select_bili_audio_stream(
@@ -124,6 +191,17 @@ fn select_bili_audio_stream(
         _ => normal_streams().next().cloned(),
     }
     .or(fallback)
+}
+
+fn build_bili_audio_candidates(streams: &[BiliAudioStream]) -> Vec<BiliAudioCandidate> {
+    streams
+        .iter()
+        .map(|stream| BiliAudioCandidate {
+            url: stream.url.clone(),
+            bandwidth: stream.bandwidth,
+            codecs: stream.codecs.clone(),
+        })
+        .collect()
 }
 
 /// 获取 YouTube 音频流 URL
@@ -181,4 +259,57 @@ pub async fn get_build_info() -> AppResult<BuildInfo> {
         build_timestamp: env!("BUILD_TIMESTAMP").to_string(),
         version: env!("BUILD_VERSION").to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_bili_audio_candidates,
+        select_bili_audio_stream,
+        split_legacy_bili_song_id,
+        LegacyBiliSongId,
+    };
+    use crate::api::bilibili::client::BiliAudioStream;
+
+    fn stream(url: &str, bandwidth: u64, codecs: &str, quality_id: u32) -> BiliAudioStream {
+        BiliAudioStream {
+            url: url.to_string(),
+            bandwidth,
+            codecs: codecs.to_string(),
+            quality_id,
+        }
+    }
+
+    #[test]
+    fn bili_candidates_keep_all_fallback_streams() {
+        let streams = vec![
+            stream("https://audio/high", 320_000, "flac", 30251),
+            stream("https://audio/medium", 192_000, "mp4a.40.2", 30280),
+        ];
+
+        let candidates = build_bili_audio_candidates(&streams);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].url, "https://audio/high");
+        assert_eq!(candidates[1].bandwidth, 192_000);
+    }
+
+    #[test]
+    fn bili_quality_falls_back_to_available_stream() {
+        let streams = vec![stream("https://audio/high", 320_000, "flac", 30251)];
+
+        let selected = select_bili_audio_stream(streams, Some("dolby"));
+        assert_eq!(selected.map(|stream| stream.url), Some("https://audio/high".into()));
+    }
+
+    #[test]
+    fn splits_android_legacy_bili_song_id() {
+        assert_eq!(
+            split_legacy_bili_song_id(12_345_678_900_007),
+            Some(LegacyBiliSongId {
+                avid: 1_234_567_890,
+                page: 7,
+            })
+        );
+        assert_eq!(split_legacy_bili_song_id(12_345_0000), None);
+    }
 }

@@ -1,6 +1,10 @@
 // 同步数据模型 — 与 Android 端 SyncDataModels.kt 保持 JSON 字段兼容
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+pub const LEGACY_SYNC_METADATA_VERSION: i32 = 0;
+pub const CURRENT_SYNC_METADATA_VERSION: i32 = 1;
 
 /// 反序列化辅助：同时接受 string 和 number 类型，统一转为 String
 fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -259,6 +263,21 @@ fn stable_remote_identity_id(channel: &str, audio: &str, sub_audio: &str) -> i64
     stable_sync_identity_id(&format!("{channel}|{audio}|{sub_audio}"))
 }
 
+pub fn default_history_update_mode() -> String {
+    "immediate".into()
+}
+
+/// 将桌面端旧值和 Android 端枚举值统一为稳定的内部值
+pub fn normalize_history_update_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "every_10_minutes" | "batched" | "batched_10" => "every_10_minutes".into(),
+        "every_15_minutes" | "batched_15" => "every_15_minutes".into(),
+        "every_30_minutes" | "batched_30" => "every_30_minutes".into(),
+        "immediate" | "every_play" | "after_play" => "immediate".into(),
+        _ => default_history_update_mode(),
+    }
+}
+
 /// 同步数据根信封
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -292,6 +311,63 @@ pub struct SyncData {
 }
 
 fn default_version() -> String { "2.0".into() }
+
+impl SyncData {
+    pub fn normalized_for_sync(&self) -> Self {
+        let mut normalized = self.clone();
+        if normalized.version.is_empty() {
+            normalized.version = default_version();
+        }
+        normalized.playlists = normalized
+            .playlists
+            .iter()
+            .map(|playlist| {
+                let mut normalized = playlist.clone();
+                normalized.songs = playlist
+                    .songs
+                    .iter()
+                    .map(SyncSong::normalized_for_sync)
+                    .collect();
+                normalized
+            })
+            .collect();
+        normalized.favorite_playlists = normalized
+            .favorite_playlists
+            .iter()
+            .map(SyncFavoritePlaylist::normalized_for_sync)
+            .collect();
+        normalized.recent_plays = normalized
+            .recent_plays
+            .iter()
+            .map(|recent| {
+                let mut normalized = recent.clone();
+                normalized.song = recent.song.normalized_for_sync();
+                normalized
+            })
+            .collect();
+        normalized.sync_log = normalized
+            .sync_log
+            .iter()
+            .map(|entry| {
+                let mut normalized = entry.clone();
+                normalized.action = normalize_sync_action(&entry.action).to_string();
+                normalized
+            })
+            .collect();
+        normalized.playlist_song_deletions = normalized
+            .playlist_song_deletions
+            .iter()
+            .map(|deletion| {
+                let mut normalized = deletion.clone();
+                normalized.removed_membership_tokens = normalize_sync_causal_tokens(
+                    &deletion.removed_membership_tokens,
+                );
+                normalized
+            })
+            .collect();
+        normalized
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,6 +537,8 @@ pub struct SyncSong {
     pub playlist_context_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_membership_tokens: Vec<SyncCausalToken>,
+    #[serde(default)]
+    pub sync_metadata_version: i32,
 }
 
 impl SyncSong {
@@ -506,6 +584,30 @@ impl SyncSong {
             media_uri: self.media_uri.clone(),
         }
     }
+
+    pub fn raw_identity(&self) -> SongIdentity {
+        SongIdentity {
+            id: self.id.clone(),
+            album: self.album.clone(),
+            media_uri: self.media_uri.clone(),
+        }
+    }
+
+    pub fn identity_keys(&self) -> Vec<String> {
+        let primary = self.identity().stable_key();
+        let raw = self.raw_identity().stable_key();
+        if primary == raw {
+            vec![primary]
+        } else {
+            vec![primary, raw]
+        }
+    }
+
+    pub fn normalized_for_sync(&self) -> Self {
+        let mut normalized = self.clone();
+        normalized.sync_membership_tokens = normalize_sync_causal_tokens(&self.sync_membership_tokens);
+        normalized
+    }
 }
 
 /// 歌曲身份标识，用于去重
@@ -531,6 +633,7 @@ pub struct SyncRecentPlay {
         deserialize_with = "deserialize_string_or_number"
     )]
     pub song_id: String,
+    #[serde(default)]
     pub song: SyncSong,
     #[serde(default)]
     pub played_at: i64,
@@ -564,6 +667,10 @@ impl SyncRecentPlayDeletion {
             album: self.album.clone(),
             media_uri: self.media_uri.clone(),
         }
+    }
+
+    pub fn identity_keys(&self) -> Vec<String> {
+        vec![self.identity().stable_key()]
     }
 }
 
@@ -607,6 +714,39 @@ impl SyncFavoritePlaylist {
     pub fn group_key(&self) -> String {
         format!("{}_{}", self.id, self.source)
     }
+
+    pub fn normalized_for_sync(&self) -> Self {
+        let mut normalized = self.clone();
+        if normalized.modified_at <= 0 {
+            normalized.modified_at = normalized.added_time.max(0);
+        }
+        if normalized.sort_order == 0 {
+            normalized.sort_order = normalized.added_time.max(0);
+        }
+        normalized.songs = normalized
+            .songs
+            .iter()
+            .map(SyncSong::normalized_for_sync)
+            .collect();
+        if normalized.is_deleted {
+            normalized.songs.clear();
+            normalized.track_count = 0;
+        } else {
+            normalized.track_count = normalized
+                .track_count
+                .max(normalized.songs.len().try_into().unwrap_or(i32::MAX));
+            if normalized.cover_url.is_empty() {
+                normalized.cover_url = normalized
+                    .songs
+                    .iter()
+                    .map(|song| song.cover_url.as_str())
+                    .find(|cover| !cover.is_empty())
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+        normalized
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,13 +777,29 @@ pub struct SyncLogEntry {
 }
 
 /// 因果一致性令牌
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncCausalToken {
     #[serde(default)]
     pub device_id: String,
     #[serde(default)]
     pub counter: i64,
+}
+
+/// 清理无效令牌并固定输出顺序，避免双端仅因输入顺序不同反复产生变更
+pub fn normalize_sync_causal_tokens(tokens: &[SyncCausalToken]) -> Vec<SyncCausalToken> {
+    let mut normalized: Vec<SyncCausalToken> = tokens
+        .iter()
+        .filter(|token| !token.device_id.trim().is_empty() && token.counter > 0)
+        .cloned()
+        .collect();
+    normalized.sort_by(|left, right| {
+        left.device_id
+            .cmp(&right.device_id)
+            .then_with(|| left.counter.cmp(&right.counter))
+    });
+    normalized.dedup();
+    normalized
 }
 
 /// 单曲播放统计
@@ -693,7 +849,7 @@ pub struct SyncTrackStat {
 }
 
 /// 播放计数分片
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncPlaybackCounterShard {
     #[serde(default)]
@@ -787,13 +943,25 @@ pub struct SyncPlaylistSongDeletion {
 }
 
 impl SyncPlaylistSongDeletion {
-    pub fn identity(&self) -> String {
+    pub fn song_identity_key(&self) -> String {
         let song_identity = SongIdentity {
             id: self.song_id.clone(),
             album: self.album.clone(),
             media_uri: self.media_uri.clone().unwrap_or_default(),
         };
-        format!("{}|{}", self.playlist_id, song_identity.stable_key())
+        song_identity.stable_key()
+    }
+
+    pub fn identity(&self) -> String {
+        format!("{}|{}", self.playlist_id, self.song_identity_key())
+    }
+
+    pub fn matches_song(&self, playlist_id: &str, song: &SyncSong) -> bool {
+        if self.playlist_id != playlist_id {
+            return false;
+        }
+        let deletion_key = self.song_identity_key();
+        song.identity_keys().iter().any(|key| key == &deletion_key)
     }
 }
 
@@ -813,6 +981,8 @@ pub struct SyncResult {
     pub songs_added: i32,
     #[serde(default)]
     pub songs_removed: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Value>,
 }
 
 /// 同步配置
@@ -833,12 +1003,27 @@ pub struct GitHubSyncConfig {
     pub data_saver: bool,
     #[serde(default)]
     pub silent_failures: bool,
-    #[serde(default = "default_history_mode")]
+    #[serde(default = "default_history_update_mode")]
     pub history_update_mode: String,
 }
 
 fn default_true() -> bool { true }
-fn default_history_mode() -> String { "immediate".into() }
+
+/// 不绑定具体同步提供商的同步偏好
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPreferencesConfig {
+    #[serde(default = "default_history_update_mode")]
+    pub history_update_mode: String,
+}
+
+impl Default for SyncPreferencesConfig {
+    fn default() -> Self {
+        Self {
+            history_update_mode: default_history_update_mode(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -886,6 +1071,7 @@ mod legacy_json_tests {
         assert_eq!(value["originalLyric"], "original");
         assert_eq!(value["originalTranslatedLyric"], "original translated");
         assert_eq!(value["userLyricOffsetMs"], 0);
+        assert_eq!(value["syncMetadataVersion"], LEGACY_SYNC_METADATA_VERSION);
         assert!(value.get("lyric").is_none());
         assert!(value.get("coverUrl").is_none());
 
@@ -909,6 +1095,7 @@ mod legacy_json_tests {
         assert_eq!(decoded.matched_lyric_source.as_deref(), Some("QQ_MUSIC"));
         assert_eq!(decoded.matched_song_id.as_deref(), Some("56"));
         assert_eq!(decoded.user_lyric_offset_ms, 0);
+        assert_eq!(decoded.sync_metadata_version, LEGACY_SYNC_METADATA_VERSION);
     }
 
     #[test]
@@ -980,5 +1167,15 @@ mod legacy_json_tests {
             normalized.songs.iter().map(|song| song.id.as_str()).collect::<Vec<_>>(),
             vec!["2", "3", "1", "4"]
         );
+    }
+
+    #[test]
+    fn history_update_mode_accepts_android_and_legacy_values() {
+        assert_eq!(normalize_history_update_mode("IMMEDIATE"), "immediate");
+        assert_eq!(normalize_history_update_mode("EVERY_10_MINUTES"), "every_10_minutes");
+        assert_eq!(normalize_history_update_mode("EVERY_15_MINUTES"), "every_15_minutes");
+        assert_eq!(normalize_history_update_mode("EVERY_30_MINUTES"), "every_30_minutes");
+        assert_eq!(normalize_history_update_mode("BATCHED"), "every_10_minutes");
+        assert_eq!(normalize_history_update_mode("unknown"), "immediate");
     }
 }

@@ -1,8 +1,11 @@
 // 同步管理器 — 协调 GitHub/WebDAV 同步流程
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
+use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use crate::error::{AppError, AppResult};
-use crate::state::TrackInfo;
+use crate::state::{TrackInfo, TrackSource};
 use crate::library::playlist::{Playlist, PlaylistStore};
 use super::models::*;
 use super::serializer;
@@ -10,124 +13,262 @@ use super::github_api::GitHubApiClient;
 use super::webdav_api::WebDavApiClient;
 use super::merge;
 
+static SYNC_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+static SYNC_CAUSAL_TOKEN_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+const MAX_GITHUB_UPLOAD_CONFLICT_RETRIES: usize = 3;
+
+async fn acquire_sync_lock() -> MutexGuard<'static, ()> {
+    SYNC_LOCK
+        .get_or_init(|| TokioMutex::new(()))
+        .lock()
+        .await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncHistoryEntry {
+    pub track: TrackInfo,
+    pub played_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncHistoryDeletion {
+    pub track: TrackInfo,
+    pub deleted_at: i64,
+}
+
 /// GitHub 同步（支持省流模式 backup.bin / 普通模式 backup.json）
 pub async fn sync_github(
     http: &reqwest::Client,
     config: &mut GitHubSyncConfig,
     local_data: &SyncData,
 ) -> AppResult<SyncResult> {
+    let _sync_guard = acquire_sync_lock().await;
     let api = GitHubApiClient::new(http, &config.token);
     let data_saver = config.data_saver;
     let primary_file = serializer::get_filename(data_saver);
-    let fallback_file = serializer::get_filename(!data_saver);
 
-    // 1. 验证 token
-    let _username = api.validate_token().await
-        .map_err(|_| AppError::Api("GitHub token invalid or expired".into()))?;
-
-    // 2. 确保仓库存在
-    if let Err(_) = api.check_repository(&config.owner, &config.repo).await {
-        api.create_repository(&config.repo).await?;
-    }
-
-    // 3. 拉取远程文件（优先主格式，降级备用格式）
-    let (remote_data, remote_sha, actual_file) = match fetch_and_parse(&api, config, primary_file).await {
-        Ok(result) => result,
-        Err(_) => {
-            // 主格式失败，尝试备用格式
-            match fetch_and_parse(&api, config, fallback_file).await {
-                Ok(result) => result,
-                Err(_) => {
-                    // 两种格式都不存在或为空，初始上传
-                    let content = serializer::serialize(local_data, data_saver)?;
-                    let existing_sha = api.get_file_content(&config.owner, &config.repo, primary_file).await?
-                        .map(|(_, sha)| sha).unwrap_or_default();
-                    let new_sha = api.update_file_content(
-                        &config.owner, &config.repo, primary_file,
-                        &content, &existing_sha, "Initial sync from NeriPlayer Desktop",
-                    ).await?;
-                    config.last_remote_sha = new_sha;
-                    config.last_sync_time = chrono::Utc::now().timestamp_millis();
-                    return Ok(SyncResult {
-                        success: true,
-                        message: "Initial upload complete".into(),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    };
-
-    // 4. 检查远程是否有变化
-    let remote_changed = remote_sha != config.last_remote_sha;
-
-    // 5. 加载 base snapshot 并三方合并
-    let base_snapshot = load_base_snapshot();
-    let merged = merge::three_way_merge(local_data, &remote_data, config.last_sync_time, &base_snapshot);
-
-    // 5.5 合并后回写本地歌单
-    save_synced_playlists(&merged);
-    // 保存本次合并结果作为下次同步的 base snapshot
-    save_base_snapshot(&merged);
-
-    // 6. 检查是否需要上传
-    if !remote_changed && !merge::has_data_changed(&remote_data, &merged) {
-        config.last_remote_sha = remote_sha;
-        config.last_sync_time = chrono::Utc::now().timestamp_millis();
-        return Ok(SyncResult {
-            success: true,
-            message: "Already up to date".into(),
-            ..Default::default()
+    let remote_snapshot = fetch_remote_snapshot(
+        &api,
+        config,
+        primary_file,
+        data_saver,
+    )
+    .await?;
+    let is_first_sync = config.last_remote_sha.is_empty();
+    let initial_remote_missing = remote_snapshot.is_none();
+    let mut remote_changed_during_sync = remote_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| {
+            !config.last_remote_sha.is_empty()
+                && config.last_remote_sha != snapshot.version.sha.as_deref().unwrap_or_default()
         });
+    let base_snapshot = load_base_snapshot("github");
+    let mut remote_data = remote_snapshot.as_ref().map(|snapshot| snapshot.data.clone());
+    let mut remote_version = remote_snapshot
+        .map(|snapshot| snapshot.version)
+        .unwrap_or_else(|| GitHubRemoteVersion {
+            sha: None,
+            file_name: primary_file.to_string(),
+        });
+    let mut final_merged = None;
+    let mut final_remote_data = None;
+    let mut upload_performed = false;
+
+    for attempt in 0..=MAX_GITHUB_UPLOAD_CONFLICT_RETRIES {
+        let merged = match remote_data.as_ref() {
+            Some(remote) => merge::three_way_merge(
+                local_data,
+                remote,
+                config.last_sync_time,
+                &base_snapshot,
+            ),
+            None => {
+                let mut initial = local_data.normalized_for_sync();
+                initial.last_modified = chrono::Utc::now().timestamp_millis();
+                initial
+            }
+        };
+
+        let has_meaningful_change = match remote_data.as_ref() {
+            Some(remote) => merge::has_data_changed(remote, &merged),
+            None => true,
+        };
+        if !has_meaningful_change {
+            final_remote_data = remote_data.clone();
+            final_merged = Some(merged);
+            break;
+        }
+
+        let use_binary_format = remote_version.file_name.ends_with(".bin");
+        let content = serializer::serialize(&merged, use_binary_format)?;
+        match api
+            .update_file_content(
+                &config.owner,
+                &config.repo,
+                &remote_version.file_name,
+                &content,
+                remote_version.sha.as_deref().unwrap_or_default(),
+                "Sync from NeriPlayer Desktop",
+            )
+            .await
+        {
+            Ok(new_sha) => {
+                remote_version.sha = Some(new_sha);
+                final_remote_data = remote_data.clone();
+                final_merged = Some(merged);
+                upload_performed = true;
+                break;
+            }
+            Err(error)
+                if error.is_content_conflict()
+                    && attempt < MAX_GITHUB_UPLOAD_CONFLICT_RETRIES =>
+            {
+                let refreshed = fetch_remote_snapshot(
+                    &api,
+                    config,
+                    &remote_version.file_name,
+                    use_binary_format,
+                )
+                .await?;
+                remote_data = refreshed.as_ref().map(|snapshot| snapshot.data.clone());
+                remote_version = refreshed
+                    .map(|snapshot| snapshot.version)
+                    .unwrap_or_else(|| GitHubRemoteVersion {
+                        sha: None,
+                        file_name: remote_version.file_name.clone(),
+                    });
+                remote_changed_during_sync = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 
-    // 7. 上传合并后的数据（始终用主格式）
-    let content = serializer::serialize(&merged, data_saver)?;
-    let upload_sha = if actual_file == primary_file {
-        remote_sha.clone()
-    } else {
-        // 读取的是备用格式，上传需要主格式文件的 sha
-        api.get_file_content(&config.owner, &config.repo, primary_file).await?
-            .map(|(_, sha)| sha).unwrap_or_default()
-    };
-    let new_sha = api.update_file_content(
-        &config.owner, &config.repo, primary_file,
-        &content, &upload_sha, "Sync from NeriPlayer Desktop",
-    ).await?;
+    let merged = final_merged.ok_or_else(|| {
+        AppError::Api("GitHub upload conflict retry budget exhausted".into())
+    })?;
 
-    // 8. 统计
-    let playlists_added = merged.playlists.len() as i32 - remote_data.playlists.len() as i32;
-    let songs_added = merged.playlists.iter().map(|p| p.songs.len()).sum::<usize>() as i32
-        - remote_data.playlists.iter().map(|p| p.songs.len()).sum::<usize>() as i32;
+    save_synced_playlists(&merged);
+    save_recent_play_history(&merged);
+    save_base_snapshot(&merged, "github");
 
-    config.last_remote_sha = new_sha;
+    let (remote_playlist_count, remote_song_count) = final_remote_data
+        .as_ref()
+        .map(|remote| {
+            (
+                remote.playlists.len(),
+                remote
+                    .playlists
+                    .iter()
+                    .map(|playlist| playlist.songs.len())
+                    .sum::<usize>(),
+            )
+        })
+        .unwrap_or_default();
+    let playlists_added = merged.playlists.len() as i32 - remote_playlist_count as i32;
+    let songs_added = merged
+        .playlists
+        .iter()
+        .map(|playlist| playlist.songs.len())
+        .sum::<usize>() as i32
+        - remote_song_count as i32;
+
+    config.last_remote_sha = remote_version.sha.unwrap_or_default();
     config.last_sync_time = chrono::Utc::now().timestamp_millis();
+    let message = if !upload_performed && !remote_changed_during_sync && !is_first_sync {
+        "Already up to date"
+    } else if initial_remote_missing && upload_performed && !remote_changed_during_sync {
+        "Initial upload complete"
+    } else {
+        "Sync complete"
+    };
 
-    Ok(SyncResult {
+    Ok(with_history(SyncResult {
         success: true,
-        message: "Sync complete".into(),
+        message: message.into(),
         playlists_added: playlists_added.max(0),
         playlists_updated: 0,
         playlists_deleted: 0,
         songs_added: songs_added.max(0),
         songs_removed: 0,
-    })
+        history: None,
+    }, &merged))
 }
 
-/// 从 GitHub 获取并解析远程数据
-async fn fetch_and_parse(
+#[derive(Debug, Clone)]
+struct GitHubRemoteVersion {
+    sha: Option<String>,
+    file_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubRemoteSnapshot {
+    data: SyncData,
+    version: GitHubRemoteVersion,
+}
+
+/// 严格读取远端快照，仅当两种格式都 404 时才视为首次同步
+async fn fetch_remote_snapshot(
     api: &GitHubApiClient,
     config: &GitHubSyncConfig,
-    filename: &str,
-) -> AppResult<(SyncData, String, String)> {
-    let (content, sha) = api.get_file_content(&config.owner, &config.repo, filename).await?
-        .ok_or_else(|| AppError::NotFound("Remote file not found".into()))?;
+    preferred_file: &str,
+    data_saver: bool,
+) -> AppResult<Option<GitHubRemoteSnapshot>> {
+    let alternative_file = serializer::get_filename(!data_saver);
+    let (content, sha, mut actual_file) = match api
+        .get_file_content(&config.owner, &config.repo, preferred_file)
+        .await
+        .map_err(AppError::from)?
+    {
+        Some((content, sha)) => (content, sha, preferred_file.to_string()),
+        None => match api
+            .get_file_content(&config.owner, &config.repo, alternative_file)
+            .await
+            .map_err(AppError::from)?
+        {
+            Some((content, sha)) => (content, sha, alternative_file.to_string()),
+            None => return Ok(None),
+        },
+    };
+
     if content.trim().is_empty() {
-        return Err(AppError::Other("Remote file is empty".into()));
+        return Err(AppError::Other("Remote backup file is empty".into()));
     }
-    let is_binary = filename.ends_with(".bin");
-    let data = serializer::deserialize(&content, is_binary)?;
-    Ok((data, sha, filename.to_string()))
+
+    let mut actual_sha = sha;
+    let data = match serializer::deserialize(&content, actual_file.ends_with(".bin")) {
+        Ok(data) => data,
+        Err(primary_error) => {
+            let fallback_file = serializer::get_filename(!actual_file.ends_with(".bin"));
+            let fallback = api
+                .get_file_content(&config.owner, &config.repo, fallback_file)
+                .await
+                .map_err(AppError::from)?;
+            let Some((fallback_content, fallback_sha)) = fallback else {
+                return Err(primary_error);
+            };
+            if fallback_content.trim().is_empty() {
+                return Err(primary_error);
+            }
+            let fallback_data = serializer::deserialize(
+                &fallback_content,
+                fallback_file.ends_with(".bin"),
+            )
+            .map_err(|_| primary_error)?;
+            actual_file = fallback_file.to_string();
+            actual_sha = fallback_sha;
+            fallback_data
+        }
+    };
+
+    Ok(Some(GitHubRemoteSnapshot {
+        data,
+        version: GitHubRemoteVersion {
+            sha: Some(actual_sha),
+            file_name: actual_file,
+        },
+    }))
 }
 
 /// WebDAV 同步
@@ -136,6 +277,7 @@ pub async fn sync_webdav(
     config: &mut WebDavSyncConfig,
     local_data: &SyncData,
 ) -> AppResult<SyncResult> {
+    let _sync_guard = acquire_sync_lock().await;
     let api = WebDavApiClient::new(http, &config.server_url, &config.username, &config.password, &config.base_path);
 
     // 1. 验证连接
@@ -147,13 +289,15 @@ pub async fn sync_webdav(
         _ => {
             let content = serde_json::to_string_pretty(local_data)?;
             let fp = api.update_file_content(&content).await?;
+            save_base_snapshot(local_data, "webdav");
+            save_recent_play_history(local_data);
             config.last_remote_fingerprint = fp;
             config.last_sync_time = chrono::Utc::now().timestamp_millis();
-            return Ok(SyncResult {
+            return Ok(with_history(SyncResult {
                 success: true,
                 message: "Initial upload complete".into(),
                 ..Default::default()
-            });
+            }, local_data));
         }
     };
 
@@ -162,19 +306,20 @@ pub async fn sync_webdav(
         .map_err(|e| AppError::Other(format!("Failed to parse remote sync data: {}", e)))?;
 
     let remote_changed = remote_fingerprint != config.last_remote_fingerprint;
-    let base_snapshot = load_base_snapshot();
+    let base_snapshot = load_base_snapshot("webdav");
     let merged = merge::three_way_merge(local_data, &remote_data, config.last_sync_time, &base_snapshot);
     save_synced_playlists(&merged);
-    save_base_snapshot(&merged);
+    save_recent_play_history(&merged);
+    save_base_snapshot(&merged, "webdav");
 
     if !remote_changed && !merge::has_data_changed(&remote_data, &merged) {
         config.last_remote_fingerprint = remote_fingerprint;
         config.last_sync_time = chrono::Utc::now().timestamp_millis();
-        return Ok(SyncResult {
+        return Ok(with_history(SyncResult {
             success: true,
             message: "Already up to date".into(),
             ..Default::default()
-        });
+        }, &merged));
     }
 
     let content = serde_json::to_string_pretty(&merged)?;
@@ -187,7 +332,7 @@ pub async fn sync_webdav(
     config.last_remote_fingerprint = fp;
     config.last_sync_time = chrono::Utc::now().timestamp_millis();
 
-    Ok(SyncResult {
+    Ok(with_history(SyncResult {
         success: true,
         message: "Sync complete".into(),
         playlists_added: playlists_added.max(0),
@@ -195,15 +340,27 @@ pub async fn sync_webdav(
         playlists_deleted: 0,
         songs_added: songs_added.max(0),
         songs_removed: 0,
-    })
+        history: None,
+    }, &merged))
 }
 
 /// 构建本地同步数据（从 tauri-plugin-store 读取歌单等）
-pub fn build_local_sync_data(app: &AppHandle) -> SyncData {
+pub fn build_local_sync_data(
+    app: &AppHandle,
+    history_entries: Option<&[SyncHistoryEntry]>,
+    history_deletions: Option<&[SyncHistoryDeletion]>,
+) -> SyncData {
     // 从 store 读取本地歌单数据
     // 当前歌单系统使用文件存储，构建 SyncData
     let device_id = get_or_create_device_id(app);
     let hostname = whoami::fallible::hostname().unwrap_or_else(|_| "Desktop".into());
+
+    let recent_plays = history_entries
+        .map(|entries| history_entries_to_sync(entries, &device_id))
+        .unwrap_or_else(load_recent_plays);
+    let recent_play_deletions = history_deletions
+        .map(|deletions| history_deletions_to_sync(deletions, &device_id))
+        .unwrap_or_else(load_recent_play_deletions);
 
     SyncData {
         version: "2.0".into(),
@@ -211,15 +368,114 @@ pub fn build_local_sync_data(app: &AppHandle) -> SyncData {
         device_name: format!("NeriPlayer Desktop ({})", hostname),
         last_modified: chrono::Utc::now().timestamp_millis(),
         playlists: load_local_playlists(app),
-        favorite_playlists: Vec::new(),
-        recent_plays: Vec::new(),
+        favorite_playlists: load_favorite_playlists(),
+        recent_plays,
         sync_log: Vec::new(),
-        recent_play_deletions: Vec::new(),
+        recent_play_deletions,
         playback_stats: Vec::new(),
         playback_stats_cleared_at: 0,
         playback_stat_buckets: Vec::new(),
-        playlist_song_deletions: Vec::new(),
+        playlist_song_deletions: load_local_playlist_song_deletions(),
     }
+}
+
+fn history_entries_to_sync(entries: &[SyncHistoryEntry], device_id: &str) -> Vec<SyncRecentPlay> {
+    entries
+        .iter()
+        .filter(|entry| entry.track.source != TrackSource::Local && !entry.track.id.is_empty())
+        .map(|entry| {
+            let song = track_to_sync_song(&entry.track);
+            SyncRecentPlay {
+                song_id: song.id.clone(),
+                song,
+                played_at: entry.played_at.max(0),
+                device_id: device_id.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn history_deletions_to_sync(
+    deletions: &[SyncHistoryDeletion],
+    device_id: &str,
+) -> Vec<SyncRecentPlayDeletion> {
+    deletions
+        .iter()
+        .filter(|deletion| deletion.track.source != TrackSource::Local && !deletion.track.id.is_empty())
+        .map(|deletion| {
+            let song = track_to_sync_song(&deletion.track);
+            SyncRecentPlayDeletion {
+                song_id: song.id,
+                album: song.album,
+                media_uri: song.media_uri,
+                deleted_at: deletion.deleted_at.max(0),
+                device_id: device_id.to_string(),
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PersistedRecentPlayHistory {
+    #[serde(default)]
+    recent_plays: Vec<SyncRecentPlay>,
+    #[serde(default)]
+    recent_play_deletions: Vec<SyncRecentPlayDeletion>,
+}
+
+fn recent_play_history_path() -> std::path::PathBuf {
+    let mut path = dirs_next::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push("NeriPlayer");
+    path.push("recent-play-history.json");
+    path
+}
+
+fn load_recent_plays() -> Vec<SyncRecentPlay> {
+    let path = recent_play_history_path();
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    serde_json::from_str::<PersistedRecentPlayHistory>(&content)
+        .map(|history| history.recent_plays)
+        .unwrap_or_default()
+}
+
+fn load_recent_play_deletions() -> Vec<SyncRecentPlayDeletion> {
+    let path = recent_play_history_path();
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    serde_json::from_str::<PersistedRecentPlayHistory>(&content)
+        .map(|history| history.recent_play_deletions)
+        .unwrap_or_default()
+}
+
+fn save_recent_play_history(data: &SyncData) {
+    let path = recent_play_history_path();
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let history = PersistedRecentPlayHistory {
+        recent_plays: data.recent_plays.clone(),
+        recent_play_deletions: data.recent_play_deletions.clone(),
+    };
+    if let Ok(content) = serde_json::to_string_pretty(&history) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
+fn with_history(mut result: SyncResult, data: &SyncData) -> SyncResult {
+    let entries: Vec<SyncHistoryEntry> = data
+        .recent_plays
+        .iter()
+        .map(|entry| SyncHistoryEntry {
+            track: sync_song_to_track(&entry.song),
+            played_at: entry.played_at,
+        })
+        .collect();
+    result.history = Some(serde_json::json!({
+        "entries": entries,
+        "deletions": &data.recent_play_deletions,
+    }));
+    result
 }
 
 /// 获取或创建设备 ID
@@ -240,6 +496,62 @@ fn get_or_create_device_id(app: &AppHandle) -> String {
     id
 }
 
+pub fn get_or_create_device_id_pub(app: &AppHandle) -> String {
+    get_or_create_device_id(app)
+}
+
+pub fn next_sync_causal_tokens_pub(
+    app: &AppHandle,
+    count: usize,
+) -> AppResult<Vec<SyncCausalToken>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let _counter_guard = SYNC_CAUSAL_TOKEN_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| AppError::Other("Sync causal counter lock is poisoned".into()))?;
+
+    use tauri_plugin_store::StoreExt;
+    let store = app
+        .store("sync-state.json")
+        .map_err(|error| AppError::Other(format!("Failed to open sync state: {}", error)))?;
+    let device_id = get_or_create_device_id(app);
+    let current = store
+        .get("syncCausalCounter")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default()
+        .max(0);
+    let count = i64::try_from(count)
+        .map_err(|_| AppError::Other("Sync causal token count is too large".into()))?;
+    let next = current
+        .checked_add(count)
+        .ok_or_else(|| AppError::Other("Sync causal counter overflow".into()))?;
+    store.set("syncCausalCounter", serde_json::json!(next));
+    store
+        .save()
+        .map_err(|error| AppError::Other(format!("Failed to persist sync state: {}", error)))?;
+
+    Ok((1..=count)
+        .map(|offset| SyncCausalToken {
+            device_id: device_id.clone(),
+            counter: current + offset,
+        })
+        .collect())
+}
+
+pub fn attach_sync_membership_token_pub(
+    track: &mut TrackInfo,
+    token: SyncCausalToken,
+) {
+    let mut payload = track_to_sync_song(track);
+    payload.added_at = track.added_at.max(0);
+    payload.sync_membership_tokens = vec![token];
+    payload.sync_metadata_version = CURRENT_SYNC_METADATA_VERSION;
+    track.playlist_key = Some(payload.identity().stable_key());
+    track.sync_payload = Some(payload);
+}
+
 /// 歌单文件路径（与 library_cmd 保持一致）
 fn playlists_path() -> std::path::PathBuf {
     let mut path = dirs_next::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -252,14 +564,49 @@ pub fn tracks_to_sync_songs_pub(tracks: &[TrackInfo]) -> Vec<SyncSong> {
     tracks_to_sync_songs(tracks)
 }
 
+pub fn playlist_track_identity_key_pub(track: &TrackInfo) -> String {
+    if track.source == TrackSource::Local {
+        return track
+            .playlist_key
+            .clone()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| track.id.clone());
+    }
+    track_to_sync_song(track).identity().stable_key()
+}
+
 fn tracks_to_sync_songs(tracks: &[TrackInfo]) -> Vec<SyncSong> {
     tracks.iter()
+        .filter(|track| track.source != TrackSource::Local)
         .map(track_to_sync_song)
         .collect()
 }
 
+pub fn track_to_playlist_song_deletion_pub(
+    playlist_id: i64,
+    track: &TrackInfo,
+    device_id: String,
+) -> SyncPlaylistSongDeletion {
+    let song = track_to_sync_song(track);
+    SyncPlaylistSongDeletion {
+        playlist_id: playlist_id.to_string(),
+        song_id: song.id,
+        album: song.album,
+        media_uri: if song.media_uri.is_empty() { None } else { Some(song.media_uri) },
+        deleted_at: chrono::Utc::now().timestamp_millis(),
+        device_id,
+        removed_membership_tokens: song.sync_membership_tokens,
+    }
+}
+
 /// TrackInfo -> SyncSong 转换（内部使用）
 fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
+    if let Some(payload) = &track.sync_payload {
+        let mut preserved = payload.normalized_for_sync();
+        preserved.added_at = track.added_at.max(0);
+        return preserved;
+    }
+
     let platform = sync_platform_identity(track);
 
     SyncSong {
@@ -290,6 +637,7 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
         sub_audio_id: platform.sub_audio_id,
         playlist_context_id: None,
         sync_membership_tokens: Vec::new(),
+        sync_metadata_version: LEGACY_SYNC_METADATA_VERSION,
     }
 }
 
@@ -418,6 +766,13 @@ fn sync_song_to_track(song: &SyncSong) -> TrackInfo {
         (song.id.clone(), TrackSource::Local)
     };
 
+    let display_cover = song
+        .custom_cover_url
+        .as_ref()
+        .filter(|url| !url.trim().is_empty())
+        .cloned()
+        .or_else(|| (!song.cover_url.is_empty()).then(|| song.cover_url.clone()));
+    let playlist_key = song.identity().stable_key();
     TrackInfo {
         id: full_id,
         title: song.custom_name.clone().unwrap_or_else(|| song.name.clone()),
@@ -426,8 +781,10 @@ fn sync_song_to_track(song: &SyncSong) -> TrackInfo {
         duration_ms: song.duration_ms.max(0) as u64,
         source,
         url: String::new(), // URL 在播放时动态获取
-        cover_url: if song.cover_url.is_empty() { None } else { Some(song.cover_url.clone()) },
+        cover_url: display_cover,
         added_at: song.added_at.max(0),
+        sync_payload: Some(song.normalized_for_sync()),
+        playlist_key: Some(playlist_key),
     }
 }
 
@@ -436,15 +793,46 @@ fn load_local_playlists(_app: &AppHandle) -> Vec<SyncPlaylist> {
     let path = playlists_path();
     let store = PlaylistStore::load(&path);
 
-    store.playlists.iter().map(|pl| SyncPlaylist {
-        id: pl.id.to_string(),
-        name: pl.name.clone(),
-        songs: tracks_to_sync_songs(&pl.tracks),
-        created_at: pl.modified_at as i64,
-        modified_at: pl.modified_at as i64,
-        is_deleted: false,
-        song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
-    }).collect()
+    let mut playlists: Vec<SyncPlaylist> = store.playlists.iter().map(|pl| {
+        let sync_id = sync_playlist_id(pl.id, &pl.name);
+        SyncPlaylist {
+            id: sync_id,
+            name: pl.name.clone(),
+            songs: tracks_to_sync_songs(&pl.tracks),
+            created_at: pl.id,
+            modified_at: pl.modified_at as i64,
+            is_deleted: false,
+            song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
+        }
+    }).collect();
+
+    let existing_ids: HashSet<String> = playlists.iter().map(|playlist| playlist.id.clone()).collect();
+    for deleted_id in store.deleted_playlist_ids {
+        let id = deleted_id.to_string();
+        if existing_ids.contains(&id) {
+            continue;
+        }
+        playlists.push(SyncPlaylist {
+            id,
+            name: String::new(),
+            songs: Vec::new(),
+            created_at: deleted_id,
+            modified_at: chrono::Utc::now().timestamp_millis(),
+            is_deleted: true,
+            song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
+        });
+    }
+    playlists
+}
+
+fn sync_playlist_id(id: i64, name: &str) -> String {
+    if is_favorites_name(name) {
+        return SYSTEM_FAVORITES_ID.to_string();
+    }
+    if is_local_name(name) {
+        return SYSTEM_LOCAL_ID.to_string();
+    }
+    id.to_string()
 }
 
 /// 系统歌单 ID（对齐 Android FavoritesPlaylist / LocalFilesPlaylist）
@@ -461,8 +849,8 @@ fn is_local_name(name: &str) -> bool { LOCAL_NAMES.iter().any(|n| *n == name) }
 /// 解析 SyncPlaylist ID，识别系统歌单
 fn resolve_system_id(sp_id: &str, sp_name: &str) -> i64 {
     if let Ok(id) = sp_id.parse::<i64>() {
-        if id == -1001 || is_favorites_name(sp_name) { return SYSTEM_FAVORITES_ID; }
-        if id == -1002 || is_local_name(sp_name) { return SYSTEM_LOCAL_ID; }
+        if id == SYSTEM_FAVORITES_ID { return SYSTEM_FAVORITES_ID; }
+        if id == SYSTEM_LOCAL_ID { return SYSTEM_LOCAL_ID; }
         if id > 0 { return id; }
     }
     if is_favorites_name(sp_name) { return SYSTEM_FAVORITES_ID; }
@@ -474,28 +862,28 @@ fn resolve_system_id(sp_id: &str, sp_name: &str) -> i64 {
 pub fn save_synced_playlists(merged: &SyncData) {
     let path = playlists_path();
     let mut store = PlaylistStore::load(&path);
+    let existing_playlists = store.playlists.clone();
 
     let mut new_playlists: Vec<Playlist> = Vec::new();
-    let mut max_id: i64 = store.playlists.iter().map(|p| p.id).filter(|&id| id > 0).max().unwrap_or(0);
-
-    // 歌单级别去重：同名歌单只保留第一个
-    let mut seen_names = std::collections::HashSet::new();
+    let mut max_id: i64 = existing_playlists.iter().map(|p| p.id).filter(|&id| id > 0).max().unwrap_or(0);
+    let mut active_ids = HashSet::new();
+    let mut deleted_ids = HashSet::new();
     let now = chrono::Utc::now().timestamp_millis();
 
     for sp in &merged.playlists {
-        if sp.is_deleted { continue; }
-        let playlist = sp.normalized_for_display_order(now);
-
-        let normalized_name = playlist.name.trim().to_string();
-        if !seen_names.insert(normalized_name.clone()) {
+        if sp.is_deleted {
+            if let Ok(id) = sp.id.parse::<i64>() {
+                deleted_ids.insert(id);
+            }
             continue;
         }
+        let playlist = sp.normalized_for_display_order(now);
 
         let mut local_id = resolve_system_id(&playlist.id, &playlist.name);
         if local_id == 0 {
             local_id = playlist.id.parse::<i64>().ok()
                 .filter(|&id| id > 0)
-                .or_else(|| store.playlists.iter().find(|p| p.name == playlist.name).map(|p| p.id))
+                .or_else(|| existing_playlists.iter().find(|p| p.name == playlist.name).map(|p| p.id))
                 .unwrap_or_else(|| { max_id += 1; max_id });
         }
 
@@ -504,19 +892,32 @@ pub fn save_synced_playlists(merged: &SyncData) {
             max_id += 1;
             local_id = max_id;
         }
+        active_ids.insert(local_id);
 
-        // 歌曲去重
-        let mut seen_tracks = std::collections::HashSet::new();
-        let tracks: Vec<TrackInfo> = playlist.songs.iter()
-            .filter_map(|song| {
-                let track = sync_song_to_track(song);
-                if track.id.is_empty() || !seen_tracks.insert(track.id.clone()) {
-                    None
-                } else {
-                    Some(track)
+        let current_playlist = existing_playlists.iter().find(|current| {
+            current.id == local_id || sync_playlist_id(current.id, &current.name) == playlist.id
+        });
+        let mut seen_song_keys = HashSet::new();
+        let mut tracks: Vec<TrackInfo> = playlist.songs.iter()
+            .filter(|song| {
+                let keys = song.identity_keys();
+                if keys.iter().any(|key| seen_song_keys.contains(key)) {
+                    return false;
                 }
+                seen_song_keys.extend(keys);
+                true
             })
+            .map(sync_song_to_track)
+            .filter(|track| !track.id.is_empty())
             .collect();
+        let mut local_track_ids: HashSet<String> = tracks.iter().map(|track| track.id.clone()).collect();
+        if let Some(current) = current_playlist {
+            for track in &current.tracks {
+                if track.source == TrackSource::Local && local_track_ids.insert(track.id.clone()) {
+                    tracks.push(track.clone());
+                }
+            }
+        }
 
         new_playlists.push(Playlist {
             id: local_id,
@@ -525,6 +926,16 @@ pub fn save_synced_playlists(merged: &SyncData) {
             modified_at: playlist.modified_at.max(0) as u64,
         });
     }
+
+    for id in deleted_ids {
+        if active_ids.contains(&id) {
+            continue;
+        }
+        if !store.deleted_playlist_ids.contains(&id) {
+            store.deleted_playlist_ids.push(id);
+        }
+    }
+    store.deleted_playlist_ids.retain(|id| !active_ids.contains(id));
 
     // 排序：我喜欢的音乐始终第一，本地文件始终最后，其余保持原序
     new_playlists.sort_by(|a, b| {
@@ -537,6 +948,17 @@ pub fn save_synced_playlists(merged: &SyncData) {
     });
 
     store.playlists = new_playlists;
+    store.playlist_song_deletions = merged
+        .playlist_song_deletions
+        .iter()
+        .map(|deletion| {
+            let mut normalized = deletion.clone();
+            normalized.removed_membership_tokens = normalize_sync_causal_tokens(
+                &deletion.removed_membership_tokens,
+            );
+            normalized
+        })
+        .collect();
     store.fix_next_id();
     let _ = store.save(&path);
 
@@ -567,23 +989,39 @@ pub fn load_favorite_playlists() -> Vec<SyncFavoritePlaylist> {
     let path = favorites_path();
     if !path.exists() { return Vec::new(); }
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or_default()
+    serde_json::from_str::<Vec<SyncFavoritePlaylist>>(&content)
+        .map(|favorites| favorites.into_iter().map(|favorite| favorite.normalized_for_sync()).collect())
+        .unwrap_or_default()
+}
+
+fn load_local_playlist_song_deletions() -> Vec<SyncPlaylistSongDeletion> {
+    let store = PlaylistStore::load(&playlists_path());
+    store
+        .playlist_song_deletions
+        .into_iter()
+        .map(|mut deletion| {
+            deletion.removed_membership_tokens = normalize_sync_causal_tokens(
+                &deletion.removed_membership_tokens,
+            );
+            deletion
+        })
+        .collect()
 }
 
 // ===== Base Snapshot — 用于三方歌曲合并的删除检测 =====
 
 /// snapshot 文件路径
-fn base_snapshot_path() -> std::path::PathBuf {
+fn base_snapshot_path(scope: &str) -> std::path::PathBuf {
     let mut path = dirs_next::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     path.push("NeriPlayer");
-    path.push("sync-base-snapshot.json");
+    path.push(format!("sync-base-snapshot-{}.json", scope));
     path
 }
 
 /// 加载上次同步后每个歌单的歌曲 stable_key 集合
 /// 格式: { "playlist_id": ["key1", "key2", ...], ... }
-pub fn load_base_snapshot() -> HashMap<String, HashSet<String>> {
-    let path = base_snapshot_path();
+pub fn load_base_snapshot(scope: &str) -> HashMap<String, HashSet<String>> {
+    let path = base_snapshot_path(scope);
     if !path.exists() {
         return HashMap::new();
     }
@@ -595,7 +1033,7 @@ pub fn load_base_snapshot() -> HashMap<String, HashSet<String>> {
 }
 
 /// 保存当前合并结果作为下次同步的 base snapshot
-fn save_base_snapshot(merged: &SyncData) {
+fn save_base_snapshot(merged: &SyncData, scope: &str) {
     let snapshot: HashMap<String, Vec<String>> = merged.playlists.iter()
         .filter(|p| !p.is_deleted)
         .map(|p| {
@@ -606,7 +1044,7 @@ fn save_base_snapshot(merged: &SyncData) {
         })
         .collect();
 
-    let path = base_snapshot_path();
+    let path = base_snapshot_path(scope);
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let _ = std::fs::write(&path, serde_json::to_string(&snapshot).unwrap_or_default());
 }
@@ -615,6 +1053,84 @@ fn save_base_snapshot(merged: &SyncData) {
 mod tests {
     use super::*;
     use crate::state::{TrackInfo, TrackSource};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn mock_github_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{}", address), handle)
+    }
+
+    fn github_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
+    }
+
+    fn github_config() -> GitHubSyncConfig {
+        GitHubSyncConfig {
+            owner: "owner".into(),
+            repo: "repo".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_api_failure_is_not_treated_as_initial_sync() {
+        let (base, server) = mock_github_server(vec![github_response(
+            "500 Internal Server Error",
+            r#"{"message":"temporary failure"}"#,
+        )])
+        .await;
+        let api = GitHubApiClient::new_with_api_base(
+            &reqwest::Client::new(),
+            "token",
+            &base,
+        );
+
+        let error = fetch_remote_snapshot(&api, &github_config(), "backup.bin", true)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("500"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_sync_requires_both_remote_formats_to_be_missing() {
+        let (base, server) = mock_github_server(vec![
+            github_response("404 Not Found", "{}"),
+            github_response("404 Not Found", "{}"),
+        ])
+        .await;
+        let api = GitHubApiClient::new_with_api_base(
+            &reqwest::Client::new(),
+            "token",
+            &base,
+        );
+
+        let snapshot = fetch_remote_snapshot(&api, &github_config(), "backup.bin", true)
+            .await
+            .unwrap();
+
+        assert!(snapshot.is_none());
+        server.await.unwrap();
+    }
 
     #[test]
     fn sync_song_conversion_preserves_playlist_added_at() {
@@ -639,6 +1155,99 @@ mod tests {
         assert_eq!(roundtrip[0].added_at, 777);
     }
 
+    #[test]
+    fn sync_song_conversion_preserves_complete_metadata_payload() {
+        let original = SyncSong {
+            id: "42".into(),
+            name: "Original".into(),
+            artist: "Artist".into(),
+            album: "netease".into(),
+            cover_url: "https://example.com/base.jpg".into(),
+            added_at: 777,
+            matched_lyric: Some("[00:01.00]lyric".into()),
+            matched_translated_lyric: Some("[00:01.00]translation".into()),
+            custom_cover_url: Some("https://example.com/custom.jpg".into()),
+            custom_name: Some("Custom title".into()),
+            original_name: Some("Original".into()),
+            channel_id: Some("netease".into()),
+            audio_id: Some("42".into()),
+            playlist_context_id: Some("context".into()),
+            sync_membership_tokens: vec![SyncCausalToken {
+                device_id: "android".into(),
+                counter: 1,
+            }],
+            sync_metadata_version: CURRENT_SYNC_METADATA_VERSION,
+            ..Default::default()
+        };
+
+        let imported = sync_song_to_track(&original);
+        let expected_playlist_key = original.identity().stable_key();
+        assert_eq!(
+            imported.cover_url.as_deref(),
+            Some("https://example.com/custom.jpg")
+        );
+        assert_eq!(
+            imported.playlist_key.as_deref(),
+            Some(expected_playlist_key.as_str())
+        );
+        let roundtrip = tracks_to_sync_songs_pub(&[imported]);
+
+        assert_eq!(roundtrip[0].matched_lyric, original.matched_lyric);
+        assert_eq!(
+            roundtrip[0].matched_translated_lyric,
+            original.matched_translated_lyric
+        );
+        assert_eq!(roundtrip[0].custom_name, original.custom_name);
+        assert_eq!(roundtrip[0].custom_cover_url, original.custom_cover_url);
+        assert_eq!(roundtrip[0].original_name, original.original_name);
+        assert_eq!(roundtrip[0].playlist_context_id, original.playlist_context_id);
+        assert_eq!(
+            roundtrip[0].sync_membership_tokens,
+            original.sync_membership_tokens
+        );
+        assert_eq!(
+            roundtrip[0].sync_metadata_version,
+            CURRENT_SYNC_METADATA_VERSION
+        );
+    }
+
+    #[test]
+    fn imported_and_fresh_tracks_share_playlist_identity_key() {
+        let imported = sync_song_to_track(&SyncSong {
+            id: "42".into(),
+            name: "Song".into(),
+            album: "netease".into(),
+            channel_id: Some("netease".into()),
+            audio_id: Some("42".into()),
+            ..Default::default()
+        });
+        let fresh = track("netease:42", 0);
+
+        assert_eq!(
+            playlist_track_identity_key_pub(&imported),
+            playlist_track_identity_key_pub(&fresh)
+        );
+    }
+
+    #[test]
+    fn legacy_track_is_upgraded_only_after_complete_payload_is_attached() {
+        let mut existing = track("netease:42", 100);
+        assert_eq!(
+            track_to_sync_song(&existing).sync_metadata_version,
+            LEGACY_SYNC_METADATA_VERSION
+        );
+
+        let token = SyncCausalToken {
+            device_id: "desktop".into(),
+            counter: 1,
+        };
+        attach_sync_membership_token_pub(&mut existing, token.clone());
+        let upgraded = track_to_sync_song(&existing);
+
+        assert_eq!(upgraded.sync_metadata_version, CURRENT_SYNC_METADATA_VERSION);
+        assert_eq!(upgraded.sync_membership_tokens, vec![token]);
+    }
+
     fn track(id: &str, added_at: i64) -> TrackInfo {
         TrackInfo {
             id: id.into(),
@@ -650,6 +1259,8 @@ mod tests {
             url: String::new(),
             cover_url: None,
             added_at,
+            sync_payload: None,
+            playlist_key: None,
         }
     }
 }

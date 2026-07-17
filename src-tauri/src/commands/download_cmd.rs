@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::lyrics::manager::LyricsManager;
 use crate::lyrics::parser::LyricLine;
+use crate::settings::store::DEFAULT_DOWNLOAD_NAME_TEMPLATE;
 use crate::state::AppState;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -52,15 +53,18 @@ fn render_download_filename(
     source: &str,
     template: Option<&str>,
 ) -> String {
-    let default_template = "{artist} - {title}";
     let tpl = template
         .filter(|t| !t.is_empty())
-        .unwrap_or(default_template);
+        .unwrap_or(DEFAULT_DOWNLOAD_NAME_TEMPLATE);
     let rendered = tpl
         .replace("{title}", title)
         .replace("{artist}", artist)
         .replace("{album}", album)
-        .replace("{source}", source);
+        .replace("{source}", source)
+        .replace("%title%", title)
+        .replace("%artist%", artist)
+        .replace("%album%", album)
+        .replace("%source%", source);
     let sanitized = sanitize_filename(&rendered);
     if sanitized.is_empty() {
         sanitize_filename(title)

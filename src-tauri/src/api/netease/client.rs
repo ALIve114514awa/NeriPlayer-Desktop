@@ -30,6 +30,17 @@ pub struct NeteaseSongUrl {
     pub br: u64,
     pub size: u64,
     pub r#type: String,
+    pub is_preview: bool,
+    pub unavailable_reason: Option<NeteasePlaybackUnavailableReason>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NeteasePlaybackUnavailableReason {
+    RequiresLogin,
+    NoPermission,
+    NoPlayUrl,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,24 +139,10 @@ impl NeteaseClient {
 
         eprintln!("[netease] song url response code: {:?}", body["code"]);
 
-        let data = body["data"].as_array()
-            .and_then(|arr| arr.first())
-            .ok_or_else(|| {
-                eprintln!("[netease] No song URL data in response: {}",
-                    serde_json::to_string(&body).unwrap_or_default().chars().take(500).collect::<String>());
-                AppError::Api("No song URL data".into())
-            })?;
-
-        let url = data["url"].as_str().map(String::from);
+        let result = parse_song_url_response(&body);
         eprintln!("[netease] song url result: url={}, br={}",
-            url.as_deref().unwrap_or("null"), data["br"].as_u64().unwrap_or(0));
-
-        Ok(NeteaseSongUrl {
-            url,
-            br: data["br"].as_u64().unwrap_or(0),
-            size: data["size"].as_u64().unwrap_or(0),
-            r#type: data["type"].as_str().unwrap_or("mp3").to_string(),
-        })
+            result.url.as_deref().unwrap_or("null"), result.br);
+        Ok(result)
     }
 
     /// 获取歌词（plain API，无需加密，最可靠）
@@ -313,10 +310,14 @@ impl NeteaseClient {
         let data = &body["data"];
 
         Ok(NeteaseSongUrl {
-            url: data["url"].as_str().map(String::from),
-            br: data["br"].as_u64().unwrap_or(0),
-            size: data["size"].as_u64().unwrap_or(0),
-            r#type: data["type"].as_str().unwrap_or("mp3").to_string(),
+            url: clean_json_string(&data["url"]),
+            br: json_u64(&data["br"]),
+            size: json_u64(&data["size"]),
+            r#type: clean_json_string(&data["type"]).unwrap_or_else(|| "mp3".into()),
+            is_preview: data
+                .get("freeTrialInfo")
+                .is_some_and(|value| !value.is_null()),
+            unavailable_reason: None,
         })
     }
 
@@ -352,5 +353,162 @@ impl NeteaseClient {
             &format!("{}/weapi/album/sublist", BASE_URL),
             &params,
         ).await
+    }
+}
+
+fn parse_song_url_response(body: &Value) -> NeteaseSongUrl {
+    let root_code = body["code"].as_i64().unwrap_or(-1);
+    if root_code == 301 {
+        return unavailable_song_url(NeteasePlaybackUnavailableReason::RequiresLogin);
+    }
+    if root_code != 200 {
+        return unavailable_song_url(NeteasePlaybackUnavailableReason::Unknown);
+    }
+
+    let data = match &body["data"] {
+        Value::Array(values) => values.first(),
+        Value::Object(_) => Some(&body["data"]),
+        _ => None,
+    };
+    let Some(data) = data else {
+        return unavailable_song_url(NeteasePlaybackUnavailableReason::NoPlayUrl);
+    };
+
+    let url = clean_json_string(&data["url"]);
+    let unavailable_reason = if url.is_none() {
+        let data_code = data["code"].as_i64().unwrap_or(-1);
+        let cannot_listen_reason = data["freeTrialPrivilege"]["cannotListenReason"]
+            .as_i64()
+            .or_else(|| {
+                data["freeTrialPrivilege"]["cannotListenReason"]
+                    .as_str()
+                    .and_then(|value| value.parse::<i64>().ok())
+            });
+        let fee = data["fee"].as_i64().unwrap_or(0);
+        Some(
+            if data_code == 404 || cannot_listen_reason == Some(1) || fee > 0 {
+                NeteasePlaybackUnavailableReason::NoPermission
+            } else {
+                NeteasePlaybackUnavailableReason::NoPlayUrl
+            },
+        )
+    } else {
+        None
+    };
+
+    NeteaseSongUrl {
+        url,
+        br: json_u64(&data["br"]),
+        size: json_u64(&data["size"]),
+        r#type: clean_json_string(&data["type"]).unwrap_or_else(|| "mp3".into()),
+        is_preview: data
+            .get("freeTrialInfo")
+            .is_some_and(|value| !value.is_null()),
+        unavailable_reason,
+    }
+}
+
+fn unavailable_song_url(reason: NeteasePlaybackUnavailableReason) -> NeteaseSongUrl {
+    NeteaseSongUrl {
+        url: None,
+        br: 0,
+        size: 0,
+        r#type: "mp3".into(),
+        is_preview: false,
+        unavailable_reason: Some(reason),
+    }
+}
+
+fn clean_json_string(value: &Value) -> Option<String> {
+    let value = value.as_str()?.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("null")).then(|| value.to_string())
+}
+
+fn json_u64(value: &Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_song_url_response, NeteasePlaybackUnavailableReason,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn playback_response_marks_explicit_free_trial_as_preview() {
+        let result = parse_song_url_response(&json!({
+            "code": 200,
+            "data": [{
+                "url": "https://m801.music.126.net/demo.mp3",
+                "br": 320000,
+                "size": "1234567",
+                "type": "mp3",
+                "freeTrialInfo": { "fragmentType": 6 }
+            }]
+        }));
+
+        assert!(result.is_preview);
+        assert_eq!(result.size, 1_234_567);
+        assert_eq!(result.unavailable_reason, None);
+    }
+
+    #[test]
+    fn playback_response_does_not_infer_preview_without_free_trial_info() {
+        let result = parse_song_url_response(&json!({
+            "code": 200,
+            "data": [{
+                "url": "https://m801.music.126.net/full.flac",
+                "freeTrialInfo": null
+            }]
+        }));
+
+        assert!(!result.is_preview);
+    }
+
+    #[test]
+    fn playback_response_classifies_null_url_permission_failure() {
+        let result = parse_song_url_response(&json!({
+            "code": 200,
+            "data": [{
+                "url": null,
+                "code": 404,
+                "fee": 0,
+                "freeTrialPrivilege": { "cannotListenReason": 1 }
+            }]
+        }));
+
+        assert_eq!(result.url, None);
+        assert_eq!(
+            result.unavailable_reason,
+            Some(NeteasePlaybackUnavailableReason::NoPermission)
+        );
+    }
+
+    #[test]
+    fn playback_response_classifies_login_requirement() {
+        let result = parse_song_url_response(&json!({ "code": 301 }));
+
+        assert_eq!(
+            result.unavailable_reason,
+            Some(NeteasePlaybackUnavailableReason::RequiresLogin)
+        );
+    }
+
+    #[test]
+    fn playback_response_rejects_literal_null_url() {
+        let result = parse_song_url_response(&json!({
+            "code": 200,
+            "data": [{ "url": "null" }]
+        }));
+
+        assert_eq!(result.url, None);
+        assert_eq!(
+            result.unavailable_reason,
+            Some(NeteasePlaybackUnavailableReason::NoPlayUrl)
+        );
     }
 }

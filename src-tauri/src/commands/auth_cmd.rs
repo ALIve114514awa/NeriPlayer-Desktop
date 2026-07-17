@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -639,6 +640,61 @@ pub async fn refresh_youtube_profile(
 pub async fn check_auth_status(state: State<'_, AppState>) -> AppResult<AuthStatusResponse> {
     let auth = state.auth.lock();
     Ok(auth.to_status_response())
+}
+
+#[derive(Serialize)]
+pub struct DebugCookieStorageStatus {
+    available: bool,
+    stored: bool,
+}
+
+/// 查询 Debug Cookie 存储状态，不读取 Cookie 内容
+#[tauri::command]
+pub fn get_debug_cookie_storage_status() -> DebugCookieStorageStatus {
+    DebugCookieStorageStatus {
+        available: cfg!(debug_assertions),
+        stored: crate::security::debug_secret_exists(crate::security::AUTH_STATE_KEY),
+    }
+}
+
+/// Debug 构建中删除持久化、内存、请求 Jar 和 WebView 中的全部登录 Cookie
+#[tauri::command]
+pub async fn clear_debug_cookie_storage(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = state;
+        return Err(AppError::Other(
+            "Debug Cookie storage is unavailable in release builds".into(),
+        ));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        if !cookies::delete_persisted_auth(&app) {
+            return Err(AppError::Other(
+                "Failed to delete debug Cookie storage".into(),
+            ));
+        }
+
+        let previous_auth = {
+            let mut auth = state.auth.lock();
+            std::mem::take(&mut *auth)
+        };
+        for platform in ["netease", "bilibili", "youtube"] {
+            cookies::expire_platform_cookies(&state.cookie_jar, &previous_auth, platform);
+        }
+
+        clear_and_reinject_webview_cookies(
+            &app,
+            &state.cookie_jar,
+            &crate::auth::state::AuthState::default(),
+        )
+        .await
+    }
 }
 
 /// 登出指定平台

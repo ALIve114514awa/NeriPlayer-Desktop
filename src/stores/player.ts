@@ -4,9 +4,32 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useHistoryStore } from './history'
 import { useToastStore } from './toast'
-import { useSettingsStore } from './settings'
+import {
+  MAX_MEDIA_CACHE_SIZE_MB,
+  MIN_MEDIA_CACHE_SIZE_MB,
+  useSettingsStore,
+} from './settings'
 import { useDownloadStore } from './download'
 import i18n from '@/i18n'
+import {
+  getPlaybackSourceKind,
+  isRemotePlaybackTrack,
+  normalizeBitrateKbps,
+  playbackCacheReadCandidates,
+  playbackCacheWriteOptions,
+  playbackPrefetchCacheId,
+  playbackUrlResolver,
+  resolvePlaybackResult,
+  type PlaybackSourceSettings,
+  type PlaybackResolution,
+  type ResolvedPlaybackSource,
+} from '@/utils/playbackSource'
+import { PlaybackPrefetchManager } from '@/utils/playbackPrefetch'
+import {
+  PlaybackStartupWatchdog,
+  resolvePlaybackFailureAdvanceAction,
+} from '@/utils/playbackPolicy'
+import { resolvePlaybackQueueStartIndex } from '@/utils/playbackQueue'
 
 export interface TrackInfo {
   id: string
@@ -16,6 +39,10 @@ export interface TrackInfo {
   durationMs: number
   coverUrl: string
   audioUrl: string
+  source?: string
+  addedAt?: number
+  syncPayload?: Record<string, unknown>
+  playlistKey?: string
 }
 
 /**
@@ -31,6 +58,10 @@ export function normalizeTrack(raw: any): TrackInfo {
     durationMs: raw.durationMs ?? raw.duration_ms ?? 0,
     coverUrl: raw.coverUrl ?? raw.cover_url ?? '',
     audioUrl: raw.audioUrl ?? raw.audio_url ?? raw.url ?? '',
+    source: raw.source,
+    addedAt: raw.addedAt ?? raw.added_at ?? 0,
+    syncPayload: raw.syncPayload ?? raw.sync_payload,
+    playlistKey: raw.playlistKey ?? raw.playlist_key,
   }
 }
 
@@ -124,7 +155,7 @@ let shuffleHistory: number[] = []   // 已播放栈 (previous 回溯)
 let shuffleFuture: number[] = []    // 预排队栈 (next 或 previous 回退)
 
 // ─── 批次 2.2: playbackRequestToken 防竞态 ───
-let playbackRequestToken = 0
+let playbackRequestToken = Date.now() * 1000
 
 // ─── 批次 2.3: URL 过期检测 (10min) ───
 let lastUrlResolveTime = 0
@@ -134,24 +165,13 @@ const URL_EXPIRY_MS = 10 * 60 * 1000
 let lastTrackEndedId: string | null = null
 let lastTrackEndedTime = 0
 
-type PrefetchedUrl = {
-  url: string
-  time: number
-  bitrate?: number
-  mime_type?: string
-  format?: string
-  bandwidth?: number
-  codecs?: string
-  cacheKey?: string
-  source?: 'netease' | 'qq' | 'bilibili' | 'youtube'
-  qualityKey?: string
-}
-
-// ─── 批次 5.1: URL 预热缓存 ───
-const prefetchedUrls = new Map<string, { url: string; time: number; bitrate: number; mime_type: string }>()
-const prefetchedPlaybackUrls = new Map<string, PrefetchedUrl>()
-const PREFETCH_TTL_MS = 8 * 60 * 1000
-const DEFAULT_TRACK_SWITCH_FADE_MS = 350
+// ─── 播放抽象层：解析缓存、预热仲裁、启动看门狗 ───
+const playbackPrefetchManager = new PlaybackPrefetchManager()
+const playbackStartupWatchdog = new PlaybackStartupWatchdog()
+let startupRecoveryAttempts = 0
+const MAX_STARTUP_RECOVERY_ATTEMPTS = 2
+const STARTUP_WATCHDOG_REMOTE_MS = 8_000
+const STARTUP_WATCHDOG_YOUTUBE_MS = 12_000
 
 // ─── 批次 1.1: 状态持久化 ───
 const PLAYER_STATE_KEY = 'neri:player-state'
@@ -165,6 +185,7 @@ let _remoteSyncGuardUntil = 0
 let _currentLoadedFromDownloadPath: string | null = null
 
 export const usePlayerStore = defineStore('player', () => {
+  const settings = useSettingsStore()
   const isPlaying = ref(false)
   const currentTrack = ref<TrackInfo | null>(null)
   const positionMs = ref(0)
@@ -173,7 +194,7 @@ export const usePlayerStore = defineStore('player', () => {
   const queueIndex = ref(-1)
   const repeatMode = ref<RepeatMode>('off')
   const shuffleEnabled = ref(false)
-  const volume = ref(1)
+  const volume = ref(settings.volume)
   const lyrics = ref<LyricLine[]>([])
 
   // 播放错误信息（供 UI 展示）
@@ -188,6 +209,13 @@ export const usePlayerStore = defineStore('player', () => {
     format?: string   // 原始格式标识
     source?: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local'
     qualityKey?: string
+    qualityLabel?: string
+    qualityOptions?: Array<{ key: string; label: string }>
+    mimeType?: string
+    sampleRateHz?: number
+    bitDepth?: number
+    channelCount?: number
+    specLabel?: string
   }
   const audioInfo = ref<AudioInfo | null>(null)
   const isPlayingFromDownload = ref(false)
@@ -354,10 +382,6 @@ export const usePlayerStore = defineStore('player', () => {
         }
       }
 
-      if (typeof state.volume === 'number') {
-        volume.value = Math.max(0, Math.min(1, state.volume))
-      }
-
       // 恢复 durationMs 以便 UI 显示进度条
       if (currentTrack.value && currentTrack.value.durationMs > 0) {
         durationMs.value = currentTrack.value.durationMs
@@ -405,137 +429,124 @@ export const usePlayerStore = defineStore('player', () => {
 
   // ─── URL 预热 ───
 
-  /** 预热下一首在线曲目的播放 URL：只解析 URL，不下载音频正文 */
+  function playbackSourceSettings(): PlaybackSourceSettings {
+    return {
+      neteaseQuality: settings.neteaseQuality,
+      qqMusicQuality: settings.qqMusicQuality,
+      biliQuality: settings.biliQuality,
+      youtubeQuality: settings.youtubeQuality,
+    }
+  }
+
+  function playbackDemandKey(track: TrackInfo | null): string | null {
+    if (!track || !isRemotePlaybackTrack(track)) return null
+    return playbackPrefetchCacheId(track, playbackSourceSettings())
+  }
+
+  function replacePlaybackDemand(track: TrackInfo | null): void {
+    playbackPrefetchManager.replacePlaybackDemand(playbackDemandKey(track))
+  }
+
+  function nextPrefetchTracks(): TrackInfo[] {
+    if (!queue.value.length) return []
+
+    const firstIndex = (() => {
+      if (shuffleEnabled.value) {
+        if (shuffleFuture.length > 0) return shuffleFuture[shuffleFuture.length - 1]
+        if (shuffleBag.length > 0) return shuffleBag[0]
+        return -1
+      }
+      const nextIndex = queueIndex.value + 1
+      if (nextIndex < queue.value.length) return nextIndex
+      return repeatMode.value === 'all' ? 0 : -1
+    })()
+    if (firstIndex < 0) return []
+
+    const tracks: TrackInfo[] = []
+    const maxWindow = getPlaybackSourceKindForPrefetch(queue.value[firstIndex]) === 'youtube'
+      ? 6
+      : 1
+    let index = firstIndex
+    for (let count = 0; count < maxWindow; count += 1) {
+      const track = queue.value[index]
+      if (track && isRemotePlaybackTrack(track)) tracks.push(track)
+      if (maxWindow === 1) break
+      index += 1
+      if (index >= queue.value.length) {
+        if (repeatMode.value !== 'all') break
+        index = 0
+      }
+      if (index === queueIndex.value) break
+    }
+    return tracks
+  }
+
+  function getPlaybackSourceKindForPrefetch(track?: TrackInfo): string | null {
+    return track ? getPlaybackSourceKind(track) : null
+  }
+
+  /** 预热后续曲目的解析结果，当前播放需求始终拥有优先级 */
   function maybePrefetchNext() {
-    if (!queue.value.length) return
-    let nextIdx: number
-    if (shuffleEnabled.value) {
-      if (shuffleFuture.length > 0) nextIdx = shuffleFuture[shuffleFuture.length - 1]
-      else if (shuffleBag.length > 0) nextIdx = shuffleBag[0]
-      else return
-    } else {
-      nextIdx = queueIndex.value + 1
-      if (nextIdx >= queue.value.length) {
-        if (repeatMode.value === 'all') nextIdx = 0
-        else return
-      }
-    }
+    const tracks = nextPrefetchTracks()
+    if (tracks.length === 0) return
 
-    const nextTrack = queue.value[nextIdx]
-    if (!nextTrack || !isOnlineTrack(nextTrack)) return
+    playbackPrefetchManager.prefetchWindow(
+      tracks,
+      playbackSourceSettings(),
+      playbackUrlResolver,
+    )
+  }
 
-    // 缓存未过期则跳过
-    const cacheId = playbackPrefetchCacheId(nextTrack)
-    const cached = prefetchedPlaybackUrls.get(cacheId)
-    const expectedPrefix = playbackQualityCachePrefix(nextTrack)
-    if (
-      cached
-      && Date.now() - cached.time < PREFETCH_TTL_MS
-      && isPrefetchedQualityMatch(cached, expectedPrefix)
-    ) return
+  async function resolvePlaybackUrl(
+    track: TrackInfo,
+    forceRefresh = false,
+    qualityOverride?: string,
+  ): Promise<PlaybackResolution> {
+    return resolvePlaybackResult(track, playbackSourceSettings(), {
+      forceRefresh,
+      qualityOverride,
+    })
+  }
 
-    resolvePlaybackUrl(nextTrack)
-      .then(resolved => {
-        if (resolved?.url) {
-          prefetchedPlaybackUrls.set(cacheId, { ...resolved, time: Date.now() })
+  function takePrefetchedPlaybackUrl(track: TrackInfo): ResolvedPlaybackSource | null {
+    return playbackPrefetchManager.take(track, playbackSourceSettings())
+  }
+
+  function schedulePlaybackStartupWatchdog(
+    token: number,
+    track: TrackInfo,
+    startPositionMs: number,
+    commandSource: PlaybackCommandSource,
+  ): void {
+    if (!isRemotePlaybackTrack(track)) return
+    const sourceKind = getPlaybackSourceKind(track)
+    const timeoutMs = sourceKind === 'youtube'
+      ? STARTUP_WATCHDOG_YOUTUBE_MS
+      : STARTUP_WATCHDOG_REMOTE_MS
+    playbackStartupWatchdog.schedule({
+      timeoutMs,
+      startPositionMs,
+      getPositionMs: () => positionMs.value,
+      isActive: () => token === playbackRequestToken
+        && currentTrack.value?.id === track.id
+        && isPlaying.value
+        && !isLoadingAudio.value,
+      onStall: () => {
+        if (token !== playbackRequestToken) return
+        if (startupRecoveryAttempts >= MAX_STARTUP_RECOVERY_ATTEMPTS) {
+          playbackStartupWatchdog.cancel()
+          consecutivePlayFailures += 1
+          _isAutoSkipping = true
+          void next(true, commandSource).finally(() => {
+            _isAutoSkipping = false
+          })
+          return
         }
-      })
-      .catch(() => {}) // 预热失败不影响主流程
-  }
-
-  async function resolvePlaybackUrl(track: TrackInfo): Promise<Omit<PrefetchedUrl, 'time'> | null> {
-    const settings = useSettingsStore()
-    if (track.id.startsWith('netease:')) {
-      const songId = parseInt(track.id.replace('netease:', ''))
-      const quality = settings.neteaseQuality
-      const result = await invoke<{ url: string | null; bitrate: number; format: string }>('get_netease_song_url', {
-        songId,
-        quality,
-      })
-      return result.url
-        ? {
-            url: result.url,
-            bitrate: result.bitrate,
-            format: result.format,
-            cacheKey: playbackCacheKey(track, ['netease', quality, result.bitrate, result.format]),
-            source: 'netease',
-            qualityKey: quality,
-          }
-        : null
-    }
-    if (track.id.startsWith('qq:')) {
-      const songMid = track.id.replace('qq:', '')
-      const quality = settings.qqMusicQuality
-      const result = await invoke<{ url: string | null; bitrate: number; format: string }>('get_qq_song_url', {
-        songMid,
-        quality,
-      })
-      return result.url
-        ? {
-            url: result.url,
-            bitrate: result.bitrate,
-            format: result.format,
-            cacheKey: playbackCacheKey(track, ['qq', quality, result.bitrate, result.format]),
-            source: 'qq',
-            qualityKey: quality,
-          }
-        : null
-    }
-    if (track.id.startsWith('bilibili:')) {
-      const biliId = track.id.replace('bilibili:', '')
-      const isAvid = /^\d+$/.test(biliId)
-      const cidMatch = track.album?.match(/^Bilibili\|(\d+)/)
-      const cid = cidMatch ? parseInt(cidMatch[1]) : undefined
-      const quality = settings.biliQuality
-      const result = await invoke<{ url: string; bandwidth: number; codecs: string }>('get_bili_audio_url', {
-        bvid: isAvid ? '' : biliId,
-        avid: isAvid ? parseInt(biliId) : null,
-        cid: cid || null,
-        quality,
-      })
-      return {
-        url: result.url,
-        bandwidth: result.bandwidth,
-        codecs: result.codecs,
-        cacheKey: playbackCacheKey(track, ['bilibili', quality, cid || '', result.bandwidth, result.codecs]),
-        source: 'bilibili',
-        qualityKey: quality,
-      }
-    }
-    if (track.id.startsWith('youtube:')) {
-      const videoId = track.id.replace('youtube:', '')
-      const streams = await invoke<{ url: string; bitrate: number; mime_type: string }[]>('get_youtube_audio_url', { videoId })
-      const quality = settings.youtubeQuality
-      const stream = selectYoutubeStream(streams || [], quality)
-      return stream?.url
-        ? {
-            url: stream.url,
-            bitrate: stream.bitrate,
-            mime_type: stream.mime_type,
-            cacheKey: playbackCacheKey(track, ['youtube', quality, stream.bitrate, stream.mime_type]),
-            source: 'youtube',
-            qualityKey: quality,
-          }
-        : null
-    }
-    return null
-  }
-
-  function takePrefetchedPlaybackUrl(track: TrackInfo): PrefetchedUrl | null {
-    const cacheId = playbackPrefetchCacheId(track)
-    const expectedPrefix = playbackQualityCachePrefix(track)
-    const cached = prefetchedPlaybackUrls.get(cacheId)
-    if (!cached) return null
-    if (Date.now() - cached.time >= PREFETCH_TTL_MS) {
-      prefetchedPlaybackUrls.delete(cacheId)
-      return null
-    }
-    if (!isPrefetchedQualityMatch(cached, expectedPrefix)) {
-      prefetchedPlaybackUrls.delete(cacheId)
-      return null
-    }
-    prefetchedPlaybackUrls.delete(cacheId)
-    return cached
+        startupRecoveryAttempts += 1
+        const resumePositionMs = currentRenderedPosition()
+        void play(track, commandSource, resumePositionMs, true)
+      },
+    })
   }
 
   function commitBackendPosition(nextPositionMs: number, nextDurationMs?: number, forceRendered = false) {
@@ -769,31 +780,54 @@ export const usePlayerStore = defineStore('player', () => {
     })
   }
 
-  async function play(track: TrackInfo, commandSource: PlaybackCommandSource = 'local', startPositionMs = 0) {
+  async function play(
+    track: TrackInfo,
+    commandSource: PlaybackCommandSource = 'local',
+    startPositionMs = 0,
+    forceResolve = false,
+  ) {
     initEvents()
     markCommandSource(commandSource)
     const token = ++playbackRequestToken
+    const backendRequestReady = invoke<void>('begin_playback_request', {
+      requestGeneration: token,
+    })
+    replacePlaybackDemand(track)
+    playbackStartupWatchdog.cancel()
     const previousTrack = currentTrack.value
     const wasPlayingBeforeSwitch = isPlaying.value
     const isSwitchingTrack = !!previousTrack && previousTrack.id !== track.id
     const settings = useSettingsStore()
+    const fadeInDurationMs = Math.max(0, Math.round(settings.fadeInDuration))
+    const fadeOutDurationMs = Math.max(0, Math.round(settings.fadeOutDuration))
+    const overlapFadeInDurationMs = settings.crossfadeNext
+      ? Math.max(0, Math.round(settings.crossfadeInDuration))
+      : fadeInDurationMs
+    const overlapFadeOutDurationMs = settings.crossfadeNext
+      ? Math.max(0, Math.round(settings.crossfadeOutDuration))
+      : fadeOutDurationMs
     const useOverlapCrossfade = wasPlayingBeforeSwitch && isSwitchingTrack
-      && settings.crossfadeNext
-      && settings.crossfadeOutDuration > 0
-      && settings.crossfadeInDuration > 0
-    const usePreStopFade = wasPlayingBeforeSwitch && isSwitchingTrack && !useOverlapCrossfade
-    const preStopFadeMs = usePreStopFade
-      ? Math.max(0, settings.fadeOutDuration || DEFAULT_TRACK_SWITCH_FADE_MS)
-      : 0
-    const transitionFadeInMs = usePreStopFade
-      ? Math.max(0, settings.fadeInDuration || DEFAULT_TRACK_SWITCH_FADE_MS)
-      : settings.crossfadeInDuration
+      && (settings.crossfadeNext || settings.crossfade)
+      && overlapFadeOutDurationMs > 0
+      && overlapFadeInDurationMs > 0
+    const useTrackSwitchFadeIn = settings.fadeIn
+      && wasPlayingBeforeSwitch
+      && isSwitchingTrack
+      && !useOverlapCrossfade
+      && fadeInDurationMs > 0
     let trackCommitted = false
     const requestedStartMs = startPositionMs > 1000
       ? track.durationMs > 0
         ? clampPlaybackPosition(startPositionMs, track.durationMs)
         : Math.max(0, Math.round(startPositionMs))
       : 0
+    const useInitialFadeIn = settings.fadeIn
+      && !wasPlayingBeforeSwitch
+      && fadeInDurationMs > 0
+      && requestedStartMs === 0
+    const transitionFadeInMs = useTrackSwitchFadeIn || useInitialFadeIn
+      ? fadeInDurationMs
+      : overlapFadeInDurationMs
 
     if (requestedStartMs > 0) {
       markOptimisticSeek(requestedStartMs, commandSource, { durationMs: track.durationMs })
@@ -813,47 +847,35 @@ export const usePlayerStore = defineStore('player', () => {
     if (!queue.value.find(t => t.id === track.id)) {
       queue.value.push(track)
     }
+    // 当前选择代表用户的最新播放意图，必须在任何异步解析前提交
+    commitTrack()
 
     try {
+      await backendRequestReady
+      if (token !== playbackRequestToken) return
+
       let dur = 0
       let playedFromDownloadedFile = false
+      let playedFromPlaybackCache = false
       playError.value = null
       isLoadingAudio.value = true
       audioInfo.value = null
       isPlayingFromDownload.value = false
-      if (!isSwitchingTrack || !wasPlayingBeforeSwitch) {
-        commitTrack()
-      }
-
-      if (usePreStopFade) {
-        // 先让旧曲保持旧 UI 完成短渐出，避免“新封面 + 旧声音”错位。
-        isPlaying.value = false
-        _interpIsPlaying = false
-        try {
-          await invoke('pause_with_fade', { durationMs: preStopFadeMs })
-          if (preStopFadeMs > 0) {
-            await sleep(preStopFadeMs + 30)
-          }
-        } catch {
-          try { await invoke('pause') } catch {}
-        }
-        if (token !== playbackRequestToken) return
-        commitTrack()
-      }
-
-      // Crossfade 判断：当前有正在播放的曲目且 crossfade 开启
-      const useCrossfade = useOverlapCrossfade || usePreStopFade
-      const transitionFadeOutMs = useOverlapCrossfade ? settings.crossfadeOutDuration : 0
+      // 渐变播放判断：切歌交叉过渡或新曲目首次播放
+      const useCrossfade = useOverlapCrossfade || useTrackSwitchFadeIn || useInitialFadeIn
+      const transitionFadeOutMs = useOverlapCrossfade ? overlapFadeOutDurationMs : 0
       const backendStartMs = useCrossfade ? 0 : requestedStartMs
 
       const downloaded = useDownloadStore().getDownloadedTrack(track.id)
-      if (downloaded?.filePath && isOnlineTrack(track)) {
+      if (downloaded?.filePath && isRemotePlaybackTrack(track)) {
         try {
           dur = await playDownloadedFile(
             downloaded.filePath,
+            downloaded.durationMs || track.durationMs,
             useCrossfade,
             transitionFadeOutMs,
             transitionFadeInMs,
+            token,
             backendStartMs,
           )
           if (token !== playbackRequestToken) return
@@ -861,6 +883,7 @@ export const usePlayerStore = defineStore('player', () => {
           _currentLoadedFromDownloadPath = downloaded.filePath
           isPlayingFromDownload.value = true
         } catch (e) {
+          if (token !== playbackRequestToken) return
           console.warn('[player] downloaded file unavailable, falling back to online source:', e)
           _currentLoadedFromDownloadPath = null
           isPlayingFromDownload.value = false
@@ -874,102 +897,117 @@ export const usePlayerStore = defineStore('player', () => {
           source: 'local',
         }
         lastUrlResolveTime = 0
-      } else if (track.id.startsWith('netease:')) {
+      } else if (isRemotePlaybackTrack(track)) {
         _currentLoadedFromDownloadPath = null
         isPlayingFromDownload.value = false
-        // 网易云：优先使用预热 URL，未命中再解析
-        const cached = takePrefetchedPlaybackUrl(track)
-        const urlResult = cached || await resolvePlaybackUrl(track)
-        if (token !== playbackRequestToken) return
-        if (urlResult?.url) {
-          dur = await playRemoteUrl(
-            urlResult.url,
-            track.durationMs,
-            useCrossfade,
-            transitionFadeOutMs,
-            transitionFadeInMs,
-            backendStartMs,
-            urlResult.cacheKey,
-          )
+        const cacheCandidates = playbackCacheReadCandidates(track, playbackSourceSettings())
+        for (const cacheCandidate of cacheCandidates) {
+          try {
+            const cachedDuration = await playCachedRemoteAudio(
+              cacheCandidate.cacheKey,
+              track.durationMs,
+              useCrossfade,
+              transitionFadeOutMs,
+              transitionFadeInMs,
+              token,
+              backendStartMs,
+            )
+            if (token !== playbackRequestToken) return
+            if (cachedDuration !== null) {
+              dur = cachedDuration
+              playedFromPlaybackCache = true
+              audioInfo.value = {
+                source: cacheCandidate.source,
+                qualityKey: cacheCandidate.qualityKey,
+                qualityLabel: cacheCandidate.qualityKey,
+              }
+              break
+            }
+          } catch (error) {
+            if (token !== playbackRequestToken) return
+            console.warn('[player] persistent cache unavailable, resolving online source:', error)
+          }
+        }
+
+        if (!playedFromPlaybackCache) {
+          let result = takePrefetchedPlaybackUrl(track)
+          if (!result) {
+            const resolution = await resolvePlaybackUrl(track, forceResolve)
+            if (resolution.type !== 'success') {
+              if (resolution.type === 'requires_login') {
+                throw new Error(resolution.message || 'Playback requires login')
+              }
+              if (resolution.type === 'waiting_for_authoritative_stream') {
+                throw new Error('Waiting for authoritative playback stream')
+              }
+              throw new Error(resolution.message)
+            }
+            result = resolution
+          }
+          if (token !== playbackRequestToken) return
+
+          const playResolvedSource = async (resolved: ResolvedPlaybackSource) => {
+            let lastError: unknown = null
+            const candidates = [resolved.url, ...resolved.candidateUrls]
+              .filter((url, index, values) => values.indexOf(url) === index)
+            for (const [candidateIndex, candidateUrl] of candidates.entries()) {
+              if (token !== playbackRequestToken) return 0
+              try {
+                const cacheWrite = playbackCacheWriteOptions(
+                  resolved,
+                  candidateIndex,
+                  candidateUrl,
+                )
+                return await playRemoteUrl(
+                  candidateUrl,
+                  track.durationMs,
+                  useCrossfade,
+                  transitionFadeOutMs,
+                  transitionFadeInMs,
+                  token,
+                  backendStartMs,
+                  cacheWrite.cacheKey,
+                  cacheWrite.expectedContentLength,
+                )
+              } catch (error) {
+                lastError = error
+              }
+            }
+            throw lastError instanceof Error
+              ? lastError
+              : new Error(String(lastError || 'All playback candidates failed'))
+          }
+
+          try {
+            dur = await playResolvedSource(result)
+          } catch (firstError) {
+            if (token !== playbackRequestToken) return
+            playbackUrlResolver.invalidate(track, playbackSourceSettings())
+            const refreshed = await resolvePlaybackUrl(
+              track,
+              true,
+              getPlaybackSourceKind(track) === 'youtube' ? 'high' : undefined,
+            )
+            if (refreshed.type !== 'success') throw firstError
+            result = refreshed
+            dur = await playResolvedSource(result)
+          }
           if (token !== playbackRequestToken) return
           audioInfo.value = {
-            bitrate: (urlResult.bitrate || 0) > 0 ? Math.round((urlResult.bitrate || 0) / 1000) : undefined,
-            codec: urlResult.format ? urlResult.format.toUpperCase() : undefined,
-            format: urlResult.format || undefined,
-            source: urlResult.source,
-            qualityKey: urlResult.qualityKey,
+            bitrate: result.audioInfo?.bitrateKbps
+              ?? normalizeBitrateKbps(result.bitrate),
+            codec: result.audioInfo?.codecLabel ?? result.codec,
+            format: result.format || result.audioInfo?.mimeType,
+            source: result.source,
+            qualityKey: result.audioInfo?.qualityKey ?? result.qualityKey,
+            qualityLabel: result.audioInfo?.qualityLabel,
+            qualityOptions: result.audioInfo?.qualityOptions,
+            mimeType: result.audioInfo?.mimeType,
+            sampleRateHz: result.audioInfo?.sampleRateHz,
+            bitDepth: result.audioInfo?.bitDepth,
+            channelCount: result.audioInfo?.channelCount,
+            specLabel: result.audioInfo?.specLabel,
           }
-        } else {
-          throw new Error('No playback URL')
-        }
-      } else if (track.id.startsWith('qq:')) {
-        _currentLoadedFromDownloadPath = null
-        isPlayingFromDownload.value = false
-        const result = takePrefetchedPlaybackUrl(track) || await resolvePlaybackUrl(track)
-        if (!result?.url) throw new Error('No QQ Music audio stream')
-        if (token !== playbackRequestToken) return
-        dur = await playRemoteUrl(
-          result.url,
-          track.durationMs,
-          useCrossfade,
-          transitionFadeOutMs,
-          transitionFadeInMs,
-          backendStartMs,
-          result.cacheKey,
-        )
-        if (token !== playbackRequestToken) return
-        audioInfo.value = {
-          bitrate: (result.bitrate || 0) > 0 ? Math.round((result.bitrate || 0) / 1000) : undefined,
-          codec: result.format ? result.format.toUpperCase() : undefined,
-          format: result.format || undefined,
-          source: result.source,
-          qualityKey: result.qualityKey,
-        }
-      } else if (track.id.startsWith('bilibili:')) {
-        _currentLoadedFromDownloadPath = null
-        isPlayingFromDownload.value = false
-        const result = takePrefetchedPlaybackUrl(track) || await resolvePlaybackUrl(track)
-        if (!result?.url) throw new Error('No Bilibili audio stream')
-        if (token !== playbackRequestToken) return
-        dur = await playRemoteUrl(
-          result.url,
-          track.durationMs,
-          useCrossfade,
-          transitionFadeOutMs,
-          transitionFadeInMs,
-          backendStartMs,
-          result.cacheKey,
-        )
-        if (token !== playbackRequestToken) return
-        audioInfo.value = {
-          bitrate: (result.bandwidth || 0) > 0 ? Math.round((result.bandwidth || 0) / 1000) : undefined,
-          codec: normalizeCodecName(result.codecs),
-          source: result.source,
-          qualityKey: result.qualityKey,
-        }
-      } else if (track.id.startsWith('youtube:')) {
-        _currentLoadedFromDownloadPath = null
-        isPlayingFromDownload.value = false
-        // YouTube：获取音频流，优先使用预热缓存
-        const best = takePrefetchedPlaybackUrl(track) || await resolvePlaybackUrl(track)
-        if (token !== playbackRequestToken) return
-
-        if (!best?.url) throw new Error('No YouTube audio stream')
-        dur = await playRemoteUrl(
-          best.url,
-          track.durationMs || 0,
-          useCrossfade,
-          transitionFadeOutMs,
-          transitionFadeInMs,
-          backendStartMs,
-          best.cacheKey,
-        )
-        if (token !== playbackRequestToken) return
-        audioInfo.value = {
-          bitrate: (best.bitrate || 0) > 0 ? Math.round((best.bitrate || 0) / 1000) : undefined,
-          codec: best.mime_type ? extractCodecFromMime(best.mime_type) : undefined,
-          source: best.source,
-          qualityKey: best.qualityKey,
         }
       } else {
         _currentLoadedFromDownloadPath = null
@@ -978,12 +1016,16 @@ export const usePlayerStore = defineStore('player', () => {
         if (useCrossfade) {
           dur = await invoke<number>('crossfade_file', {
             path: track.audioUrl,
+            durationHintMs: track.durationMs,
             fadeOutMs: transitionFadeOutMs, fadeInMs: transitionFadeInMs,
+            requestGeneration: token,
           })
         } else {
           dur = await invoke<number>('play_file', {
             path: track.audioUrl,
+            durationHintMs: track.durationMs,
             startPositionMs: backendStartMs,
+            requestGeneration: token,
           })
         }
         if (token !== playbackRequestToken) return
@@ -1026,8 +1068,11 @@ export const usePlayerStore = defineStore('player', () => {
 
       // 重置连续失败计数
       consecutivePlayFailures = 0
+      startupRecoveryAttempts = 0
       // 记录 URL 解析时间（用于过期检测）
-      if (!_currentLoadedFromDownloadPath) {
+      if (playedFromPlaybackCache) {
+        lastUrlResolveTime = 0
+      } else if (!_currentLoadedFromDownloadPath) {
         lastUrlResolveTime = Date.now()
       }
       // 标记已加载（取消 restore 重载标记）
@@ -1042,8 +1087,11 @@ export const usePlayerStore = defineStore('player', () => {
       // 持久化状态 + 预热下一首
       savePlayerState()
       maybePrefetchNext()
+      schedulePlaybackStartupWatchdog(token, track, startMs, commandSource)
     } catch (e) {
       if (token !== playbackRequestToken) return // 竞态过期请求，静默忽略
+
+      playbackStartupWatchdog.cancel()
 
       if (requestedStartMs > 0) {
         pendingSeek = null
@@ -1075,10 +1123,21 @@ export const usePlayerStore = defineStore('player', () => {
 
       // 连续失败熔断 + 自动 skip
       consecutivePlayFailures++
-      if (consecutivePlayFailures < MAX_CONSECUTIVE_FAILURES && queue.value.length > 1) {
+      const failureAction = resolvePlaybackFailureAdvanceAction({
+        currentIndex: queueIndex.value,
+        queueSize: queue.value.length,
+        repeatAll: repeatMode.value === 'all',
+        shuffle: shuffleEnabled.value,
+        shuffleFutureSize: shuffleFuture.length,
+        shuffleBagSize: shuffleBag.length,
+      })
+      if (
+        consecutivePlayFailures < MAX_CONSECUTIVE_FAILURES
+        && failureAction !== 'stop'
+      ) {
         _isAutoSkipping = true
         try {
-          await next(true)
+          await next(failureAction === 'wrap', commandSource)
         } finally {
           _isAutoSkipping = false
         }
@@ -1110,20 +1169,21 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     try {
-      const playing = await invoke<boolean>('toggle_play_pause')
-      // 后端确认：如果与乐观预测不一致则修正
-      if (playing !== optimistic) {
-        isPlaying.value = playing
-        if (playing) {
-          startInterpolationFromRenderedPosition()
+      const settings = useSettingsStore()
+      if (optimistic) {
+        if (settings.fadeIn && settings.fadeInDuration > 0) {
+          await invoke('resume_with_fade', { durationMs: settings.fadeInDuration })
         } else {
-          _interpIsPlaying = false
-          freezeRenderedPosition()
+          await invoke('resume')
         }
-      }
-      // 恢复播放成功后不再需要 pause seek 兜底
-      if (playing) {
+        // 恢复播放成功后不再需要 pause seek 兜底
         lastSeekedMs = null
+      } else if (settings.fadeIn && settings.fadeOutDuration > 0) {
+        playbackStartupWatchdog.cancel()
+        await invoke('pause_with_fade', { durationMs: settings.fadeOutDuration })
+      } else {
+        playbackStartupWatchdog.cancel()
+        await invoke('pause')
       }
     } catch {
       isPlaying.value = previousPlaying
@@ -1138,6 +1198,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function pause(commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
+    playbackStartupWatchdog.cancel()
     // 乐观更新
     isPlaying.value = false
     _interpIsPlaying = false
@@ -1165,11 +1226,11 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     // URL 过期检测（10min）：在线来源 URL 过期后需重新解析
-    const isOnlineSource = isOnlineTrack(currentTrack.value)
+    const isOnlineSource = isRemotePlaybackTrack(currentTrack.value)
     if (isOnlineSource && lastUrlResolveTime > 0
       && Date.now() - lastUrlResolveTime > URL_EXPIRY_MS) {
       // URL 已过期，重新解析
-      await play(currentTrack.value, commandSource, currentRenderedPosition())
+      await play(currentTrack.value, commandSource, currentRenderedPosition(), true)
       return
     }
 
@@ -1192,12 +1253,15 @@ export const usePlayerStore = defineStore('player', () => {
     const maxSeekMs = durationMs.value || currentTrack.value?.durationMs || 0
     const posMs = maxSeekMs > 0 ? Math.min(roundedMs, maxSeekMs) : roundedMs
     const safePosMs = markOptimisticSeek(posMs, commandSource, { durationMs: maxSeekMs })
+    const seekSeq = lastSeekCommand.value.seq
 
     // Fire-and-forget：不阻塞 UI，后端异步执行 seek
     invoke('seek', { positionMs: safePosMs }).then(() => {
+      if (lastSeekCommand.value.seq !== seekSeq) return
       positionMs.value = safePosMs
       seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
     }).catch((e) => {
+      if (lastSeekCommand.value.seq !== seekSeq) return
       pendingSeek = null
       seekGuardUntil = 0
       console.error('Seek failed:', e)
@@ -1423,15 +1487,17 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   async function setVolume(vol: number) {
-    volume.value = vol
-    try { await invoke('set_volume', { level: vol }) } catch {}
+    volume.value = Math.max(0, Math.min(1, vol))
+    settings.volume = volume.value
+    try { await invoke('set_volume', { level: volume.value }) } catch {}
     savePlayerState()
   }
 
   // 播放速度
-  const playbackSpeed = ref(1.0)
+  const playbackSpeed = ref(settings.playbackSpeed)
   async function setSpeed(spd: number) {
-    playbackSpeed.value = spd
+    playbackSpeed.value = Math.max(0.25, Math.min(3, spd))
+    settings.playbackSpeed = playbackSpeed.value
     _interpSpeed = spd
     // 重新锚定以反映速度变化
     if (_interpIsPlaying) {
@@ -1439,14 +1505,14 @@ export const usePlayerStore = defineStore('player', () => {
       _interpAnchorTime = performance.now()
       _interpRenderedMs = interpolatedPositionMs.value
     }
-    try { await invoke('set_speed', { speed: spd }) } catch {}
+    try { await invoke('set_speed', { speed: playbackSpeed.value }) } catch {}
   }
 
   // ─── 音效参数（响度增益 + 均衡器） ───
-  const loudnessGainMb = ref(0)
-  const equalizerEnabled = ref(false)
-  const equalizerPresetId = ref('flat')
-  const equalizerBands = ref([0, 0, 0, 0, 0]) // 5 bands, mB values
+  const loudnessGainMb = ref(settings.loudnessGainMb)
+  const equalizerEnabled = ref(settings.equalizerEnabled)
+  const equalizerPresetId = ref(settings.equalizerPresetId)
+  const equalizerBands = ref([...settings.equalizerBands]) // 5 bands, mB values
 
   /** 是否有任何非默认音效 */
   const hasActiveEffects = computed(() =>
@@ -1457,17 +1523,21 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function setLoudnessGain(mb: number) {
     loudnessGainMb.value = Math.round(Math.max(0, Math.min(1500, mb)))
+    settings.loudnessGainMb = loudnessGainMb.value
     try { await invoke('set_loudness_gain', { gainMb: loudnessGainMb.value }) } catch {}
   }
 
   async function setEqualizer(enabled: boolean, bands: number[]) {
     equalizerEnabled.value = enabled
     equalizerBands.value = bands.map(v => Math.round(Math.max(-1500, Math.min(1500, v))))
+    settings.equalizerEnabled = enabled
+    settings.equalizerBands = [...equalizerBands.value]
     try { await invoke('set_equalizer', { enabled, bandLevelsMb: equalizerBands.value }) } catch {}
   }
 
   async function setEqualizerPreset(presetId: string) {
     equalizerPresetId.value = presetId
+    settings.equalizerPresetId = presetId
     const bands = EQ_PRESETS[presetId] || [0, 0, 0, 0, 0]
     await setEqualizer(presetId !== 'flat', [...bands])
   }
@@ -1478,6 +1548,11 @@ export const usePlayerStore = defineStore('player', () => {
     equalizerPresetId.value = 'flat'
     equalizerBands.value = [0, 0, 0, 0, 0]
     playbackSpeed.value = 1.0
+    settings.loudnessGainMb = 0
+    settings.equalizerEnabled = false
+    settings.equalizerPresetId = 'flat'
+    settings.equalizerBands = [0, 0, 0, 0, 0]
+    settings.playbackSpeed = 1.0
     _interpSpeed = 1.0
     try {
       await invoke('reset_audio_effects')
@@ -1485,15 +1560,42 @@ export const usePlayerStore = defineStore('player', () => {
     } catch {}
   }
 
-  // 批量替换队列并播放第一首
-  function playAll(tracks: TrackInfo[]) {
-    if (tracks.length === 0) return
+  async function applyPersistedSettings() {
+    volume.value = Math.max(0, Math.min(1, settings.volume))
+    playbackSpeed.value = Math.max(0.25, Math.min(3, settings.playbackSpeed))
+    loudnessGainMb.value = Math.round(Math.max(0, Math.min(1500, settings.loudnessGainMb)))
+    equalizerEnabled.value = settings.equalizerEnabled
+    equalizerPresetId.value = settings.equalizerPresetId
+    equalizerBands.value = settings.equalizerBands.map(value => Math.round(Math.max(-1500, Math.min(1500, value))))
+    _interpSpeed = playbackSpeed.value
+
+    await Promise.allSettled([
+      invoke('set_volume', { level: volume.value }),
+      invoke('set_speed', { speed: playbackSpeed.value }),
+      invoke('set_loudness_gain', { gainMb: loudnessGainMb.value }),
+      invoke('set_equalizer', { enabled: equalizerEnabled.value, bandLevelsMb: equalizerBands.value }),
+    ])
+  }
+
+  // 批量替换队列，并且只发起一次目标曲目的播放请求
+  function playAll(
+    tracks: TrackInfo[],
+    requestedTrackId?: string,
+    requestedPlaylistKey?: string,
+  ) {
+    const playlistIndex = requestedPlaylistKey
+      ? tracks.findIndex(track => track.playlistKey === requestedPlaylistKey)
+      : -1
+    const startIndex = playlistIndex >= 0
+      ? playlistIndex
+      : resolvePlaybackQueueStartIndex(tracks, requestedTrackId)
+    if (startIndex < 0) return
     queue.value = [...tracks]
-    queueIndex.value = 0
+    queueIndex.value = startIndex
     shuffleBag = []
     shuffleHistory = []
     shuffleFuture = []
-    play(tracks[0])
+    void play(queue.value[startIndex])
   }
 
   // 洗牌后替换队列并播放
@@ -1616,10 +1718,12 @@ export const usePlayerStore = defineStore('player', () => {
     if (!track) return
     const pos = positionMs.value
     const wasPlaying = isPlaying.value
-    clearPrefetchedPlaybackUrls(track)
+    const sourceSettings = playbackSourceSettings()
+    playbackPrefetchManager.clearForTrack(track, sourceSettings)
+    playbackUrlResolver.invalidate(track, sourceSettings)
     lastUrlResolveTime = 0
     playError.value = null
-    await play(track, 'local', pos)
+    await play(track, 'local', pos, true)
     if (playError.value) {
       throw new Error(playError.value)
     }
@@ -1630,10 +1734,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   // ─── 初始化：恢复持久化状态 ───
   loadPlayerState()
-  // 同步恢复的音量到后端
-  if (volume.value !== 1) {
-    invoke('set_volume', { level: volume.value }).catch(() => {})
-  }
+  void applyPersistedSettings()
 
   return {
     isPlaying, currentTrack, positionMs, durationMs, queue, queueIndex,
@@ -1647,6 +1748,7 @@ export const usePlayerStore = defineStore('player', () => {
     play, togglePlayPause, pause, resume, seekTo, next, previous,
     toggleRepeatMode, toggleShuffle, cyclePlayMode, playMode, setVolume, setSpeed,
     setLoudnessGain, setEqualizer, setEqualizerPreset, resetAudioEffects,
+    applyPersistedSettings,
     startSleepTimer, startSleepTimerEndOfTrack, startSleepTimerEndOfQueue, cancelSleepTimer,
     playAll, shufflePlay, addToQueueNext, addToQueueEnd, removeFromQueue, clearQueue,
     updateCurrentTrackInfo, restoreOriginalTrackInfo, hasOriginalTrackInfo,
@@ -1654,32 +1756,29 @@ export const usePlayerStore = defineStore('player', () => {
   }
 })
 
-function isOnlineTrack(track: TrackInfo): boolean {
-  return (
-    track.id.startsWith('netease:')
-    || track.id.startsWith('qq:')
-    || track.id.startsWith('bilibili:')
-    || track.id.startsWith('youtube:')
-  )
-}
-
 async function playDownloadedFile(
   path: string,
+  durationHintMs: number,
   useCrossfade: boolean,
   fadeOutMs: number,
   fadeInMs: number,
+  requestGeneration: number,
   startPositionMs = 0,
 ): Promise<number> {
   if (useCrossfade) {
     return invoke<number>('crossfade_file', {
       path,
+      durationHintMs,
       fadeOutMs,
       fadeInMs,
+      requestGeneration,
     })
   }
   return invoke<number>('play_file', {
     path,
+    durationHintMs,
     startPositionMs: Math.max(0, Math.round(startPositionMs)),
+    requestGeneration,
   })
 }
 
@@ -1689,10 +1788,13 @@ async function playRemoteUrl(
   useCrossfade: boolean,
   fadeOutMs: number,
   fadeInMs: number,
+  requestGeneration: number,
   startPositionMs = 0,
   cacheKey?: string,
+  expectedContentLength?: number,
 ): Promise<number> {
   const safeStartMs = Math.max(0, Math.round(startPositionMs))
+  const cacheLimitBytes = playbackCacheLimitBytes()
   if (useCrossfade) {
     try {
       return await invoke<number>('crossfade_url_streaming', {
@@ -1701,14 +1803,22 @@ async function playRemoteUrl(
         fadeOutMs,
         fadeInMs,
         cacheKey,
+        cacheLimitBytes,
+        expectedContentLength,
+        requestGeneration,
       })
     } catch (streamError) {
+      if (requestGeneration !== playbackRequestToken) throw streamError
       console.warn('[player] streaming playback failed, falling back to temp-file playback:', streamError)
       return invoke<number>('crossfade_url_fast', {
         url,
         durationHintMs,
         fadeOutMs,
         fadeInMs,
+        cacheKey,
+        cacheLimitBytes,
+        expectedContentLength,
+        requestGeneration,
       })
     }
   }
@@ -1719,74 +1829,55 @@ async function playRemoteUrl(
       durationHintMs,
       startPositionMs: safeStartMs,
       cacheKey,
+      cacheLimitBytes,
+      expectedContentLength,
+      requestGeneration,
     })
   } catch (streamError) {
+    if (requestGeneration !== playbackRequestToken) throw streamError
     console.warn('[player] streaming playback failed, falling back to temp-file playback:', streamError)
     return invoke<number>('play_url_fast', {
       url,
       durationHintMs,
       startPositionMs: safeStartMs,
+      cacheKey,
+      cacheLimitBytes,
+      expectedContentLength,
+      requestGeneration,
     })
   }
 }
 
-function playbackCacheKey(track: TrackInfo, parts: Array<string | number | null | undefined>): string {
-  const normalizedParts = parts
-    .map(part => String(part ?? '').trim().toLowerCase())
-    .filter(Boolean)
-  return ['v1', track.id, ...normalizedParts].join('|')
+async function playCachedRemoteAudio(
+  cacheKey: string,
+  durationHintMs: number,
+  useCrossfade: boolean,
+  fadeOutMs: number,
+  fadeInMs: number,
+  requestGeneration: number,
+  startPositionMs = 0,
+): Promise<number | null> {
+  return invoke<number | null>('play_cached_audio', {
+    request: {
+      cacheKey,
+      durationHintMs,
+      startPositionMs: Math.max(0, Math.round(startPositionMs)),
+      useCrossfade,
+      fadeOutMs,
+      fadeInMs,
+      cacheLimitBytes: playbackCacheLimitBytes(),
+      requestGeneration,
+    },
+  })
 }
 
-function playbackQualityCachePrefix(track: TrackInfo): string | null {
+function playbackCacheLimitBytes(): number {
   const settings = useSettingsStore()
-  if (track.id.startsWith('netease:')) {
-    return playbackCacheKey(track, ['netease', settings.neteaseQuality])
-  }
-  if (track.id.startsWith('qq:')) {
-    return playbackCacheKey(track, ['qq', settings.qqMusicQuality])
-  }
-  if (track.id.startsWith('bilibili:')) {
-    return playbackCacheKey(track, ['bilibili', settings.biliQuality])
-  }
-  if (track.id.startsWith('youtube:')) {
-    return playbackCacheKey(track, ['youtube', settings.youtubeQuality])
-  }
-  return null
-}
-
-function isPrefetchedQualityMatch(prefetched: PrefetchedUrl, expectedPrefix?: string | null): boolean {
-  if (!expectedPrefix) return true
-  return !!prefetched.cacheKey && prefetched.cacheKey.startsWith(`${expectedPrefix}|`)
-}
-
-function playbackPrefetchCacheId(track: TrackInfo): string {
-  return playbackQualityCachePrefix(track) ?? track.id
-}
-
-function clearPrefetchedPlaybackUrls(track: TrackInfo): void {
-  prefetchedPlaybackUrls.delete(track.id)
-  const prefix = `v1|${track.id}|`
-  for (const key of prefetchedPlaybackUrls.keys()) {
-    if (key.startsWith(prefix)) {
-      prefetchedPlaybackUrls.delete(key)
-    }
-  }
-}
-
-function selectYoutubeStream(
-  streams: Array<{ url: string; bitrate: number; mime_type: string }>,
-  quality: string,
-) {
-  if (!streams.length) return null
-  const sorted = [...streams].sort((a, b) => b.bitrate - a.bitrate)
-  if (quality === 'low') return sorted[sorted.length - 1]
-  if (quality === 'medium') return sorted[Math.floor((sorted.length - 1) / 2)]
-  if (quality === 'high') return sorted[Math.min(1, sorted.length - 1)]
-  return sorted[0]
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+  const cacheSizeMb = Math.min(
+    MAX_MEDIA_CACHE_SIZE_MB,
+    Math.max(MIN_MEDIA_CACHE_SIZE_MB, settings.maxCacheSize),
+  )
+  return Math.round(cacheSizeMb * 1024 * 1024)
 }
 
 function formatTime(ms: number): string {
@@ -1794,45 +1885,4 @@ function formatTime(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
-}
-
-/** 从 MIME type 提取编解码器名称，例如 'audio/webm; codecs="opus"' -> 'Opus' */
-function extractCodecFromMime(mime: string): string | undefined {
-  // 尝试从 codecs 参数提取
-  const codecsMatch = mime.match(/codecs="?([^";\s]+)"?/)
-  if (codecsMatch) {
-    const raw = codecsMatch[1].split('.')[0] // 去除 profile，如 mp4a.40.2 -> mp4a
-    const codecMap: Record<string, string> = {
-      opus: 'Opus', vorbis: 'Vorbis', mp4a: 'AAC', flac: 'FLAC', mp3: 'MP3',
-    }
-    return codecMap[raw.toLowerCase()] ?? raw.toUpperCase()
-  }
-  // 从 MIME 主类型推断
-  const typeMatch = mime.match(/^audio\/(\w+)/)
-  if (typeMatch) {
-    const codecMap: Record<string, string> = {
-      webm: 'WebM', mp4: 'AAC', mpeg: 'MP3', ogg: 'Vorbis', flac: 'FLAC', wav: 'WAV',
-    }
-    return codecMap[typeMatch[1].toLowerCase()] ?? typeMatch[1].toUpperCase()
-  }
-  return undefined
-}
-
-function normalizeCodecName(codec?: string): string | undefined {
-  if (!codec) return undefined
-  const raw = codec.trim()
-  const lower = raw.toLowerCase()
-  const codecMap: Record<string, string> = {
-    flac: 'FLAC',
-    mp3: 'MP3',
-    mpeg: 'MP3',
-    aac: 'AAC',
-    mp4a: 'AAC',
-    opus: 'Opus',
-    vorbis: 'Vorbis',
-    'ec-3': 'EC-3',
-    ac3: 'AC-3',
-  }
-  const family = lower.split('.')[0]
-  return codecMap[lower] ?? codecMap[family] ?? raw
 }

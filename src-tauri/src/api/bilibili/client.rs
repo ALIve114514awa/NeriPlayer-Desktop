@@ -254,4 +254,37 @@ impl BiliClient {
         params.insert("bvid".into(), bvid.into());
         self.wbi_get("https://api.bilibili.com/x/player/wbi/pagelist", params).await
     }
+
+    /// 按 Android 旧式分 P 编号查找对应 cid
+    pub async fn get_video_page_cid(&self, bvid: &str, page: u64) -> AppResult<Option<u64>> {
+        let response = self.get_video_pages(bvid).await?;
+        Ok(find_video_page_cid(&response, page))
+    }
+}
+
+fn find_video_page_cid(response: &Value, page: u64) -> Option<u64> {
+    response["data"]
+        .as_array()?
+        .iter()
+        .find(|item| item["page"].as_u64() == Some(page))
+        .and_then(|item| item["cid"].as_u64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_video_page_cid;
+    use serde_json::json;
+
+    #[test]
+    fn finds_cid_for_legacy_page_number() {
+        let response = json!({
+            "data": [
+                { "page": 1, "cid": 101 },
+                { "page": 7, "cid": 707 }
+            ]
+        });
+
+        assert_eq!(find_video_page_cid(&response, 7), Some(707));
+        assert_eq!(find_video_page_cid(&response, 2), None);
+    }
 }

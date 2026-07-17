@@ -2,7 +2,11 @@ import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useToastStore } from './toast'
+import { useHistoryStore } from './history'
+import { useSettingsStore } from './settings'
+import { useAuthStore } from './auth'
 import i18n from '@/i18n'
+import { setLocale } from '@/i18n'
 
 // 全局 i18n 翻译（非组件上下文）
 const t = (key: string, params?: Record<string, any>) =>
@@ -14,12 +18,46 @@ export interface SyncConfig {
   lastSyncTime: number
 }
 
+export type SyncFrequency =
+  | 'immediate'
+  | 'every_10_minutes'
+  | 'every_15_minutes'
+  | 'every_30_minutes'
+
+const SYNC_FREQUENCY_DELAYS: Record<SyncFrequency, number> = {
+  immediate: 0,
+  every_10_minutes: 10 * 60 * 1000,
+  every_15_minutes: 15 * 60 * 1000,
+  every_30_minutes: 30 * 60 * 1000,
+}
+
+export function normalizeSyncFrequency(value: unknown): SyncFrequency {
+  switch (String(value ?? '').trim().toLowerCase()) {
+    case 'every_10_minutes':
+    case 'batched':
+    case 'batched_10':
+      return 'every_10_minutes'
+    case 'every_15_minutes':
+    case 'batched_15':
+      return 'every_15_minutes'
+    case 'every_30_minutes':
+    case 'batched_30':
+      return 'every_30_minutes'
+    default:
+      return 'immediate'
+  }
+}
+
+export function syncFrequencyDelayMs(frequency: SyncFrequency): number {
+  return SYNC_FREQUENCY_DELAYS[frequency]
+}
+
 export interface GitHubSyncConfig extends SyncConfig {
   owner: string
   repo: string
   dataSaver: boolean
   silentFailures: boolean
-  historyUpdateMode: 'immediate' | 'batched'
+  historyUpdateMode: SyncFrequency
 }
 
 export interface WebDavSyncConfig extends SyncConfig {
@@ -45,6 +83,7 @@ export const useSyncStore = defineStore('sync', () => {
     historyUpdateMode: 'immediate',
   })
   const webdav = ref<WebDavSyncConfig>({ configured: false, serverUrl: '', basePath: '', autoSync: false, lastSyncTime: 0 })
+  const syncFrequency = ref<SyncFrequency>('immediate')
 
   const isSyncing = ref(false)
   const lastResult = ref<SyncResult | null>(null)
@@ -57,8 +96,10 @@ export const useSyncStore = defineStore('sync', () => {
   /** 加载同步配置 */
   async function loadConfigs() {
     _loading = true
+    let legacyFrequency: SyncFrequency = 'immediate'
     try {
       const gh = await invoke<any>('get_github_sync_config')
+      legacyFrequency = normalizeSyncFrequency(gh.historyUpdateMode)
       github.value = {
         configured: gh.configured ?? false,
         owner: gh.owner ?? '',
@@ -67,7 +108,7 @@ export const useSyncStore = defineStore('sync', () => {
         lastSyncTime: gh.lastSyncTime ?? 0,
         dataSaver: gh.dataSaver ?? true,
         silentFailures: gh.silentFailures ?? false,
-        historyUpdateMode: gh.historyUpdateMode ?? 'immediate',
+        historyUpdateMode: legacyFrequency,
       }
     } catch (e) {
       console.error('loadGitHubConfig:', e)
@@ -85,8 +126,31 @@ export const useSyncStore = defineStore('sync', () => {
     } catch (e) {
       console.error('loadWebDavConfig:', e)
     }
+
+    try {
+      const preferences = await invoke<any>('get_sync_preferences')
+      syncFrequency.value = normalizeSyncFrequency(preferences.historyUpdateMode)
+    } catch (e) {
+      // 兼容浏览器开发模式和未升级的后端，回退到旧 GitHub 字段
+      syncFrequency.value = legacyFrequency
+    }
+    github.value.historyUpdateMode = syncFrequency.value
     _loading = false
   }
+
+  // 播放历史频率是跨 GitHub/WebDAV 的全局偏好
+  watch(
+    syncFrequency,
+    async (value) => {
+      github.value.historyUpdateMode = value
+      if (_loading) return
+      try {
+        await invoke('update_sync_preferences', { historyUpdateMode: value })
+      } catch (e) {
+        console.error('Failed to save sync frequency:', e)
+      }
+    },
+  )
 
   // 监听 GitHub 子设置变化，自动保存到后端
   watch(
@@ -94,7 +158,6 @@ export const useSyncStore = defineStore('sync', () => {
       autoSync: github.value.autoSync,
       dataSaver: github.value.dataSaver,
       silentFailures: github.value.silentFailures,
-      historyUpdateMode: github.value.historyUpdateMode,
     }),
     async (val) => {
       if (_loading || !github.value.configured) return
@@ -103,7 +166,6 @@ export const useSyncStore = defineStore('sync', () => {
           autoSync: val.autoSync,
           dataSaver: val.dataSaver,
           silentFailures: val.silentFailures,
-          historyUpdateMode: val.historyUpdateMode,
         })
       } catch (e) {
         console.error('Failed to save GitHub sync settings:', e)
@@ -145,7 +207,7 @@ export const useSyncStore = defineStore('sync', () => {
       github.value = {
         configured: true, owner: result.owner, repo: result.repo,
         autoSync: true, lastSyncTime: 0,
-        dataSaver: true, silentFailures: false, historyUpdateMode: 'immediate',
+        dataSaver: true, silentFailures: false, historyUpdateMode: syncFrequency.value,
       }
       return true
     } catch (e: any) {
@@ -162,7 +224,7 @@ export const useSyncStore = defineStore('sync', () => {
       github.value = {
         configured: true, owner: result.owner, repo: result.repo,
         autoSync: true, lastSyncTime: 0,
-        dataSaver: true, silentFailures: false, historyUpdateMode: 'immediate',
+        dataSaver: true, silentFailures: false, historyUpdateMode: syncFrequency.value,
       }
       return true
     } catch (e: any) {
@@ -179,7 +241,7 @@ export const useSyncStore = defineStore('sync', () => {
       github.value = {
         configured: true, owner: result.owner, repo: result.repo,
         autoSync: true, lastSyncTime: 0,
-        dataSaver: true, silentFailures: false, historyUpdateMode: 'immediate',
+        dataSaver: true, silentFailures: false, historyUpdateMode: syncFrequency.value,
       }
       return true
     } catch (e: any) {
@@ -192,9 +254,15 @@ export const useSyncStore = defineStore('sync', () => {
   async function syncGitHub(silent = false) {
     if (isSyncing.value) return
     const toast = useToastStore()
+    const history = useHistoryStore()
     isSyncing.value = true
     try {
-      const result = await invoke<any>('sync_github')
+      const historySnapshot = history.getSyncSnapshot()
+      const result = await invoke<any>('sync_github', {
+        historyEntries: historySnapshot.entries,
+        historyDeletions: historySnapshot.deletions,
+      })
+      if (result.history) await history.applySyncPayload(result.history)
       lastResult.value = {
         success: result.success, message: result.message,
         playlistsAdded: result.playlists_added ?? result.playlistsAdded ?? 0,
@@ -209,8 +277,10 @@ export const useSyncStore = defineStore('sync', () => {
       await loadConfigs()
     } catch (e: any) {
       // 错误始终显示（除非 silentFailures 开启）
-      if (!github.value.silentFailures) {
-        toast.error(e?.toString() || 'Sync failed')
+      const message = e?.toString() || 'Sync failed'
+      const tokenExpired = /token|unauthorized|401|expired/i.test(message)
+      if (!silent || !github.value.silentFailures || tokenExpired) {
+        toast.error(message)
       }
     } finally {
       isSyncing.value = false
@@ -225,7 +295,7 @@ export const useSyncStore = defineStore('sync', () => {
       github.value = {
         configured: false, owner: '', repo: '',
         autoSync: false, lastSyncTime: 0,
-        dataSaver: true, silentFailures: false, historyUpdateMode: 'immediate',
+        dataSaver: true, silentFailures: false, historyUpdateMode: syncFrequency.value,
       }
       toast.success(t('settings.github_disconnected'))
     } catch (e) {
@@ -252,9 +322,15 @@ export const useSyncStore = defineStore('sync', () => {
   async function syncWebDav(silent = false) {
     if (isSyncing.value) return
     const toast = useToastStore()
+    const history = useHistoryStore()
     isSyncing.value = true
     try {
-      const result = await invoke<any>('sync_webdav')
+      const historySnapshot = history.getSyncSnapshot()
+      const result = await invoke<any>('sync_webdav', {
+        historyEntries: historySnapshot.entries,
+        historyDeletions: historySnapshot.deletions,
+      })
+      if (result.history) await history.applySyncPayload(result.history)
       lastResult.value = {
         success: result.success, message: result.message,
         playlistsAdded: result.playlists_added ?? result.playlistsAdded ?? 0,
@@ -285,6 +361,16 @@ export const useSyncStore = defineStore('sync', () => {
       toast.success(t('settings.webdav_disconnected'))
     } catch (e) {
       console.error('disconnectWebDav:', e)
+    }
+  }
+
+  /** 按 Android 的策略顺序执行所有已启用自动同步的提供商 */
+  async function syncAuto(silent = true) {
+    if (github.value.configured && github.value.autoSync) {
+      await syncGitHub(silent)
+    }
+    if (webdav.value.configured && webdav.value.autoSync) {
+      await syncWebDav(silent)
     }
   }
 
@@ -334,12 +420,54 @@ export const useSyncStore = defineStore('sync', () => {
     }
   }
 
+  async function exportConfig() {
+    const toast = useToastStore()
+    const settings = useSettingsStore()
+    try {
+      const result = await invoke<any>('export_config', {
+        settings: settings.snapshot(),
+        listenTogetherUserUuid: localStorage.getItem('neri:lt-uuid') || '',
+      })
+      if (result.success) {
+        toast.success(t('settings.export_config_success'))
+      }
+      return result
+    } catch (e: any) {
+      toast.error(e?.toString() || t('settings.export_config_failed'))
+      return { success: false }
+    }
+  }
+
+  async function importConfig() {
+    const toast = useToastStore()
+    const settings = useSettingsStore()
+    const auth = useAuthStore()
+    try {
+      const result = await invoke<any>('import_config')
+      if (!result.success) return result
+      settings.applySnapshot(result.settings)
+      if (result.listenTogetherUserUuid) {
+        localStorage.setItem('neri:lt-uuid', result.listenTogetherUserUuid)
+      } else {
+        localStorage.removeItem('neri:lt-uuid')
+      }
+      if (result.settings?.locale) setLocale(result.settings.locale, false)
+      await auth.checkStatus()
+      await loadConfigs()
+      toast.success(t('settings.import_config_success'))
+      return result
+    } catch (e: any) {
+      toast.error(e?.toString() || t('settings.import_config_failed'))
+      return { success: false }
+    }
+  }
+
   return {
-    github, webdav, isSyncing, lastResult, dialogError,
+    github, webdav, syncFrequency, isSyncing, lastResult, dialogError,
     loadConfigs,
     validateGitHubToken, createGitHubRepo, useExistingGitHubRepo,
-    configureGitHub, syncGitHub, disconnectGitHub,
+    configureGitHub, syncGitHub, syncAuto, disconnectGitHub,
     configureWebDav, syncWebDav, disconnectWebDav,
-    clearCache, exportPlaylists, importPlaylists,
+    clearCache, exportPlaylists, importPlaylists, exportConfig, importConfig,
   }
 })

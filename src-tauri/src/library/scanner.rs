@@ -111,6 +111,8 @@ fn read_track_info(path: &Path, name_template: Option<&str>) -> AppResult<TrackI
         url: path.to_string_lossy().to_string(),
         cover_url,
         added_at: 0,
+        sync_payload: None,
+        playlist_key: None,
     })
 }
 
