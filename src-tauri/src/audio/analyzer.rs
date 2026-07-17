@@ -30,6 +30,20 @@ impl SharedAudioLevel {
             lock.beat_impulse = 0.0;
         }
     }
+
+    pub fn try_update(shared: &Arc<Mutex<Self>>, level: f32, beat_impulse: f32) -> bool {
+        let Ok(mut lock) = shared.try_lock() else {
+            return false;
+        };
+        lock.level = level;
+        lock.beat_impulse = beat_impulse;
+        true
+    }
+
+    pub fn try_snapshot(shared: &Arc<Mutex<Self>>) -> Option<(f32, f32)> {
+        let lock = shared.try_lock().ok()?;
+        Some((lock.level, lock.beat_impulse))
+    }
 }
 
 /// PCM 音频分析器 — 精确对齐 Android `AudioReactive.kt`
@@ -156,5 +170,23 @@ impl AudioAnalyzer {
             level: level.clamp(0.0, 1.0),
             beat_impulse: self.beat_impulse.clamp(0.0, 1.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SharedAudioLevel;
+
+    #[test]
+    fn visualization_updates_do_not_wait_for_a_busy_consumer() {
+        let shared = SharedAudioLevel::new();
+        let guard = shared.lock().expect("shared audio level lock");
+
+        assert!(!SharedAudioLevel::try_update(&shared, 0.4, 0.8));
+        assert!(SharedAudioLevel::try_snapshot(&shared).is_none());
+
+        drop(guard);
+        assert!(SharedAudioLevel::try_update(&shared, 0.4, 0.8));
+        assert_eq!(SharedAudioLevel::try_snapshot(&shared), Some((0.4, 0.8)));
     }
 }

@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod buffered;
 pub mod effects;
 pub mod growing;
 pub mod media_session;

@@ -4,6 +4,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
 };
 use std::time::{Duration, Instant};
+use symphonia::core::io::MediaSource;
 
 #[derive(Clone)]
 pub struct GrowingAudioBuffer {
@@ -147,6 +148,13 @@ impl GrowingAudioReader {
         self.inner.aborted.store(true, Ordering::SeqCst);
         self.inner.cv.notify_all();
     }
+
+    fn known_byte_len(&self) -> Option<u64> {
+        let state = self.inner.state.lock().ok()?;
+        state
+            .total_len
+            .or_else(|| state.complete.then_some(state.data.len() as u64))
+    }
 }
 
 impl Read for GrowingAudioReader {
@@ -225,5 +233,15 @@ impl Seek for GrowingAudioReader {
         }
         self.pos = next as u64;
         Ok(self.pos)
+    }
+}
+
+impl MediaSource for GrowingAudioReader {
+    fn is_seekable(&self) -> bool {
+        self.known_byte_len().is_some()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.known_byte_len()
     }
 }

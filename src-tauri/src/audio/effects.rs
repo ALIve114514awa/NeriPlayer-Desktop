@@ -196,7 +196,7 @@ where
     }
 
     fn update_params(&mut self) {
-        let p = match self.params.lock() {
+        let p = match self.params.try_lock() {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -323,7 +323,7 @@ where
     }
 
     fn update_params(&mut self) {
-        if let Ok(p) = self.params.lock() {
+        if let Ok(p) = self.params.try_lock() {
             if p.loudness_gain_mb != self.gain_mb {
                 self.gain_mb = p.loudness_gain_mb;
                 self.gain = mb_to_linear(self.gain_mb);
