@@ -1,0 +1,73 @@
+<script setup lang="ts">
+import { useI18n } from 'vue-i18n'
+
+withDefaults(defineProps<{
+  selectedCount: number
+  visibleSelectedCount: number
+  allVisibleSelected: boolean
+  showPlay?: boolean
+  showQueue?: boolean
+  showPlaylist?: boolean
+  showDownload?: boolean
+  showDelete?: boolean
+}>(), {
+  showPlay: true,
+  showQueue: true,
+  showPlaylist: true,
+  showDownload: true,
+  showDelete: false,
+})
+
+const emit = defineEmits<{
+  selectAll: []
+  play: []
+  queue: []
+  playlist: []
+  download: []
+  delete: []
+  exit: []
+}>()
+
+const { t } = useI18n()
+</script>
+
+<template>
+  <div class="selection-toolbar">
+    <div class="selection-count">{{ t('common.selected_count', { count: selectedCount }) }}</div>
+    <div class="selection-actions">
+      <button class="selection-btn" type="button" :title="allVisibleSelected ? t('common.deselect_all') : t('common.select_all')" @click="emit('selectAll')">
+        <span class="material-symbols-rounded">{{ allVisibleSelected ? 'deselect' : 'select_all' }}</span>
+      </button>
+      <button v-if="showPlay" class="selection-btn" type="button" :disabled="selectedCount === 0" :title="t('common.play_selected')" @click="emit('play')">
+        <span class="material-symbols-rounded">play_arrow</span>
+      </button>
+      <button v-if="showQueue" class="selection-btn" type="button" :disabled="selectedCount === 0" :title="t('common.queue_selected')" @click="emit('queue')">
+        <span class="material-symbols-rounded">add_to_queue</span>
+      </button>
+      <button v-if="showPlaylist" class="selection-btn" type="button" :disabled="selectedCount === 0" :title="t('common.playlist_selected')" @click="emit('playlist')">
+        <span class="material-symbols-rounded">playlist_add</span>
+      </button>
+      <button v-if="showDownload" class="selection-btn" type="button" :disabled="selectedCount === 0" :title="t('common.download_selected')" @click="emit('download')">
+        <span class="material-symbols-rounded">download</span>
+      </button>
+      <button v-if="showDelete" class="selection-btn danger" type="button" :disabled="selectedCount === 0" :title="t('common.delete_selected')" @click="emit('delete')">
+        <span class="material-symbols-rounded">delete</span>
+      </button>
+      <button class="selection-btn ghost" type="button" :title="t('common.exit_selection')" @click="emit('exit')">
+        <span class="material-symbols-rounded">close</span>
+      </button>
+    </div>
+  </div>
+</template>
+
+<style scoped lang="scss">
+.selection-toolbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; margin-bottom: 12px; border-radius: 14px; background: var(--md-primary-container); color: var(--md-on-primary-container); }
+.selection-count { flex: 1; font-size: 13px; font-weight: 700; }
+.selection-actions { display: flex; align-items: center; gap: 4px; }
+.selection-btn { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
+.selection-btn:hover:not(:disabled) { background: color-mix(in srgb, currentColor 12%, transparent); }
+.selection-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.selection-btn.danger { color: var(--md-error); }
+.selection-btn.ghost { color: var(--md-on-primary-container); }
+.material-symbols-rounded { font-size: 19px; }
+</style>

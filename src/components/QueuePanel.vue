@@ -1,11 +1,48 @@
 <script setup lang="ts">
+import { computed, ref } from 'vue'
 import { usePlayerStore } from '@/stores/player'
 import { useI18n } from 'vue-i18n'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
+import {
+  createContextMenuItem,
+  createContextMenuSeparator,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+  type ContextMenuPosition,
+} from '@/utils/contextMenu'
 
 const emit = defineEmits<{ close: [] }>()
 const player = usePlayerStore()
 const { t } = useI18n()
+const queueContextMenuOpen = ref(false)
+const queueContextMenuPosition = ref<ContextMenuPosition>({ x: 0, y: 0 })
+const queueContextMenuIndex = ref(-1)
+
+const queueContextMenuItems = computed<readonly ContextMenuItem[]>(() => {
+  if (queueContextMenuIndex.value < 0 || !player.queue[queueContextMenuIndex.value]) return []
+
+  return [
+    createContextMenuItem(t('player.play_all'), {
+      id: 'play',
+      icon: 'play_arrow',
+    }),
+    createContextMenuItem(t('player.play_next'), {
+      id: 'play-next',
+      icon: 'queue_play_next',
+    }),
+    createContextMenuItem(t('player.add_to_queue'), {
+      id: 'queue-end',
+      icon: 'add_to_queue',
+    }),
+    createContextMenuSeparator('queue-actions'),
+    createContextMenuItem(t('common.delete'), {
+      id: 'remove',
+      icon: 'delete',
+      danger: true,
+    }),
+  ]
+})
 
 function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000)
@@ -23,6 +60,44 @@ function removeFromQueue(index: number) {
 function clearQueue() {
   player.clearQueue()
   player.queueIndex = -1
+}
+
+function openQueueContextMenu(event: MouseEvent, index: number) {
+  const target = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  const rect = target?.getBoundingClientRect()
+  const isMoreButton = event.type === 'click' && rect
+
+  queueContextMenuPosition.value = isMoreButton
+    ? { x: rect.right, y: rect.bottom }
+    : { x: event.clientX, y: event.clientY }
+  queueContextMenuIndex.value = index
+  queueContextMenuOpen.value = true
+}
+
+function closeQueueContextMenu() {
+  queueContextMenuOpen.value = false
+  queueContextMenuIndex.value = -1
+}
+
+function handleQueueContextMenuClick(item: ContextMenuActionItem) {
+  const index = queueContextMenuIndex.value
+  const track = player.queue[index]
+  if (!track) return
+
+  switch (item.id) {
+    case 'play':
+      player.play(track)
+      break
+    case 'play-next':
+      player.addToQueueNext(track)
+      break
+    case 'queue-end':
+      player.addToQueueEnd(track)
+      break
+    case 'remove':
+      removeFromQueue(index)
+      break
+  }
 }
 </script>
 
@@ -53,16 +128,16 @@ function clearQueue() {
           class="queue-item"
           :class="{ active: index === player.queueIndex }"
           @click="playFromQueue(index)"
+          @contextmenu.prevent.stop="openQueueContextMenu($event, index)"
         >
           <div class="qi-index">
             <div v-if="index === player.queueIndex && player.isPlaying" class="equalizer-bars"><span class="bar"/><span class="bar"/><span class="bar"/></div>
             <span v-else class="qi-num">{{ index + 1 }}</span>
           </div>
           <div class="qi-cover">
-            <BilibiliCoverImage v-if="track.coverUrl && track.id.startsWith('bilibili:')" :src="track.coverUrl" loading="lazy">
+            <BilibiliCoverImage v-if="track.coverUrl" :src="track.coverUrl" loading="lazy">
               <span class="material-symbols-rounded filled">music_note</span>
             </BilibiliCoverImage>
-            <img v-else-if="track.coverUrl" :src="track.coverUrl" referrerpolicy="no-referrer" loading="lazy" @error="($event.target as HTMLImageElement).style.display = 'none'" />
             <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="qi-info">
@@ -70,12 +145,24 @@ function clearQueue() {
             <div class="qi-meta">{{ track.artist }}</div>
           </div>
           <div class="qi-duration">{{ formatDuration(track.durationMs) }}</div>
+          <button class="qi-more" :title="t('player.more_options')" @click.stop="openQueueContextMenu($event, index)">
+            <span class="material-symbols-rounded">more_vert</span>
+          </button>
           <button class="qi-remove" @click.stop="removeFromQueue(index)">
             <span class="material-symbols-rounded">close</span>
           </button>
         </div>
       </div>
     </div>
+
+    <ContextMenu
+      v-model:open="queueContextMenuOpen"
+      :x="queueContextMenuPosition.x"
+      :y="queueContextMenuPosition.y"
+      :items="queueContextMenuItems"
+      @click="handleQueueContextMenuClick"
+      @close="closeQueueContextMenu"
+    />
   </div>
 </template>
 
@@ -272,6 +359,7 @@ function clearQueue() {
   flex-shrink: 0;
 }
 
+.qi-more,
 .qi-remove {
   width: 28px;
   height: 28px;

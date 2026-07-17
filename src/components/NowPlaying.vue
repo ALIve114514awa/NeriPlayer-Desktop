@@ -9,7 +9,11 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { invoke } from '@tauri-apps/api/core'
 import { extractPalette, type PaletteResult } from '@/utils/paletteExtractor'
-import { normalizeBilibiliCoverUrl, resolveBilibiliCover } from '@/utils/bilibiliCover'
+import {
+  normalizeCoverUrlForDisplay,
+  normalizeProxiedCoverUrl,
+  resolveCoverImage,
+} from '@/utils/bilibiliCover'
 import { clearCachedLyrics, getCachedLyrics, saveCachedLyrics } from '@/utils/lyricsCache'
 import HyperBackground from './HyperBackground.vue'
 import CoverBlurBackground from './CoverBlurBackground.vue'
@@ -20,6 +24,9 @@ import QueuePanel from './QueuePanel.vue'
 import AddToPlaylistDialog from './AddToPlaylistDialog.vue'
 import ListenTogetherPanel from './ListenTogetherPanel.vue'
 import CustomSelect from './ui/CustomSelect.vue'
+import EditableRangeValue from './ui/EditableRangeValue.vue'
+import ContextMenu from './ui/ContextMenu.vue'
+import type { ContextMenuActionItem } from '@/utils/contextMenu'
 
 const emit = defineEmits<{ collapse: [] }>()
 const props = defineProps<{
@@ -49,6 +56,8 @@ const controlFeedbackPulse = ref(0)
 const lastControlDirection = ref<'prev' | 'next' | 'misc' | null>(null)
 let trackSwitchAnimTimer: ReturnType<typeof setTimeout> | null = null
 let controlFeedbackPulseTimer: ReturnType<typeof setTimeout> | null = null
+let moreSheetSwitchTimer: ReturnType<typeof setTimeout> | null = null
+let coverRenderRetryCount = 0
 
 function hideMoreSheet() {
   showMoreSheet.value = false
@@ -64,6 +73,7 @@ function onEqBandChange(index: number, value: number) {
   bands[index] = Math.round(value)
   player.setEqualizer(player.equalizerEnabled, bands)
   player.equalizerPresetId = 'custom'
+  settings.equalizerPresetId = 'custom'
 }
 
 // --- 来源徽章（对齐 Android PlaybackSourceBadge） ---
@@ -78,7 +88,7 @@ const playbackSourceLabel = computed(() => {
 })
 const playbackSourceIcon = computed(() => {
   const id = player.currentTrack?.id || ''
-  if (id.startsWith('netease:')) return 'cloud'
+  if (id.startsWith('netease:')) return 'netease'
   if (id.startsWith('qq:')) return 'music_note'
   if (id.startsWith('bilibili:')) return 'smart_display'
   if (id.startsWith('youtube:')) return 'play_circle'
@@ -319,74 +329,151 @@ function onSliderPreviewEnd() {
 }
 
 // 从封面提取的动态颜色（归一化 RGBA）
-const extractedColors = ref<[number[], number[], number[], number[], number[]]>([
-  [0.07, 0.27, 0.42, 1],
-  [0.35, 0.24, 0.20, 1],
-  [0.34, 0.12, 0.26, 1],
-  [0.17, 0.14, 0.34, 1],
-  [0.18, 0.34, 0.36, 1],
-])
-const paletteResult = ref<PaletteResult | null>(null)
-const PALETTE_COVER_DECODE_SIZE = 320
-
-// 使用 Android 同尺寸封面采样，避免小图把细节压成单色
-function extractColorsFromCover(url: string) {
-  const img = new Image()
-  img.crossOrigin = 'anonymous'
-  img.referrerPolicy = 'no-referrer'
-  img.onload = () => {
-    try {
-      const canvas = document.createElement('canvas')
-      const size = PALETTE_COVER_DECODE_SIZE
-      canvas.width = size
-      canvas.height = size
-      const ctx = canvas.getContext('2d', { willReadFrequently: true })!
-      ctx.drawImage(img, 0, 0, size, size)
-      const imageData = ctx.getImageData(0, 0, size, size)
-
-      const palette = extractPalette(imageData, 16)
-      paletteResult.value = palette
-
-      extractedColors.value = palette.shaderColors.map(
-        (c) => [c[0] / 255, c[1] / 255, c[2] / 255, 1]
-      ) as [number[], number[], number[], number[], number[]]
-    } catch (e) {
-      console.error('[NowPlaying] color extraction failed:', e)
-    }
-  }
-  img.onerror = () => {
-    console.error('[NowPlaying] cover image load failed:', url)
-  }
-  img.src = url
+function createDefaultExtractedColors(): [number[], number[], number[], number[], number[]] {
+  return [
+    [0.07, 0.27, 0.42, 1],
+    [0.35, 0.24, 0.20, 1],
+    [0.34, 0.12, 0.26, 1],
+    [0.17, 0.14, 0.34, 1],
+    [0.18, 0.34, 0.36, 1],
+  ]
 }
 
-// B站封面复用后端网络链路，避免 WebView 直连 CDN 失败
+const extractedColors = ref(createDefaultExtractedColors())
+const paletteResult = ref<PaletteResult | null>(null)
+const PALETTE_COVER_DECODE_SIZE = 320
+let paletteRequestToken = 0
+
+function resetExtractedPalette() {
+  paletteResult.value = null
+  extractedColors.value = createDefaultExtractedColors()
+}
+
+// 使用 Android 同尺寸封面采样，避免小图把细节压成单色
+function extractColorsFromCover(url: string): Promise<boolean> {
+  const requestToken = ++paletteRequestToken
+  return new Promise((resolve) => {
+    const img = new Image()
+    if (!url.startsWith('data:') && !url.startsWith('blob:')) {
+      img.crossOrigin = 'anonymous'
+    }
+    img.referrerPolicy = 'no-referrer'
+    img.onload = () => {
+      if (requestToken !== paletteRequestToken) {
+        resolve(false)
+        return
+      }
+      try {
+        const canvas = document.createElement('canvas')
+        const size = PALETTE_COVER_DECODE_SIZE
+        canvas.width = size
+        canvas.height = size
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
+        if (!ctx) throw new Error('Canvas 2D context is unavailable')
+        ctx.drawImage(img, 0, 0, size, size)
+        const imageData = ctx.getImageData(0, 0, size, size)
+
+        const palette = extractPalette(imageData, 16)
+        paletteResult.value = palette
+        extractedColors.value = palette.shaderColors.map(
+          (c) => [c[0] / 255, c[1] / 255, c[2] / 255, 1]
+        ) as [number[], number[], number[], number[], number[]]
+        resolve(true)
+      } catch (error) {
+        if (requestToken === paletteRequestToken) resetExtractedPalette()
+        console.error('[NowPlaying] color extraction failed:', error)
+        resolve(false)
+      }
+    }
+    img.onerror = () => {
+      if (requestToken === paletteRequestToken) {
+        resetExtractedPalette()
+        const sourceLabel = url.startsWith('data:') ? 'proxied image data' : url
+        console.error('[NowPlaying] cover image load failed:', sourceLabel)
+      }
+      resolve(false)
+    }
+    img.src = url
+  })
+}
+
+// 支持的平台封面统一走后端代理，保证显示与取色读取同一份已验证数据
 watch(
-  () => [player.currentTrack?.coverUrl || '', player.currentTrack?.id || ''] as const,
-  async ([rawUrl, trackId], _, onCleanup) => {
+  () => [
+    player.currentTrack?.coverUrl || '',
+    player.currentTrack?.id || '',
+  ] as const,
+  async ([rawUrl], _, onCleanup) => {
     let active = true
     onCleanup(() => { active = false })
 
-    const isBilibiliTrack = trackId.startsWith('bilibili:')
-    const normalizedUrl = isBilibiliTrack ? normalizeBilibiliCoverUrl(rawUrl) : rawUrl.trim()
-    coverUrl.value = normalizedUrl
-    if (!normalizedUrl) return
+    paletteRequestToken++
+    coverRenderRetryCount = 0
+    coverLoadError.value = false
+    coverUrl.value = ''
+
+    const proxiedUrl = normalizeProxiedCoverUrl(rawUrl)
+    const normalizedUrl = proxiedUrl || normalizeCoverUrlForDisplay(rawUrl)
+    if (!normalizedUrl) {
+      resetExtractedPalette()
+      return
+    }
 
     let displayUrl = normalizedUrl
-    if (isBilibiliTrack) {
+    if (proxiedUrl) {
       try {
-        displayUrl = await resolveBilibiliCover(normalizedUrl)
-      } catch {
-        // 保留标准 HTTPS 地址，让 WebView 仍有一次直接加载机会
+        displayUrl = await resolveCoverImage(proxiedUrl)
+      } catch (error) {
+        if (active) {
+          resetExtractedPalette()
+          console.error('[NowPlaying] failed to resolve proxied cover:', error)
+        }
+        return
       }
     }
 
     if (!active) return
+    // 封面解析成功即显示，取色仅作背景调色板的尽力而为，不再阻塞封面渲染
+    // 否则取色失败（canvas 读取异常/token 竞态）会让已解析封面永远显示不出来
     coverUrl.value = displayUrl
-    extractColorsFromCover(displayUrl)
+    void extractColorsFromCover(displayUrl)
   },
   { immediate: true },
 )
+
+async function handleNowPlayingCoverError(event: Event) {
+  const failedSrc = (event.currentTarget as HTMLImageElement).src
+  const track = player.currentTrack
+  const proxiedUrl = normalizeProxiedCoverUrl(track?.coverUrl || '')
+  coverLoadError.value = true
+  if (
+    !track
+    || !proxiedUrl
+    || failedSrc !== coverUrl.value
+    || coverRenderRetryCount >= 1
+  ) return
+
+  coverRenderRetryCount++
+  paletteRequestToken++
+  resetExtractedPalette()
+  const expectedTrackId = track.id
+  const expectedRawUrl = track.coverUrl
+
+  try {
+    const refreshedUrl = await resolveCoverImage(proxiedUrl, { forceRefresh: true })
+    if (
+      player.currentTrack?.id !== expectedTrackId
+      || player.currentTrack?.coverUrl !== expectedRawUrl
+    ) return
+
+    // 重新解析成功即恢复封面显示，取色失败不应再次把封面隐藏
+    coverUrl.value = refreshedUrl
+    coverLoadError.value = false
+    void extractColorsFromCover(refreshedUrl)
+  } catch (error) {
+    console.error('[NowPlaying] failed to refresh proxied cover:', error)
+  }
+}
 
 function onSeek(progress: number) {
   player.seekTo(Math.round(progress * player.durationMs))
@@ -646,6 +733,7 @@ onUnmounted(() => {
   cancelAnimationFrame(discAnimFrame)
   if (trackSwitchAnimTimer) clearTimeout(trackSwitchAnimTimer)
   if (controlFeedbackPulseTimer) clearTimeout(controlFeedbackPulseTimer)
+  if (moreSheetSwitchTimer) clearTimeout(moreSheetSwitchTimer)
   closeToolbarPopovers()
 })
 
@@ -657,11 +745,19 @@ defineExpose({
 // --- 右键菜单（歌曲名/歌手复制 + 封面保存） ---
 const contextMenu = ref({ show: false, x: 0, y: 0, type: '' as 'title' | 'artist' | 'cover' })
 
+const contextMenuItems = computed(() => {
+  if (contextMenu.value.type === 'title') {
+    return [{ id: 'copy-title', label: t('player.copy_title'), icon: 'content_copy' }]
+  }
+  if (contextMenu.value.type === 'artist') {
+    return [{ id: 'copy-artist', label: t('player.copy_artist'), icon: 'content_copy' }]
+  }
+  return [{ id: 'save-cover', label: t('player.save_cover'), icon: 'save' }]
+})
+
 function openContextMenu(e: MouseEvent, type: 'title' | 'artist' | 'cover') {
   e.preventDefault()
-  const x = Math.min(e.clientX, window.innerWidth - 220)
-  const y = Math.min(e.clientY, window.innerHeight - 100)
-  contextMenu.value = { show: true, x, y, type }
+  contextMenu.value = { show: true, x: e.clientX, y: e.clientY, type }
 }
 
 function closeContextMenu() {
@@ -676,6 +772,16 @@ async function copyText(text: string) {
     toast.error(t('player.copy_failed'))
   }
   closeContextMenu()
+}
+
+function handleContextMenuClick(item: ContextMenuActionItem) {
+  if (item.id === 'copy-title') {
+    void copyText(player.currentTrack?.title || '')
+  } else if (item.id === 'copy-artist') {
+    void copyText(player.currentTrack?.artist || '')
+  } else if (item.id === 'save-cover') {
+    void saveCoverArt()
+  }
 }
 
 async function saveCoverArt() {
@@ -1081,7 +1187,11 @@ async function openCurrentAlbum() {
 
 function openListenTogetherFromMore() {
   hideMoreSheet()
-  showLtPanel.value = true
+  if (moreSheetSwitchTimer) clearTimeout(moreSheetSwitchTimer)
+  moreSheetSwitchTimer = window.setTimeout(() => {
+    moreSheetSwitchTimer = null
+    if (!showMoreSheet.value) showLtPanel.value = true
+  }, 220)
 }
 
 // 分享歌曲
@@ -1325,7 +1435,7 @@ const sliderActiveColor = computed(() => {
                 :src="coverUrl"
                 referrerpolicy="no-referrer"
                 class="cover-card-img"
-                @error="coverLoadError = true"
+                @error="handleNowPlayingCoverError"
               />
               <span
                 v-else
@@ -1345,7 +1455,7 @@ const sliderActiveColor = computed(() => {
                   :src="coverUrl"
                   referrerpolicy="no-referrer"
                   class="cover-img"
-                  @error="coverLoadError = true"
+                  @error="handleNowPlayingCoverError"
                 />
                 <span
                   v-else
@@ -1361,7 +1471,12 @@ const sliderActiveColor = computed(() => {
           <!-- 来源徽章（对齐 Android PlaybackSourceBadge） -->
           <transition name="np-badge-swap" mode="out-in">
             <div v-if="showSourceBadge && settings.coverStyle === 'card'" :key="sourceBadgeKey" class="source-badge">
-              <span class="material-symbols-rounded source-badge-icon">{{ playbackSourceIcon }}</span>
+              <span
+                v-if="playbackSourceIcon === 'netease'"
+                class="source-badge-icon source-badge-icon--netease"
+                aria-hidden="true"
+              />
+              <span v-else class="material-symbols-rounded source-badge-icon">{{ playbackSourceIcon }}</span>
               <span class="source-badge-label">{{ playbackSourceLabel }}</span>
             </div>
           </transition>
@@ -1531,7 +1646,20 @@ const sliderActiveColor = computed(() => {
                 class="volume-slider"
                 @input="player.setVolume(1 - parseFloat(($event.target as HTMLInputElement).value))"
               />
-              <span class="volume-label">{{ Math.round(player.volume * 100) }}%</span>
+              <EditableRangeValue
+                :model-value="player.volume"
+                class="volume-label"
+                :min="0"
+                :max="1"
+                :step="0.01"
+                :input-scale="100"
+                :input-width="32"
+                :range-reversed="true"
+                :display-value="`${Math.round(player.volume * 100)}%`"
+                input-suffix="%"
+                :aria-label="t('player.volume')"
+                @update:model-value="player.setVolume($event)"
+              />
             </div>
           </div>
           <!-- 音效 (AudioFX) -->
@@ -1563,7 +1691,17 @@ const sliderActiveColor = computed(() => {
                     @input="player.setSpeed(parseFloat(($event.target as HTMLInputElement).value))"
                   />
                   <span class="audiofx-slider-label">3x</span>
-                  <span class="audiofx-slider-value">{{ player.playbackSpeed.toFixed(2) }}x</span>
+                  <EditableRangeValue
+                    :model-value="player.playbackSpeed"
+                    class="audiofx-slider-value"
+                    :min="0.25"
+                    :max="3"
+                    :step="0.05"
+                    :display-value="`${player.playbackSpeed.toFixed(2)}x`"
+                    input-suffix="x"
+                    :aria-label="t('player.playback_speed')"
+                    @update:model-value="player.setSpeed($event)"
+                  />
                 </div>
               </div>
 
@@ -1587,7 +1725,19 @@ const sliderActiveColor = computed(() => {
                     @input="player.setLoudnessGain(parseFloat(($event.target as HTMLInputElement).value))"
                   />
                   <span class="audiofx-slider-label">+15dB</span>
-                  <span class="audiofx-slider-value">+{{ (player.loudnessGainMb / 100).toFixed(1) }}dB</span>
+                  <EditableRangeValue
+                    :model-value="player.loudnessGainMb"
+                    class="audiofx-slider-value"
+                    :min="0"
+                    :max="1500"
+                    :step="50"
+                    :input-scale="0.01"
+                    :input-width="44"
+                    :display-value="`+${(player.loudnessGainMb / 100).toFixed(1)}dB`"
+                    input-suffix="dB"
+                    :aria-label="t('player.loudness_gain')"
+                    @update:model-value="player.setLoudnessGain($event)"
+                  />
                 </div>
               </div>
 
@@ -1609,7 +1759,19 @@ const sliderActiveColor = computed(() => {
                 />
                 <div v-if="player.equalizerEnabled" class="audiofx-eq-bands">
                   <div v-for="(freq, i) in eqFreqLabels" :key="i" class="audiofx-eq-band">
-                    <span class="audiofx-eq-val">{{ (player.equalizerBands[i] / 100).toFixed(1) }}</span>
+                    <EditableRangeValue
+                      :model-value="player.equalizerBands[i]"
+                      class="audiofx-eq-val"
+                      :min="-1500"
+                      :max="1500"
+                      :step="50"
+                      :input-scale="0.01"
+                      :input-width="44"
+                      :display-value="(player.equalizerBands[i] / 100).toFixed(1)"
+                      input-suffix="dB"
+                      :aria-label="`${freq} Hz`"
+                      @update:model-value="onEqBandChange(i, $event)"
+                    />
                     <input type="range" min="-1500" max="1500" step="50"
                       class="audiofx-eq-slider" orient="vertical"
                       :value="player.equalizerBands[i]"
@@ -1818,9 +1980,17 @@ const sliderActiveColor = computed(() => {
                   class="np-more-slider"
                   @input="currentLyricOffsetMs = parseInt(($event.target as HTMLInputElement).value)"
                 />
-                <span class="np-offset-value" :class="{ positive: currentLyricOffsetMs > 0, negative: currentLyricOffsetMs < 0 }">
-                  {{ currentLyricOffsetMs > 0 ? '+' : '' }}{{ currentLyricOffsetMs }}ms
-                </span>
+                <EditableRangeValue
+                  v-model="currentLyricOffsetMs"
+                  class="np-offset-value"
+                  :class="{ positive: currentLyricOffsetMs > 0, negative: currentLyricOffsetMs < 0 }"
+                  :min="-2000"
+                  :max="2000"
+                  :step="50"
+                  :display-value="`${currentLyricOffsetMs > 0 ? '+' : ''}${currentLyricOffsetMs}ms`"
+                  input-suffix="ms"
+                  :aria-label="t('player.lyric_offset')"
+                />
               </div>
             </div>
           </template>
@@ -1840,7 +2010,17 @@ const sliderActiveColor = computed(() => {
                   class="np-more-slider"
                   @input="settings.lyricFontScale = parseFloat(($event.target as HTMLInputElement).value)"
                 />
-                <span class="np-offset-value">{{ Math.round(settings.lyricFontScale * 100) }}%</span>
+                <EditableRangeValue
+                  v-model="settings.lyricFontScale"
+                  class="np-offset-value"
+                  :min="0.6"
+                  :max="1.6"
+                  :step="0.05"
+                  :input-scale="100"
+                  :display-value="`${Math.round(settings.lyricFontScale * 100)}%`"
+                  input-suffix="%"
+                  :aria-label="t('player.font_scale')"
+                />
               </div>
               <p class="np-more-preview" :style="{ fontSize: `${24 * settings.lyricFontScale}px` }">
                 {{ t('player.font_preview') }}
@@ -1880,7 +2060,17 @@ const sliderActiveColor = computed(() => {
                   class="np-more-slider"
                   @input="player.setSpeed(parseFloat(($event.target as HTMLInputElement).value))"
                 />
-                <span class="np-offset-value">{{ player.playbackSpeed.toFixed(2) }}x</span>
+                <EditableRangeValue
+                  :model-value="player.playbackSpeed"
+                  class="np-offset-value"
+                  :min="0.25"
+                  :max="3"
+                  :step="0.05"
+                  :display-value="`${player.playbackSpeed.toFixed(2)}x`"
+                  input-suffix="x"
+                  :aria-label="t('player.playback_speed')"
+                  @update:model-value="player.setSpeed($event)"
+                />
               </div>
             </div>
           </template>
@@ -1940,8 +2130,7 @@ const sliderActiveColor = computed(() => {
                 :class="{ active: infoApplyCandidate === r }"
                 @click="applySearchResult(r)"
               >
-                <BilibiliCoverImage v-if="r.cover_url && r.source === 'bilibili'" :src="r.cover_url" class="np-more-search-cover" />
-                <img v-else-if="r.cover_url" :src="r.cover_url" class="np-more-search-cover" referrerpolicy="no-referrer" />
+                <BilibiliCoverImage v-if="r.cover_url" :src="r.cover_url" class="np-more-search-cover" />
                 <div class="np-more-search-info">
                   <span class="np-more-search-title">{{ r.title }}</span>
                   <span class="np-more-search-artist">{{ r.artist }}</span>
@@ -1952,15 +2141,9 @@ const sliderActiveColor = computed(() => {
             <div v-if="infoApplyCandidate" class="np-more-field-picker">
               <div class="np-more-candidate-preview">
                 <BilibiliCoverImage
-                  v-if="(infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl) && infoApplyCandidate.source === 'bilibili'"
+                  v-if="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
                   :src="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
                   class="np-more-candidate-cover"
-                />
-                <img
-                  v-else-if="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
-                  :src="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
-                  class="np-more-candidate-cover"
-                  referrerpolicy="no-referrer"
                 />
                 <div class="np-more-search-info">
                   <span class="np-more-search-title">{{ infoApplyCandidate.title }}</span>
@@ -2227,7 +2410,7 @@ const sliderActiveColor = computed(() => {
                 class="np-more-search-item"
                 @click="applyLyricFill(r)"
               >
-                <img v-if="r.cover_url" :src="r.cover_url" class="np-more-search-cover" referrerpolicy="no-referrer" />
+                <BilibiliCoverImage v-if="r.cover_url" :src="r.cover_url" class="np-more-search-cover" />
                 <div class="np-more-search-info">
                   <span class="np-more-search-title">{{ r.title }}</span>
                   <span class="np-more-search-artist">{{ r.artist }}</span>
@@ -2245,31 +2428,15 @@ const sliderActiveColor = computed(() => {
       </Transition>
     </Teleport>
 
-    <!-- 右键菜单 -->
-    <Teleport to="body">
-      <div v-if="contextMenu.show" class="np-ctx-overlay" @click="closeContextMenu" @contextmenu.prevent="closeContextMenu">
-        <div class="np-ctx-menu" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }">
-          <template v-if="contextMenu.type === 'title'">
-            <button class="np-ctx-item" @click="copyText(player.currentTrack?.title || '')">
-              <span class="material-symbols-rounded" style="font-size: 20px">content_copy</span>
-              <span>{{ t('player.copy_title') }}</span>
-            </button>
-          </template>
-          <template v-else-if="contextMenu.type === 'artist'">
-            <button class="np-ctx-item" @click="copyText(player.currentTrack?.artist || '')">
-              <span class="material-symbols-rounded" style="font-size: 20px">content_copy</span>
-              <span>{{ t('player.copy_artist') }}</span>
-            </button>
-          </template>
-          <template v-else-if="contextMenu.type === 'cover'">
-            <button class="np-ctx-item" @click="saveCoverArt">
-              <span class="material-symbols-rounded" style="font-size: 20px">save</span>
-              <span>{{ t('player.save_cover') }}</span>
-            </button>
-          </template>
-        </div>
-      </div>
-    </Teleport>
+    <ContextMenu
+      :open="contextMenu.show"
+      :x="contextMenu.x"
+      :y="contextMenu.y"
+      :items="contextMenuItems"
+      @update:open="contextMenu.show = $event"
+      @close="closeContextMenu"
+      @click="handleContextMenuClick"
+    />
   </div>
 </template>
 
@@ -3365,6 +3532,14 @@ const sliderActiveColor = computed(() => {
   color: rgba(255, 255, 255, 0.7);
 }
 
+.source-badge-icon--netease {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.7);
+  mask: url('/icons/ic_netease.svg') center / contain no-repeat;
+}
+
 .source-badge-label {
   font-size: 11px;
   font-weight: 600;
@@ -3808,50 +3983,7 @@ const sliderActiveColor = computed(() => {
 }
 </style>
 
-<!-- 右键菜单样式（Teleport 到 body，需 unscoped） -->
 <style lang="scss">
-.np-ctx-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-}
-
-.np-ctx-menu {
-  position: fixed;
-  min-width: 200px;
-  background: rgba(30, 28, 34, 0.95);
-  backdrop-filter: blur(20px);
-  border-radius: 12px;
-  border: 1px solid rgba(255,255,255,0.08);
-  padding: 4px 0;
-  z-index: 501;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-  animation: np-ctx-in 120ms ease-out;
-}
-
-@keyframes np-ctx-in {
-  from { opacity: 0; transform: scale(0.95) translateY(-4px); }
-  to { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-.np-ctx-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 10px 16px;
-  border: none;
-  background: transparent;
-  color: rgba(255,255,255,0.8);
-  font-size: 14px;
-  cursor: pointer;
-  transition: background 0.1s;
-
-  &:hover {
-    background: rgba(255,255,255,0.08);
-  }
-}
-
 /* 更多选项面板 — Overlay + Sheet 过渡 */
 .more-sheet-enter-active {
   transition: opacity 280ms cubic-bezier(0.2, 0, 0, 1);
@@ -3893,13 +4025,18 @@ const sliderActiveColor = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 16px;
   background: rgba(0,0,0,0.35);
   backdrop-filter: blur(4px);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  clip-path: inset(0 round var(--radius-lg));
 }
 
 .np-more-sheet {
-  width: 380px;
-  max-height: 80vh;
+  width: min(380px, 100%);
+  max-width: calc(100vw - 32px);
+  max-height: min(80vh, calc(100vh - 32px));
   overflow-y: auto;
   background: rgba(30, 28, 34, 0.95);
   backdrop-filter: blur(20px);
@@ -3955,19 +4092,18 @@ const sliderActiveColor = computed(() => {
   align-items: center;
   gap: 16px;
   width: 100%;
-  padding: 14px 4px;
-  border: none;
-  border-bottom: 1px solid rgba(255,255,255,0.05);
-  background: transparent;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 13px 8px;
+  border: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.025);
   color: rgba(255,255,255,0.85);
   cursor: pointer;
-  border-radius: 0;
+  border-radius: var(--radius-md);
   transition: background 0.15s, transform 0.15s cubic-bezier(0.2, 0, 0, 1);
 
-  &:last-child { border-bottom: none; }
-
   &:hover {
-    background: rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.08);
     transform: translateX(2px);
     .np-more-chevron { color: rgba(255,255,255,0.45) !important; }
   }
@@ -3988,6 +4124,7 @@ const sliderActiveColor = computed(() => {
 
 .np-more-list-info {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -4145,6 +4282,9 @@ const sliderActiveColor = computed(() => {
 .np-more-search-results {
   max-height: 300px;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   &::-webkit-scrollbar { display: none; }
 }
 

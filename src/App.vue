@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { usePlayerStore, displayAlbum } from '@/stores/player'
-import { useSyncStore } from '@/stores/sync'
+import { syncFrequencyDelayMs, useSyncStore } from '@/stores/sync'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import { HISTORY_CHANGED_EVENT } from '@/stores/history'
 import { useLikedSongsStore } from '@/stores/likedSongs'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import MiniPlayer from '@/components/MiniPlayer.vue'
 import NowPlaying from '@/components/NowPlaying.vue'
 import SideNav from '@/components/SideNav.vue'
 import AppToast from '@/components/AppToast.vue'
 import TitleBar from '@/components/TitleBar.vue'
+import { setLocale } from '@/i18n'
+import { applyTheme } from '@/utils/theme'
+import { applyThemeColor } from '@/utils/themeColor'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }
@@ -25,6 +29,7 @@ const player = usePlayerStore()
 const settingsStore = useSettingsStore()
 const likedSongs = useLikedSongsStore()
 const route = useRoute()
+const router = useRouter()
 const isNowPlayingOpen = ref(false)
 const contentRef = ref<HTMLElement | null>(null)
 const miniPlayerRef = ref<InstanceType<typeof MiniPlayer> | null>(null)
@@ -154,11 +159,12 @@ const bgImageStyle = computed(() => {
   }
 })
 
-// 防抖自动同步（歌单变更后 30s 触发，批量合并快速操作）
-const DEBOUNCE_SYNC_MS = 30_000
-const HISTORY_BATCHED_SYNC_MS = 10 * 60 * 1000
+// 对齐 Android：数据变更后短暂延迟，给连续操作留出合并时间
+const DEBOUNCE_SYNC_MS = 5_000
+const PERIODIC_SYNC_MS = 60 * 60 * 1000
 let debounceSyncTimer: ReturnType<typeof setTimeout> | null = null
 let historyBatchedTimer: ReturnType<typeof setTimeout> | null = null
+let periodicSyncTimer: ReturnType<typeof setInterval> | null = null
 let unlistenPlaylistChanged: UnlistenFn | null = null
 
 function scheduleDebouncedSync() {
@@ -169,50 +175,36 @@ function scheduleDebouncedSync() {
   if (debounceSyncTimer) clearTimeout(debounceSyncTimer)
   debounceSyncTimer = setTimeout(() => {
     debounceSyncTimer = null
-    if (syncStore.github.configured && syncStore.github.autoSync) {
-      syncStore.syncGitHub(true)
-    } else if (syncStore.webdav.configured && syncStore.webdav.autoSync) {
-      syncStore.syncWebDav(true)
-    }
+    void syncStore.syncAuto(true)
   }, DEBOUNCE_SYNC_MS)
 }
 
 function triggerSilentSync() {
   const syncStore = useSyncStore()
   if (syncStore.isSyncing) return
-  if (syncStore.github.configured && syncStore.github.autoSync) {
-    syncStore.syncGitHub(true)
-  } else if (syncStore.webdav.configured && syncStore.webdav.autoSync) {
-    syncStore.syncWebDav(true)
-  }
+  void syncStore.syncAuto(true)
 }
 
 function scheduleHistorySync() {
   const syncStore = useSyncStore()
   if (syncStore.isSyncing) return
 
-  // 优先使用 GitHub 历史同步频率配置
-  if (syncStore.github.configured && syncStore.github.autoSync) {
-    if (syncStore.github.historyUpdateMode === 'immediate') {
-      triggerSilentSync()
-      return
-    }
-    if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
-    historyBatchedTimer = setTimeout(() => {
-      historyBatchedTimer = null
-      triggerSilentSync()
-    }, HISTORY_BATCHED_SYNC_MS)
+  if (!(
+    (syncStore.github.configured && syncStore.github.autoSync) ||
+    (syncStore.webdav.configured && syncStore.webdav.autoSync)
+  )) return
+
+  const delay = syncFrequencyDelayMs(syncStore.syncFrequency)
+  if (delay === 0) {
+    triggerSilentSync()
     return
   }
 
-  // WebDAV 没有独立频率配置，默认采用批量同步，避免频繁请求
-  if (syncStore.webdav.configured && syncStore.webdav.autoSync) {
-    if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
-    historyBatchedTimer = setTimeout(() => {
-      historyBatchedTimer = null
-      triggerSilentSync()
-    }, HISTORY_BATCHED_SYNC_MS)
-  }
+  if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
+  historyBatchedTimer = setTimeout(() => {
+    historyBatchedTimer = null
+    triggerSilentSync()
+  }, delay)
 }
 
 watch(() => route.fullPath, async () => {
@@ -228,6 +220,21 @@ onMounted(async () => {
   const syncStore = useSyncStore()
   const authStore = useAuthStore()
 
+  // Rust 配置是启动后的规范来源，本地影子只负责首屏快速显示
+  await settingsStore.hydrate()
+  applyTheme(settingsStore.darkMode, false)
+  applyThemeColor(settingsStore.themeColor, undefined, false)
+  setLocale(settingsStore.locale, false)
+  await player.applyPersistedSettings()
+  if (route.name === 'home' && settingsStore.defaultScreen !== 'home') {
+    await router.replace({ name: settingsStore.defaultScreen })
+  }
+  try {
+    await invoke('set_bypass_proxy', { bypass: settingsStore.bypassProxy })
+  } catch {
+    // 浏览器开发模式没有 Rust bridge 时忽略
+  }
+
   // 并行加载
   await Promise.allSettled([
     syncStore.loadConfigs(),
@@ -235,12 +242,12 @@ onMounted(async () => {
     likedSongs.start(),
   ])
 
+  periodicSyncTimer = setInterval(() => {
+    void syncStore.syncAuto(true)
+  }, PERIODIC_SYNC_MS)
+
   // 自动同步（配置开启且已配置），静默模式
-  if (syncStore.github.configured && syncStore.github.autoSync) {
-    syncStore.syncGitHub(true)
-  } else if (syncStore.webdav.configured && syncStore.webdav.autoSync) {
-    syncStore.syncWebDav(true)
-  }
+  void syncStore.syncAuto(true)
 
   // 监听后端 playlists-changed 事件，防抖触发自动同步
   unlistenPlaylistChanged = await listen('playlists-changed', () => {
@@ -256,6 +263,7 @@ onUnmounted(() => {
   if (nowPlayingMotionTimer) clearTimeout(nowPlayingMotionTimer)
   if (debounceSyncTimer) clearTimeout(debounceSyncTimer)
   if (historyBatchedTimer) clearTimeout(historyBatchedTimer)
+  if (periodicSyncTimer) clearInterval(periodicSyncTimer)
   likedSongs.stop()
   window.removeEventListener(HISTORY_CHANGED_EVENT, scheduleHistorySync as EventListener)
   if (unlistenPlaylistChanged) unlistenPlaylistChanged()
@@ -351,6 +359,7 @@ onUnmounted(() => {
   height: 100%;
   overflow: hidden;
   position: relative;
+  border-radius: var(--radius-lg);
   padding-top: 36px; /* 让出顶栏高度 */
   isolation: isolate;
 }

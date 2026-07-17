@@ -6,6 +6,7 @@ import { useI18n } from 'vue-i18n'
 import QueuePanel from './QueuePanel.vue'
 import ListenTogetherPanel from './ListenTogetherPanel.vue'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
+import EditableRangeValue from './ui/EditableRangeValue.vue'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }
@@ -203,20 +204,13 @@ defineExpose({
         <div ref="coverRef" class="mp-cover" :class="{ playing: player.isPlaying, 'mp-cover-hidden': props.coverHiddenByFlip }">
           <transition name="mp-cover-swap" mode="out-in">
             <BilibiliCoverImage
-              v-if="displayCoverUrl && player.currentTrack?.id.startsWith('bilibili:') && !props.coverFallbackSrc"
+              v-if="displayCoverUrl"
               :key="`cover:${miniTrackKey}`"
               :src="displayCoverUrl"
               class="mp-cover-img"
             >
               <span class="material-symbols-rounded filled" style="font-size: 20px; opacity: 0.6">music_note</span>
             </BilibiliCoverImage>
-            <img
-              v-else-if="displayCoverUrl"
-              :key="`cover:${miniTrackKey}`"
-              :src="displayCoverUrl"
-              referrerpolicy="no-referrer"
-              class="mp-cover-img"
-            />
             <span
               v-else
               :key="`placeholder:${miniTrackKey}`"
@@ -296,7 +290,19 @@ defineExpose({
               class="mp-volume-slider"
               @input="player.setVolume(parseFloat(($event.target as HTMLInputElement).value))"
             />
-            <div class="mp-volume-label">{{ volumePercent }}%</div>
+            <EditableRangeValue
+              :model-value="player.volume"
+              class="mp-volume-label"
+              :min="0"
+              :max="1"
+              :step="0.01"
+              :input-scale="100"
+              :input-width="32"
+              :display-value="`${volumePercent}%`"
+              input-suffix="%"
+              :aria-label="t('player.volume')"
+              @update:model-value="player.setVolume($event)"
+            />
           </div>
         </div>
         <button

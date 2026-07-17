@@ -115,6 +115,9 @@ function toBackendTrack(track: TrackInfo) {
     source: inferSource(track),
     url: track.audioUrl || '',
     cover_url: track.coverUrl || null,
+    added_at: Math.max(0, Math.round(track.addedAt || 0)),
+    sync_payload: track.syncPayload ?? null,
+    playlist_key: track.playlistKey ?? null,
   }
 }
 </script>

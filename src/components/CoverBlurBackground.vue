@@ -24,16 +24,23 @@ let pendingImg: HTMLImageElement | null = null
 let swapTimer: ReturnType<typeof setTimeout> | null = null
 
 watch(() => props.coverUrl, (newUrl) => {
-  if (!newUrl || newUrl === frontUrl.value) return
-
   // 取消上一张仍在加载/等待交换的图，防止迟到回调覆盖更新的封面
   if (pendingImg) { pendingImg.onload = null; pendingImg.onerror = null; pendingImg = null }
   if (swapTimer) { clearTimeout(swapTimer); swapTimer = null }
+  if (!newUrl) {
+    frontUrl.value = ''
+    backUrl.value = ''
+    showBack.value = false
+    return
+  }
+  if (newUrl === frontUrl.value) return
 
   // 预加载新图片，加载完成后交叉淡入
   const img = new Image()
   pendingImg = img
-  img.crossOrigin = 'anonymous'
+  if (!newUrl.startsWith('data:') && !newUrl.startsWith('blob:')) {
+    img.crossOrigin = 'anonymous'
+  }
   img.referrerPolicy = 'no-referrer'
   img.onload = () => {
     // 若期间又切歌，当前回调已过期，丢弃

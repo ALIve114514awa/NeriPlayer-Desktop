@@ -109,8 +109,14 @@ function onAction(msg: ToastMessage) {
 .toast-text {
   line-height: 1.4;
   min-width: 0;
+  /* 兜底：限制最多 4 行，避免后端/代理返回的超长文本或 HTML 撑满界面 */
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  -webkit-box-orient: vertical;
   overflow: hidden;
   text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .toast-action {

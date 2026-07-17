@@ -272,6 +272,7 @@ function syncPlayState(): void {
 function syncLyricOptions(): void {
   if (!lyricPlayer) return
   lyricPlayer.setEnableBlur(settings.lyricBlur)
+  lyricPlayer.setBlurAmount(settings.lyricBlurAmount)
   lyricPlayer.setWordFadeWidth(AMLL_WORD_FADE_WIDTH)
 }
 
@@ -385,7 +386,7 @@ watch(() => settings.showTranslation, () => {
   reloadLyrics()
 })
 
-watch(() => settings.lyricBlur, () => {
+watch([() => settings.lyricBlur, () => settings.lyricBlurAmount], () => {
   syncLyricOptions()
 })
 

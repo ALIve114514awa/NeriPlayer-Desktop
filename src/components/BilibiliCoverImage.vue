@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { resolveBilibiliCover } from '@/utils/bilibiliCover'
+import {
+  normalizeCoverUrlForDisplay,
+  normalizeProxiedCoverUrl,
+  resolveCoverImage,
+} from '@/utils/bilibiliCover'
 
 defineOptions({ inheritAttrs: false })
 
@@ -13,27 +17,43 @@ const props = withDefaults(defineProps<{
 })
 
 const resolvedSrc = ref('')
-const isLoaded = ref(false)
+let resolveRequestToken = 0
+let renderRetryCount = 0
 
-watch(() => props.src, async (src) => {
+watch(() => props.src, (src) => {
+  resolveRequestToken++
   resolvedSrc.value = ''
-  isLoaded.value = false
+  renderRetryCount = 0
   if (!src) return
 
-  try {
-    resolvedSrc.value = await resolveBilibiliCover(src)
-  } catch {
-    resolvedSrc.value = ''
+  const proxiedUrl = normalizeProxiedCoverUrl(src)
+  if (!proxiedUrl) {
+    resolvedSrc.value = normalizeCoverUrlForDisplay(src)
+    return
   }
+  void loadCover(proxiedUrl, false)
 }, { immediate: true })
 
-function handleLoad() {
-  isLoaded.value = true
+async function loadCover(src: string, forceRefresh: boolean) {
+  const requestToken = ++resolveRequestToken
+  try {
+    const nextSrc = await resolveCoverImage(src, { forceRefresh })
+    if (requestToken === resolveRequestToken) resolvedSrc.value = nextSrc
+  } catch {
+    if (requestToken === resolveRequestToken) resolvedSrc.value = ''
+  }
 }
 
-function handleError() {
+function handleError(event: Event) {
+  const failedSrc = (event.currentTarget as HTMLImageElement).src
+  const proxiedUrl = normalizeProxiedCoverUrl(props.src || '')
+  if (!proxiedUrl || failedSrc !== resolvedSrc.value) return
+
   resolvedSrc.value = ''
-  isLoaded.value = false
+  if (renderRetryCount >= 1) return
+
+  renderRetryCount++
+  void loadCover(proxiedUrl, true)
 }
 </script>
 
@@ -44,7 +64,6 @@ function handleError() {
     :src="resolvedSrc"
     :alt="alt"
     referrerpolicy="no-referrer"
-    @load="handleLoad"
     @error="handleError"
   />
   <slot v-else />
