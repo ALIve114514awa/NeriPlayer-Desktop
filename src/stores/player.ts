@@ -12,6 +12,7 @@ import {
 import { useDownloadStore } from './download'
 import i18n from '@/i18n'
 import {
+  canonicalizePlaybackTrack,
   getPlaybackSourceKind,
   isRemotePlaybackTrack,
   normalizeBitrateKbps,
@@ -20,6 +21,7 @@ import {
   playbackPrefetchCacheId,
   playbackUrlResolver,
   resolvePlaybackResult,
+  type PlaybackCacheReadCandidate,
   type PlaybackSourceSettings,
   type PlaybackResolution,
   type ResolvedPlaybackSource,
@@ -30,6 +32,13 @@ import {
   resolvePlaybackFailureAdvanceAction,
 } from '@/utils/playbackPolicy'
 import { resolvePlaybackQueueStartIndex } from '@/utils/playbackQueue'
+import {
+  isPlaybackSeekCompletionCurrent,
+  resolvePlaybackLoadStart,
+  shouldDeferPlaybackSeek,
+  shouldResolvePlaybackSourceInParallel,
+  type DeferredPlaybackSeek,
+} from '@/utils/playbackRequest'
 
 export interface TrackInfo {
   id: string
@@ -50,19 +59,55 @@ export interface TrackInfo {
  * 前端手动构造的对象已经是 camelCase，此函数同时兼容两种格式
  */
 export function normalizeTrack(raw: any): TrackInfo {
-  return {
+  const syncPayload = raw.syncPayload ?? raw.sync_payload
+  const coverUrl = [
+    raw.coverUrl,
+    raw.cover_url,
+    syncPayload?.customCoverUrl,
+    syncPayload?.custom_cover_url,
+    syncPayload?.coverUrl,
+    syncPayload?.cover_url,
+    syncPayload?.originalCoverUrl,
+    syncPayload?.original_cover_url,
+  ].find(value => typeof value === 'string' && value.trim())
+  return canonicalizePlaybackTrack({
     id: raw.id ?? '',
     title: raw.title ?? '',
     artist: raw.artist ?? '',
     album: raw.album ?? '',
     durationMs: raw.durationMs ?? raw.duration_ms ?? 0,
-    coverUrl: raw.coverUrl ?? raw.cover_url ?? '',
+    coverUrl: coverUrl ?? '',
     audioUrl: raw.audioUrl ?? raw.audio_url ?? raw.url ?? '',
     source: raw.source,
     addedAt: raw.addedAt ?? raw.added_at ?? 0,
-    syncPayload: raw.syncPayload ?? raw.sync_payload,
+    syncPayload,
     playlistKey: raw.playlistKey ?? raw.playlist_key,
-  }
+  })
+}
+
+export function tracePlaybackUi(
+  stage: string,
+  track?: TrackInfo | null,
+  detail?: string,
+  requestGeneration?: number,
+) {
+  const source = track ? getPlaybackSourceKind(track) || track.source || 'local' : undefined
+  console.info(
+    `[playback-ui] stage=${stage}`,
+    { generation: requestGeneration, id: track?.id, source, detail },
+  )
+  if (!import.meta.env.DEV) return
+  void invoke<void>('trace_playback_ui', {
+    request: {
+      stage,
+      trackId: track?.id,
+      source,
+      detail,
+      requestGeneration,
+    },
+  }).catch((error) => {
+    console.warn('[playback-ui] backend trace unavailable:', error)
+  })
 }
 
 /** UI 显示用的专辑名：清理 B站 "Bilibili|{cid}" 等内部格式 */
@@ -93,6 +138,7 @@ export interface SeekCommandSnapshot {
   seq: number
   positionMs: number
   source: PlaybackCommandSource
+  requestGeneration: number
 }
 
 interface PendingSeekState {
@@ -201,6 +247,8 @@ export const usePlayerStore = defineStore('player', () => {
   const playError = ref<string | null>(null)
   // 是否正在加载音频（下载/解码中）
   const isLoadingAudio = ref(false)
+  // 区分持久化恢复的曲目信息与后端已装载的真实播放会话
+  const hasPlaybackSession = ref(false)
 
   // 当前音频质量信息
   interface AudioInfo {
@@ -302,7 +350,10 @@ export const usePlayerStore = defineStore('player', () => {
     seq: 0,
     positionMs: 0,
     source: 'local',
+    requestGeneration: 0,
   })
+  let loadedPlaybackRequestToken = 0
+  let deferredPlaybackSeek: DeferredPlaybackSeek | null = null
 
   function markCommandSource(source: PlaybackCommandSource) {
     lastCommandSource.value = source
@@ -629,6 +680,7 @@ export const usePlayerStore = defineStore('player', () => {
       seq: options.bumpSeq === false ? lastSeekCommand.value.seq : lastSeekCommand.value.seq + 1,
       positionMs: safeTargetMs,
       source: commandSource,
+      requestGeneration: playbackRequestToken,
     }
     lastSeekedMs = safeTargetMs
     clearPauseGuard()
@@ -727,7 +779,12 @@ export const usePlayerStore = defineStore('player', () => {
     _startInterpolationLoop()
 
     // 监听后端播放位置更新
-    listen<{ positionMs: number; durationMs: number }>('player:position', (e) => {
+    listen<{
+      positionMs: number
+      durationMs: number
+      requestGeneration: number
+    }>('player:position', (e) => {
+      if (e.payload.requestGeneration !== playbackRequestToken) return
       // seek 后时间窗口内忽略旧位置事件
       if (Date.now() < seekGuardUntil) return
       if (!shouldAcceptPositionAfterSeek(e.payload.positionMs, e.payload.durationMs)) return
@@ -748,19 +805,22 @@ export const usePlayerStore = defineStore('player', () => {
     })
 
     // 监听播放完成（对齐 Android handleTrackEnded）
-    listen('player:track-ended', () => {
+    listen<{ requestGeneration: number }>('player:track-ended', (e) => {
+      if (e.payload.requestGeneration !== playbackRequestToken) return
       handleTrackEnded()
     })
 
     // ─── 系统媒体键事件（SMTC / MPRIS，来自 Rust 后端） ───
-    listen<{ isPlaying: boolean }>('media:play-state-changed', (e) => {
-      isPlaying.value = e.payload.isPlaying
-      if (e.payload.isPlaying) {
-        startInterpolationFromRenderedPosition()
-      } else {
-        _interpIsPlaying = false
-        freezeRenderedPosition()
-      }
+    listen('media:play', () => {
+      void resume()
+    })
+
+    listen('media:pause', () => {
+      void pause()
+    })
+
+    listen('media:toggle', () => {
+      void togglePlayPause()
     })
 
     listen('media:next', () => {
@@ -771,12 +831,8 @@ export const usePlayerStore = defineStore('player', () => {
       previous()
     })
 
-    listen<{ positionMs: number }>('media:seeked', (e) => {
-      if (!shouldAcceptPositionAfterSeek(e.payload.positionMs)) return
-      clearPauseGuard()
-      commitBackendPosition(e.payload.positionMs, undefined, true)
-      _interpRenderedMs = positionMs.value
-      interpolatedPositionMs.value = positionMs.value
+    listen<{ positionMs: number }>('media:seek-requested', (e) => {
+      void seekTo(e.payload.positionMs)
     })
   }
 
@@ -789,13 +845,29 @@ export const usePlayerStore = defineStore('player', () => {
     initEvents()
     markCommandSource(commandSource)
     const token = ++playbackRequestToken
-    const backendRequestReady = invoke<void>('begin_playback_request', {
+    tracePlaybackUi(
+      'store_play_enter',
+      track,
+      `command=${commandSource}, startMs=${Math.max(0, Math.round(startPositionMs))}, force=${forceResolve}`,
+      token,
+    )
+    void invoke<void>('begin_playback_request', {
       requestGeneration: token,
+      trackId: track.id,
+      source: getPlaybackSourceKind(track) || track.source || 'local',
+      hasCover: !!track.coverUrl,
+      hasAudioUrl: !!track.audioUrl,
+      hasSyncPayload: !!track.syncPayload,
+    }).catch((error) => {
+      if (token === playbackRequestToken) {
+        console.warn('[player] playback request preclaim failed:', error)
+      }
     })
     replacePlaybackDemand(track)
     playbackStartupWatchdog.cancel()
     const previousTrack = currentTrack.value
     const wasPlayingBeforeSwitch = isPlaying.value
+    const hadPlaybackSessionBeforeRequest = hasPlaybackSession.value
     const isSwitchingTrack = !!previousTrack && previousTrack.id !== track.id
     const settings = useSettingsStore()
     const fadeInDurationMs = Math.max(0, Math.round(settings.fadeInDuration))
@@ -828,18 +900,50 @@ export const usePlayerStore = defineStore('player', () => {
     const transitionFadeInMs = useTrackSwitchFadeIn || useInitialFadeIn
       ? fadeInDurationMs
       : overlapFadeInDurationMs
+    const wantsCrossfade = useOverlapCrossfade || useTrackSwitchFadeIn || useInitialFadeIn
+    const transitionFadeOutMs = useOverlapCrossfade ? overlapFadeOutDurationMs : 0
+    let appliedLoadSeekSeq: number | null = null
+    let appliedLoadPositionMs = 0
 
     if (requestedStartMs > 0) {
       markOptimisticSeek(requestedStartMs, commandSource, { durationMs: track.durationMs })
+      deferredPlaybackSeek = {
+        requestGeneration: token,
+        positionMs: requestedStartMs,
+        seekSeq: lastSeekCommand.value.seq,
+      }
     } else {
+      deferredPlaybackSeek = null
       pendingSeek = null
       seekGuardUntil = 0
+      setRenderedPosition(0, track.durationMs)
+    }
+
+    function currentLoadStartPlan() {
+      const start = resolvePlaybackLoadStart(
+        token,
+        requestedStartMs,
+        deferredPlaybackSeek,
+      )
+      return {
+        ...start,
+        useCrossfade: wantsCrossfade && start.positionMs === 0,
+      }
+    }
+
+    function markLoadStartApplied(start: { positionMs: number; seekSeq: number | null }) {
+      appliedLoadPositionMs = start.positionMs
+      if (start.seekSeq !== null) appliedLoadSeekSeq = start.seekSeq
     }
 
     function commitTrack() {
       if (trackCommitted) return
       currentTrack.value = track
-      queueIndex.value = queue.value.findIndex(t => t.id === track.id)
+      queueIndex.value = resolvePlaybackQueueStartIndex(
+        queue.value,
+        track.id,
+        track.playlistKey,
+      )
       trackCommitted = true
     }
 
@@ -849,36 +953,36 @@ export const usePlayerStore = defineStore('player', () => {
     }
     // 当前选择代表用户的最新播放意图，必须在任何异步解析前提交
     commitTrack()
+    isLoadingAudio.value = true
+    hasPlaybackSession.value = true
+    isPlaying.value = false
+    _interpIsPlaying = false
 
     try {
-      await backendRequestReady
       if (token !== playbackRequestToken) return
 
       let dur = 0
       let playedFromDownloadedFile = false
       let playedFromPlaybackCache = false
       playError.value = null
-      isLoadingAudio.value = true
       audioInfo.value = null
       isPlayingFromDownload.value = false
-      // 渐变播放判断：切歌交叉过渡或新曲目首次播放
-      const useCrossfade = useOverlapCrossfade || useTrackSwitchFadeIn || useInitialFadeIn
-      const transitionFadeOutMs = useOverlapCrossfade ? overlapFadeOutDurationMs : 0
-      const backendStartMs = useCrossfade ? 0 : requestedStartMs
 
       const downloaded = useDownloadStore().getDownloadedTrack(track.id)
       if (downloaded?.filePath && isRemotePlaybackTrack(track)) {
         try {
+          const startPlan = currentLoadStartPlan()
           dur = await playDownloadedFile(
             downloaded.filePath,
             downloaded.durationMs || track.durationMs,
-            useCrossfade,
+            startPlan.useCrossfade,
             transitionFadeOutMs,
             transitionFadeInMs,
             token,
-            backendStartMs,
+            startPlan.positionMs,
           )
           if (token !== playbackRequestToken) return
+          markLoadStartApplied(startPlan)
           playedFromDownloadedFile = true
           _currentLoadedFromDownloadPath = downloaded.filePath
           isPlayingFromDownload.value = true
@@ -900,39 +1004,71 @@ export const usePlayerStore = defineStore('player', () => {
       } else if (isRemotePlaybackTrack(track)) {
         _currentLoadedFromDownloadPath = null
         isPlayingFromDownload.value = false
+        let prefetchedResolution = takePrefetchedPlaybackUrl(track)
+        const resolveInParallel = shouldResolvePlaybackSourceInParallel(
+          hadPlaybackSessionBeforeRequest,
+          !!prefetchedResolution,
+        )
+        const coldResolution = resolveInParallel
+          ? resolvePlaybackUrl(track, forceResolve).catch((error): PlaybackResolution => ({
+              type: 'failure',
+              message: error instanceof Error ? error.message : String(error),
+              retryable: true,
+            }))
+          : null
         const cacheCandidates = playbackCacheReadCandidates(track, playbackSourceSettings())
-        for (const cacheCandidate of cacheCandidates) {
-          try {
-            const cachedDuration = await playCachedRemoteAudio(
-              cacheCandidate.cacheKey,
-              track.durationMs,
-              useCrossfade,
-              transitionFadeOutMs,
-              transitionFadeInMs,
-              token,
-              backendStartMs,
-            )
-            if (token !== playbackRequestToken) return
-            if (cachedDuration !== null) {
-              dur = cachedDuration
-              playedFromPlaybackCache = true
-              audioInfo.value = {
-                source: cacheCandidate.source,
-                qualityKey: cacheCandidate.qualityKey,
-                qualityLabel: cacheCandidate.qualityKey,
-              }
-              break
+        tracePlaybackUi(
+          'remote_pipeline_start',
+          track,
+          `cacheCandidates=${cacheCandidates.length}, prefetched=${!!prefetchedResolution}, parallelResolve=${resolveInParallel}`,
+          token,
+        )
+        try {
+          const startPlan = currentLoadStartPlan()
+          tracePlaybackUi(
+            'cache_lookup_start',
+            track,
+            `candidates=${cacheCandidates.length}, startMs=${startPlan.positionMs}`,
+            token,
+          )
+          const cached = await playCachedRemoteAudioCandidates(
+            cacheCandidates,
+            track.durationMs,
+            startPlan.useCrossfade,
+            transitionFadeOutMs,
+            transitionFadeInMs,
+            token,
+            startPlan.positionMs,
+          )
+          if (token !== playbackRequestToken) return
+          if (cached) {
+            markLoadStartApplied(startPlan)
+            dur = cached.durationMs
+            playedFromPlaybackCache = true
+            audioInfo.value = {
+              source: cached.source,
+              qualityKey: cached.qualityKey,
+              qualityLabel: cached.qualityKey,
             }
-          } catch (error) {
-            if (token !== playbackRequestToken) return
-            console.warn('[player] persistent cache unavailable, resolving online source:', error)
+            tracePlaybackUi(
+              'cache_lookup_hit',
+              track,
+              `quality=${cached.qualityKey}, durationMs=${cached.durationMs}`,
+              token,
+            )
+          } else {
+            tracePlaybackUi('cache_lookup_miss', track, undefined, token)
           }
+        } catch (error) {
+          if (token !== playbackRequestToken) return
+          console.warn('[player] persistent cache unavailable, resolving online source:', error)
         }
 
         if (!playedFromPlaybackCache) {
-          let result = takePrefetchedPlaybackUrl(track)
+          let result = prefetchedResolution
+          prefetchedResolution = null
           if (!result) {
-            const resolution = await resolvePlaybackUrl(track, forceResolve)
+            const resolution = await (coldResolution ?? resolvePlaybackUrl(track, forceResolve))
             if (resolution.type !== 'success') {
               if (resolution.type === 'requires_login') {
                 throw new Error(resolution.message || 'Playback requires login')
@@ -944,6 +1080,12 @@ export const usePlayerStore = defineStore('player', () => {
             }
             result = resolution
           }
+          tracePlaybackUi(
+            'source_resolved',
+            track,
+            `quality=${result.qualityKey}, candidates=${result.candidateUrls?.length ?? 0}`,
+            token,
+          )
           if (token !== playbackRequestToken) return
 
           const playResolvedSource = async (resolved: ResolvedPlaybackSource) => {
@@ -952,23 +1094,38 @@ export const usePlayerStore = defineStore('player', () => {
               .filter((url, index, values) => values.indexOf(url) === index)
             for (const [candidateIndex, candidateUrl] of candidates.entries()) {
               if (token !== playbackRequestToken) return 0
-              try {
+                try {
                 const cacheWrite = playbackCacheWriteOptions(
                   resolved,
                   candidateIndex,
                   candidateUrl,
                 )
-                return await playRemoteUrl(
+                  const startPlan = currentLoadStartPlan()
+                  tracePlaybackUi(
+                    'backend_stream_start',
+                    track,
+                    `candidate=${candidateIndex}, startMs=${startPlan.positionMs}, crossfade=${startPlan.useCrossfade}`,
+                    token,
+                  )
+                  const duration = await playRemoteUrl(
                   candidateUrl,
                   track.durationMs,
-                  useCrossfade,
+                  startPlan.useCrossfade,
                   transitionFadeOutMs,
                   transitionFadeInMs,
                   token,
-                  backendStartMs,
+                  startPlan.positionMs,
                   cacheWrite.cacheKey,
                   cacheWrite.expectedContentLength,
-                )
+                  )
+                  markLoadStartApplied(startPlan)
+                  tracePlaybackUi(
+                    'backend_stream_ready',
+                    track,
+                    `candidate=${candidateIndex}, durationMs=${duration}`,
+                    token,
+                  )
+                  return duration
               } catch (error) {
                 lastError = error
               }
@@ -1013,7 +1170,14 @@ export const usePlayerStore = defineStore('player', () => {
         _currentLoadedFromDownloadPath = null
         isPlayingFromDownload.value = false
         // 本地文件
-        if (useCrossfade) {
+        const startPlan = currentLoadStartPlan()
+        tracePlaybackUi(
+          'backend_file_start',
+          track,
+          `startMs=${startPlan.positionMs}, crossfade=${startPlan.useCrossfade}`,
+          token,
+        )
+        if (startPlan.useCrossfade) {
           dur = await invoke<number>('crossfade_file', {
             path: track.audioUrl,
             durationHintMs: track.durationMs,
@@ -1024,30 +1188,62 @@ export const usePlayerStore = defineStore('player', () => {
           dur = await invoke<number>('play_file', {
             path: track.audioUrl,
             durationHintMs: track.durationMs,
-            startPositionMs: backendStartMs,
+            startPositionMs: startPlan.positionMs,
             requestGeneration: token,
           })
         }
         if (token !== playbackRequestToken) return
+        markLoadStartApplied(startPlan)
       }
 
       commitTrack()
       durationMs.value = dur || track.durationMs
-      const startMs = requestedStartMs > 0 ? clampPlaybackPosition(requestedStartMs) : 0
-      if (startMs > 0) {
-        markOptimisticSeek(startMs, commandSource, { bumpSeq: false })
-        if (backendStartMs <= 0) {
-          invoke('seek', { positionMs: startMs }).then(() => {
-            if (token !== playbackRequestToken) return
-            seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
-          }).catch((e) => {
-            console.warn('[player] restore seek failed after reload:', e)
+      loadedPlaybackRequestToken = token
+      const deferredSeek = deferredPlaybackSeek?.requestGeneration === token
+        ? deferredPlaybackSeek
+        : null
+      let deferredSeekFailed = false
+      if (deferredSeek && deferredSeek.seekSeq !== appliedLoadSeekSeq) {
+        try {
+          await invoke<void>('seek', {
+            positionMs: deferredSeek.positionMs,
+            requestGeneration: token,
+          })
+          if (token !== playbackRequestToken) return
+          if (isPlaybackSeekCompletionCurrent(
+            token,
+            playbackRequestToken,
+            deferredSeek.seekSeq,
+            lastSeekCommand.value.seq,
+          )) {
+            appliedLoadSeekSeq = deferredSeek.seekSeq
+          }
+        } catch (error) {
+          if (isPlaybackSeekCompletionCurrent(
+            token,
+            playbackRequestToken,
+            deferredSeek.seekSeq,
+            lastSeekCommand.value.seq,
+          )) {
+            deferredSeekFailed = true
             pendingSeek = null
             seekGuardUntil = 0
             lastSeekedMs = null
-            setRenderedPosition(0)
-          })
+            console.warn('[player] deferred seek failed after media load:', error)
+          }
         }
+      }
+      if (deferredPlaybackSeek?.requestGeneration === token) {
+        deferredPlaybackSeek = null
+      }
+      const startMs = !deferredSeekFailed
+        && lastSeekCommand.value.requestGeneration === token
+        ? clampPlaybackPosition(lastSeekCommand.value.positionMs)
+        : clampPlaybackPosition(appliedLoadPositionMs)
+      if (startMs > 0) {
+        setRenderedPosition(startMs)
+        lastSeekedMs = startMs
+        armPendingSeek(startMs)
       } else {
         setRenderedPosition(0)
         pendingSeek = null
@@ -1056,7 +1252,14 @@ export const usePlayerStore = defineStore('player', () => {
         lastSeekedMs = null
       }
       isPlaying.value = true
+      hasPlaybackSession.value = true
       isLoadingAudio.value = false
+      tracePlaybackUi(
+        'session_committed',
+        track,
+        `durationMs=${durationMs.value}, startMs=${startMs}`,
+        token,
+      )
 
       // 重置插值状态
       _interpAnchorMs = startMs
@@ -1093,15 +1296,20 @@ export const usePlayerStore = defineStore('player', () => {
 
       playbackStartupWatchdog.cancel()
 
-      if (requestedStartMs > 0) {
+      if (deferredPlaybackSeek?.requestGeneration === token) {
+        deferredPlaybackSeek = null
+      }
+      if (lastSeekCommand.value.requestGeneration === token) {
         pendingSeek = null
         seekGuardUntil = 0
       }
 
       const msg = e instanceof Error ? e.message : String(e)
       console.error('Play failed:', msg)
+      tracePlaybackUi('play_failed', track, msg, token)
       playError.value = msg
       isPlayingFromDownload.value = false
+      hasPlaybackSession.value = false
       const shouldRestorePreviousPlaybackState = useOverlapCrossfade && wasPlayingBeforeSwitch && !trackCommitted
       if (shouldRestorePreviousPlaybackState) {
         try {
@@ -1149,6 +1357,13 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function togglePlayPause(commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
+    if (isLoadingAudio.value && shouldDeferPlaybackSeek(
+      playbackRequestToken,
+      loadedPlaybackRequestToken,
+    )) {
+      await pause(commandSource)
+      return
+    }
     // 恢复后首次播放：需要重新加载曲目
     if (!isPlaying.value && currentTrack.value && _needsReload) {
       _needsReload = false
@@ -1203,6 +1418,28 @@ export const usePlayerStore = defineStore('player', () => {
     isPlaying.value = false
     _interpIsPlaying = false
     freezeRenderedPosition()
+    if (isLoadingAudio.value && shouldDeferPlaybackSeek(
+      playbackRequestToken,
+      loadedPlaybackRequestToken,
+    )) {
+      const cancellationToken = ++playbackRequestToken
+      deferredPlaybackSeek = null
+      isLoadingAudio.value = false
+      hasPlaybackSession.value = false
+      _needsReload = !!currentTrack.value
+      replacePlaybackDemand(null)
+      try {
+        await invoke<void>('begin_playback_request', {
+          requestGeneration: cancellationToken,
+          trackId: currentTrack.value?.id,
+          source: currentTrack.value
+            ? getPlaybackSourceKind(currentTrack.value) || currentTrack.value.source || 'local'
+            : 'local',
+        })
+      } catch {}
+      savePlayerState()
+      return
+    }
     try {
       const settings = useSettingsStore()
       if (settings.fadeIn && settings.fadeOutDuration > 0) {
@@ -1217,6 +1454,12 @@ export const usePlayerStore = defineStore('player', () => {
   async function resume(commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
     if (!currentTrack.value) return
+    if (isLoadingAudio.value && shouldDeferPlaybackSeek(
+      playbackRequestToken,
+      loadedPlaybackRequestToken,
+    )) {
+      return
+    }
 
     if (_needsReload) {
       _needsReload = false
@@ -1254,14 +1497,34 @@ export const usePlayerStore = defineStore('player', () => {
     const posMs = maxSeekMs > 0 ? Math.min(roundedMs, maxSeekMs) : roundedMs
     const safePosMs = markOptimisticSeek(posMs, commandSource, { durationMs: maxSeekMs })
     const seekSeq = lastSeekCommand.value.seq
+    const requestGeneration = playbackRequestToken
+
+    if (shouldDeferPlaybackSeek(requestGeneration, loadedPlaybackRequestToken)) {
+      deferredPlaybackSeek = {
+        requestGeneration,
+        positionMs: safePosMs,
+        seekSeq,
+      }
+      return
+    }
 
     // Fire-and-forget：不阻塞 UI，后端异步执行 seek
-    invoke('seek', { positionMs: safePosMs }).then(() => {
-      if (lastSeekCommand.value.seq !== seekSeq) return
+    invoke('seek', { positionMs: safePosMs, requestGeneration }).then(() => {
+      if (!isPlaybackSeekCompletionCurrent(
+        requestGeneration,
+        playbackRequestToken,
+        seekSeq,
+        lastSeekCommand.value.seq,
+      )) return
       positionMs.value = safePosMs
       seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
     }).catch((e) => {
-      if (lastSeekCommand.value.seq !== seekSeq) return
+      if (!isPlaybackSeekCompletionCurrent(
+        requestGeneration,
+        playbackRequestToken,
+        seekSeq,
+        lastSeekCommand.value.seq,
+      )) return
       pendingSeek = null
       seekGuardUntil = 0
       console.error('Seek failed:', e)
@@ -1583,13 +1846,24 @@ export const usePlayerStore = defineStore('player', () => {
     requestedTrackId?: string,
     requestedPlaylistKey?: string,
   ) {
-    const playlistIndex = requestedPlaylistKey
-      ? tracks.findIndex(track => track.playlistKey === requestedPlaylistKey)
-      : -1
-    const startIndex = playlistIndex >= 0
-      ? playlistIndex
-      : resolvePlaybackQueueStartIndex(tracks, requestedTrackId)
-    if (startIndex < 0) return
+    const startIndex = resolvePlaybackQueueStartIndex(
+      tracks,
+      requestedTrackId,
+      requestedPlaylistKey,
+    )
+    if (startIndex < 0) {
+      tracePlaybackUi(
+        'queue_start_rejected',
+        undefined,
+        `tracks=${tracks.length}, requestedId=${requestedTrackId || '-'}, requestedKey=${requestedPlaylistKey || '-'}`,
+      )
+      return
+    }
+    tracePlaybackUi(
+      'queue_start_resolved',
+      tracks[startIndex],
+      `index=${startIndex}, tracks=${tracks.length}, requestedId=${requestedTrackId || '-'}`,
+    )
     queue.value = [...tracks]
     queueIndex.value = startIndex
     shuffleBag = []
@@ -1739,6 +2013,7 @@ export const usePlayerStore = defineStore('player', () => {
   return {
     isPlaying, currentTrack, positionMs, durationMs, queue, queueIndex,
     repeatMode, shuffleEnabled, volume, lyrics, playError, isLoadingAudio,
+    hasPlaybackSession,
     audioLevel, beatImpulse, audioInfo, isPlayingFromDownload,
     lastCommandSource, lastSeekCommand, isRemoteSyncGuardActive,
     playbackSpeed, sleepTimerMode, sleepRemainingSeconds,
@@ -1848,18 +2123,25 @@ async function playRemoteUrl(
   }
 }
 
-async function playCachedRemoteAudio(
-  cacheKey: string,
+interface CachedRemoteAudioResult {
+  durationMs: number
+  source: 'netease' | 'qq' | 'bilibili' | 'youtube'
+  qualityKey: string
+}
+
+async function playCachedRemoteAudioCandidates(
+  candidates: PlaybackCacheReadCandidate[],
   durationHintMs: number,
   useCrossfade: boolean,
   fadeOutMs: number,
   fadeInMs: number,
   requestGeneration: number,
   startPositionMs = 0,
-): Promise<number | null> {
-  return invoke<number | null>('play_cached_audio', {
+): Promise<CachedRemoteAudioResult | null> {
+  if (candidates.length === 0) return null
+  return invoke<CachedRemoteAudioResult | null>('play_cached_audio_candidates', {
     request: {
-      cacheKey,
+      candidates,
       durationHintMs,
       startPositionMs: Math.max(0, Math.round(startPositionMs)),
       useCrossfade,

@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
 import type { TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
-import M3Dialog from '@/components/ui/M3Dialog.vue'
 import M3Input from '@/components/ui/M3Input.vue'
 
 const props = defineProps<{
@@ -24,28 +23,38 @@ interface PlaylistInfo { id: number; name: string; track_count: number; modified
 
 const playlists = ref<PlaylistInfo[]>([])
 const isLoading = ref(false)
+const isSubmitting = ref(false)
 const showCreateInput = ref(false)
 const newName = ref('')
 const createInputRef = ref<InstanceType<typeof M3Input>>()
+let loadRequest: Promise<void> | null = null
 
 // 打开时加载歌单列表
 watch(() => props.open, async (isOpen) => {
   if (isOpen) {
     showCreateInput.value = false
     newName.value = ''
-    await loadPlaylists()
+    void loadPlaylists()
   }
 })
 
 async function loadPlaylists() {
-  isLoading.value = true
+  if (loadRequest) return loadRequest
+  isLoading.value = playlists.value.length === 0
+  loadRequest = invoke<PlaylistInfo[]>('list_playlists')
+    .then(result => {
+      playlists.value = result
+    })
+    .catch(e => {
+      console.error('Load local playlists failed:', e)
+    })
+    .finally(() => {
+      isLoading.value = false
+      loadRequest = null
+    })
   try {
-    playlists.value = await invoke<PlaylistInfo[]>('list_playlists')
-  } catch (e) {
-    console.error('Load playlists failed:', e)
-  } finally {
-    isLoading.value = false
-  }
+    await loadRequest
+  } catch { /* 错误已记录 */ }
 }
 
 function targetTracks(): TrackInfo[] {
@@ -55,7 +64,8 @@ function targetTracks(): TrackInfo[] {
 
 async function addToPlaylist(playlistId: number) {
   const targets = targetTracks()
-  if (targets.length === 0) return
+  if (targets.length === 0 || isSubmitting.value) return
+  isSubmitting.value = true
   try {
     if (targets.length === 1) {
       await invoke('add_to_playlist', { playlistId, track: toBackendTrack(targets[0]) })
@@ -66,6 +76,8 @@ async function addToPlaylist(playlistId: number) {
     emit('update:open', false)
   } catch (e) {
     console.error('Add to playlist failed:', e)
+  } finally {
+    isSubmitting.value = false
   }
 }
 
@@ -78,7 +90,8 @@ function toggleCreateInput() {
 
 async function createAndAdd() {
   const targets = targetTracks()
-  if (!newName.value.trim() || targets.length === 0) return
+  if (!newName.value.trim() || targets.length === 0 || isSubmitting.value) return
+  isSubmitting.value = true
   try {
     const pl = await invoke<PlaylistInfo>('create_playlist', { name: newName.value.trim() })
     if (targets.length === 1) {
@@ -90,12 +103,27 @@ async function createAndAdd() {
     emit('update:open', false)
   } catch (e) {
     console.error('Create & add failed:', e)
+  } finally {
+    isSubmitting.value = false
   }
 }
 
 function close() {
   emit('update:open', false)
 }
+
+function handleKeydown(event: KeyboardEvent) {
+  if (props.open && event.key === 'Escape') close()
+}
+
+onMounted(() => {
+  document.addEventListener('keydown', handleKeydown)
+  void loadPlaylists()
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', handleKeydown)
+})
 
 function inferSource(track: TrackInfo) {
   if (track.id.startsWith('netease:')) return 'netease'
@@ -126,10 +154,19 @@ function toBackendTrack(track: TrackInfo) {
   <Teleport to="body">
     <Transition name="dialog">
       <div v-if="open" class="atp-overlay" @click="close">
-        <div class="atp-dialog" @click.stop>
+        <div
+          class="atp-dialog"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="t('player.add_to_local_playlist')"
+          @click.stop
+        >
           <div class="atp-header">
             <span class="material-symbols-rounded" style="font-size: 24px; color: var(--md-primary)">playlist_add</span>
-            <h3 class="atp-title">{{ t('player.add_to_playlist') }}</h3>
+            <h3 class="atp-title">{{ t('player.add_to_local_playlist') }}</h3>
+            <button class="atp-close-btn" :title="t('common.close')" @click="close">
+              <span class="material-symbols-rounded">close</span>
+            </button>
           </div>
 
           <!-- 快速新建 -->
@@ -148,17 +185,23 @@ function toBackendTrack(track: TrackInfo) {
               :maxlength="50"
               @enter="createAndAdd"
             />
-            <button class="atp-create-btn" :disabled="!newName.trim()" @click="createAndAdd">
+            <button
+              class="atp-create-btn"
+              :title="t('common.confirm')"
+              :disabled="!newName.trim() || isSubmitting"
+              @click="createAndAdd"
+            >
               <span class="material-symbols-rounded">check</span>
             </button>
           </div>
 
           <!-- 歌单列表 -->
-          <div class="atp-list" v-if="playlists.length > 0">
+          <div v-if="playlists.length > 0" class="atp-list">
             <div
               v-for="pl in playlists"
               :key="pl.id"
               class="atp-item"
+              :class="{ disabled: isSubmitting }"
               @click="addToPlaylist(pl.id)"
             >
               <div class="atp-item-icon">
@@ -169,6 +212,10 @@ function toBackendTrack(track: TrackInfo) {
                 <div class="atp-item-count">{{ t('library.track_count', { count: pl.track_count }) }}</div>
               </div>
             </div>
+          </div>
+
+          <div v-else-if="isLoading" class="atp-loading" role="status">
+            <span class="material-symbols-rounded">progress_activity</span>
           </div>
 
           <div v-else-if="!isLoading" class="atp-empty">
@@ -195,11 +242,14 @@ function toBackendTrack(track: TrackInfo) {
 .atp-dialog {
   width: 380px;
   max-width: calc(100vw - 48px);
-  max-height: 70vh;
+  height: min(70vh, 640px);
+  max-height: calc(100vh - 48px);
   background: var(--md-surface-container-high);
   border-radius: 28px;
   padding: 24px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   box-shadow:
     0 8px 32px rgba(0, 0, 0, 0.35),
     0 2px 8px rgba(0, 0, 0, 0.2);
@@ -213,8 +263,24 @@ function toBackendTrack(track: TrackInfo) {
 }
 
 .atp-title {
+  flex: 1;
+  min-width: 0;
   font-size: 20px;
   font-weight: 600;
+}
+
+.atp-close-btn {
+  width: 40px;
+  height: 40px;
+  margin: -8px -8px -8px 0;
+  border-radius: var(--radius-full);
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: var(--md-on-surface-variant);
+  transition: background 150ms;
+
+  &:hover { background: var(--md-surface-container); }
 }
 
 .atp-create {
@@ -250,14 +316,21 @@ function toBackendTrack(track: TrackInfo) {
 
 .atp-create-input {
   display: flex;
+  align-items: flex-end;
   gap: 8px;
   padding: 8px 12px;
   margin-bottom: 8px;
+
+  :deep(.m3-input) {
+    flex: 1;
+    min-width: 0;
+  }
 }
 
 .atp-create-btn {
-  width: 40px;
-  height: 40px;
+  width: 48px;
+  height: 48px;
+  margin-bottom: 2px;
   border-radius: var(--radius-full);
   background: var(--md-primary);
   color: var(--md-on-primary);
@@ -275,7 +348,13 @@ function toBackendTrack(track: TrackInfo) {
 .atp-list {
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
   gap: 2px;
+
+  &::-webkit-scrollbar { display: none; }
 }
 
 .atp-item {
@@ -288,6 +367,7 @@ function toBackendTrack(track: TrackInfo) {
   transition: background 150ms;
 
   &:hover { background: var(--md-surface-container); }
+  &.disabled { pointer-events: none; opacity: 0.6; }
 }
 
 .atp-item-icon {
@@ -323,6 +403,21 @@ function toBackendTrack(track: TrackInfo) {
   padding: 24px;
   color: var(--md-on-surface-variant);
   font-size: 14px;
+}
+
+.atp-loading {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--md-primary);
+
+  .material-symbols-rounded {
+    animation: atp-spin 800ms linear infinite;
+  }
+}
+
+@keyframes atp-spin {
+  to { transform: rotate(360deg); }
 }
 
 // 过渡动画

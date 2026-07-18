@@ -18,6 +18,7 @@ import TitleBar from '@/components/TitleBar.vue'
 import { setLocale } from '@/i18n'
 import { applyTheme } from '@/utils/theme'
 import { applyThemeColor } from '@/utils/themeColor'
+import { hasVisiblePlaybackSession } from '@/utils/playbackRequest'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }
@@ -42,7 +43,10 @@ const isFlipAnimating = ref(false)
 const nowPlayingMotionState = ref<'opening' | 'closing' | null>(null)
 const lastCoverSnapshot = ref<{ trackId: string; src: string } | null>(null)
 
-const hasMiniPlayer = computed(() => !!player.currentTrack)
+const hasMiniPlayer = computed(() => hasVisiblePlaybackSession(
+  player.hasPlaybackSession,
+  player.currentTrack?.id,
+))
 const transitionTrackKey = computed(() => player.currentTrack?.id || 'empty')
 const hideMiniCoverForFlip = computed(() => isFlipAnimating.value)
 const isNowPlayingMotionActive = computed(() => nowPlayingMotionState.value !== null)
@@ -118,6 +122,7 @@ function runFlipTransition(from: CoverSnapshot, to: CoverSnapshot, mode: 'openin
 }
 
 async function openNowPlaying() {
+  if (!hasMiniPlayer.value) return
   resetFlipState()
   nowPlayingMotionState.value = null
   playerTransitionPulse.value = Date.now()
@@ -326,8 +331,9 @@ onUnmounted(() => {
     <TitleBar
       :force-light="isNowPlayingOpen"
       :now-playing="isNowPlayingOpen"
-      :track-name="player.currentTrack?.title"
-      :album-name="player.currentTrack?.album ? displayAlbum(player.currentTrack.album) : ''"
+      :has-playback-session="player.hasPlaybackSession"
+      :track-name="player.hasPlaybackSession ? player.currentTrack?.title : ''"
+      :album-name="player.hasPlaybackSession && player.currentTrack?.album ? displayAlbum(player.currentTrack.album) : ''"
       :transitioning="isNowPlayingOpen || isNowPlayingMotionActive"
       :transition-state="nowPlayingMotionState"
       @collapse="closeNowPlaying()"

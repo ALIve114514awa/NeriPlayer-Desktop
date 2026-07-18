@@ -15,12 +15,25 @@ const transpiled = ts.transpileModule(source, {
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled.outputText).toString('base64')}`
 const { resolvePlaybackQueueStartIndex } = await import(moduleUrl)
 
-const tracks = [{ id: 'first' }, { id: 'second' }, { id: 'third' }]
+const tracks = [
+  { id: 'first', playlistKey: 'membership:first' },
+  { id: 'second', playlistKey: 'membership:second-a' },
+  { id: 'second', playlistKey: 'membership:second-b' },
+  { id: 'third', playlistKey: 'membership:third' },
+]
 
 assert.equal(resolvePlaybackQueueStartIndex([], 'second'), -1)
 assert.equal(resolvePlaybackQueueStartIndex(tracks), 0)
-assert.equal(resolvePlaybackQueueStartIndex(tracks, 'third'), 2)
+assert.equal(resolvePlaybackQueueStartIndex(tracks, 'third'), 3)
 assert.equal(resolvePlaybackQueueStartIndex(tracks, 'missing'), 0)
 assert.equal(resolvePlaybackQueueStartIndex(tracks, '  second  '), 1)
+assert.equal(
+  resolvePlaybackQueueStartIndex(tracks, 'second', 'membership:second-b'),
+  2,
+)
+assert.equal(
+  resolvePlaybackQueueStartIndex(tracks, 'second', 'missing-membership'),
+  1,
+)
 
 console.log('playback queue tests passed')

@@ -9,6 +9,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "test:bilibili-cover-cache": "node scripts/test-bilibili-cover-cache.mjs",
+    "test:playback-request": "node scripts/playback-request.test.mjs",
     "test:playback-source": "node scripts/test-playback-source.mjs",
     "tauri": "node scripts/run-tauri.mjs"
   },

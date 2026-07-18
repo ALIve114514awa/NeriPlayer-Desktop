@@ -3,8 +3,8 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use rodio::Source;
-use rodio::source::SeekError;
+
+use crate::audio::pcm::{PcmSeekError, PcmSource};
 
 // ─── 共享音效参数 ──────────────────────────────────────────────────────────────
 
@@ -165,7 +165,7 @@ pub struct EqualizerSource<S> {
 
 impl<S> EqualizerSource<S>
 where
-    S: Source<Item = i16> + Send,
+    S: PcmSource,
 {
     pub fn new(source: S, params: Arc<Mutex<AudioEffectsParams>>) -> Self {
         let channels = source.channels();
@@ -216,11 +216,11 @@ where
 
 impl<S> Iterator for EqualizerSource<S>
 where
-    S: Source<Item = i16> + Send,
+    S: PcmSource,
 {
-    type Item = i16;
+    type Item = f32;
 
-    fn next(&mut self) -> Option<i16> {
+    fn next(&mut self) -> Option<f32> {
         let sample = self.inner.next()?;
 
         // 周期性检查参数更新
@@ -240,13 +240,12 @@ where
         self.current_channel = (self.current_channel + 1) % self.channels as usize;
 
         // 串联 5 个滤波器
-        let mut val = sample as f64;
+        let mut val = f64::from(sample);
         for filter in self.filters.iter_mut() {
             val = filter.process(val, ch);
         }
 
-        // 钳位到 i16 范围
-        Some(val.round().max(-32768.0).min(32767.0) as i16)
+        Some(val.clamp(-1.0, 1.0) as f32)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -254,14 +253,10 @@ where
     }
 }
 
-impl<S> Source for EqualizerSource<S>
+impl<S> PcmSource for EqualizerSource<S>
 where
-    S: Source<Item = i16> + Send,
+    S: PcmSource,
 {
-    fn current_frame_len(&self) -> Option<usize> {
-        self.inner.current_frame_len()
-    }
-
     fn channels(&self) -> u16 {
         self.channels
     }
@@ -274,7 +269,7 @@ where
         self.inner.total_duration()
     }
 
-    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+    fn try_seek(&mut self, pos: Duration) -> Result<(), PcmSeekError> {
         let result = self.inner.try_seek(pos);
         if result.is_ok() {
             for f in self.filters.iter_mut() {
@@ -302,7 +297,7 @@ pub struct LoudnessSource<S> {
 
 impl<S> LoudnessSource<S>
 where
-    S: Source<Item = i16> + Send,
+    S: PcmSource,
 {
     pub fn new(source: S, params: Arc<Mutex<AudioEffectsParams>>) -> Self {
         let channels = source.channels();
@@ -334,11 +329,11 @@ where
 
 impl<S> Iterator for LoudnessSource<S>
 where
-    S: Source<Item = i16> + Send,
+    S: PcmSource,
 {
-    type Item = i16;
+    type Item = f32;
 
-    fn next(&mut self) -> Option<i16> {
+    fn next(&mut self) -> Option<f32> {
         let sample = self.inner.next()?;
 
         self.sample_counter += 1;
@@ -351,8 +346,8 @@ where
             return Some(sample);
         }
 
-        let val = (sample as f64 * self.gain).round();
-        Some(val.max(-32768.0).min(32767.0) as i16)
+        let val = f64::from(sample) * self.gain;
+        Some(val.clamp(-1.0, 1.0) as f32)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -360,14 +355,10 @@ where
     }
 }
 
-impl<S> Source for LoudnessSource<S>
+impl<S> PcmSource for LoudnessSource<S>
 where
-    S: Source<Item = i16> + Send,
+    S: PcmSource,
 {
-    fn current_frame_len(&self) -> Option<usize> {
-        self.inner.current_frame_len()
-    }
-
     fn channels(&self) -> u16 {
         self.channels
     }
@@ -380,7 +371,7 @@ where
         self.inner.total_duration()
     }
 
-    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+    fn try_seek(&mut self, pos: Duration) -> Result<(), PcmSeekError> {
         self.inner.try_seek(pos)
     }
 }

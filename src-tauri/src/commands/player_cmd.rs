@@ -1,4 +1,5 @@
 use crate::audio::growing::GrowingAudioBuffer;
+use crate::audio::player::wait_for_seek_result;
 use crate::audio::remote::{RemoteAudioCache, RemoteAudioSource};
 use crate::error::{AppError, AppResult};
 use crate::settings::store::{MAX_MEDIA_CACHE_SIZE_MB, MIN_MEDIA_CACHE_SIZE_MB};
@@ -8,12 +9,56 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 
 const STREAM_START_BUFFER_BYTES: usize = 64 * 1024;
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
+const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_CACHE_LOOKUP_CANDIDATES: usize = 16;
 const PLAYBACK_SUPERSEDED_ERROR: &str = "Playback request superseded";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackUiTraceRequest {
+    stage: String,
+    track_id: Option<String>,
+    source: Option<String>,
+    detail: Option<String>,
+    request_generation: Option<u64>,
+}
+
+fn playback_trace_field(value: Option<&str>) -> String {
+    value
+        .unwrap_or("-")
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(240)
+        .collect()
+}
+
+#[tauri::command]
+pub fn trace_playback_ui(request: PlaybackUiTraceRequest) {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[playback-ui] stage={}, generation={}, id={}, source={}, detail={}",
+            playback_trace_field(Some(&request.stage)),
+            request
+                .request_generation
+                .map_or_else(|| "-".to_string(), |generation| generation.to_string()),
+            playback_trace_field(request.track_id.as_deref()),
+            playback_trace_field(request.source.as_deref()),
+            playback_trace_field(request.detail.as_deref()),
+        );
+    }
+}
 
 fn claim_generation(generation: &AtomicU64, request_generation: u64) -> bool {
     generation.fetch_max(request_generation, Ordering::AcqRel) <= request_generation
@@ -46,8 +91,22 @@ fn advance_playback_request(state: &State<'_, AppState>) -> u64 {
 #[tauri::command]
 pub async fn begin_playback_request(
     request_generation: u64,
+    track_id: Option<String>,
+    source: Option<String>,
+    has_cover: Option<bool>,
+    has_audio_url: Option<bool>,
+    has_sync_payload: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
+    eprintln!(
+        "[playback-request] begin generation={}, id={}, source={}, cover={}, direct_url={}, sync_payload={}",
+        request_generation,
+        track_id.as_deref().unwrap_or("unknown"),
+        source.as_deref().unwrap_or("unknown"),
+        has_cover.unwrap_or(false),
+        has_audio_url.unwrap_or(false),
+        has_sync_payload.unwrap_or(false)
+    );
     claim_playback_request(&state, request_generation)
 }
 
@@ -159,6 +218,142 @@ pub async fn play_cached_audio(
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAudioPlaybackCandidate {
+    cache_key: String,
+    source: String,
+    quality_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAudioCandidatesPlaybackRequest {
+    candidates: Vec<CachedAudioPlaybackCandidate>,
+    duration_hint_ms: u64,
+    start_position_ms: Option<u64>,
+    use_crossfade: bool,
+    fade_out_ms: u32,
+    fade_in_ms: u32,
+    cache_limit_bytes: Option<u64>,
+    request_generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAudioPlaybackResult {
+    duration_ms: u64,
+    source: String,
+    quality_key: String,
+}
+
+/// 一次后台任务按优先级检查所有稳定缓存键，避免每个音质候选各跨一次 IPC
+#[tauri::command]
+pub async fn play_cached_audio_candidates(
+    request: CachedAudioCandidatesPlaybackRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<CachedAudioPlaybackResult>> {
+    let CachedAudioCandidatesPlaybackRequest {
+        candidates,
+        duration_hint_ms,
+        start_position_ms,
+        use_crossfade,
+        fade_out_ms,
+        fade_in_ms,
+        cache_limit_bytes,
+        request_generation,
+    } = request;
+    claim_playback_request(&state, request_generation)?;
+    eprintln!(
+        "[play_cached_audio_candidates] begin generation={}, requested={}",
+        request_generation,
+        candidates.len().min(MAX_CACHE_LOOKUP_CANDIDATES),
+    );
+
+    let caches = candidates
+        .into_iter()
+        .take(MAX_CACHE_LOOKUP_CANDIDATES)
+        .filter_map(|candidate| {
+            playback_cache(
+                &app,
+                Some(&candidate.cache_key),
+                cache_limit_bytes,
+                None,
+                duration_hint_ms,
+            )
+            .map(|cache| (candidate, cache))
+        })
+        .collect::<Vec<_>>();
+    if caches.is_empty() {
+        return Ok(None);
+    }
+
+    let validation_started = std::time::Instant::now();
+    let candidate_count = caches.len();
+    eprintln!(
+        "[play_cached_audio_candidates] checking {} candidates",
+        candidate_count
+    );
+    let validation = tokio::task::spawn_blocking(move || {
+        caches.into_iter().find_map(|(candidate, cache)| {
+            cache.ready_path().map(|path| (candidate, path))
+        })
+    });
+    let found = match tokio::time::timeout(CACHE_LOOKUP_TIMEOUT, validation).await {
+        Ok(result) => result.map_err(|err| AppError::Other(err.to_string()))?,
+        Err(_) => {
+            eprintln!(
+                "[play_cached_audio_candidates] timed out after {}ms",
+                CACHE_LOOKUP_TIMEOUT.as_millis(),
+            );
+            return Ok(None);
+        }
+    };
+    let Some((candidate, path)) = found else {
+        eprintln!(
+            "[play_cached_audio_candidates] miss in {}ms",
+            validation_started.elapsed().as_millis()
+        );
+        return Ok(None);
+    };
+    ensure_playback_request(&state, request_generation)?;
+    eprintln!(
+        "[play_cached_audio_candidates] hit {}/{} in {}ms: {}",
+        candidate.quality_key,
+        candidate_count,
+        validation_started.elapsed().as_millis(),
+        path.display()
+    );
+
+    let mut player = state.player.lock();
+    let duration_ms = if use_crossfade {
+        player.crossfade_file_with_hint(
+            &path.to_string_lossy(),
+            duration_hint_ms,
+            fade_out_ms,
+            fade_in_ms,
+            request_generation,
+        )?
+    } else {
+        player.play_file_at_with_hint(
+            &path.to_string_lossy(),
+            duration_hint_ms,
+            start_position_ms.unwrap_or(0),
+            request_generation,
+        )?
+    };
+    Ok(Some(CachedAudioPlaybackResult {
+        duration_ms: if duration_ms > 0 {
+            duration_ms
+        } else {
+            duration_hint_ms
+        },
+        source: candidate.source,
+        quality_key: candidate.quality_key,
+    }))
+}
+
 /// 从 URL 下载音频并播放（网易云 / B站 / YouTube 流式播放）
 #[tauri::command]
 pub async fn play_url(
@@ -260,11 +455,16 @@ pub async fn play_url_fast(
         duration_hint_ms,
     );
     let path = match cache {
-        Some(cache) => download_url_to_playback_cache(&url, &state, cache)
+        Some(cache) => download_url_to_playback_cache(
+            &url,
+            &state,
+            cache,
+            request_generation,
+        )
             .await?
             .to_string_lossy()
             .to_string(),
-        None => download_url_to_temp_audio(&url, &state).await?,
+        None => download_url_to_temp_audio(&url, &state, request_generation).await?,
     };
     ensure_playback_request(&state, request_generation)?;
     eprintln!("[play_url_fast] temp ready: {}", path);
@@ -341,7 +541,15 @@ pub async fn play_url_streaming(
         }
     });
 
-    match open_remote_audio_source(&url, duration_hint_ms, &state, cache).await {
+    match open_remote_audio_source(
+        &url,
+        duration_hint_ms,
+        request_generation,
+        &state,
+        cache,
+    )
+    .await
+    {
         Ok(reader) => {
             ensure_playback_request(&state, request_generation)?;
             let result = {
@@ -388,7 +596,13 @@ async fn play_url_streaming_fallback(
 ) -> AppResult<u64> {
     ensure_playback_request(state, request_generation)?;
     if let Some(cache) = cache {
-        let path = download_url_to_playback_cache(url, state, cache).await?;
+        let path = download_url_to_playback_cache(
+            url,
+            state,
+            cache,
+            request_generation,
+        )
+        .await?;
         ensure_playback_request(state, request_generation)?;
         let mut player = state.player.lock();
         let dur = player.play_file_at_with_hint(
@@ -401,7 +615,7 @@ async fn play_url_streaming_fallback(
     }
 
     if start_position_ms > 0 {
-        let path = download_url_to_temp_audio(url, state).await?;
+        let path = download_url_to_temp_audio(url, state, request_generation).await?;
         ensure_playback_request(state, request_generation)?;
         let mut player = state.player.lock();
         let dur = player.play_file_at_with_hint(
@@ -413,7 +627,13 @@ async fn play_url_streaming_fallback(
         return Ok(if dur > 0 { dur } else { duration_hint_ms });
     }
 
-    let buffer = start_streaming_download(url, state, "play_url_streaming").await?;
+    let buffer = start_streaming_download(
+        url,
+        state,
+        "play_url_streaming",
+        request_generation,
+    )
+    .await?;
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
         Err(err) => {
@@ -477,8 +697,18 @@ pub async fn set_volume(level: f32, state: State<'_, AppState>) -> AppResult<()>
 }
 
 #[tauri::command]
-pub async fn seek(position_ms: u64, state: State<'_, AppState>) -> AppResult<()> {
-    state.player.lock().seek_to(position_ms)
+pub async fn seek(
+    position_ms: u64,
+    request_generation: u64,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let receiver = state
+        .player
+        .lock()
+        .request_seek(position_ms, request_generation)?;
+    tokio::task::spawn_blocking(move || wait_for_seek_result(receiver))
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
 }
 
 #[tauri::command]
@@ -535,7 +765,13 @@ pub async fn crossfade_url(
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     claim_playback_request(&state, request_generation)?;
-    let data = download_url_bytes(&url, &state, "crossfade_url").await?;
+    let data = download_url_bytes(
+        &url,
+        &state,
+        "crossfade_url",
+        request_generation,
+    )
+    .await?;
     ensure_playback_request(&state, request_generation)?;
     let mut player = state.player.lock();
     player.crossfade_bytes(
@@ -569,11 +805,16 @@ pub async fn crossfade_url_fast(
         duration_hint_ms,
     );
     let path = match cache {
-        Some(cache) => download_url_to_playback_cache(&url, &state, cache)
+        Some(cache) => download_url_to_playback_cache(
+            &url,
+            &state,
+            cache,
+            request_generation,
+        )
             .await?
             .to_string_lossy()
             .to_string(),
-        None => download_url_to_temp_audio(&url, &state).await?,
+        None => download_url_to_temp_audio(&url, &state, request_generation).await?,
     };
     ensure_playback_request(&state, request_generation)?;
     let mut player = state.player.lock();
@@ -656,7 +897,15 @@ pub async fn crossfade_url_streaming(
         }
     });
 
-    match open_remote_audio_source(&url, duration_hint_ms, &state, cache).await {
+    match open_remote_audio_source(
+        &url,
+        duration_hint_ms,
+        request_generation,
+        &state,
+        cache,
+    )
+    .await
+    {
         Ok(reader) => {
             ensure_playback_request(&state, request_generation)?;
             let result = {
@@ -706,7 +955,13 @@ async fn crossfade_url_streaming_fallback(
 ) -> AppResult<u64> {
     ensure_playback_request(state, request_generation)?;
     if let Some(cache) = cache {
-        let path = download_url_to_playback_cache(url, state, cache).await?;
+        let path = download_url_to_playback_cache(
+            url,
+            state,
+            cache,
+            request_generation,
+        )
+        .await?;
         ensure_playback_request(state, request_generation)?;
         let mut player = state.player.lock();
         let dur = player.crossfade_file_with_hint(
@@ -719,7 +974,13 @@ async fn crossfade_url_streaming_fallback(
         return Ok(if dur > 0 { dur } else { duration_hint_ms });
     }
 
-    let buffer = start_streaming_download(url, state, "crossfade_url_streaming").await?;
+    let buffer = start_streaming_download(
+        url,
+        state,
+        "crossfade_url_streaming",
+        request_generation,
+    )
+    .await?;
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
         Err(err) => {
@@ -789,6 +1050,7 @@ fn playback_referer(url: &str) -> &'static str {
 async fn open_remote_audio_source(
     url: &str,
     duration_hint_ms: u64,
+    request_generation: u64,
     state: &State<'_, AppState>,
     cache: Option<RemoteAudioCache>,
 ) -> AppResult<RemoteAudioSource> {
@@ -798,6 +1060,8 @@ async fn open_remote_audio_source(
         playback_referer(url).to_string(),
         cache,
         duration_hint_ms,
+        Arc::clone(&state.playback_generation),
+        request_generation,
     )
     .await
 }
@@ -842,25 +1106,40 @@ async fn download_url_bytes(
     url: &str,
     state: &State<'_, AppState>,
     tag: &str,
+    request_generation: u64,
 ) -> AppResult<Vec<u8>> {
     let start = std::time::Instant::now();
-    let resp = state.http().get(url)
-        .header("Referer", playback_referer(url))
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .send().await
-        .map_err(|e| AppError::Network(e))?;
+    ensure_playback_request(state, request_generation)?;
+    let download = async {
+        let resp = state.http().get(url)
+            .header("Referer", playback_referer(url))
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .send().await
+            .map_err(AppError::Network)?;
 
-    if !resp.status().is_success() {
-        return Err(AppError::Api(format!(
-            "HTTP {}: stream fetch failed",
-            resp.status()
-        )));
-    }
+        if !resp.status().is_success() {
+            return Err(AppError::Api(format!(
+                "HTTP {}: stream fetch failed",
+                resp.status()
+            )));
+        }
 
-    let bytes = resp.bytes().await.map_err(|e| AppError::Network(e))?;
-    if bytes.is_empty() {
-        return Err(AppError::Audio("Empty audio data received".into()));
-    }
+        let bytes = resp.bytes().await.map_err(AppError::Network)?;
+        if bytes.is_empty() {
+            return Err(AppError::Audio("Empty audio data received".into()));
+        }
+        Ok(bytes)
+    };
+    tokio::pin!(download);
+    let bytes = tokio::select! {
+        result = &mut download => result?,
+        () = wait_for_playback_superseded(
+            &state.playback_generation,
+            request_generation,
+        ) => {
+            return Err(AppError::Audio(PLAYBACK_SUPERSEDED_ERROR.into()));
+        }
+    };
     eprintln!(
         "[{}] downloaded {} bytes in {}ms",
         tag,
@@ -870,8 +1149,12 @@ async fn download_url_bytes(
     Ok(bytes.to_vec())
 }
 
-async fn download_url_to_temp_audio(url: &str, state: &State<'_, AppState>) -> AppResult<String> {
-    let data = download_url_bytes(url, state, "playback_temp").await?;
+async fn download_url_to_temp_audio(
+    url: &str,
+    state: &State<'_, AppState>,
+    request_generation: u64,
+) -> AppResult<String> {
+    let data = download_url_bytes(url, state, "playback_temp", request_generation).await?;
     tokio::task::spawn_blocking(move || -> AppResult<String> {
         let mut file = tempfile::Builder::new()
             .prefix("neri-playback-")
@@ -893,8 +1176,16 @@ async fn download_url_to_playback_cache(
     url: &str,
     state: &State<'_, AppState>,
     cache: RemoteAudioCache,
+    request_generation: u64,
 ) -> AppResult<PathBuf> {
-    let data = download_url_bytes(url, state, "playback_cache_fallback").await?;
+    let data = download_url_bytes(
+        url,
+        state,
+        "playback_cache_fallback",
+        request_generation,
+    )
+    .await?;
+    ensure_playback_request(state, request_generation)?;
     tokio::task::spawn_blocking(move || cache.publish_complete_bytes(&data))
         .await
         .map_err(|err| AppError::Other(err.to_string()))?
@@ -904,16 +1195,27 @@ async fn start_streaming_download(
     url: &str,
     state: &State<'_, AppState>,
     tag: &'static str,
+    request_generation: u64,
 ) -> AppResult<GrowingAudioBuffer> {
     let start = std::time::Instant::now();
-    let resp = state.http().get(url)
+    ensure_playback_request(state, request_generation)?;
+    let request = state.http().get(url)
         .header("Referer", playback_referer(url))
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .send().await
-        .map_err(|e| {
-            eprintln!("[{}] HTTP send error: {}", tag, e);
-            AppError::Network(e)
-        })?;
+        .send();
+    tokio::pin!(request);
+    let resp = tokio::select! {
+        result = &mut request => result.map_err(|error| {
+            eprintln!("[{}] HTTP send error: {}", tag, error);
+            AppError::Network(error)
+        })?,
+        () = wait_for_playback_superseded(
+            &state.playback_generation,
+            request_generation,
+        ) => {
+            return Err(AppError::Audio(PLAYBACK_SUPERSEDED_ERROR.into()));
+        }
+    };
 
     let status = resp.status();
     eprintln!("[{}] HTTP status: {}", tag, status);
@@ -929,10 +1231,25 @@ async fn start_streaming_download(
     buffer.set_total_len(total_len);
     let writer = buffer.clone();
     let mut stream = resp.bytes_stream();
+    let playback_generation = Arc::clone(&state.playback_generation);
 
     tauri::async_runtime::spawn(async move {
         let mut downloaded: usize = 0;
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => item,
+                () = wait_for_playback_superseded(
+                    &playback_generation,
+                    request_generation,
+                ) => {
+                    writer.abort();
+                    eprintln!("[{}] download superseded after {} bytes", tag, downloaded);
+                    return;
+                }
+            };
+            let Some(item) = item else {
+                break;
+            };
             if writer.is_aborted() {
                 eprintln!("[{}] download aborted after {} bytes", tag, downloaded);
                 return;
@@ -959,6 +1276,12 @@ async fn start_streaming_download(
     });
 
     Ok(buffer)
+}
+
+async fn wait_for_playback_superseded(generation: &AtomicU64, expected: u64) {
+    while generation.load(Ordering::Acquire) == expected {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn wait_for_stream_start(buffer: GrowingAudioBuffer) -> AppResult<usize> {
@@ -1040,7 +1363,10 @@ pub async fn cycle_repeat(state: State<'_, AppState>) -> AppResult<crate::state:
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_generation, is_generation_current, CachedAudioPlaybackRequest};
+    use super::{
+        claim_generation, is_generation_current, playback_trace_field,
+        CachedAudioPlaybackRequest, PlaybackUiTraceRequest,
+    };
     use std::sync::atomic::AtomicU64;
 
     #[test]
@@ -1072,5 +1398,21 @@ mod tests {
         assert_eq!(request.cache_key, "bili-BV1-high");
         assert_eq!(request.start_position_ms, Some(22_720));
         assert_eq!(request.request_generation, 42);
+    }
+
+    #[test]
+    fn playback_ui_trace_accepts_camel_case_and_sanitizes_lines() {
+        let request: PlaybackUiTraceRequest = serde_json::from_value(serde_json::json!({
+            "stage": "store_play_enter",
+            "trackId": "netease:42",
+            "source": "netease",
+            "detail": "first\nsecond",
+            "requestGeneration": 9,
+        }))
+        .expect("playback UI trace request");
+
+        assert_eq!(request.track_id.as_deref(), Some("netease:42"));
+        assert_eq!(request.request_generation, Some(9));
+        assert_eq!(playback_trace_field(request.detail.as_deref()), "first second");
     }
 }

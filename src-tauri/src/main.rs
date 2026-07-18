@@ -92,26 +92,14 @@ fn main() {
                     // ── 处理媒体键事件 ──
                     while let Ok(action) = media_action_rx.try_recv() {
                         match action {
-                            MediaAction::Play | MediaAction::Toggle => {
-                                let mut player = state.player.lock();
-                                if player.is_playing {
-                                    player.pause();
-                                } else {
-                                    player.resume();
-                                }
-                                let playing = player.is_playing;
-                                drop(player);
-                                let _ = handle_ticker.emit(
-                                    "media:play-state-changed",
-                                    serde_json::json!({ "isPlaying": playing }),
-                                );
+                            MediaAction::Play => {
+                                let _ = handle_ticker.emit("media:play", ());
                             }
                             MediaAction::Pause => {
-                                state.player.lock().pause();
-                                let _ = handle_ticker.emit(
-                                    "media:play-state-changed",
-                                    serde_json::json!({ "isPlaying": false }),
-                                );
+                                let _ = handle_ticker.emit("media:pause", ());
+                            }
+                            MediaAction::Toggle => {
+                                let _ = handle_ticker.emit("media:toggle", ());
                             }
                             MediaAction::Next => {
                                 let _ = handle_ticker.emit("media:next", ());
@@ -120,9 +108,10 @@ fn main() {
                                 let _ = handle_ticker.emit("media:previous", ());
                             }
                             MediaAction::SeekTo(ms) => {
-                                let _ = state.player.lock().seek_to(ms);
-                                let _ = handle_ticker
-                                    .emit("media:seeked", serde_json::json!({ "positionMs": ms }));
+                                let _ = handle_ticker.emit(
+                                    "media:seek-requested",
+                                    serde_json::json!({ "positionMs": ms }),
+                                );
                             }
                         }
                     }
@@ -145,11 +134,13 @@ fn main() {
                             player.is_playing,
                             player.position_ms(),
                             player.duration_ms,
+                            player.loaded_generation().unwrap_or(0),
                             player.shared_audio_level.clone(),
                         )
                     }; // ← 锁在此释放
 
-                    let (snap_playing, snap_pos, snap_dur, shared_level) = snapshot;
+                    let (snap_playing, snap_pos, snap_dur, snap_generation, shared_level) =
+                        snapshot;
 
                     // ── Phase 2: 发射事件（无锁） ──
                     if snap_playing || snap_pos > 0 {
@@ -159,6 +150,7 @@ fn main() {
                                 "positionMs": snap_pos,
                                 "durationMs": snap_dur,
                                 "isPlaying": snap_playing,
+                                "requestGeneration": snap_generation,
                             }),
                         );
                     }
@@ -211,9 +203,15 @@ fn main() {
                             player.is_finished() && player.is_playing && player.position_ms() > 500;
                         if finished && !last_ended {
                             last_ended = true;
+                            let ended_generation = player.loaded_generation().unwrap_or(0);
                             player.mark_ended();
                             drop(player);
-                            let _ = handle_ticker.emit("player:track-ended", ());
+                            let _ = handle_ticker.emit(
+                                "player:track-ended",
+                                serde_json::json!({
+                                    "requestGeneration": ended_generation,
+                                }),
+                            );
                         } else if !finished {
                             last_ended = false;
                         }
@@ -224,9 +222,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            player_cmd::trace_playback_ui,
             player_cmd::begin_playback_request,
             player_cmd::play_file,
             player_cmd::play_cached_audio,
+            player_cmd::play_cached_audio_candidates,
             player_cmd::play_url,
             player_cmd::play_url_fast,
             player_cmd::play_url_streaming,

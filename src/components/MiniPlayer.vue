@@ -142,7 +142,9 @@ const currentTimeMs = computed(() =>
 
 const currentTimeFormatted = computed(() => formatTime(currentTimeMs.value))
 const durationFormatted = computed(() => formatTime(player.durationMs))
-const miniTrackKey = computed(() => player.currentTrack?.id || 'empty')
+const miniTrackKey = computed(() => (
+  player.currentTrack?.playlistKey || player.currentTrack?.id || 'empty'
+))
 const displayCoverUrl = computed(() =>
   props.coverFallbackSrc || player.currentTrack?.coverUrl || '',
 )

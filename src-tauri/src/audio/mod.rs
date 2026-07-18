@@ -3,6 +3,7 @@ pub mod buffered;
 pub mod effects;
 pub mod growing;
 pub mod media_session;
+pub mod pcm;
 pub mod player;
 pub mod queue;
 pub mod remote;

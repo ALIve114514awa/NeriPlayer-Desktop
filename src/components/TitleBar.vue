@@ -7,6 +7,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 const props = defineProps<{
   forceLight?: boolean
   nowPlaying?: boolean
+  hasPlaybackSession?: boolean
   trackName?: string
   albumName?: string
   transitioning?: boolean
@@ -19,7 +20,12 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const titleBarTrackText = computed(() => props.albumName || props.trackName || '')
+const titleBarTrackText = computed(() => (
+  props.hasPlaybackSession ? props.albumName || props.trackName || '' : ''
+))
+const titleBarLabel = computed(() => (
+  props.hasPlaybackSession ? t('player.now_playing') : t('player.not_playing')
+))
 const titleBarTrackKey = computed(() => `${props.nowPlaying ? 'np' : 'base'}:${titleBarTrackText.value || 'empty'}`)
 const titleBarSideKey = computed(() => props.nowPlaying ? 'np' : 'brand')
 
@@ -102,7 +108,7 @@ onUnmounted(() => {
     <!-- 播放器模式：居中播放信息 -->
     <transition name="tb-center-fade">
       <div v-if="nowPlaying" class="tb-np-center" data-tauri-drag-region>
-        <span class="tb-np-label">{{ t('player.now_playing') }}</span>
+        <span class="tb-np-label">{{ titleBarLabel }}</span>
         <transition name="tb-track-swap" mode="out-in">
           <span :key="titleBarTrackKey" class="tb-np-track">{{ titleBarTrackText }}</span>
         </transition>
@@ -116,7 +122,7 @@ onUnmounted(() => {
     <div class="tb-right-slot">
       <transition name="tb-side-swap" mode="out-in">
         <!-- 播放器模式：更多按钮 -->
-        <button v-if="nowPlaying" :key="`more:${titleBarSideKey}`" class="tb-np-btn tb-np-more" type="button" data-tauri-drag-region="false" @click="emit('toggleMore')">
+        <button v-if="nowPlaying && hasPlaybackSession" :key="`more:${titleBarSideKey}`" class="tb-np-btn tb-np-more" type="button" data-tauri-drag-region="false" @click="emit('toggleMore')">
           <span class="material-symbols-rounded">more_vert</span>
         </button>
         <div v-else :key="`spacer:${titleBarSideKey}`" class="tb-np-more-spacer" aria-hidden="true"></div>

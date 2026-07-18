@@ -19,6 +19,7 @@ const compiled = ts.transpileModule(source, {
 }).outputText
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`
 const {
+  canonicalizePlaybackTrack,
   playbackCacheReadCandidates,
   playbackCacheWriteOptions,
   resolvePlaybackResult,
@@ -159,6 +160,116 @@ await run('cache-first keys match resolution keys and include NetEase fallbacks'
 
   const resolved = await resolvePlaybackSource(biliTrack, settings)
   assert.equal(biliCandidate.cacheKey, resolved?.cacheKey)
+})
+
+await run('uses Android sync subAudioId as the Bilibili CID', async () => {
+  const syncedTrack = {
+    id: 'bilibili:BV1sync',
+    title: 'synced-video',
+    artist: 'artist',
+    album: 'Synced album',
+    durationMs: 180_000,
+    audioUrl: '',
+    source: 'bilibili',
+    syncPayload: { subAudioId: '7654321' },
+  }
+  const [cacheCandidate] = playbackCacheReadCandidates(syncedTrack, settings)
+  let receivedArgs
+  globalThis.__playbackInvoke = async (command, args) => {
+    assert.equal(command, 'get_bili_audio_url')
+    receivedArgs = args
+    return {
+      url: 'https://audio.example/bili-synced',
+      bandwidth: 192_000,
+      codecs: 'mp4a.40.2',
+      candidates: [],
+    }
+  }
+
+  const resolved = await resolvePlaybackSource(syncedTrack, settings)
+
+  assert.equal(receivedArgs.cid, 7_654_321)
+  assert.match(cacheCandidate.cacheKey, /-7654321-high$/)
+  assert.equal(cacheCandidate.cacheKey, resolved?.cacheKey)
+})
+
+await run('restores a remote source from legacy local-playlist sync payload', async () => {
+  const syncedTrack = {
+    id: '-8837200123',
+    title: 'synced-song',
+    artist: 'artist',
+    album: 'album',
+    durationMs: 180_000,
+    audioUrl: '',
+    source: 'local',
+    syncPayload: {
+      channelId: 'netease',
+      audioId: '1973665667',
+    },
+  }
+  const [cacheCandidate] = playbackCacheReadCandidates(syncedTrack, settings)
+  let receivedArgs
+  globalThis.__playbackInvoke = async (command, args) => {
+    assert.equal(command, 'get_netease_song_url')
+    receivedArgs = args
+    return {
+      url: 'https://music.example/synced.flac',
+      bitrate: 999_000,
+      format: 'flac',
+      is_preview: false,
+      unavailable_reason: null,
+    }
+  }
+
+  const resolved = await resolvePlaybackSource(syncedTrack, settings)
+  const canonical = canonicalizePlaybackTrack(syncedTrack)
+
+  assert.equal(receivedArgs.songId, 1_973_665_667)
+  assert.equal(canonical.id, 'netease:1973665667')
+  assert.equal(canonical.source, 'netease')
+  assert.match(cacheCandidate.cacheKey, /^netease-1973665667-exhigh$/)
+  assert.equal(cacheCandidate.cacheKey, resolved?.cacheKey)
+})
+
+await run('accepts Android YouTube channel aliases and media URI fallback', async () => {
+  const channelTrack = {
+    id: '-100',
+    title: 'synced-youtube',
+    artist: 'artist',
+    album: '',
+    durationMs: 180_000,
+    audioUrl: '',
+    source: 'local',
+    syncPayload: {
+      channelId: 'youtubeMusic',
+      audioId: 'channel-video-id',
+    },
+  }
+  const mediaUriTrack = {
+    ...channelTrack,
+    id: '-101',
+    syncPayload: {
+      mediaUri: 'ytmusic://video/media-uri-video-id?playlistId=test',
+    },
+  }
+  const receivedVideoIds = []
+  globalThis.__playbackInvoke = async (command, args) => {
+    assert.equal(command, 'get_youtube_audio_url')
+    receivedVideoIds.push(args.videoId)
+    return [{
+      url: 'https://audio.example/youtube',
+      bitrate: 128_000,
+      mime_type: 'audio/webm; codecs="opus"',
+      content_length: 1_000_000,
+    }]
+  }
+
+  await resolvePlaybackSource(channelTrack, settings)
+  await resolvePlaybackSource(mediaUriTrack, settings)
+
+  assert.deepEqual(receivedVideoIds, ['channel-video-id', 'media-uri-video-id'])
+  assert.equal(canonicalizePlaybackTrack(channelTrack).id, 'youtube:channel-video-id')
+  assert.equal(canonicalizePlaybackTrack(mediaUriTrack).id, 'youtube:media-uri-video-id')
 })
 
 await run('surfaces the Android-aligned login requirement', async () => {

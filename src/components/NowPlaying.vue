@@ -27,6 +27,7 @@ import CustomSelect from './ui/CustomSelect.vue'
 import EditableRangeValue from './ui/EditableRangeValue.vue'
 import ContextMenu from './ui/ContextMenu.vue'
 import type { ContextMenuActionItem } from '@/utils/contextMenu'
+import { playbackSessionTrackKey } from '@/utils/playbackRequest'
 
 const emit = defineEmits<{ collapse: [] }>()
 const props = defineProps<{
@@ -400,10 +401,11 @@ function extractColorsFromCover(url: string): Promise<boolean> {
 // 支持的平台封面统一走后端代理，保证显示与取色读取同一份已验证数据
 watch(
   () => [
-    player.currentTrack?.coverUrl || '',
-    player.currentTrack?.id || '',
+    player.hasPlaybackSession,
+    player.hasPlaybackSession ? player.currentTrack?.coverUrl || '' : '',
+    player.hasPlaybackSession ? player.currentTrack?.id || '' : '',
   ] as const,
-  async ([rawUrl], _, onCleanup) => {
+  async ([, rawUrl], _, onCleanup) => {
     let active = true
     onCleanup(() => { active = false })
 
@@ -442,6 +444,7 @@ watch(
 )
 
 async function handleNowPlayingCoverError(event: Event) {
+  if (!player.hasPlaybackSession) return
   const failedSrc = (event.currentTarget as HTMLImageElement).src
   const track = player.currentTrack
   const proxiedUrl = normalizeProxiedCoverUrl(track?.coverUrl || '')
@@ -517,7 +520,13 @@ function formatSleepRemaining(seconds: number): string {
   return m > 0 ? `${m}:${s.toString().padStart(2, '0')}` : `${s}s`
 }
 
-const nowPlayingTrackKey = computed(() => player.currentTrack?.id || 'empty')
+const nowPlayingTrackKey = computed(() => (
+  playbackSessionTrackKey(
+    player.hasPlaybackSession,
+    player.currentTrack?.playlistKey,
+    player.currentTrack?.id,
+  )
+))
 const transitionStateClass = computed(() => props.transitionState ? `np-shell--${props.transitionState}` : '')
 const nowPlayingTimeKey = computed(() => `time:${nowPlayingTrackKey.value}`)
 const nowPlayingAudioInfoKey = computed(() => [
@@ -642,7 +651,7 @@ function getCoverSnapshot(): CoverSnapshot | null {
 }
 
 // 封面加载错误时重置
-watch(() => player.currentTrack?.id, () => {
+watch(nowPlayingTrackKey, () => {
   coverLoadError.value = false
   closeToolbarPopovers()
   if (!controlFeedbackPulse.value || lastControlDirection.value === 'misc') {
@@ -659,10 +668,10 @@ watch(() => player.currentTrack?.id, () => {
 let lyricFetchRequestId = 0
 
 // 当曲目切换时自动获取歌词
-watch(() => player.currentTrack?.id, async (id) => {
+watch(nowPlayingTrackKey, async (trackKey) => {
   const requestId = ++lyricFetchRequestId
   const track = player.currentTrack
-  if (!id || !track) {
+  if (trackKey === 'empty' || !track) {
     fetchedLyrics.value = []
     isFetchingLyrics.value = false
     return
@@ -672,8 +681,12 @@ watch(() => player.currentTrack?.id, async (id) => {
   fetchedLyrics.value = cachedLyrics || []
   isFetchingLyrics.value = true
   try {
-    const neteaseId = id.startsWith('netease:') ? parseInt(id.replace('netease:', '')) : undefined
-    const qqSongMid = id.startsWith('qq:') ? id.replace('qq:', '') : undefined
+    const neteaseId = track.id.startsWith('netease:')
+      ? parseInt(track.id.replace('netease:', ''))
+      : undefined
+    const qqSongMid = track.id.startsWith('qq:')
+      ? track.id.replace('qq:', '')
+      : undefined
 
     const lyrics = await invoke<any[]>('fetch_lyrics', {
       title: track.title,
@@ -738,12 +751,23 @@ onUnmounted(() => {
 })
 
 defineExpose({
-  toggleMore() { showMoreSheet.value = !showMoreSheet.value },
+  toggleMore() {
+    if (player.hasPlaybackSession) showMoreSheet.value = !showMoreSheet.value
+  },
   getCoverSnapshot,
 })
 
 // --- 右键菜单（歌曲名/歌手复制 + 封面保存） ---
 const contextMenu = ref({ show: false, x: 0, y: 0, type: '' as 'title' | 'artist' | 'cover' })
+
+watch(() => player.hasPlaybackSession, (hasSession) => {
+  if (hasSession) return
+  closeToolbarPopovers()
+  showQueue.value = false
+  showMoreSheet.value = false
+  showLtPanel.value = false
+  contextMenu.value.show = false
+})
 
 const contextMenuItems = computed(() => {
   if (contextMenu.value.type === 'title') {
@@ -1286,6 +1310,7 @@ function isSameAudioInfoToken(left: string, right: string) {
 
 // AccentBackdrop 底色（对齐 Android：主色降饱和调暗后铺底）
 const accentBgStyle = computed(() => {
+  if (!player.hasPlaybackSession) return { background: 'rgb(18, 18, 18)' }
   const bg = paletteResult.value?.accentBg
   if (!bg) return { background: 'rgb(18, 18, 18)' }
   return { background: `rgb(${bg[0]}, ${bg[1]}, ${bg[2]})` }
@@ -1293,6 +1318,7 @@ const accentBgStyle = computed(() => {
 
 // 动态主题 CSS 变量（对齐 Android M3 动态配色）
 const dynamicColorVars = computed(() => {
+  if (!player.hasPlaybackSession) return {}
   const p = paletteResult.value
   if (!p) return {}
   const lv = p.lightVibrant
@@ -1379,13 +1405,13 @@ const sliderActiveColor = computed(() => {
     <div class="np-bg-solid" :style="accentBgStyle" />
     <!-- 动态背景：封面模糊 OR WebGL 着色器，互斥 -->
     <CoverBlurBackground
-      v-if="settings.coverBlurBg"
+      v-if="player.hasPlaybackSession && settings.coverBlurBg"
       :cover-url="coverUrl"
       :blur-amount="settings.coverBlurAmount * 30"
       :darken-alpha="settings.coverBlurDarken"
     />
     <HyperBackground
-      v-else-if="settings.dynamicBackground"
+      v-else-if="player.hasPlaybackSession && settings.dynamicBackground"
       :music-level="settings.audioReactive ? player.audioLevel : 0"
       :beat-impulse="settings.audioReactive ? player.beatImpulse : 0"
       :colors="extractedColors"
@@ -1402,18 +1428,31 @@ const sliderActiveColor = computed(() => {
         <span class="material-symbols-rounded">keyboard_arrow_down</span>
       </button>
       <div class="np-header-center">
-        <span class="np-from-label">{{ t('player.now_playing') }}</span>
+        <span class="np-from-label">
+          {{ player.hasPlaybackSession ? t('player.now_playing') : t('player.not_playing') }}
+        </span>
         <transition name="np-header-meta-swap" mode="out-in">
-          <span :key="headerAlbumKey" class="np-from-name">{{ albumName }}</span>
+          <span :key="headerAlbumKey" class="np-from-name">
+            {{ player.hasPlaybackSession ? albumName : '' }}
+          </span>
         </transition>
       </div>
-      <button class="np-icon-btn" @click="showMoreSheet = !showMoreSheet">
+      <button v-if="player.hasPlaybackSession" class="np-icon-btn" @click="showMoreSheet = !showMoreSheet">
         <span class="material-symbols-rounded">more_vert</span>
       </button>
+      <span v-else class="np-header-spacer" aria-hidden="true" />
     </header>
 
+    <div v-if="!player.hasPlaybackSession" class="np-empty-state">
+      <span
+        class="material-symbols-rounded np-empty-icon"
+        :class="{ spinning: player.isLoadingAudio }"
+      >{{ player.isLoadingAudio ? 'progress_activity' : 'music_off' }}</span>
+      <h2>{{ player.isLoadingAudio ? t('player.loading') : t('player.not_playing') }}</h2>
+    </div>
+
     <!-- 双栏 -->
-    <div class="np-body" :class="[{ 'np-body--no-header': props.hideHeader }, playViewMode === 'lyrics' ? 'np-body--lyrics-mode' : 'np-body--cover-mode']">
+    <div v-else class="np-body" :class="[{ 'np-body--no-header': props.hideHeader }, playViewMode === 'lyrics' ? 'np-body--lyrics-mode' : 'np-body--cover-mode']">
       <!-- 左侧 -->
       <section class="np-left" :class="{ 'np-left--beat-active': isVisualBeatActive }">
         <div
@@ -1818,15 +1857,15 @@ const sliderActiveColor = computed(() => {
 
     <!-- 播放队列面板（Teleport 到 body，避免被全屏页开合动画的 transform 包含块限制） -->
     <Teleport to="body">
-      <QueuePanel v-if="showQueue" @close="showQueue = false" />
+      <QueuePanel v-if="player.hasPlaybackSession && showQueue" @close="showQueue = false" />
     </Teleport>
-    <AddToPlaylistDialog v-model:open="showAddToPlaylist" :track="player.currentTrack" />
-    <ListenTogetherPanel v-if="showLtPanel" class="np-lt-panel" @close="showLtPanel = false" />
+    <AddToPlaylistDialog v-if="player.hasPlaybackSession" v-model:open="showAddToPlaylist" :track="player.currentTrack" />
+    <ListenTogetherPanel v-if="player.hasPlaybackSession && showLtPanel" class="np-lt-panel" @close="showLtPanel = false" />
 
     <!-- 更多选项面板（对齐 Android MoreOptionsSheet） -->
     <Teleport to="body">
       <Transition name="more-sheet">
-      <div v-if="showMoreSheet" class="np-more-overlay" @click="showMoreSheet = false">
+      <div v-if="player.hasPlaybackSession && showMoreSheet" class="np-more-overlay" @click="showMoreSheet = false">
         <div class="np-more-sheet" @click.stop>
 
           <Transition :name="moreSheetTransition" mode="out-in">
@@ -2429,7 +2468,7 @@ const sliderActiveColor = computed(() => {
     </Teleport>
 
     <ContextMenu
-      :open="contextMenu.show"
+      :open="player.hasPlaybackSession && contextMenu.show"
       :x="contextMenu.x"
       :y="contextMenu.y"
       :items="contextMenuItems"
@@ -2453,6 +2492,36 @@ const sliderActiveColor = computed(() => {
   user-select: none;
   -webkit-user-select: none;
   transition: transform 460ms cubic-bezier(0.22, 1, 0.36, 1), opacity 300ms ease;
+}
+
+.np-empty-state {
+  position: relative;
+  z-index: 3;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.np-empty-state h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.np-empty-icon {
+  font-size: 48px;
+  opacity: 0.68;
+}
+
+.np-header-spacer {
+  width: 40px;
+  height: 40px;
 }
 
 .np-shell--opening {

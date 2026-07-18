@@ -192,6 +192,7 @@
     "play_next": "Play Next",
     "add_to_queue": "Add to Queue",
     "add_to_playlist": "Add to Playlist",
+    "add_to_local_playlist": "Add to Local Playlist",
     "track_count": "{count} tracks",
     "video_count": "{count} videos",
     "loading": "Loading...",

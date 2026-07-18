@@ -772,12 +772,21 @@ fn sync_song_to_track(song: &SyncSong) -> TrackInfo {
         .filter(|url| !url.trim().is_empty())
         .cloned()
         .or_else(|| (!song.cover_url.is_empty()).then(|| song.cover_url.clone()));
+    let playback_album = if is_bilibili {
+        song.sub_audio_id
+            .as_deref()
+            .filter(|cid| !cid.trim().is_empty())
+            .map(|cid| format!("Bilibili|{}", cid.trim()))
+            .unwrap_or_else(|| song.album.clone())
+    } else {
+        song.album.clone()
+    };
     let playlist_key = song.identity().stable_key();
     TrackInfo {
         id: full_id,
         title: song.custom_name.clone().unwrap_or_else(|| song.name.clone()),
         artist: song.custom_artist.clone().unwrap_or_else(|| song.artist.clone()),
-        album: song.album.clone(),
+        album: playback_album,
         duration_ms: song.duration_ms.max(0) as u64,
         source,
         url: String::new(), // URL 在播放时动态获取
@@ -1227,6 +1236,54 @@ mod tests {
             playlist_track_identity_key_pub(&imported),
             playlist_track_identity_key_pub(&fresh)
         );
+    }
+
+    #[test]
+    fn sync_song_conversion_restores_bilibili_cid_for_playback() {
+        let imported = sync_song_to_track(&SyncSong {
+            id: "-123456".into(),
+            name: "Bilibili song".into(),
+            album: "Synced album".into(),
+            channel_id: Some("bilibili".into()),
+            audio_id: Some("BV1sync".into()),
+            sub_audio_id: Some("987654".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(imported.id, "bilibili:BV1sync");
+        assert_eq!(imported.album, "Bilibili|987654");
+        assert_eq!(
+            imported
+                .sync_payload
+                .as_ref()
+                .and_then(|payload| payload.sub_audio_id.as_deref()),
+            Some("987654")
+        );
+    }
+
+    #[test]
+    fn sync_song_conversion_accepts_backup_source_aliases_without_optional_cid() {
+        let bilibili = sync_song_to_track(&SyncSong {
+            id: "-1".into(),
+            name: "Bilibili song".into(),
+            album: "Bilibili".into(),
+            channel_id: Some("bilibili".into()),
+            audio_id: Some("1252950228".into()),
+            ..Default::default()
+        });
+        let youtube = sync_song_to_track(&SyncSong {
+            id: "-2".into(),
+            name: "YouTube song".into(),
+            channel_id: Some("youtubeMusic".into()),
+            audio_id: Some("video-id".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(bilibili.id, "bilibili:1252950228");
+        assert_eq!(bilibili.album, "Bilibili");
+        assert_eq!(bilibili.source, TrackSource::Bilibili);
+        assert_eq!(youtube.id, "youtube:video-id");
+        assert_eq!(youtube.source, TrackSource::Youtube);
     }
 
     #[test]

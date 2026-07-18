@@ -36,7 +36,12 @@ pub struct PlaylistInfo {
 
 #[tauri::command]
 pub async fn list_playlists() -> AppResult<Vec<PlaylistInfo>> {
-    let path = playlists_path();
+    tokio::task::spawn_blocking(|| list_playlists_blocking(playlists_path()))
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+}
+
+fn list_playlists_blocking(path: std::path::PathBuf) -> AppResult<Vec<PlaylistInfo>> {
     let mut store = PlaylistStore::load(&path);
 
     // 自动清理重复歌单（同名只保留歌曲最多的）

@@ -192,6 +192,7 @@
     "play_next": "下一首播放",
     "add_to_queue": "添加到队列",
     "add_to_playlist": "添加到歌单",
+    "add_to_local_playlist": "添加到本地歌单",
     "track_count": "{count} 首",
     "video_count": "{count} 个视频",
     "loading": "加载中...",

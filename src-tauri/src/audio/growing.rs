@@ -151,9 +151,10 @@ impl GrowingAudioReader {
 
     fn known_byte_len(&self) -> Option<u64> {
         let state = self.inner.state.lock().ok()?;
-        state
-            .total_len
-            .or_else(|| state.complete.then_some(state.data.len() as u64))
+        if !state.complete {
+            return None;
+        }
+        state.total_len.or(Some(state.data.len() as u64))
     }
 }
 
@@ -243,5 +244,28 @@ impl MediaSource for GrowingAudioReader {
 
     fn byte_len(&self) -> Option<u64> {
         self.known_byte_len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GrowingAudioBuffer;
+    use symphonia::core::io::MediaSource;
+
+    #[test]
+    fn in_progress_download_is_progressive_until_complete() {
+        let buffer = GrowingAudioBuffer::new();
+        buffer.set_total_len(Some(4));
+        buffer.append(&[1, 2]);
+        let reader = buffer.reader();
+
+        assert!(!reader.is_seekable());
+        assert_eq!(reader.byte_len(), None);
+
+        buffer.append(&[3, 4]);
+        buffer.finish();
+
+        assert!(reader.is_seekable());
+        assert_eq!(reader.byte_len(), Some(4));
     }
 }

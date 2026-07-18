@@ -192,6 +192,7 @@
     "play_next": "下一首播放",
     "add_to_queue": "加入佇列",
     "add_to_playlist": "加入歌單",
+    "add_to_local_playlist": "加入本機歌單",
     "track_count": "{count} 首",
     "video_count": "{count} 個影片",
     "loading": "載入中...",

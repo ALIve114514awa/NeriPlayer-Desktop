@@ -119,9 +119,22 @@ export function getPlaybackSourceKind(track: TrackInfo): PlaybackSourceKind | nu
 
   const source = track.source?.toLowerCase()
   if (source === 'youtube_music') return 'youtube'
-  return REMOTE_SOURCE_KINDS.includes(source as PlaybackSourceKind)
-    ? source as PlaybackSourceKind
-    : null
+  if (REMOTE_SOURCE_KINDS.includes(source as PlaybackSourceKind)) {
+    return source as PlaybackSourceKind
+  }
+
+  const syncChannel = syncPayloadString(track, 'channelId', 'channel_id')?.toLowerCase()
+  if (syncChannel === 'youtube_music' || syncChannel === 'youtubemusic') {
+    return 'youtube'
+  }
+  if (REMOTE_SOURCE_KINDS.includes(syncChannel as PlaybackSourceKind)) {
+    return syncChannel as PlaybackSourceKind
+  }
+
+  const mediaUri = syncPayloadString(track, 'mediaUri', 'media_uri')
+  if (mediaUri?.toLowerCase().startsWith('ytmusic://')) return 'youtube'
+  if (!track.audioUrl?.trim() && track.album?.startsWith('Bilibili')) return 'bilibili'
+  return null
 }
 
 export function getPlaybackSourceAdapter(track: TrackInfo): PlaybackSourceAdapter | null {
@@ -130,6 +143,21 @@ export function getPlaybackSourceAdapter(track: TrackInfo): PlaybackSourceAdapte
 
 export function isRemotePlaybackTrack(track: TrackInfo): boolean {
   return getPlaybackSourceAdapter(track) !== null
+}
+
+export function canonicalizePlaybackTrack(track: TrackInfo): TrackInfo {
+  const kind = getPlaybackSourceKind(track)
+  if (!kind) return track
+  const sourceId = trackValue(track, kind).trim()
+  if (!sourceId) return track
+
+  const cid = kind === 'bilibili' ? bilibiliCid(track) : undefined
+  return {
+    ...track,
+    id: `${kind}:${sourceId}`,
+    source: kind,
+    album: cid ? `Bilibili|${cid}` : track.album,
+  }
 }
 
 export function isDirectStreamUrl(url?: string | null): boolean {
@@ -343,9 +371,26 @@ function neteaseQualityFallbacks(preferred: string): string[] {
 }
 
 function trackValue(track: TrackInfo, kind: PlaybackSourceKind): string {
+  const payloadAudioId = syncPayloadString(track, 'audioId', 'audio_id')
+  if (payloadAudioId) return payloadAudioId
+  if (kind === 'youtube') {
+    const mediaUri = syncPayloadString(track, 'mediaUri', 'media_uri')
+    const videoId = mediaUri
+      ?.match(/^ytmusic:\/\/video\/([^?]+)/i)?.[1]
+    if (videoId) return videoId
+  }
   const prefix = `${kind}:`
   if (track.id.toLowerCase().startsWith(prefix)) return track.id.slice(prefix.length)
   return track.id
+}
+
+function syncPayloadString(track: TrackInfo, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = track.syncPayload?.[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  }
+  return undefined
 }
 
 function stablePlaybackCacheKey(
@@ -364,9 +409,15 @@ function stablePlaybackCacheKey(
     return `ytmusic-${trackValue(track, kind)}-${normalizedQuality}`
   }
 
-  const cid = track.album?.match(/^Bilibili\|(\d+)/i)?.[1]
+  const cid = bilibiliCid(track)
   const base = `bili-${trackValue(track, kind)}`
   return cid ? `${base}-${cid}-${normalizedQuality}` : `${base}-${normalizedQuality}`
+}
+
+function bilibiliCid(track: TrackInfo): string | undefined {
+  const payloadCid = syncPayloadString(track, 'subAudioId', 'sub_audio_id')
+  if (payloadCid) return payloadCid
+  return track.album?.match(/^Bilibili\|(\d+)/i)?.[1]
 }
 
 function createSuccess(
@@ -557,7 +608,7 @@ function resolveBilibili(
 ): Promise<ResolvedPlaybackSource | null> {
   const biliId = trackValue(track, 'bilibili')
   const isAvid = /^\d+$/.test(biliId)
-  const cid = track.album?.match(/^Bilibili\|(\d+)/i)?.[1]
+  const cid = bilibiliCid(track)
   const quality = settings.biliQuality
 
   return invoke<{

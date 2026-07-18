@@ -1,206 +1,120 @@
-// 音频播放引擎 — 专用线程架构
-// OutputStream 是 !Send，必须在创建它的线程上操作。
-// 所有 Sink 操作通过 channel 发送到专用音频线程执行。
-
-use rodio::source::SeekError;
-use rodio::{OutputStream, Sink, Source};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::analyzer::{AudioAnalyzer, SharedAudioLevel};
-use crate::audio::buffered::{
-    AsyncPcmSource, DEFAULT_BUFFER_CAPACITY, DEFAULT_PREBUFFER_DURATION,
-};
+use crate::audio::buffered::PcmRing;
 use crate::audio::effects::{AudioEffectsParams, EqualizerSource, LoudnessSource};
 use crate::audio::growing::GrowingAudioReader;
-use crate::audio::remote::{RemoteAudioSource, SymphoniaAudioDecoder};
+use crate::audio::pcm::PcmSource;
+use crate::audio::remote::{
+    RemoteAudioSource, RemoteReadCancellation, SymphoniaAudioDecoder,
+};
 use crate::error::{AppError, AppResult};
 
-/// 播放操作 recv 超时（网络音频解码可能慢）
-const RECV_TIMEOUT: Duration = Duration::from_secs(30);
-/// 分析帧大小（样本数），~46ms@44.1kHz
-const ANALYSIS_FRAME_SIZE: usize = 2048;
-const LOCAL_PREBUFFER_DURATION: Duration = Duration::from_millis(80);
-const LOCAL_BUFFER_CAPACITY: Duration = Duration::from_secs(3);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_PREBUFFER: Duration = Duration::from_millis(80);
+const REMOTE_PREBUFFER: Duration = Duration::from_millis(800);
+const REBUFFER_TARGET: Duration = Duration::from_millis(1_500);
+const PCM_CAPACITY: Duration = Duration::from_secs(4);
+const DECODE_IDLE_SLEEP: Duration = Duration::from_millis(2);
+const READY_POLL: Duration = Duration::from_millis(20);
+const FADE_STEP: Duration = Duration::from_millis(10);
+const ANALYSIS_FRAME_SIZE: usize = 2_048;
+const PLAYBACK_SUPERSEDED: &str = "Playback request superseded";
+const SEEK_SUPERSEDED: &str = "Seek request superseded";
 
-// 音频来源——seek 时需要重建 decoder
+#[derive(Clone)]
+struct GenerationToken {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl GenerationToken {
+    fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.expected
+    }
+}
+
 #[derive(Clone)]
 enum AudioSource {
-    Bytes(Vec<u8>),
+    Bytes(Arc<[u8]>, u64),
     File(String, u64),
     Growing(GrowingAudioReader, u64),
     Remote(RemoteAudioSource, u64),
 }
 
 impl AudioSource {
+    fn duration_hint_ms(&self) -> u64 {
+        match self {
+            Self::Bytes(_, hint)
+            | Self::File(_, hint)
+            | Self::Growing(_, hint)
+            | Self::Remote(_, hint) => *hint,
+        }
+    }
+
+    fn prebuffer_duration(&self) -> Duration {
+        match self {
+            Self::Growing(_, _) | Self::Remote(_, _) => REMOTE_PREBUFFER,
+            Self::Bytes(_, _) | Self::File(_, _) => LOCAL_PREBUFFER,
+        }
+    }
+
     fn abort_if_stream(&self) {
-        if let AudioSource::Growing(reader, _) = self {
+        if let Self::Growing(reader, _) = self {
             reader.abort();
         }
     }
 
-    fn is_remote(&self) -> bool {
-        matches!(self, AudioSource::Remote(_, _))
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Bytes(_, _) => "bytes",
+            Self::File(_, _) => "file",
+            Self::Growing(_, _) => "growing",
+            Self::Remote(_, _) => "remote",
+        }
     }
 
-    fn pcm_buffer_durations(&self) -> (Duration, Duration) {
-        if matches!(self, AudioSource::Growing(_, _) | AudioSource::Remote(_, _)) {
-            (DEFAULT_PREBUFFER_DURATION, DEFAULT_BUFFER_CAPACITY)
-        } else {
-            (LOCAL_PREBUFFER_DURATION, LOCAL_BUFFER_CAPACITY)
+    fn decoder_source_for_position(
+        &self,
+        position_ms: u64,
+        read_cancellation: RemoteReadCancellation,
+    ) -> Self {
+        match self {
+            Self::Remote(reader, hint) => {
+                let reader = if position_ms == 0 {
+                    reader.clone()
+                } else {
+                    reader.seekable_clone()
+                };
+                Self::Remote(reader.with_read_cancellation(read_cancellation), *hint)
+            }
+            _ => self.clone(),
         }
     }
 }
 
-fn stop_prev_transition(
-    prev_sink: &mut Option<Arc<Sink>>,
-    prev_source: &mut Option<AudioSource>,
-    prev_cleanup_deadline: &mut Option<Instant>,
-) {
-    if let Some(old_prev) = prev_sink.take() {
-        old_prev.stop();
-    }
-    if let Some(old_prev_source) = prev_source.take() {
-        old_prev_source.abort_if_stream();
-    }
-    *prev_cleanup_deadline = None;
+#[derive(Clone, Copy)]
+enum PlayTransition {
+    Replace,
+    Crossfade { fade_out_ms: u32, fade_in_ms: u32 },
 }
 
-fn take_latest_seek(
-    position_ms: &mut u64,
-    rx: &mpsc::Receiver<AudioCmd>,
-    deferred_cmd: &mut Option<AudioCmd>,
-) {
-    loop {
-        match rx.try_recv() {
-            Ok(AudioCmd::Seek { position_ms: next }) => {
-                *position_ms = next;
-            }
-            Ok(next_cmd) => {
-                *deferred_cmd = Some(next_cmd);
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
-        }
-    }
-}
-
-/// Fade 步进间隔
-const FADE_STEP_MS: u64 = 20;
-
-fn fade_step_count(duration_ms: u32) -> u64 {
-    if duration_ms == 0 {
-        return 0;
-    }
-    u64::from(duration_ms).div_ceil(FADE_STEP_MS)
-}
-
-fn fade_progress(step: u64, duration_ms: u32) -> f32 {
-    if duration_ms == 0 {
-        return 1.0;
-    }
-    ((step * FADE_STEP_MS) as f32 / duration_ms as f32).min(1.0)
-}
-
-fn fade_timeout(duration_ms: u32) -> Duration {
-    RECV_TIMEOUT + Duration::from_millis(u64::from(duration_ms) + 1000)
-}
-
-fn receive_fade_result(rx: mpsc::Receiver<Result<(), String>>, duration_ms: u32) -> AppResult<()> {
-    rx.recv_timeout(fade_timeout(duration_ms))
-        .map_err(|error| AppError::Audio(format!("Audio thread timeout: {}", error)))?
-        .map_err(AppError::Audio)
-}
-
-fn next_transition_generation(generation: &AtomicU64) -> u64 {
-    generation.fetch_add(1, Ordering::AcqRel) + 1
-}
-
-fn cancel_active_transition(
-    transition_generation: &AtomicU64,
-    prev_sink: &mut Option<Arc<Sink>>,
-    prev_source: &mut Option<AudioSource>,
-    prev_cleanup_deadline: &mut Option<Instant>,
-) -> u64 {
-    let generation = next_transition_generation(transition_generation);
-    stop_prev_transition(prev_sink, prev_source, prev_cleanup_deadline);
-    generation
-}
-
-fn is_transition_current(generation: &AtomicU64, expected: u64) -> bool {
-    generation.load(Ordering::Acquire) == expected
-}
-
-fn is_crossfade_worker_current(
-    transition_generation: &AtomicU64,
-    expected_transition: u64,
-    playback_generation: &AtomicU64,
-    expected_playback: u64,
-) -> bool {
-    is_transition_current(transition_generation, expected_transition)
-        && playback_generation.load(Ordering::Acquire) == expected_playback
-}
-
-fn query_empty_result(result: Result<bool, mpsc::RecvTimeoutError>) -> bool {
-    match result {
-        Ok(empty) => empty,
-        Err(mpsc::RecvTimeoutError::Timeout) => false,
-        Err(mpsc::RecvTimeoutError::Disconnected) => true,
-    }
-}
-
-fn ensure_playback_generation(generation: &AtomicU64, expected: u64) -> Result<(), String> {
-    if generation.load(Ordering::Acquire) == expected {
-        Ok(())
-    } else {
-        Err("Playback request superseded".to_string())
-    }
-}
-
-fn duration_from_hint_or_else<F>(duration_hint_ms: u64, probe: F) -> u64
-where
-    F: FnOnce() -> u64,
-{
-    if duration_hint_ms > 0 {
-        duration_hint_ms
-    } else {
-        probe()
-    }
-}
-
-// 音频线程命令
 enum AudioCmd {
-    PlayBytes {
-        data: Vec<u8>,
-        duration_hint_ms: u64,
+    Play {
+        source: AudioSource,
         start_position_ms: u64,
+        transition: PlayTransition,
         playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
-    PlayFile {
-        path: String,
-        duration_hint_ms: u64,
-        start_position_ms: u64,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
-    PlayStream {
-        reader: GrowingAudioReader,
-        duration_hint_ms: u64,
-        start_position_ms: u64,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
-    PlayRemote {
-        reader: RemoteAudioSource,
-        duration_hint_ms: u64,
-        start_position_ms: u64,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
+        transition_generation: u64,
+        reply: mpsc::Sender<Result<PlaybackStarted, String>>,
     },
     Pause,
     Resume,
@@ -209,169 +123,278 @@ enum AudioCmd {
     SetSpeed(f32),
     Seek {
         position_ms: u64,
+        playback_generation: u64,
+        seek_generation: u64,
+        reply: mpsc::Sender<Result<(), String>>,
     },
-    QueryEmpty {
-        reply: mpsc::Sender<bool>,
-    },
-    /// 渐出后暂停：在 duration_ms 内将音量降至 0，然后 pause
+    QueryEmpty { reply: mpsc::Sender<bool> },
     FadeOutPause {
         duration_ms: u32,
+        transition_generation: u64,
         reply: mpsc::Sender<Result<(), String>>,
     },
-    /// resume 后渐入：先 resume，然后在 duration_ms 内将音量从 0 升至目标音量
     FadeInResume {
         duration_ms: u32,
+        transition_generation: u64,
         reply: mpsc::Sender<Result<(), String>>,
     },
-    /// Crossfade 播放新字节流：对当前 sink fade out，新 sink fade in
-    CrossfadeBytes {
-        data: Vec<u8>,
-        duration_hint_ms: u64,
-        fade_out_ms: u32,
-        fade_in_ms: u32,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
-    /// Crossfade 播放新文件
-    CrossfadeFile {
-        path: String,
-        duration_hint_ms: u64,
-        fade_out_ms: u32,
-        fade_in_ms: u32,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
-    /// Crossfade 播放边下边读的音频流
-    CrossfadeStream {
-        reader: GrowingAudioReader,
-        duration_hint_ms: u64,
-        fade_out_ms: u32,
-        fade_in_ms: u32,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
-    CrossfadeRemote {
-        reader: RemoteAudioSource,
-        duration_hint_ms: u64,
-        fade_out_ms: u32,
-        fade_in_ms: u32,
-        playback_generation: u64,
-        reply: mpsc::Sender<Result<u64, String>>,
-    },
 }
 
-struct CrossfadeWorker {
-    old_sink: Option<Arc<Sink>>,
-    new_sink: Arc<Sink>,
-    target_volume: f32,
-    fade_out_ms: u32,
-    fade_in_ms: u32,
-    transition_generation: Arc<AtomicU64>,
-    expected_transition_generation: u64,
-    playback_generation: Arc<AtomicU64>,
-    expected_playback_generation: u64,
+#[derive(Clone)]
+struct PlaybackStarted {
+    duration_ms: u64,
+    clock: Arc<PlaybackClock>,
 }
 
-// ─── AnalyzingSource ─────────────────────────────────────────────────────────
-// rodio Source 包装器：透传所有音频数据，同时在 ring buffer 中累积样本，
-// 每 ANALYSIS_FRAME_SIZE 个样本调用 AudioAnalyzer 分析一帧。
-
-struct AnalyzingSource<S> {
-    inner: S,
-    analyzer: AudioAnalyzer,
-    shared: Arc<Mutex<SharedAudioLevel>>,
-    buffer: Vec<f32>,
-    channels: u16,
-    sample_rate: u32,
-    channel_index: u16,
+struct PlaybackClock {
+    position_us: AtomicU64,
 }
 
-impl<S> AnalyzingSource<S>
-where
-    S: Source<Item = i16> + Send,
-{
-    fn new(source: S, shared: Arc<Mutex<SharedAudioLevel>>) -> Self {
-        let channels = source.channels();
-        let sample_rate = source.sample_rate();
-        let mut analyzer = AudioAnalyzer::new();
-        analyzer.configure(sample_rate, ANALYSIS_FRAME_SIZE);
+impl PlaybackClock {
+    fn new(position_ms: u64) -> Self {
         Self {
-            inner: source,
-            analyzer,
-            shared,
-            buffer: Vec::with_capacity(ANALYSIS_FRAME_SIZE),
-            channels,
-            sample_rate,
-            channel_index: 0,
+            position_us: AtomicU64::new(position_ms.saturating_mul(1_000)),
         }
     }
 
-    fn flush_buffer(&mut self) {
-        if self.buffer.is_empty() {
+    fn position_ms(&self) -> u64 {
+        self.position_us.load(Ordering::Acquire) / 1_000
+    }
+}
+
+struct AtomicF32(AtomicU32);
+
+impl AtomicF32 {
+    fn new(value: f32) -> Self {
+        Self(AtomicU32::new(value.to_bits()))
+    }
+
+    fn load(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Acquire))
+    }
+
+    fn store(&self, value: f32) {
+        self.0.store(value.to_bits(), Ordering::Release);
+    }
+}
+
+struct PlaybackShared {
+    ring: Arc<PcmRing>,
+    channels: usize,
+    sample_rate: u32,
+    paused: AtomicBool,
+    buffering: AtomicBool,
+    finished: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    volume: AtomicF32,
+    fade_gain: AtomicF32,
+    speed: AtomicF32,
+    buffer_target_frames: AtomicUsize,
+    clock: Arc<PlaybackClock>,
+    wake_lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl PlaybackShared {
+    fn buffered_frames(&self) -> usize {
+        self.ring.readable_samples() / self.channels.max(1)
+    }
+
+    fn rebuffer_frames(&self) -> usize {
+        duration_to_frames(REBUFFER_TARGET, self.sample_rate)
+    }
+
+    fn update_buffering_state(&self) {
+        if !self.buffering.load(Ordering::Acquire) {
             return;
         }
-        let result = self.analyzer.analyze_frame(&self.buffer);
-        SharedAudioLevel::try_update(&self.shared, result.level, result.beat_impulse);
-        self.buffer.clear();
+        let target = self.buffer_target_frames.load(Ordering::Acquire);
+        if self.buffered_frames() >= target || self.finished.load(Ordering::Acquire) {
+            self.buffering.store(false, Ordering::Release);
+            self.wake.notify_all();
+        }
+    }
+
+    fn begin_rebuffering(&self) {
+        if self.finished.load(Ordering::Acquire) {
+            return;
+        }
+        self.buffer_target_frames
+            .store(self.rebuffer_frames(), Ordering::Release);
+        self.buffering.store(true, Ordering::Release);
+        self.wake.notify_all();
     }
 }
 
-impl<S> Iterator for AnalyzingSource<S>
-where
-    S: Source<Item = i16> + Send,
-{
-    type Item = i16;
+struct PlaybackSession {
+    source: AudioSource,
+    stream: Stream,
+    shared: Arc<PlaybackShared>,
+    worker: Option<JoinHandle<()>>,
+    duration_ms: u64,
+    playback_generation: u64,
+}
 
-    fn next(&mut self) -> Option<i16> {
-        let sample = self.inner.next()?;
-        if self.channel_index == 0 {
-            self.buffer.push(sample as f32 / 32768.0);
-        }
-        self.channel_index = (self.channel_index + 1) % self.channels.max(1);
-        if self.buffer.len() >= ANALYSIS_FRAME_SIZE {
-            self.flush_buffer();
-        }
-        Some(sample)
-    }
+struct OutputDeviceProfile {
+    device: Device,
+    config: StreamConfig,
+    sample_format: SampleFormat,
+    name: String,
+}
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+impl OutputDeviceProfile {
+    fn open_default() -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "No default audio output device".to_string())?;
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "default output".to_string());
+        let supported = device
+            .default_output_config()
+            .map_err(|error| format!("Could not query output format: {error}"))?;
+        let sample_format = supported.sample_format();
+        let config = supported.into();
+        Ok(Self {
+            device,
+            config,
+            sample_format,
+            name,
+        })
     }
 }
 
-impl<S> Source for AnalyzingSource<S>
-where
-    S: Source<Item = i16> + Send,
-{
-    fn current_frame_len(&self) -> Option<usize> {
-        self.inner.current_frame_len()
+impl PlaybackSession {
+    fn play(&self) -> Result<(), String> {
+        self.shared.paused.store(false, Ordering::Release);
+        self.stream
+            .play()
+            .map_err(|error| format!("Could not start audio output: {error}"))
     }
 
-    fn channels(&self) -> u16 {
-        self.channels
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn total_duration(&self) -> Option<Duration> {
-        self.inner.total_duration()
-    }
-
-    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
-        let result = self.inner.try_seek(pos);
-        if result.is_ok() {
-            // seek 成功，重置分析器状态避免残留数据影响
-            self.analyzer.reset();
-            self.buffer.clear();
-            self.channel_index = 0;
+    fn pause(&self) {
+        self.shared.paused.store(true, Ordering::Release);
+        if let Err(error) = self.stream.pause() {
+            eprintln!("[cpal-output] pause failed: {error}");
         }
-        result
+    }
+
+    fn stop(&mut self) {
+        self.source.abort_if_stream();
+        self.shared.cancelled.store(true, Ordering::Release);
+        self.shared.wake.notify_all();
+        let _ = self.stream.pause();
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.shared.finished.load(Ordering::Acquire)
+            && self.shared.ring.readable_samples() < self.shared.channels
     }
 }
 
-// ─── PlayerEngine ────────────────────────────────────────────────────────────
+impl Drop for PlaybackSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct FrameResampler {
+    source: Box<dyn PcmSource>,
+    source_rate: u32,
+    current: Vec<f32>,
+    next: Vec<f32>,
+    phase: f64,
+    initialized: bool,
+    source_ended: bool,
+    finished: bool,
+}
+
+impl FrameResampler {
+    fn new(source: Box<dyn PcmSource>) -> Self {
+        let source_channels = usize::from(source.channels().max(1));
+        let source_rate = source.sample_rate().max(1);
+        Self {
+            source,
+            source_rate,
+            current: vec![0.0; source_channels],
+            next: vec![0.0; source_channels],
+            phase: 0.0,
+            initialized: false,
+            source_ended: false,
+            finished: false,
+        }
+    }
+
+    fn read_source_frame(source: &mut dyn PcmSource, frame: &mut [f32]) -> bool {
+        for sample in frame {
+            let Some(value) = source.next() else {
+                return false;
+            };
+            *sample = value;
+        }
+        true
+    }
+
+    fn initialize(&mut self) -> bool {
+        if self.initialized {
+            return !self.finished;
+        }
+        if !Self::read_source_frame(self.source.as_mut(), &mut self.current) {
+            self.finished = true;
+            return false;
+        }
+        if !Self::read_source_frame(self.source.as_mut(), &mut self.next) {
+            self.next.copy_from_slice(&self.current);
+            self.source_ended = true;
+        }
+        self.initialized = true;
+        true
+    }
+
+    fn next_frame(&mut self, output_rate: u32, speed: f32, output: &mut [f32]) -> bool {
+        if self.finished || !self.initialize() {
+            return false;
+        }
+
+        let phase = self.phase as f32;
+        let output_channels = output.len();
+        for (channel, sample) in output.iter_mut().enumerate() {
+            let current = channel_sample(&self.current, channel, output_channels);
+            let next = channel_sample(&self.next, channel, output_channels);
+            *sample = current + (next - current) * phase;
+        }
+
+        self.phase += f64::from(self.source_rate) * f64::from(speed.clamp(0.25, 3.0))
+            / f64::from(output_rate.max(1));
+        while self.phase >= 1.0 {
+            self.phase -= 1.0;
+            if self.source_ended {
+                self.finished = true;
+                break;
+            }
+            self.current.copy_from_slice(&self.next);
+            if !Self::read_source_frame(self.source.as_mut(), &mut self.next) {
+                self.next.copy_from_slice(&self.current);
+                self.source_ended = true;
+            }
+        }
+        true
+    }
+}
+
+fn channel_sample(frame: &[f32], output_channel: usize, output_channels: usize) -> f32 {
+    match (frame.len(), output_channels) {
+        (1, _) => frame[0],
+        (_, 1) => frame.iter().copied().sum::<f32>() / frame.len() as f32,
+        _ => frame.get(output_channel).copied().unwrap_or(0.0),
+    }
+}
 
 pub struct PlayerEngine {
     cmd_tx: mpsc::Sender<AudioCmd>,
@@ -381,16 +404,14 @@ pub struct PlayerEngine {
     pub speed: f32,
     pub current_path: Option<String>,
     pub duration_ms: u64,
-    play_start_time: Option<Instant>,
-    accumulated_ms: u64,
-    /// 共享音频电平数据，供 main.rs ticker 线程读取
     pub shared_audio_level: Arc<Mutex<SharedAudioLevel>>,
-    /// 共享音效参数（响度增益 + 均衡器），音频线程实时读取
-    pub effects_params: Arc<std::sync::Mutex<AudioEffectsParams>>,
+    pub effects_params: Arc<Mutex<AudioEffectsParams>>,
     playback_generation: Arc<AtomicU64>,
+    seek_generation: Arc<AtomicU64>,
+    transition_generation: Arc<AtomicU64>,
+    loaded_generation: Option<u64>,
+    clock: Option<Arc<PlaybackClock>>,
 }
-
-unsafe impl Send for PlayerEngine {}
 
 impl Default for PlayerEngine {
     fn default() -> Self {
@@ -404,1139 +425,127 @@ impl PlayerEngine {
     }
 
     pub fn with_playback_generation(playback_generation: Arc<AtomicU64>) -> Self {
-        let shared_level = SharedAudioLevel::new();
+        let shared_audio_level = SharedAudioLevel::new();
         let effects_params = AudioEffectsParams::new_shared();
-        let (tx, alive) = Self::spawn_audio_thread(
-            shared_level.clone(),
-            effects_params.clone(),
-            playback_generation.clone(),
+        let seek_generation = Arc::new(AtomicU64::new(0));
+        let transition_generation = Arc::new(AtomicU64::new(0));
+        let (cmd_tx, thread_alive) = spawn_audio_thread(
+            Arc::clone(&shared_audio_level),
+            Arc::clone(&effects_params),
+            Arc::clone(&playback_generation),
+            Arc::clone(&seek_generation),
+            Arc::clone(&transition_generation),
         );
         Self {
-            cmd_tx: tx,
-            thread_alive: alive,
+            cmd_tx,
+            thread_alive,
             is_playing: false,
             volume: 1.0,
             speed: 1.0,
             current_path: None,
             duration_ms: 0,
-            play_start_time: None,
-            accumulated_ms: 0,
-            shared_audio_level: shared_level,
+            shared_audio_level,
             effects_params,
             playback_generation,
-        }
-    }
-
-    /// 启动音频线程，返回 (命令发送端, 存活标记)
-    fn spawn_audio_thread(
-        shared_level: Arc<Mutex<SharedAudioLevel>>,
-        effects_params: Arc<std::sync::Mutex<AudioEffectsParams>>,
-        playback_generation: Arc<AtomicU64>,
-    ) -> (mpsc::Sender<AudioCmd>, Arc<AtomicBool>) {
-        let (tx, rx) = mpsc::channel::<AudioCmd>();
-        let alive = Arc::new(AtomicBool::new(true));
-        let alive_flag = alive.clone();
-
-        std::thread::Builder::new()
-            .name("audio-engine".into())
-            .spawn(move || {
-                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Self::audio_thread(rx, shared_level, effects_params, playback_generation);
-                })) {
-                    eprintln!("[audio-thread] PANIC: {:?}", e);
-                }
-                alive_flag.store(false, Ordering::SeqCst);
-                eprintln!("[audio-thread] thread exited");
-            })
-            .expect("Failed to spawn audio thread");
-
-        (tx, alive)
-    }
-
-    /// 检查并重启已死的音频线程
-    fn ensure_alive(&mut self) {
-        if !self.thread_alive.load(Ordering::SeqCst) {
-            eprintln!("[PlayerEngine] audio thread dead, respawning...");
-            let (tx, alive) = Self::spawn_audio_thread(
-                self.shared_audio_level.clone(),
-                self.effects_params.clone(),
-                self.playback_generation.clone(),
-            );
-            self.cmd_tx = tx;
-            self.thread_alive = alive;
-            let _ = self.cmd_tx.send(AudioCmd::SetVolume(self.volume));
-            if (self.speed - 1.0).abs() > 0.01 {
-                let _ = self.cmd_tx.send(AudioCmd::SetSpeed(self.speed));
-            }
-        }
-    }
-
-    fn ensure_playback_request_current(&self, expected_playback_generation: u64) -> AppResult<()> {
-        ensure_playback_generation(&self.playback_generation, expected_playback_generation)
-            .map_err(AppError::Audio)
-    }
-
-    /// 从 source 创建 decoder，成功返回 (decoder_box, duration_ms)
-    fn make_decoder(
-        source: &AudioSource,
-    ) -> Result<(Box<dyn Source<Item = i16> + Send>, u64), String> {
-        match source {
-            AudioSource::Bytes(data) => {
-                let dec = SymphoniaAudioDecoder::new(Box::new(Cursor::new(data.clone())), None)?;
-                let dur = dec
-                    .total_duration()
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                Ok((Box::new(dec), dur))
-            }
-            AudioSource::File(path, duration_hint_ms) => {
-                let dec = SymphoniaAudioDecoder::new_file(Path::new(path))?;
-                let dur = duration_from_hint_or_else(*duration_hint_ms, || {
-                    dec.total_duration()
-                        .map(|duration| duration.as_millis() as u64)
-                        .unwrap_or(0)
-                });
-                Ok((Box::new(dec), dur))
-            }
-            AudioSource::Growing(reader, duration_hint_ms) => {
-                let dec = SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)?;
-                let dur = dec
-                    .total_duration()
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(*duration_hint_ms);
-                Ok((Box::new(dec), dur))
-            }
-            AudioSource::Remote(reader, duration_hint_ms) => {
-                let dec = SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)?;
-                let dur = dec
-                    .total_duration()
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(*duration_hint_ms);
-                Ok((Box::new(dec), dur))
-            }
-        }
-    }
-
-    fn clamp_start_position(position_ms: u64, duration_ms: u64) -> u64 {
-        if duration_ms > 0 {
-            position_ms.min(duration_ms)
-        } else {
-            position_ms
-        }
-    }
-
-    fn prepare_decoder_position(
-        mut source: Box<dyn Source<Item = i16> + Send>,
-        position_ms: u64,
-    ) -> (Box<dyn Source<Item = i16> + Send>, bool) {
-        if position_ms == 0 {
-            return (source, true);
-        }
-
-        let position = Duration::from_millis(position_ms);
-        if source.try_seek(position).is_ok() {
-            eprintln!("[audio-thread] decoder seek OK: {}ms", position_ms);
-            (source, true)
-        } else {
-            eprintln!(
-                "[audio-thread] decoder seek failed, using skip fallback: {}ms",
-                position_ms
-            );
-            (Box::new(source.skip_duration(position)), false)
-        }
-    }
-
-    fn buffer_decoder(
-        source: &AudioSource,
-        decoder: Box<dyn Source<Item = i16> + Send>,
-        playback_generation: &AtomicU64,
-        expected_playback_generation: u64,
-    ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
-        let (prebuffer, capacity) = source.pcm_buffer_durations();
-        let buffered = AsyncPcmSource::new_cancellable(
-            decoder,
-            prebuffer,
-            capacity,
-            || playback_generation.load(Ordering::Acquire) != expected_playback_generation,
-        )
-        .ok_or_else(|| "Playback request superseded".to_string())?;
-        Ok(Box::new(buffered))
-    }
-
-    /// 在音频线程中执行 fade out（阻塞调用线程）
-    fn do_fade_out_sink(sink: &Sink, target_volume: f32, duration_ms: u32) {
-        if duration_ms == 0 {
-            sink.set_volume(0.0);
-            return;
-        }
-        let steps = fade_step_count(duration_ms);
-        let start_vol = target_volume;
-        for i in 1..=steps {
-            let t = fade_progress(i, duration_ms);
-            sink.set_volume(start_vol * (1.0 - t));
-            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
-        }
-        sink.set_volume(0.0);
-    }
-
-    /// 在音频线程中执行 fade in（阻塞调用线程）
-    fn do_fade_in_sink(sink: &Sink, target_volume: f32, duration_ms: u32) {
-        if duration_ms == 0 {
-            sink.set_volume(target_volume);
-            return;
-        }
-        let steps = fade_step_count(duration_ms);
-        sink.set_volume(0.0);
-        for i in 1..=steps {
-            let t = fade_progress(i, duration_ms);
-            sink.set_volume(target_volume * t);
-            std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
-        }
-        sink.set_volume(target_volume);
-    }
-
-    fn spawn_crossfade_worker(worker: CrossfadeWorker) {
-        let CrossfadeWorker {
-            old_sink,
-            new_sink,
-            target_volume,
-            fade_out_ms,
-            fade_in_ms,
+            seek_generation,
             transition_generation,
-            expected_transition_generation,
-            playback_generation,
-            expected_playback_generation,
-        } = worker;
-        let _ = std::thread::Builder::new()
-            .name("audio-crossfade".into())
-            .spawn(move || {
-                let fade_duration = fade_out_ms.max(fade_in_ms);
-                if fade_duration == 0 {
-                    if !is_crossfade_worker_current(
-                        &transition_generation,
-                        expected_transition_generation,
-                        &playback_generation,
-                        expected_playback_generation,
-                    ) {
-                        return;
-                    }
-                    if let Some(ref old) = old_sink {
-                        old.stop();
-                    }
-                    new_sink.set_volume(target_volume);
-                    return;
-                }
-
-                let steps = fade_step_count(fade_duration);
-                for i in 1..=steps {
-                    if !is_crossfade_worker_current(
-                        &transition_generation,
-                        expected_transition_generation,
-                        &playback_generation,
-                        expected_playback_generation,
-                    ) {
-                        return;
-                    }
-                    if let Some(ref old) = old_sink {
-                        let out_t = fade_progress(i, fade_out_ms);
-                        old.set_volume(target_volume * (1.0 - out_t));
-                    }
-                    let in_t = fade_progress(i, fade_in_ms);
-                    new_sink.set_volume(target_volume * in_t);
-                    std::thread::sleep(Duration::from_millis(FADE_STEP_MS));
-                }
-
-                if !is_crossfade_worker_current(
-                    &transition_generation,
-                    expected_transition_generation,
-                    &playback_generation,
-                    expected_playback_generation,
-                ) {
-                    return;
-                }
-                if let Some(ref old) = old_sink {
-                    old.stop();
-                }
-                new_sink.set_volume(target_volume);
-            });
+            loaded_generation: None,
+            clock: None,
+        }
     }
 
-    /// 音频线程主循环
-    fn audio_thread(
-        rx: mpsc::Receiver<AudioCmd>,
-        shared_level: Arc<Mutex<SharedAudioLevel>>,
-        effects_params: Arc<std::sync::Mutex<AudioEffectsParams>>,
-        playback_generation: Arc<AtomicU64>,
-    ) {
-        let (mut stream, mut handle) = match OutputStream::try_default() {
-            Ok((stream, handle)) => (Some(stream), Some(handle)),
-            Err(error) => {
-                eprintln!("[audio-thread] audio output warmup failed: {}", error);
-                (None, None)
-            }
+    fn ensure_alive(&mut self) {
+        if self.thread_alive.load(Ordering::Acquire) {
+            return;
+        }
+        eprintln!("[cpal-output] audio thread stopped, restarting");
+        let (cmd_tx, thread_alive) = spawn_audio_thread(
+            Arc::clone(&self.shared_audio_level),
+            Arc::clone(&self.effects_params),
+            Arc::clone(&self.playback_generation),
+            Arc::clone(&self.seek_generation),
+            Arc::clone(&self.transition_generation),
+        );
+        self.cmd_tx = cmd_tx;
+        self.thread_alive = thread_alive;
+        let _ = self.cmd_tx.send(AudioCmd::SetVolume(self.volume));
+        let _ = self.cmd_tx.send(AudioCmd::SetSpeed(self.speed));
+    }
+
+    fn ensure_request_current(&self, expected: u64) -> AppResult<()> {
+        if self.playback_generation.load(Ordering::Acquire) == expected {
+            Ok(())
+        } else {
+            Err(AppError::Audio(PLAYBACK_SUPERSEDED.into()))
+        }
+    }
+
+    fn start_source(
+        &mut self,
+        source: AudioSource,
+        start_position_ms: u64,
+        transition: PlayTransition,
+        expected_generation: u64,
+        current_path: String,
+    ) -> AppResult<u64> {
+        self.ensure_alive();
+        self.ensure_request_current(expected_generation)?;
+        let transition_generation =
+            self.transition_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(AudioCmd::Play {
+                source,
+                start_position_ms,
+                transition,
+                playback_generation: expected_generation,
+                transition_generation,
+                reply: reply_tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+
+        let fade_ms = match transition {
+            PlayTransition::Replace => 0,
+            PlayTransition::Crossfade {
+                fade_out_ms,
+                fade_in_ms,
+            } => fade_out_ms.max(fade_in_ms),
         };
-        let mut current_sink: Option<Arc<Sink>> = None;
-        let mut prev_sink: Option<Arc<Sink>> = None; // crossfade 过渡用
-        let mut prev_source: Option<AudioSource> = None;
-        let mut prev_cleanup_deadline: Option<Instant> = None;
-        let mut current_volume: f32 = 1.0;
-        let mut current_speed: f32 = 1.0;
-        // 保留当前音频来源，用于 seek 时重建 decoder
-        let mut current_source: Option<AudioSource> = None;
-        let mut current_duration_ms: u64 = 0;
-        let mut deferred_cmd: Option<AudioCmd> = None;
-        let transition_generation = Arc::new(AtomicU64::new(0));
-
-        macro_rules! ensure_output {
-            () => {
-                if handle.is_none() {
-                    match OutputStream::try_default() {
-                        Ok((s, h)) => {
-                            stream = Some(s);
-                            handle = Some(h);
-                        }
-                        Err(e) => {
-                            eprintln!("[audio-thread] Failed to open audio output: {}", e);
-                        }
-                    }
-                }
-            };
-        }
-
-        loop {
-            let cmd = if let Some(cmd) = deferred_cmd.take() {
-                cmd
-            } else {
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(cmd) => cmd,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let should_cleanup_prev = prev_cleanup_deadline
-                            .map(|deadline| Instant::now() >= deadline)
-                            .unwrap_or(false)
-                            || prev_sink.as_ref().map(|sink| sink.empty()).unwrap_or(false);
-                        if should_cleanup_prev {
-                            stop_prev_transition(
-                                &mut prev_sink,
-                                &mut prev_source,
-                                &mut prev_cleanup_deadline,
-                            );
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        eprintln!("[audio-thread] channel disconnected, exiting");
-                        break;
-                    }
-                }
-            };
-
-            match cmd {
-                AudioCmd::PlayBytes {
-                    data,
-                    duration_hint_ms,
-                    start_position_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        let data_len = data.len();
-                        eprintln!(
-                            "[audio-thread] PlayBytes: {} bytes, hint={}ms, start={}ms",
-                            data_len, duration_hint_ms, start_position_ms
-                        );
-
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let source = AudioSource::Bytes(data);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
-                        let start_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-                        let (dec, _) = Self::prepare_decoder_position(dec, start_ms);
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-
-                        eprintln!("[audio-thread] decoded ok, duration={}ms", duration_ms);
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-
-                        if let Some(old_source) = current_source.take() {
-                            old_source.abort_if_stream();
-                        }
-                        if let Some(old_sink) = current_sink.take() {
-                            old_sink.stop();
-                        }
-                        // 音效链: Decoder → Equalizer → Loudness → Analyzer
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        sink.set_volume(current_volume);
-                        sink.set_speed(current_speed);
-                        sink.append(analyzing);
-
-                        current_sink = Some(sink);
-                        current_source = Some(source);
-                        current_duration_ms = duration_ms;
-                        Ok(duration_ms)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::PlayFile {
-                    path,
-                    duration_hint_ms,
-                    start_position_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let source = AudioSource::File(path, duration_hint_ms);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let start_ms = Self::clamp_start_position(start_position_ms, dur);
-                        let (dec, _) = Self::prepare_decoder_position(dec, start_ms);
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-
-                        if let Some(old_source) = current_source.take() {
-                            old_source.abort_if_stream();
-                        }
-                        if let Some(old_sink) = current_sink.take() {
-                            old_sink.stop();
-                        }
-                        // 音效链: Decoder → Equalizer → Loudness → Analyzer
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        sink.set_volume(current_volume);
-                        sink.set_speed(current_speed);
-                        sink.append(analyzing);
-
-                        current_sink = Some(sink);
-                        current_source = Some(source);
-                        current_duration_ms = dur;
-                        Ok(dur)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::PlayStream {
-                    reader,
-                    duration_hint_ms,
-                    start_position_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        eprintln!(
-                            "[audio-thread] PlayStream: hint={}ms, start={}ms",
-                            duration_hint_ms, start_position_ms
-                        );
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let source = AudioSource::Growing(reader, duration_hint_ms);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
-                        let start_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-                        let (dec, _) = Self::prepare_decoder_position(dec, start_ms);
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-                        eprintln!(
-                            "[audio-thread] streaming decoder ok, duration={}ms",
-                            duration_ms
-                        );
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-
-                        if let Some(old_source) = current_source.take() {
-                            old_source.abort_if_stream();
-                        }
-                        if let Some(old_sink) = current_sink.take() {
-                            old_sink.stop();
-                        }
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        sink.set_volume(current_volume);
-                        sink.set_speed(current_speed);
-                        sink.append(analyzing);
-
-                        current_sink = Some(sink);
-                        current_source = Some(source);
-                        current_duration_ms = duration_ms;
-                        Ok(duration_ms)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::PlayRemote {
-                    reader,
-                    duration_hint_ms,
-                    start_position_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        eprintln!(
-                            "[audio-thread] PlayRemote: hint={}ms, start={}ms",
-                            duration_hint_ms, start_position_ms
-                        );
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let source = AudioSource::Remote(reader, duration_hint_ms);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let duration_ms = if dur > 0 { dur } else { duration_hint_ms };
-                        let start_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-                        let (dec, used_native_seek) = Self::prepare_decoder_position(dec, start_ms);
-                        if start_ms > 0 && !used_native_seek {
-                            return Err("Remote source is not seekable".to_string());
-                        }
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-                        eprintln!(
-                            "[audio-thread] remote decoder ok, duration={}ms",
-                            duration_ms
-                        );
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-
-                        if let Some(old_source) = current_source.take() {
-                            old_source.abort_if_stream();
-                        }
-                        if let Some(old_sink) = current_sink.take() {
-                            old_sink.stop();
-                        }
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        sink.set_volume(current_volume);
-                        sink.set_speed(current_speed);
-                        sink.append(analyzing);
-
-                        current_sink = Some(sink);
-                        current_source = Some(source);
-                        current_duration_ms = duration_ms;
-                        Ok(duration_ms)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::Pause => {
-                    cancel_active_transition(
-                        &transition_generation,
-                        &mut prev_sink,
-                        &mut prev_source,
-                        &mut prev_cleanup_deadline,
-                    );
-                    if let Some(ref sink) = current_sink {
-                        sink.pause();
-                    }
-                }
-
-                AudioCmd::Resume => {
-                    if let Some(ref sink) = current_sink {
-                        sink.play();
-                    }
-                }
-
-                AudioCmd::Stop => {
-                    cancel_active_transition(
-                        &transition_generation,
-                        &mut prev_sink,
-                        &mut prev_source,
-                        &mut prev_cleanup_deadline,
-                    );
-                    if let Some(old_source) = current_source.take() {
-                        old_source.abort_if_stream();
-                    }
-                    if let Some(sink) = current_sink.take() {
-                        sink.stop();
-                    }
-                    current_duration_ms = 0;
-                    // 重置共享电平
-                    SharedAudioLevel::reset(&shared_level);
-                }
-
-                AudioCmd::SetVolume(vol) => {
-                    current_volume = vol;
-                    if let Some(ref sink) = current_sink {
-                        sink.set_volume(vol);
-                    }
-                }
-
-                AudioCmd::SetSpeed(spd) => {
-                    current_speed = spd;
-                    if let Some(ref sink) = current_sink {
-                        sink.set_speed(spd);
-                    }
-                }
-
-                AudioCmd::Seek { position_ms } => {
-                    let mut position_ms = position_ms;
-                    take_latest_seek(&mut position_ms, &rx, &mut deferred_cmd);
-                    let result = (|| -> Result<(), String> {
-                        eprintln!("[audio-thread] Seek to {}ms", position_ms);
-
-                        // 所有来源先尝试原生 seek（symphonia 对 File 和 Cursor<Vec<u8>> 都支持）
-                        if let Some(ref sink) = current_sink {
-                            if sink.try_seek(Duration::from_millis(position_ms)).is_ok() {
-                                eprintln!("[audio-thread] Native seek OK");
-                                return Ok(());
-                            }
-                            eprintln!("[audio-thread] Native seek failed, falling back to rebuild");
-                        }
-
-                        // 原生 seek 失败时重建 decoder；远端流必须走真正 seek，不能慢速跳样本
-                        let source = current_source
-                            .as_ref()
-                            .cloned()
-                            .ok_or_else(|| "Nothing is playing".to_string())?;
-                        let seek_generation = playback_generation.load(Ordering::Acquire);
-                        let source_is_remote = source.is_remote();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let was_paused = current_sink
-                            .as_ref()
-                            .map(|s| s.is_paused())
-                            .unwrap_or(false);
-
-                        if source_is_remote {
-                            stop_prev_transition(
-                                &mut prev_sink,
-                                &mut prev_source,
-                                &mut prev_cleanup_deadline,
-                            );
-                            if let Some(old_sink) = current_sink.take() {
-                                old_sink.stop();
-                            }
-                            current_source = None;
-                        }
-
-                        let (dec, _) = Self::make_decoder(&source)?;
-                        let (dec, used_native_seek) =
-                            Self::prepare_decoder_position(dec, position_ms);
-                        if source_is_remote && !used_native_seek {
-                            return Err("Remote source is not seekable".to_string());
-                        }
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            seek_generation,
-                        )?;
-
-                        // 音效链: Decoder → Equalizer → Loudness → Analyzer
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        sink.set_volume(current_volume);
-                        sink.set_speed(current_speed);
-                        sink.append(analyzing);
-                        if was_paused {
-                            sink.pause();
-                        }
-
-                        if !source_is_remote {
-                            stop_prev_transition(
-                                &mut prev_sink,
-                                &mut prev_source,
-                                &mut prev_cleanup_deadline,
-                            );
-                            if let Some(old_sink) = current_sink.take() {
-                                old_sink.stop();
-                            }
-                        }
-
-                        current_sink = Some(sink);
-                        current_source = Some(source);
-                        eprintln!("[audio-thread] Seek via rebuild OK");
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        eprintln!("[audio-thread] Seek failed: {}", error);
-                    }
-
-                    // 远端 seek 可能会阻塞在一次 Range 请求上，完成后再次合并期间到达的连续 seek
-                    // 让拖动进度条最终落到最新位置，而不是反馈一个已经过期的中间位置
-                    if deferred_cmd.is_none() {
-                        if let Ok(next_cmd) = rx.try_recv() {
-                            match next_cmd {
-                                AudioCmd::Seek { position_ms } => {
-                                    let mut latest_position_ms = position_ms;
-                                    take_latest_seek(
-                                        &mut latest_position_ms,
-                                        &rx,
-                                        &mut deferred_cmd,
-                                    );
-                                    if deferred_cmd.is_none() {
-                                        deferred_cmd = Some(AudioCmd::Seek {
-                                            position_ms: latest_position_ms,
-                                        });
-                                    }
-                                }
-                                next_cmd => deferred_cmd = Some(next_cmd),
-                            }
-                        }
-                    }
-                }
-
-                AudioCmd::QueryEmpty { reply } => {
-                    let empty = match &current_sink {
-                        Some(sink) => sink.empty(),
-                        None => true,
-                    };
-                    let _ = reply.send(empty);
-                }
-
-                AudioCmd::FadeOutPause { duration_ms, reply } => {
-                    cancel_active_transition(
-                        &transition_generation,
-                        &mut prev_sink,
-                        &mut prev_source,
-                        &mut prev_cleanup_deadline,
-                    );
-                    let result = match current_sink.as_ref() {
-                        Some(sink) => {
-                            Self::do_fade_out_sink(sink, current_volume, duration_ms);
-                            sink.pause();
-                            // 恢复 volume 设置（pause 状态下不影响听感）
-                            sink.set_volume(current_volume);
-                            Ok(())
-                        }
-                        None => Err("Nothing is playing".to_string()),
-                    };
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::FadeInResume { duration_ms, reply } => {
-                    let result = match current_sink.as_ref() {
-                        Some(sink) => {
-                            sink.set_volume(0.0);
-                            sink.play();
-                            Self::do_fade_in_sink(sink, current_volume, duration_ms);
-                            Ok(())
-                        }
-                        None => Err("Nothing is playing".to_string()),
-                    };
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::CrossfadeBytes {
-                    data,
-                    duration_hint_ms,
-                    fade_out_ms,
-                    fade_in_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        // 创建新 sink
-                        let source = AudioSource::Bytes(data);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let duration_ms_val = if dur > 0 { dur } else { duration_hint_ms };
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let new_sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        new_sink.set_volume(0.0); // 从 0 开始 fade in
-                        new_sink.set_speed(current_speed);
-                        new_sink.append(analyzing);
-
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        let generation = cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-                        let old_source = current_source.take();
-                        let old_sink = current_sink.take();
-
-                        current_sink = Some(new_sink.clone());
-                        current_source = Some(source);
-                        current_duration_ms = duration_ms_val;
-
-                        if let Some(ref old) = old_sink {
-                            prev_sink = Some(old.clone());
-                            prev_source = old_source;
-                            prev_cleanup_deadline = Some(
-                                Instant::now()
-                                    + Duration::from_millis(
-                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
-                                    ),
-                            );
-                        } else if let Some(old_source) = old_source {
-                            old_source.abort_if_stream();
-                        }
-                        Self::spawn_crossfade_worker(CrossfadeWorker {
-                            old_sink,
-                            new_sink,
-                            target_volume: current_volume,
-                            fade_out_ms,
-                            fade_in_ms,
-                            transition_generation: transition_generation.clone(),
-                            expected_transition_generation: generation,
-                            playback_generation: playback_generation.clone(),
-                            expected_playback_generation: request_generation,
-                        });
-
-                        Ok(duration_ms_val)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::CrossfadeFile {
-                    path,
-                    duration_hint_ms,
-                    fade_out_ms,
-                    fade_in_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        // 创建新 sink
-                        let source = AudioSource::File(path, duration_hint_ms);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let new_sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        new_sink.set_volume(0.0);
-                        new_sink.set_speed(current_speed);
-                        new_sink.append(analyzing);
-
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        let generation = cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-                        let old_source = current_source.take();
-                        let old_sink = current_sink.take();
-
-                        current_sink = Some(new_sink.clone());
-                        current_source = Some(source);
-                        current_duration_ms = dur;
-
-                        if let Some(ref old) = old_sink {
-                            prev_sink = Some(old.clone());
-                            prev_source = old_source;
-                            prev_cleanup_deadline = Some(
-                                Instant::now()
-                                    + Duration::from_millis(
-                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
-                                    ),
-                            );
-                        } else if let Some(old_source) = old_source {
-                            old_source.abort_if_stream();
-                        }
-                        Self::spawn_crossfade_worker(CrossfadeWorker {
-                            old_sink,
-                            new_sink,
-                            target_volume: current_volume,
-                            fade_out_ms,
-                            fade_in_ms,
-                            transition_generation: transition_generation.clone(),
-                            expected_transition_generation: generation,
-                            playback_generation: playback_generation.clone(),
-                            expected_playback_generation: request_generation,
-                        });
-
-                        Ok(dur)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::CrossfadeStream {
-                    reader,
-                    duration_hint_ms,
-                    fade_out_ms,
-                    fade_in_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        eprintln!(
-                            "[audio-thread] CrossfadeStream: hint={}ms",
-                            duration_hint_ms
-                        );
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let source = AudioSource::Growing(reader, duration_hint_ms);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let duration_ms_val = if dur > 0 { dur } else { duration_hint_ms };
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let new_sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        new_sink.set_volume(0.0);
-                        new_sink.set_speed(current_speed);
-                        new_sink.append(analyzing);
-
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        let generation = cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-                        let old_source = current_source.take();
-                        let old_sink = current_sink.take();
-
-                        current_sink = Some(new_sink.clone());
-                        current_source = Some(source);
-                        current_duration_ms = duration_ms_val;
-
-                        if let Some(ref old) = old_sink {
-                            prev_sink = Some(old.clone());
-                            prev_source = old_source;
-                            prev_cleanup_deadline = Some(
-                                Instant::now()
-                                    + Duration::from_millis(
-                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
-                                    ),
-                            );
-                        } else if let Some(old_source) = old_source {
-                            old_source.abort_if_stream();
-                        }
-                        Self::spawn_crossfade_worker(CrossfadeWorker {
-                            old_sink,
-                            new_sink,
-                            target_volume: current_volume,
-                            fade_out_ms,
-                            fade_in_ms,
-                            transition_generation: transition_generation.clone(),
-                            expected_transition_generation: generation,
-                            playback_generation: playback_generation.clone(),
-                            expected_playback_generation: request_generation,
-                        });
-
-                        Ok(duration_ms_val)
-                    })();
-                    let _ = reply.send(result);
-                }
-
-                AudioCmd::CrossfadeRemote {
-                    reader,
-                    duration_hint_ms,
-                    fade_out_ms,
-                    fade_in_ms,
-                    playback_generation: request_generation,
-                    reply,
-                } => {
-                    let result = (|| -> Result<u64, String> {
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        eprintln!(
-                            "[audio-thread] CrossfadeRemote: hint={}ms",
-                            duration_hint_ms
-                        );
-                        ensure_output!();
-                        let h = handle
-                            .as_ref()
-                            .ok_or_else(|| "No audio output available".to_string())?;
-
-                        let source = AudioSource::Remote(reader, duration_hint_ms);
-                        let (dec, dur) = Self::make_decoder(&source)?;
-                        let duration_ms_val = if dur > 0 { dur } else { duration_hint_ms };
-                        let dec = Self::buffer_decoder(
-                            &source,
-                            dec,
-                            &playback_generation,
-                            request_generation,
-                        )?;
-
-                        let eq = EqualizerSource::new(dec, effects_params.clone());
-                        let loud = LoudnessSource::new(eq, effects_params.clone());
-                        let analyzing = AnalyzingSource::new(loud, shared_level.clone());
-
-                        let new_sink =
-                            Arc::new(Sink::try_new(h).map_err(|e| format!("Sink error: {}", e))?);
-                        new_sink.set_volume(0.0);
-                        new_sink.set_speed(current_speed);
-                        new_sink.append(analyzing);
-
-                        ensure_playback_generation(&playback_generation, request_generation)?;
-                        let generation = cancel_active_transition(
-                            &transition_generation,
-                            &mut prev_sink,
-                            &mut prev_source,
-                            &mut prev_cleanup_deadline,
-                        );
-                        let old_source = current_source.take();
-                        let old_sink = current_sink.take();
-
-                        current_sink = Some(new_sink.clone());
-                        current_source = Some(source);
-                        current_duration_ms = duration_ms_val;
-
-                        if let Some(ref old) = old_sink {
-                            prev_sink = Some(old.clone());
-                            prev_source = old_source;
-                            prev_cleanup_deadline = Some(
-                                Instant::now()
-                                    + Duration::from_millis(
-                                        fade_out_ms.max(fade_in_ms) as u64 + FADE_STEP_MS * 2,
-                                    ),
-                            );
-                        } else if let Some(old_source) = old_source {
-                            old_source.abort_if_stream();
-                        }
-                        Self::spawn_crossfade_worker(CrossfadeWorker {
-                            old_sink,
-                            new_sink,
-                            target_volume: current_volume,
-                            fade_out_ms,
-                            fade_in_ms,
-                            transition_generation: transition_generation.clone(),
-                            expected_transition_generation: generation,
-                            playback_generation: playback_generation.clone(),
-                            expected_playback_generation: request_generation,
-                        });
-
-                        Ok(duration_ms_val)
-                    })();
-                    let _ = reply.send(result);
-                }
-            }
-        }
+        let timeout = COMMAND_TIMEOUT + Duration::from_millis(u64::from(fade_ms) + 1_000);
+        let started = reply_rx
+            .recv_timeout(timeout)
+            .map_err(|error| AppError::Audio(format!("Audio thread timeout: {error}")))?
+            .map_err(AppError::Audio)?;
+        self.ensure_request_current(expected_generation)?;
+
+        self.is_playing = true;
+        self.current_path = Some(current_path);
+        self.duration_ms = started.duration_ms;
+        self.loaded_generation = Some(expected_generation);
+        self.clock = Some(started.clock);
+        Ok(started.duration_ms)
     }
 
-    /// 播放本地文件
-    pub fn play_file(&mut self, path: &str, expected_playback_generation: u64) -> AppResult<u64> {
-        self.play_file_at_with_hint(path, 0, 0, expected_playback_generation)
+    pub fn play_file(&mut self, path: &str, generation: u64) -> AppResult<u64> {
+        self.play_file_at_with_hint(path, 0, 0, generation)
     }
 
     pub fn play_file_with_hint(
         &mut self,
         path: &str,
         duration_hint_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.play_file_at_with_hint(path, duration_hint_ms, 0, expected_playback_generation)
+        self.play_file_at_with_hint(path, duration_hint_ms, 0, generation)
     }
 
     pub fn play_file_at(
         &mut self,
         path: &str,
         start_position_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.play_file_at_with_hint(path, 0, start_position_ms, expected_playback_generation)
+        self.play_file_at_with_hint(path, 0, start_position_ms, generation)
     }
 
     pub fn play_file_at_with_hint(
@@ -1544,44 +553,24 @@ impl PlayerEngine {
         path: &str,
         duration_hint_ms: u64,
         start_position_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::PlayFile {
-                path: path.to_string(),
-                duration_hint_ms,
-                start_position_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let duration_ms = rx
-            .recv_timeout(RECV_TIMEOUT)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some(path.to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-
-        Ok(duration_ms)
+        self.start_source(
+            AudioSource::File(path.into(), duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            path.into(),
+        )
     }
 
-    /// 播放内存中的音频数据
     pub fn play_bytes(
         &mut self,
         data: Vec<u8>,
         duration_hint_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.play_bytes_at(data, duration_hint_ms, 0, expected_playback_generation)
+        self.play_bytes_at(data, duration_hint_ms, 0, generation)
     }
 
     pub fn play_bytes_at(
@@ -1589,44 +578,24 @@ impl PlayerEngine {
         data: Vec<u8>,
         duration_hint_ms: u64,
         start_position_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::PlayBytes {
-                data,
-                duration_hint_ms,
-                start_position_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let duration_ms = rx
-            .recv_timeout(RECV_TIMEOUT)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some("__stream__".to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-
-        Ok(duration_ms)
+        self.start_source(
+            AudioSource::Bytes(Arc::<[u8]>::from(data), duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            "__bytes__".into(),
+        )
     }
 
-    /// 播放边下载边读取的音频流（用于远程 MP3 首播加速）
     pub fn play_stream(
         &mut self,
         reader: GrowingAudioReader,
         duration_hint_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.play_stream_at(reader, duration_hint_ms, 0, expected_playback_generation)
+        self.play_stream_at(reader, duration_hint_ms, 0, generation)
     }
 
     pub fn play_stream_at(
@@ -1634,34 +603,15 @@ impl PlayerEngine {
         reader: GrowingAudioReader,
         duration_hint_ms: u64,
         start_position_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::PlayStream {
-                reader,
-                duration_hint_ms,
-                start_position_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let duration_ms = rx
-            .recv_timeout(RECV_TIMEOUT)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some("__streaming__".to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-
-        Ok(duration_ms)
+        self.start_source(
+            AudioSource::Growing(reader, duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            "__growing__".into(),
+        )
     }
 
     pub fn play_remote_at(
@@ -1669,270 +619,199 @@ impl PlayerEngine {
         reader: RemoteAudioSource,
         duration_hint_ms: u64,
         start_position_ms: u64,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::PlayRemote {
-                reader,
-                duration_hint_ms,
-                start_position_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let duration_ms = rx
-            .recv_timeout(RECV_TIMEOUT)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some("__remote__".to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = Self::clamp_start_position(start_position_ms, duration_ms);
-
-        Ok(duration_ms)
+        self.start_source(
+            AudioSource::Remote(reader, duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            "__remote__".into(),
+        )
     }
 
-    /// 获取当前播放位置（毫秒）
-    /// 考虑播放速度：wall-clock 经过 1s 但 speed=1.5 时实际播放了 1.5s
     pub fn position_ms(&self) -> u64 {
-        let elapsed = match (self.is_playing, self.play_start_time) {
-            (true, Some(start)) => {
-                let wall_ms = start.elapsed().as_millis() as f64;
-                (wall_ms * self.speed as f64) as u64
-            }
-            _ => 0,
-        };
-        let pos = self.accumulated_ms + elapsed;
-        if self.duration_ms > 0 {
-            pos.min(self.duration_ms)
-        } else {
-            pos
-        }
+        self.clock
+            .as_ref()
+            .map(|clock| clock.position_ms())
+            .unwrap_or(0)
+            .min(self.duration_ms.max(1))
     }
 
     pub fn pause(&mut self) {
-        if let Some(start) = self.play_start_time.take() {
-            let wall_ms = start.elapsed().as_millis() as f64;
-            self.accumulated_ms += (wall_ms * self.speed as f64) as u64;
+        if self.is_playing {
+            self.transition_generation.fetch_add(1, Ordering::AcqRel);
+            let _ = self.cmd_tx.send(AudioCmd::Pause);
+            self.is_playing = false;
         }
-        let _ = self.cmd_tx.send(AudioCmd::Pause);
-        self.is_playing = false;
     }
 
     pub fn resume(&mut self) {
-        self.play_start_time = Some(Instant::now());
-        let _ = self.cmd_tx.send(AudioCmd::Resume);
-        self.is_playing = true;
+        if !self.is_playing && self.current_path.is_some() {
+            self.transition_generation.fetch_add(1, Ordering::AcqRel);
+            let _ = self.cmd_tx.send(AudioCmd::Resume);
+            self.is_playing = true;
+        }
     }
 
     pub fn stop(&mut self) {
+        self.transition_generation.fetch_add(1, Ordering::AcqRel);
         let _ = self.cmd_tx.send(AudioCmd::Stop);
         self.is_playing = false;
         self.current_path = None;
         self.duration_ms = 0;
-        self.play_start_time = None;
-        self.accumulated_ms = 0;
+        self.loaded_generation = None;
+        self.clock = None;
+        SharedAudioLevel::reset(&self.shared_audio_level);
     }
 
-    pub fn set_volume(&mut self, vol: f32) {
-        self.volume = vol.clamp(0.0, 1.0);
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
         let _ = self.cmd_tx.send(AudioCmd::SetVolume(self.volume));
     }
 
-    pub fn set_speed(&mut self, spd: f32) {
-        if self.is_playing {
-            if let Some(start) = self.play_start_time.take() {
-                let wall_ms = start.elapsed().as_millis() as f64;
-                self.accumulated_ms += (wall_ms * self.speed as f64) as u64;
-                self.play_start_time = Some(Instant::now());
-            }
-        }
-        self.speed = spd.clamp(0.25, 3.0);
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = speed.clamp(0.25, 3.0);
         let _ = self.cmd_tx.send(AudioCmd::SetSpeed(self.speed));
     }
 
-    /// 设置响度增益 (millibels, 0~1500)
-    pub fn set_loudness_gain(&self, mb: i32) {
-        let mb = mb.clamp(0, 1500);
-        if let Ok(mut p) = self.effects_params.lock() {
-            p.loudness_gain_mb = mb;
+    pub fn set_loudness_gain(&self, millibels: i32) {
+        if let Ok(mut params) = self.effects_params.lock() {
+            params.loudness_gain_mb = millibels.clamp(0, 1_500);
         }
     }
 
-    /// 设置均衡器参数
     pub fn set_equalizer(&self, enabled: bool, bands: &[i32]) {
-        if let Ok(mut p) = self.effects_params.lock() {
-            p.eq_enabled = enabled;
-            for (i, &val) in bands.iter().enumerate().take(5) {
-                p.eq_band_levels_mb[i] = val.clamp(-1500, 1500);
+        if let Ok(mut params) = self.effects_params.lock() {
+            params.eq_enabled = enabled;
+            for (index, value) in bands.iter().copied().enumerate().take(5) {
+                params.eq_band_levels_mb[index] = value.clamp(-1_500, 1_500);
             }
         }
     }
 
-    /// 重置所有音效参数
     pub fn reset_effects(&self) {
-        if let Ok(mut p) = self.effects_params.lock() {
-            p.reset();
+        if let Ok(mut params) = self.effects_params.lock() {
+            params.reset();
         }
     }
 
-    /// Seek 到指定位置
-    pub fn seek_to(&mut self, position_ms: u64) -> AppResult<()> {
+    pub fn request_seek(
+        &mut self,
+        position_ms: u64,
+        request_generation: u64,
+    ) -> AppResult<mpsc::Receiver<Result<(), String>>> {
         self.ensure_alive();
-        let position_ms = Self::clamp_start_position(position_ms, self.duration_ms);
-        self.cmd_tx
-            .send(AudioCmd::Seek { position_ms })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        self.accumulated_ms = position_ms;
-        if self.is_playing {
-            self.play_start_time = Some(Instant::now());
-        } else {
-            self.play_start_time = None;
+        self.ensure_request_current(request_generation)?;
+        if self.loaded_generation != Some(request_generation) {
+            return Err(AppError::Audio(PLAYBACK_SUPERSEDED.into()));
         }
-        Ok(())
+        let position_ms = clamp_position(position_ms, self.duration_ms);
+        self.transition_generation.fetch_add(1, Ordering::AcqRel);
+        let seek_generation = self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(AudioCmd::Seek {
+                position_ms,
+                playback_generation: request_generation,
+                seek_generation,
+                reply: reply_tx,
+            })
+            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+        Ok(reply_rx)
     }
 
-    /// 检测播放是否自然结束
+    pub fn loaded_generation(&self) -> Option<u64> {
+        self.loaded_generation
+    }
+
     pub fn is_finished(&self) -> bool {
-        let elapsed_ms = match self.play_start_time {
-            Some(start) => start.elapsed().as_millis() as u64,
-            None => return false,
-        };
-        if elapsed_ms < 3000 {
+        if !self.is_playing || self.position_ms() < 500 {
             return false;
         }
-
-        let (tx, rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
         if self
             .cmd_tx
-            .send(AudioCmd::QueryEmpty { reply: tx })
+            .send(AudioCmd::QueryEmpty { reply: reply_tx })
             .is_err()
         {
             return true;
         }
-        let sink_empty = query_empty_result(rx.recv_timeout(Duration::from_millis(200)));
-
-        if !sink_empty {
-            return false;
-        }
-
-        if self.duration_ms > 0 {
-            let pos = self.position_ms();
-            let threshold = self.duration_ms.saturating_sub(5000);
-            if pos < threshold {
-                return false;
-            }
-        }
-
-        true
+        reply_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or(false)
     }
 
-    /// 标记播放结束
     pub fn mark_ended(&mut self) {
-        if let Some(start) = self.play_start_time.take() {
-            let wall_ms = start.elapsed().as_millis() as f64;
-            self.accumulated_ms += (wall_ms * self.speed as f64) as u64;
-        }
         self.is_playing = false;
     }
 
-    /// 渐出后暂停，并等待音频线程完成渐出
     pub fn pause_with_fade(&mut self, duration_ms: u32) -> AppResult<()> {
         self.ensure_alive();
-        if let Some(start) = self.play_start_time.take() {
-            let wall_ms = start.elapsed().as_millis() as f64;
-            self.accumulated_ms += (wall_ms * self.speed as f64) as u64;
-        }
-        let (tx, rx) = mpsc::channel();
+        let transition_generation =
+            self.transition_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
             .send(AudioCmd::FadeOutPause {
                 duration_ms,
-                reply: tx,
+                transition_generation,
+                reply: reply_tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-        self.is_playing = false;
-        receive_fade_result(rx, duration_ms)
+        let result = receive_fade_result(reply_rx, duration_ms);
+        if result.is_ok() {
+            self.is_playing = false;
+        }
+        result
     }
 
-    /// 渐入后恢复，并等待音频线程完成渐入
     pub fn resume_with_fade(&mut self, duration_ms: u32) -> AppResult<()> {
         self.ensure_alive();
-        self.play_start_time = Some(Instant::now());
-        let (tx, rx) = mpsc::channel();
+        let transition_generation =
+            self.transition_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
             .send(AudioCmd::FadeInResume {
                 duration_ms,
-                reply: tx,
+                transition_generation,
+                reply: reply_tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-        self.is_playing = true;
-        receive_fade_result(rx, duration_ms)
+        let result = receive_fade_result(reply_rx, duration_ms);
+        if result.is_ok() {
+            self.is_playing = true;
+        }
+        result
     }
 
-    /// Crossfade 播放内存音频数据
     pub fn crossfade_bytes(
         &mut self,
         data: Vec<u8>,
         duration_hint_ms: u64,
         fade_out_ms: u32,
         fade_in_ms: u32,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::CrossfadeBytes {
-                data,
-                duration_hint_ms,
+        self.start_source(
+            AudioSource::Bytes(Arc::<[u8]>::from(data), duration_hint_ms),
+            0,
+            PlayTransition::Crossfade {
                 fade_out_ms,
                 fade_in_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        // crossfade 包含 fade 时间，给更长的超时
-        let timeout =
-            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
-        let duration_ms = rx
-            .recv_timeout(timeout)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some("__stream__".to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
-
-        Ok(duration_ms)
+            },
+            generation,
+            "__bytes__".into(),
+        )
     }
 
-    /// Crossfade 播放本地文件
     pub fn crossfade_file(
         &mut self,
         path: &str,
         fade_out_ms: u32,
         fade_in_ms: u32,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.crossfade_file_with_hint(
-            path,
-            0,
-            fade_out_ms,
-            fade_in_ms,
-            expected_playback_generation,
-        )
+        self.crossfade_file_with_hint(path, 0, fade_out_ms, fade_in_ms, generation)
     }
 
     pub fn crossfade_file_with_hint(
@@ -1941,77 +820,38 @@ impl PlayerEngine {
         duration_hint_ms: u64,
         fade_out_ms: u32,
         fade_in_ms: u32,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::CrossfadeFile {
-                path: path.to_string(),
-                duration_hint_ms,
+        self.start_source(
+            AudioSource::File(path.into(), duration_hint_ms),
+            0,
+            PlayTransition::Crossfade {
                 fade_out_ms,
                 fade_in_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let timeout =
-            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
-        let duration_ms = rx
-            .recv_timeout(timeout)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some(path.to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
-
-        Ok(duration_ms)
+            },
+            generation,
+            path.into(),
+        )
     }
 
-    /// Crossfade 播放边下载边读取的音频流
     pub fn crossfade_stream(
         &mut self,
         reader: GrowingAudioReader,
         duration_hint_ms: u64,
         fade_out_ms: u32,
         fade_in_ms: u32,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::CrossfadeStream {
-                reader,
-                duration_hint_ms,
+        self.start_source(
+            AudioSource::Growing(reader, duration_hint_ms),
+            0,
+            PlayTransition::Crossfade {
                 fade_out_ms,
                 fade_in_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let timeout =
-            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
-        let duration_ms = rx
-            .recv_timeout(timeout)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some("__streaming__".to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
-
-        Ok(duration_ms)
+            },
+            generation,
+            "__growing__".into(),
+        )
     }
 
     pub fn crossfade_remote(
@@ -2020,217 +860,1024 @@ impl PlayerEngine {
         duration_hint_ms: u64,
         fade_out_ms: u32,
         fade_in_ms: u32,
-        expected_playback_generation: u64,
+        generation: u64,
     ) -> AppResult<u64> {
-        self.ensure_alive();
-        self.ensure_playback_request_current(expected_playback_generation)?;
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(AudioCmd::CrossfadeRemote {
-                reader,
-                duration_hint_ms,
+        self.start_source(
+            AudioSource::Remote(reader, duration_hint_ms),
+            0,
+            PlayTransition::Crossfade {
                 fade_out_ms,
                 fade_in_ms,
-                playback_generation: expected_playback_generation,
-                reply: tx,
-            })
-            .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-
-        let timeout =
-            RECV_TIMEOUT + Duration::from_millis((fade_out_ms.max(fade_in_ms) + 1000) as u64);
-        let duration_ms = rx
-            .recv_timeout(timeout)
-            .map_err(|e| AppError::Audio(format!("Audio thread timeout: {}", e)))?
-            .map_err(AppError::Audio)?;
-        self.ensure_playback_request_current(expected_playback_generation)?;
-
-        self.is_playing = true;
-        self.current_path = Some("__remote__".to_string());
-        self.duration_ms = duration_ms;
-        self.play_start_time = Some(Instant::now());
-        self.accumulated_ms = 0;
-
-        Ok(duration_ms)
+            },
+            generation,
+            "__remote__".into(),
+        )
     }
+}
+
+fn spawn_audio_thread(
+    shared_level: Arc<Mutex<SharedAudioLevel>>,
+    effects_params: Arc<Mutex<AudioEffectsParams>>,
+    playback_generation: Arc<AtomicU64>,
+    seek_generation: Arc<AtomicU64>,
+    transition_generation: Arc<AtomicU64>,
+) -> (mpsc::Sender<AudioCmd>, Arc<AtomicBool>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let alive = Arc::new(AtomicBool::new(true));
+    let alive_for_thread = Arc::clone(&alive);
+    thread::Builder::new()
+        .name("cpal-playback-control".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                audio_control_loop(
+                    cmd_rx,
+                    shared_level,
+                    effects_params,
+                    playback_generation,
+                    seek_generation,
+                    transition_generation,
+                );
+            }));
+            if let Err(error) = result {
+                eprintln!("[cpal-output] control thread panicked: {error:?}");
+            }
+            alive_for_thread.store(false, Ordering::Release);
+        })
+        .expect("Could not start CPAL playback control thread");
+    (cmd_tx, alive)
+}
+
+fn audio_control_loop(
+    receiver: mpsc::Receiver<AudioCmd>,
+    shared_level: Arc<Mutex<SharedAudioLevel>>,
+    effects_params: Arc<Mutex<AudioEffectsParams>>,
+    playback_generation: Arc<AtomicU64>,
+    seek_generation: Arc<AtomicU64>,
+    transition_generation: Arc<AtomicU64>,
+) {
+    let mut current: Option<PlaybackSession> = None;
+    let mut volume = 1.0f32;
+    let mut speed = 1.0f32;
+    let mut deferred = None;
+    let mut output_profile = match OutputDeviceProfile::open_default() {
+        Ok(profile) => {
+            eprintln!(
+                "[cpal-output] prewarmed {}: {} Hz, {} ch",
+                profile.name,
+                profile.config.sample_rate.0,
+                profile.config.channels
+            );
+            Some(profile)
+        }
+        Err(error) => {
+            eprintln!("[cpal-output] device prewarm deferred: {error}");
+            None
+        }
+    };
+
+    loop {
+        let command = match deferred.take() {
+            Some(command) => command,
+            None => match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
+        match command {
+            AudioCmd::Play {
+                source,
+                start_position_ms,
+                transition,
+                playback_generation: expected,
+                transition_generation: expected_transition,
+                reply,
+            } => {
+                let source_label = source.label();
+                let prepared = (|| {
+                    let output = ensure_output_profile(&mut output_profile)?;
+                    prepare_session(
+                        source,
+                        start_position_ms,
+                        volume,
+                        speed,
+                        Arc::clone(&shared_level),
+                        Arc::clone(&effects_params),
+                        Arc::clone(&playback_generation),
+                        expected,
+                        None,
+                        None,
+                        output,
+                    )
+                })();
+                if prepared
+                    .as_ref()
+                    .is_err_and(|error| error.starts_with("Could not build audio output"))
+                {
+                    output_profile = None;
+                }
+                let next = match prepared {
+                    Ok(next) => next,
+                    Err(error) => {
+                        eprintln!("[cpal-output] failed to prepare {source_label}: {error}");
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
+                };
+                if let Err(error) = ensure_generation(&playback_generation, expected)
+                    .and_then(|_| {
+                        ensure_generation(&transition_generation, expected_transition)
+                    })
+                {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
+
+                next.shared.fade_gain.store(match transition {
+                    PlayTransition::Crossfade { fade_in_ms, .. } if fade_in_ms > 0 => 0.0,
+                    PlayTransition::Replace | PlayTransition::Crossfade { .. } => 1.0,
+                });
+                if let Err(error) = next.play() {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
+
+                let started = PlaybackStarted {
+                    duration_ms: next.duration_ms,
+                    clock: Arc::clone(&next.shared.clock),
+                };
+                let mut previous = current.take();
+                current = Some(next);
+
+                match transition {
+                    PlayTransition::Replace => {
+                        if let Some(mut previous) = previous.take() {
+                            previous.stop();
+                        }
+                        let _ = reply.send(Ok(started));
+                    }
+                    PlayTransition::Crossfade {
+                        fade_out_ms,
+                        fade_in_ms,
+                    } => {
+                        // 新会话已可输出，先提交播放结果；淡化不再阻塞首播完成
+                        let _ = reply.send(Ok(started));
+                        let fade_result = crossfade_sessions(
+                            previous.as_ref(),
+                            current.as_ref().expect("committed playback session"),
+                            fade_out_ms,
+                            fade_in_ms,
+                            &playback_generation,
+                            expected,
+                            &transition_generation,
+                            expected_transition,
+                        );
+                        if let Some(session) = current.as_ref() {
+                            session.shared.fade_gain.store(1.0);
+                        }
+                        if let Some(mut previous) = previous.take() {
+                            previous.stop();
+                        }
+                        if let Err(error) = fade_result {
+                            eprintln!("[cpal-output] crossfade interrupted: {error}");
+                        }
+                    }
+                }
+            }
+            AudioCmd::Pause => {
+                if let Some(session) = &current {
+                    session.pause();
+                }
+            }
+            AudioCmd::Resume => {
+                if let Some(session) = &current {
+                    let _ = session.play();
+                }
+            }
+            AudioCmd::Stop => {
+                if let Some(mut session) = current.take() {
+                    session.stop();
+                }
+                SharedAudioLevel::reset(&shared_level);
+            }
+            AudioCmd::SetVolume(next_volume) => {
+                volume = next_volume.clamp(0.0, 1.0);
+                if let Some(session) = &current {
+                    session.shared.volume.store(volume);
+                }
+            }
+            AudioCmd::SetSpeed(next_speed) => {
+                speed = next_speed.clamp(0.25, 3.0);
+                if let Some(session) = &current {
+                    session.shared.speed.store(speed);
+                }
+            }
+            AudioCmd::Seek {
+                position_ms,
+                playback_generation: expected,
+                seek_generation: expected_seek,
+                reply,
+            } => {
+                let mut latest = position_ms;
+                let mut latest_generation = expected;
+                let mut latest_seek_generation = expected_seek;
+                let mut latest_reply = reply;
+                take_latest_seek(
+                    &mut latest,
+                    &mut latest_generation,
+                    &mut latest_seek_generation,
+                    &mut latest_reply,
+                    &receiver,
+                    &mut deferred,
+                );
+                let Some(session) = current.as_ref() else {
+                    let _ = latest_reply.send(Err("Nothing is playing".into()));
+                    continue;
+                };
+                if session.playback_generation != latest_generation
+                    || ensure_generation(&playback_generation, latest_generation).is_err()
+                {
+                    let _ = latest_reply.send(Err(PLAYBACK_SUPERSEDED.into()));
+                    continue;
+                }
+                let seek_token = GenerationToken {
+                    generation: Arc::clone(&seek_generation),
+                    expected: latest_seek_generation,
+                };
+                if !seek_token.is_current() {
+                    let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
+                    continue;
+                }
+                let source = session.source.clone();
+                let paused = session.shared.paused.load(Ordering::Acquire);
+                let clock = Arc::clone(&session.shared.clock);
+                let _ = session.stream.pause();
+                let prepared = (|| {
+                    let output = ensure_output_profile(&mut output_profile)?;
+                    prepare_session(
+                        source,
+                        latest,
+                        volume,
+                        speed,
+                        Arc::clone(&shared_level),
+                        Arc::clone(&effects_params),
+                        Arc::clone(&playback_generation),
+                        latest_generation,
+                        Some(seek_token.clone()),
+                        Some(clock),
+                        output,
+                    )
+                })();
+                if prepared
+                    .as_ref()
+                    .is_err_and(|error| error.starts_with("Could not build audio output"))
+                {
+                    output_profile = None;
+                }
+                match prepared {
+                    Ok(next) => {
+                        if ensure_generation(&playback_generation, latest_generation).is_err()
+                            || !seek_token.is_current()
+                            || current.as_ref().is_none_or(|session| {
+                                session.playback_generation != latest_generation
+                            })
+                        {
+                            let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
+                            continue;
+                        }
+                        if !paused {
+                            if let Err(error) = next.play() {
+                                if let Some(session) = current.as_ref() {
+                                    let _ = session.stream.play();
+                                }
+                                let _ = latest_reply.send(Err(error));
+                                continue;
+                            }
+                        }
+                        if let Some(mut previous) = current.take() {
+                            previous.stop();
+                        }
+                        current = Some(next);
+                        let _ = latest_reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let superseded = ensure_generation(
+                            &playback_generation,
+                            latest_generation,
+                        )
+                        .is_err()
+                            || !seek_token.is_current();
+                        if !paused && !superseded {
+                            if let Some(session) = current.as_ref() {
+                                let _ = session.stream.play();
+                            }
+                        }
+                        eprintln!("[cpal-output] seek failed: {error}");
+                        let _ = latest_reply.send(Err(if superseded {
+                            SEEK_SUPERSEDED.into()
+                        } else {
+                            error
+                        }));
+                    }
+                }
+            }
+            AudioCmd::QueryEmpty { reply } => {
+                let _ = reply.send(current.as_ref().is_none_or(PlaybackSession::is_empty));
+            }
+            AudioCmd::FadeOutPause {
+                duration_ms,
+                transition_generation: expected_transition,
+                reply,
+            } => {
+                let result = if let Some(session) = &current {
+                    fade_gain(
+                        &session.shared,
+                        session.shared.fade_gain.load(),
+                        0.0,
+                        duration_ms,
+                        &playback_generation,
+                        session.playback_generation,
+                        &transition_generation,
+                        expected_transition,
+                    )
+                    .map(|_| session.pause())
+                } else {
+                    Err("Nothing is playing".into())
+                };
+                let _ = reply.send(result);
+            }
+            AudioCmd::FadeInResume {
+                duration_ms,
+                transition_generation: expected_transition,
+                reply,
+            } => {
+                let result = if let Some(session) = &current {
+                    session.shared.fade_gain.store(0.0);
+                    session.play().and_then(|_| {
+                        fade_gain(
+                            &session.shared,
+                            0.0,
+                            1.0,
+                            duration_ms,
+                            &playback_generation,
+                            session.playback_generation,
+                            &transition_generation,
+                            expected_transition,
+                        )
+                    })
+                } else {
+                    Err("Nothing is playing".into())
+                };
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    if let Some(mut session) = current {
+        session.stop();
+    }
+}
+
+fn ensure_output_profile(
+    output_profile: &mut Option<OutputDeviceProfile>,
+) -> Result<&OutputDeviceProfile, String> {
+    if output_profile.is_none() {
+        *output_profile = Some(OutputDeviceProfile::open_default()?);
+    }
+    output_profile
+        .as_ref()
+        .ok_or_else(|| "No default audio output device".to_string())
+}
+
+fn prepare_session(
+    source: AudioSource,
+    start_position_ms: u64,
+    volume: f32,
+    speed: f32,
+    shared_level: Arc<Mutex<SharedAudioLevel>>,
+    effects_params: Arc<Mutex<AudioEffectsParams>>,
+    playback_generation: Arc<AtomicU64>,
+    expected_generation: u64,
+    operation_generation: Option<GenerationToken>,
+    clock: Option<Arc<PlaybackClock>>,
+    output: &OutputDeviceProfile,
+) -> Result<PlaybackSession, String> {
+    let prepare_started = Instant::now();
+    ensure_preparation_current(
+        &playback_generation,
+        expected_generation,
+        operation_generation.as_ref(),
+    )?;
+    let decoder_started = Instant::now();
+    let session_cancelled = Arc::new(AtomicBool::new(false));
+    let read_cancellation = RemoteReadCancellation::new(
+        Arc::clone(&session_cancelled),
+        operation_generation.as_ref().map(|token| {
+            (Arc::clone(&token.generation), token.expected)
+        }),
+    );
+    let decoder_source =
+        source.decoder_source_for_position(start_position_ms, read_cancellation);
+    let mut decoder = match make_decoder(&decoder_source) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            session_cancelled.store(true, Ordering::Release);
+            return Err(error);
+        }
+    };
+    let decoder_ms = decoder_started.elapsed().as_millis();
+    let duration_ms = decoder
+        .total_duration()
+        .map(|duration| duration.as_millis() as u64)
+        .filter(|duration| *duration > 0)
+        .unwrap_or_else(|| source.duration_hint_ms());
+    let start_position_ms = clamp_position(start_position_ms, duration_ms);
+    if start_position_ms > 0 {
+        decoder
+            .try_seek(Duration::from_millis(start_position_ms))
+            .map_err(|error| format!("Could not seek decoder: {error}"))?;
+    }
+
+    let config = &output.config;
+    let channels = usize::from(config.channels.max(1));
+    let sample_rate = config.sample_rate.0.max(1);
+    let capacity_samples = duration_to_frames(PCM_CAPACITY, sample_rate)
+        .saturating_mul(channels)
+        .max(channels * 2);
+    let initial_target = duration_to_frames(source.prebuffer_duration(), sample_rate);
+    let clock = clock.unwrap_or_else(|| Arc::new(PlaybackClock::new(start_position_ms)));
+    clock
+        .position_us
+        .store(start_position_ms.saturating_mul(1_000), Ordering::Release);
+    let shared = Arc::new(PlaybackShared {
+        ring: Arc::new(PcmRing::new(capacity_samples)),
+        channels,
+        sample_rate,
+        paused: AtomicBool::new(false),
+        buffering: AtomicBool::new(true),
+        finished: AtomicBool::new(false),
+        cancelled: Arc::clone(&session_cancelled),
+        volume: AtomicF32::new(volume),
+        fade_gain: AtomicF32::new(1.0),
+        speed: AtomicF32::new(speed),
+        buffer_target_frames: AtomicUsize::new(initial_target),
+        clock,
+        wake_lock: Mutex::new(()),
+        wake: Condvar::new(),
+    });
+
+    let processed: Box<dyn PcmSource> = Box::new(LoudnessSource::new(
+        EqualizerSource::new(decoder, Arc::clone(&effects_params)),
+        effects_params,
+    ));
+    let worker = spawn_decode_worker(
+        processed,
+        Arc::clone(&shared),
+        shared_level,
+        Arc::clone(&playback_generation),
+        expected_generation,
+        operation_generation.clone(),
+    )?;
+    let output_started = Instant::now();
+    let stream = match build_output_stream(
+        &output.device,
+        config,
+        output.sample_format,
+        Arc::clone(&shared),
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            shared.cancelled.store(true, Ordering::Release);
+            shared.wake.notify_all();
+            return Err(error);
+        }
+    };
+    let output_ms = output_started.elapsed().as_millis();
+    let ready_started = Instant::now();
+    if let Err(error) = wait_until_ready(
+        &shared,
+        &playback_generation,
+        expected_generation,
+        operation_generation.as_ref(),
+    ) {
+        shared.cancelled.store(true, Ordering::Release);
+        shared.wake.notify_all();
+        let _ = stream.pause();
+        return Err(error);
+    }
+    let ready_wait_ms = ready_started.elapsed().as_millis();
+
+    eprintln!(
+        "[cpal-output] prepared {} on {}: {} Hz, {} ch, target={}ms, decoder={}ms, output={}ms, wait={}ms, total={}ms",
+        source.label(),
+        output.name,
+        sample_rate,
+        channels,
+        source.prebuffer_duration().as_millis(),
+        decoder_ms,
+        output_ms,
+        ready_wait_ms,
+        prepare_started.elapsed().as_millis()
+    );
+    Ok(PlaybackSession {
+        source,
+        stream,
+        shared,
+        worker: Some(worker),
+        duration_ms,
+        playback_generation: expected_generation,
+    })
+}
+
+fn make_decoder(source: &AudioSource) -> Result<Box<dyn PcmSource>, String> {
+    match source {
+        AudioSource::Bytes(data, _) => SymphoniaAudioDecoder::new(
+            Box::new(Cursor::new(Arc::clone(data))),
+            None,
+        )
+        .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>),
+        AudioSource::File(path, _) => SymphoniaAudioDecoder::new_file(Path::new(path))
+            .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>),
+        AudioSource::Growing(reader, _) => {
+            SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)
+                .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>)
+        }
+        AudioSource::Remote(reader, _) => {
+            SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)
+                .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>)
+        }
+    }
+}
+
+fn spawn_decode_worker(
+    source: Box<dyn PcmSource>,
+    shared: Arc<PlaybackShared>,
+    shared_level: Arc<Mutex<SharedAudioLevel>>,
+    playback_generation: Arc<AtomicU64>,
+    expected_generation: u64,
+    operation_generation: Option<GenerationToken>,
+) -> Result<JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("audio-decode".into())
+        .spawn(move || {
+            let mut converter = FrameResampler::new(source);
+            let mut frame = vec![0.0; shared.channels];
+            let mut analyzer = AudioAnalyzer::new();
+            analyzer.configure(shared.sample_rate, ANALYSIS_FRAME_SIZE);
+            let mut analysis = Vec::with_capacity(ANALYSIS_FRAME_SIZE);
+
+            while !shared.cancelled.load(Ordering::Acquire)
+                && playback_generation.load(Ordering::Acquire) == expected_generation
+                && operation_generation
+                    .as_ref()
+                    .is_none_or(GenerationToken::is_current)
+            {
+                if shared.ring.writable_samples() < shared.channels {
+                    thread::sleep(DECODE_IDLE_SLEEP);
+                    continue;
+                }
+                if !converter.next_frame(shared.sample_rate, shared.speed.load(), &mut frame) {
+                    break;
+                }
+                if !shared.ring.try_push_frame(&frame) {
+                    thread::yield_now();
+                    continue;
+                }
+
+                analysis.push(frame[0]);
+                if analysis.len() >= ANALYSIS_FRAME_SIZE {
+                    let result = analyzer.analyze_frame(&analysis);
+                    SharedAudioLevel::try_update(
+                        &shared_level,
+                        result.level,
+                        result.beat_impulse,
+                    );
+                    analysis.clear();
+                }
+                shared.update_buffering_state();
+            }
+            shared.finished.store(true, Ordering::Release);
+            shared.update_buffering_state();
+            shared.wake.notify_all();
+        })
+        .map_err(|error| format!("Could not start decoder worker: {error}"))
+}
+
+fn wait_until_ready(
+    shared: &PlaybackShared,
+    playback_generation: &AtomicU64,
+    expected_generation: u64,
+    operation_generation: Option<&GenerationToken>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut guard = shared
+        .wake_lock
+        .lock()
+        .map_err(|_| "Playback ready lock poisoned".to_string())?;
+    while shared.buffering.load(Ordering::Acquire) {
+        ensure_preparation_current(
+            playback_generation,
+            expected_generation,
+            operation_generation,
+        )?;
+        if shared.cancelled.load(Ordering::Acquire) {
+            return Err(PLAYBACK_SUPERSEDED.into());
+        }
+        if started.elapsed() >= COMMAND_TIMEOUT {
+            return Err("Timed out waiting for decoded audio".into());
+        }
+        guard = shared
+            .wake
+            .wait_timeout(guard, READY_POLL)
+            .map_err(|_| "Playback ready lock poisoned".to_string())?
+            .0;
+    }
+    ensure_preparation_current(
+        playback_generation,
+        expected_generation,
+        operation_generation,
+    )?;
+    Ok(())
+}
+
+fn build_output_stream(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    shared: Arc<PlaybackShared>,
+) -> Result<Stream, String> {
+    match sample_format {
+        SampleFormat::I8 => build_typed_stream::<i8>(device, config, shared),
+        SampleFormat::I16 => build_typed_stream::<i16>(device, config, shared),
+        SampleFormat::I32 => build_typed_stream::<i32>(device, config, shared),
+        SampleFormat::I64 => build_typed_stream::<i64>(device, config, shared),
+        SampleFormat::U8 => build_typed_stream::<u8>(device, config, shared),
+        SampleFormat::U16 => build_typed_stream::<u16>(device, config, shared),
+        SampleFormat::U32 => build_typed_stream::<u32>(device, config, shared),
+        SampleFormat::U64 => build_typed_stream::<u64>(device, config, shared),
+        SampleFormat::F32 => build_typed_stream::<f32>(device, config, shared),
+        SampleFormat::F64 => build_typed_stream::<f64>(device, config, shared),
+        other => Err(format!("Unsupported output sample format: {other}")),
+    }
+}
+
+fn build_typed_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    shared: Arc<PlaybackShared>,
+) -> Result<Stream, String>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let callback_shared = Arc::clone(&shared);
+    let channels = shared.channels;
+    let mut frame = vec![0.0f32; channels];
+    device
+        .build_output_stream(
+            config,
+            move |output: &mut [T], _| {
+                let silence = T::from_sample(0.0);
+                if callback_shared.paused.load(Ordering::Acquire)
+                    || callback_shared.buffering.load(Ordering::Acquire)
+                {
+                    output.fill(silence);
+                    return;
+                }
+
+                let mut rendered_frames = 0usize;
+                let mut underflowed = false;
+                let gain = callback_shared.volume.load() * callback_shared.fade_gain.load();
+                for output_frame in output.chunks_mut(channels) {
+                    if underflowed {
+                        output_frame.fill(silence);
+                        continue;
+                    }
+                    if !callback_shared.ring.try_pop_frame(&mut frame) {
+                        output_frame.fill(silence);
+                        callback_shared.begin_rebuffering();
+                        underflowed = true;
+                        continue;
+                    }
+
+                    for (target, sample) in output_frame.iter_mut().zip(frame.iter().copied()) {
+                        *target = T::from_sample((sample * gain).clamp(-1.0, 1.0));
+                    }
+                    rendered_frames += 1;
+                }
+                if rendered_frames > 0 {
+                    let speed = callback_shared.speed.load().clamp(0.25, 3.0);
+                    let elapsed_us = ((rendered_frames as f64 * 1_000_000.0
+                        / f64::from(callback_shared.sample_rate))
+                        * f64::from(speed)) as u64;
+                    callback_shared
+                        .clock
+                        .position_us
+                        .fetch_add(elapsed_us, Ordering::AcqRel);
+                }
+            },
+            move |error| {
+                eprintln!("[cpal-output] stream error: {error}");
+                shared.begin_rebuffering();
+            },
+            None,
+        )
+        .map_err(|error| format!("Could not build audio output: {error}"))
+}
+
+fn crossfade_sessions(
+    previous: Option<&PlaybackSession>,
+    next: &PlaybackSession,
+    fade_out_ms: u32,
+    fade_in_ms: u32,
+    playback_generation: &AtomicU64,
+    expected_generation: u64,
+    transition_generation: &AtomicU64,
+    expected_transition: u64,
+) -> Result<(), String> {
+    let duration_ms = fade_out_ms.max(fade_in_ms);
+    if duration_ms == 0 {
+        next.shared.fade_gain.store(1.0);
+        return Ok(());
+    }
+    let started = Instant::now();
+    loop {
+        ensure_generation(playback_generation, expected_generation)?;
+        ensure_generation(transition_generation, expected_transition)?;
+        let elapsed_ms = started.elapsed().as_secs_f32() * 1_000.0;
+        if let Some(previous) = previous {
+            let progress = if fade_out_ms == 0 {
+                1.0
+            } else {
+                (elapsed_ms / fade_out_ms as f32).min(1.0)
+            };
+            previous.shared.fade_gain.store(1.0 - progress);
+        }
+        let progress = if fade_in_ms == 0 {
+            1.0
+        } else {
+            (elapsed_ms / fade_in_ms as f32).min(1.0)
+        };
+        next.shared.fade_gain.store(progress);
+        if elapsed_ms >= duration_ms as f32 {
+            break;
+        }
+        thread::sleep(FADE_STEP);
+    }
+    next.shared.fade_gain.store(1.0);
+    Ok(())
+}
+
+fn fade_gain(
+    shared: &PlaybackShared,
+    from: f32,
+    to: f32,
+    duration_ms: u32,
+    playback_generation: &AtomicU64,
+    expected_generation: u64,
+    transition_generation: &AtomicU64,
+    expected_transition: u64,
+) -> Result<(), String> {
+    if duration_ms == 0 {
+        shared.fade_gain.store(to);
+        return Ok(());
+    }
+    let started = Instant::now();
+    loop {
+        ensure_generation(playback_generation, expected_generation)?;
+        ensure_generation(transition_generation, expected_transition)?;
+        let progress =
+            (started.elapsed().as_secs_f32() * 1_000.0 / duration_ms as f32).min(1.0);
+        shared.fade_gain.store(from + (to - from) * progress);
+        if progress >= 1.0 {
+            break;
+        }
+        thread::sleep(FADE_STEP);
+    }
+    Ok(())
+}
+
+fn receive_fade_result(
+    receiver: mpsc::Receiver<Result<(), String>>,
+    duration_ms: u32,
+) -> AppResult<()> {
+    receiver
+        .recv_timeout(COMMAND_TIMEOUT + Duration::from_millis(u64::from(duration_ms) + 1_000))
+        .map_err(|error| AppError::Audio(format!("Audio thread timeout: {error}")))?
+        .map_err(AppError::Audio)
+}
+
+fn ensure_generation(generation: &AtomicU64, expected: u64) -> Result<(), String> {
+    if generation.load(Ordering::Acquire) == expected {
+        Ok(())
+    } else {
+        Err(PLAYBACK_SUPERSEDED.into())
+    }
+}
+
+fn ensure_preparation_current(
+    playback_generation: &AtomicU64,
+    expected_playback_generation: u64,
+    operation_generation: Option<&GenerationToken>,
+) -> Result<(), String> {
+    ensure_generation(playback_generation, expected_playback_generation)?;
+    if operation_generation.is_none_or(GenerationToken::is_current) {
+        Ok(())
+    } else {
+        Err(SEEK_SUPERSEDED.into())
+    }
+}
+
+pub fn wait_for_seek_result(
+    receiver: mpsc::Receiver<Result<(), String>>,
+) -> AppResult<()> {
+    receiver
+        .recv_timeout(COMMAND_TIMEOUT)
+        .map_err(|error| AppError::Audio(format!("Seek command timeout: {error}")))?
+        .map_err(AppError::Audio)
+}
+
+fn take_latest_seek(
+    position_ms: &mut u64,
+    playback_generation: &mut u64,
+    seek_generation: &mut u64,
+    reply: &mut mpsc::Sender<Result<(), String>>,
+    receiver: &mpsc::Receiver<AudioCmd>,
+    deferred: &mut Option<AudioCmd>,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(AudioCmd::Seek {
+                position_ms: next,
+                playback_generation: next_generation,
+                seek_generation: next_seek_generation,
+                reply: next_reply,
+            }) => {
+                let _ = reply.send(Err(SEEK_SUPERSEDED.into()));
+                *position_ms = next;
+                *playback_generation = next_generation;
+                *seek_generation = next_seek_generation;
+                *reply = next_reply;
+            }
+            Ok(command) => {
+                *deferred = Some(command);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+fn clamp_position(position_ms: u64, duration_ms: u64) -> u64 {
+    if duration_ms > 0 {
+        position_ms.min(duration_ms)
+    } else {
+        position_ms
+    }
+}
+
+fn duration_to_frames(duration: Duration, sample_rate: u32) -> usize {
+    let frames = duration
+        .as_nanos()
+        .saturating_mul(u128::from(sample_rate.max(1)))
+        .saturating_add(999_999_999)
+        / 1_000_000_000;
+    usize::try_from(frames).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cancel_active_transition, duration_from_hint_or_else, ensure_playback_generation,
-        fade_progress, fade_step_count, is_crossfade_worker_current, is_transition_current,
-        next_transition_generation, query_empty_result, take_latest_seek, AudioCmd, AudioSource,
+        channel_sample, clamp_position, duration_to_frames, ensure_generation,
+        ensure_preparation_current, take_latest_seek, AudioCmd, GenerationToken, PlaybackClock,
+        SEEK_SUPERSEDED,
     };
-    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
-    fn fade_step_count_rounds_up_short_durations() {
-        assert_eq!(fade_step_count(0), 0);
-        assert_eq!(fade_step_count(1), 1);
-        assert_eq!(fade_step_count(20), 1);
-        assert_eq!(fade_step_count(21), 2);
-        assert_eq!(fade_step_count(500), 25);
+    fn duration_to_frames_matches_android_buffer_thresholds() {
+        assert_eq!(duration_to_frames(Duration::from_millis(800), 48_000), 38_400);
+        assert_eq!(duration_to_frames(Duration::from_millis(1_500), 48_000), 72_000);
     }
 
     #[test]
-    fn fade_progress_reaches_one_without_exceeding_range() {
-        for duration_ms in [1, 20, 21, 500] {
-            let last_step = fade_step_count(duration_ms);
-            let progress = fade_progress(last_step, duration_ms);
-            assert!((progress - 1.0).abs() < f32::EPSILON);
-            assert!((0.0..=1.0).contains(&fade_progress(0, duration_ms)));
-            assert!((0.0..=1.0).contains(&fade_progress(last_step + 1, duration_ms)));
-        }
+    fn channel_conversion_handles_mono_and_downmix() {
+        assert_eq!(channel_sample(&[0.25], 1, 2), 0.25);
+        assert!((channel_sample(&[0.25, 0.75], 0, 1) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(channel_sample(&[0.25, 0.75], 1, 2), 0.75);
     }
 
     #[test]
-    fn zero_duration_is_immediate() {
-        assert_eq!(fade_progress(1, 0), 1.0);
-    }
-
-    #[test]
-    fn known_duration_hint_skips_file_duration_probe() {
-        let probed = Cell::new(false);
-        let duration_ms = duration_from_hint_or_else(321_000, || {
-            probed.set(true);
-            123
-        });
-
-        assert_eq!(duration_ms, 321_000);
-        assert!(!probed.get());
-    }
-
-    #[test]
-    fn missing_duration_hint_uses_file_duration_probe() {
-        let probed = Cell::new(false);
-        let duration_ms = duration_from_hint_or_else(0, || {
-            probed.set(true);
-            123
-        });
-
-        assert_eq!(duration_ms, 123);
-        assert!(probed.get());
-    }
-
-    #[test]
-    fn seek_queue_keeps_only_the_latest_consecutive_position() {
-        let (tx, rx) = mpsc::channel();
-        assert!(tx.send(AudioCmd::Seek { position_ms: 100 }).is_ok());
-        assert!(tx.send(AudioCmd::Seek { position_ms: 800 }).is_ok());
-        assert!(tx.send(AudioCmd::Seek { position_ms: 1600 }).is_ok());
-
-        let mut latest = 100;
+    fn seek_queue_keeps_latest_consecutive_position() {
+        let (sender, receiver) = mpsc::channel();
+        let (first_reply, first_result) = mpsc::channel();
+        let (second_reply, second_result) = mpsc::channel();
+        let (third_reply, third_result) = mpsc::channel();
+        assert!(sender
+            .send(AudioCmd::Seek {
+                position_ms: 100,
+                playback_generation: 7,
+                seek_generation: 1,
+                reply: first_reply,
+            })
+            .is_ok());
+        assert!(sender
+            .send(AudioCmd::Seek {
+                position_ms: 800,
+                playback_generation: 7,
+                seek_generation: 2,
+                reply: second_reply,
+            })
+            .is_ok());
+        assert!(sender
+            .send(AudioCmd::Seek {
+                position_ms: 1_600,
+                playback_generation: 8,
+                seek_generation: 3,
+                reply: third_reply,
+            })
+            .is_ok());
+        let mut latest = 0;
+        let mut generation = 7;
+        let mut seek_generation = 0;
+        let (initial_reply, initial_result) = mpsc::channel();
+        let mut reply = initial_reply;
         let mut deferred = None;
-        take_latest_seek(&mut latest, &rx, &mut deferred);
 
-        assert_eq!(latest, 1600);
-        assert!(deferred.is_none());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn seek_queue_preserves_commands_after_the_seek_batch() {
-        let (tx, rx) = mpsc::channel();
-        assert!(tx.send(AudioCmd::Seek { position_ms: 100 }).is_ok());
-        assert!(tx.send(AudioCmd::Pause).is_ok());
-        assert!(tx.send(AudioCmd::Seek { position_ms: 800 }).is_ok());
-
-        let mut latest = 100;
-        let mut deferred = None;
-        take_latest_seek(&mut latest, &rx, &mut deferred);
-
-        assert_eq!(latest, 100);
-        assert!(matches!(deferred, Some(AudioCmd::Pause)));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(AudioCmd::Seek { position_ms: 800 })
-        ));
-    }
-
-    #[test]
-    fn newer_transition_invalidates_older_worker() {
-        let generation = AtomicU64::new(0);
-        let first = next_transition_generation(&generation);
-        assert!(is_transition_current(&generation, first));
-
-        let second = next_transition_generation(&generation);
-        assert!(!is_transition_current(&generation, first));
-        assert!(is_transition_current(&generation, second));
-    }
-
-    #[test]
-    fn cancelling_transition_clears_previous_source_and_deadline() {
-        let transition_generation = AtomicU64::new(0);
-        let mut prev_sink = None;
-        let mut prev_source = Some(AudioSource::Bytes(vec![1, 2, 3]));
-        let mut deadline = Some(Instant::now() + Duration::from_secs(1));
-
-        let generation = cancel_active_transition(
-            &transition_generation,
-            &mut prev_sink,
-            &mut prev_source,
-            &mut deadline,
+        take_latest_seek(
+            &mut latest,
+            &mut generation,
+            &mut seek_generation,
+            &mut reply,
+            &receiver,
+            &mut deferred,
         );
 
-        assert_eq!(generation, 1);
-        assert!(is_transition_current(&transition_generation, generation));
-        assert!(prev_source.is_none());
-        assert!(deadline.is_none());
-    }
-
-    #[test]
-    fn playback_generation_rejects_superseded_request() {
-        let generation = AtomicU64::new(7);
-        assert!(ensure_playback_generation(&generation, 7).is_ok());
-
-        generation.store(8, Ordering::Release);
+        assert_eq!(latest, 1_600);
+        assert_eq!(generation, 8);
+        assert_eq!(seek_generation, 3);
         assert_eq!(
-            ensure_playback_generation(&generation, 7),
-            Err("Playback request superseded".to_string())
+            initial_result.recv().expect("initial result"),
+            Err(SEEK_SUPERSEDED.into())
         );
-        assert!(ensure_playback_generation(&generation, 8).is_ok());
+        assert_eq!(
+            first_result.recv().expect("first result"),
+            Err(SEEK_SUPERSEDED.into())
+        );
+        assert_eq!(
+            second_result.recv().expect("second result"),
+            Err(SEEK_SUPERSEDED.into())
+        );
+        reply.send(Ok(())).expect("latest reply");
+        assert_eq!(third_result.recv().expect("third result"), Ok(()));
+        assert!(deferred.is_none());
     }
 
     #[test]
-    fn crossfade_worker_requires_current_transition_and_playback_generation() {
-        let transition_generation = AtomicU64::new(3);
-        let playback_generation = AtomicU64::new(11);
-
-        assert!(is_crossfade_worker_current(
-            &transition_generation,
-            3,
-            &playback_generation,
-            11,
-        ));
-
-        transition_generation.store(4, Ordering::Release);
-        assert!(!is_crossfade_worker_current(
-            &transition_generation,
-            3,
-            &playback_generation,
-            11,
-        ));
-
-        transition_generation.store(3, Ordering::Release);
-        playback_generation.store(12, Ordering::Release);
-        assert!(!is_crossfade_worker_current(
-            &transition_generation,
-            3,
-            &playback_generation,
-            11,
-        ));
+    fn playback_generation_rejects_superseded_work() {
+        let generation = AtomicU64::new(7);
+        assert!(ensure_generation(&generation, 7).is_ok());
+        generation.store(8, Ordering::Release);
+        assert!(ensure_generation(&generation, 7).is_err());
     }
 
     #[test]
-    fn query_timeout_does_not_report_track_finished() {
-        assert!(!query_empty_result(Err(mpsc::RecvTimeoutError::Timeout)));
-        assert!(query_empty_result(Err(
-            mpsc::RecvTimeoutError::Disconnected
-        )));
-        assert!(query_empty_result(Ok(true)));
-        assert!(!query_empty_result(Ok(false)));
+    fn newer_seek_cancels_only_the_old_seek_preparation() {
+        let playback_generation = AtomicU64::new(7);
+        let seek_generation = Arc::new(AtomicU64::new(2));
+        let old_seek = GenerationToken {
+            generation: Arc::clone(&seek_generation),
+            expected: 1,
+        };
+        let current_seek = GenerationToken {
+            generation: seek_generation,
+            expected: 2,
+        };
+
+        assert!(ensure_preparation_current(
+            &playback_generation,
+            7,
+            Some(&old_seek),
+        )
+        .is_err());
+        assert!(ensure_preparation_current(
+            &playback_generation,
+            7,
+            Some(&current_seek),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn playback_clock_starts_at_requested_position() {
+        let clock = PlaybackClock::new(12_345);
+        assert_eq!(clock.position_ms(), 12_345);
+    }
+
+    #[test]
+    fn known_duration_clamps_seek() {
+        assert_eq!(clamp_position(20_000, 10_000), 10_000);
+        assert_eq!(clamp_position(20_000, 0), 20_000);
     }
 }

@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { usePlayerStore, type TrackInfo, normalizeTrack, displayAlbum } from '@/stores/player'
+import {
+  usePlayerStore,
+  type TrackInfo,
+  normalizeTrack,
+  displayAlbum,
+  tracePlaybackUi,
+} from '@/stores/player'
 import { useDownloadStore } from '@/stores/download'
 import { useToastStore } from '@/stores/toast'
 import { useI18n } from 'vue-i18n'
@@ -294,6 +300,11 @@ function shufflePlay() {
 }
 
 function playTrack(track: TrackInfo) {
+  tracePlaybackUi(
+    'local_playlist_click',
+    track,
+    `selectionMode=${selectionMode.value}, filteredTracks=${filteredTracks.value.length}`,
+  )
   if (selectionMode.value) {
     toggleSelected(trackSelectionKey(track))
     return

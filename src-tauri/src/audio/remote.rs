@@ -1,15 +1,13 @@
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE, REFERER, USER_AGENT};
 use reqwest::StatusCode;
-use rodio::source::SeekError as RodioSeekError;
-use rodio::Source;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -21,9 +19,11 @@ use symphonia::core::units::{self, Time, TimeBase};
 use symphonia::default::{get_codecs, get_probe};
 
 use crate::error::{AppError, AppResult};
+use crate::audio::pcm::{PcmSeekError, PcmSource};
 
 const REMOTE_INITIAL_BLOCK_BYTES: u64 = 128 * 1024;
-const REMOTE_FETCH_BLOCK_BYTES: u64 = 512 * 1024;
+const REMOTE_FETCH_BLOCK_BYTES: u64 = 256 * 1024;
+const REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 const REMOTE_DECODER_BUFFER_BYTES: usize = 128 * 1024;
 const REMOTE_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const REMOTE_PREFETCH_LOW_WATER_MS: u64 = 5_000;
@@ -74,6 +74,65 @@ impl Drop for CacheStaging {
 pub struct RemoteAudioSource {
     inner: Arc<RemoteAudioInner>,
     pos: u64,
+    access_mode: RemoteAccessMode,
+    read_cancellation: Option<RemoteReadCancellation>,
+}
+
+#[derive(Clone)]
+pub struct RemoteReadCancellation {
+    session_cancelled: Arc<AtomicBool>,
+    operation_generation: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl RemoteReadCancellation {
+    pub fn new(
+        session_cancelled: Arc<AtomicBool>,
+        operation_generation: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Self {
+        Self {
+            session_cancelled,
+            operation_generation,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.session_cancelled.load(Ordering::Acquire)
+            || self
+                .operation_generation
+                .as_ref()
+                .is_some_and(|(generation, expected)| {
+                    generation.load(Ordering::Acquire) != *expected
+                })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteAccessMode {
+    StandardSeekable,
+    FragmentedProgressive,
+    FragmentedSeekable,
+}
+
+impl RemoteAccessMode {
+    fn for_url(url: &str) -> Self {
+        if is_fragmented_mp4_url(url) {
+            Self::FragmentedProgressive
+        } else {
+            Self::StandardSeekable
+        }
+    }
+
+    fn is_seekable(self) -> bool {
+        !matches!(self, Self::FragmentedProgressive)
+    }
+
+    fn demand_fetch_block_bytes(self) -> u64 {
+        if matches!(self, Self::FragmentedSeekable) {
+            REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES
+        } else {
+            REMOTE_FETCH_BLOCK_BYTES
+        }
+    }
 }
 
 struct RemoteAudioInner {
@@ -85,9 +144,29 @@ struct RemoteAudioInner {
     cache: Mutex<Vec<CachedSegment>>,
     disk_ranges: Mutex<Vec<CachedRange>>,
     in_flight: Mutex<HashSet<u64>>,
+    range_available: Condvar,
     last_read_pos: Mutex<u64>,
     disk_cache: Option<RemoteAudioCache>,
     cache_finalize_started: AtomicBool,
+    playback_generation: Arc<AtomicU64>,
+    expected_generation: u64,
+}
+
+impl RemoteAudioInner {
+    fn playback_cancelled(&self) -> bool {
+        self.playback_generation.load(Ordering::Acquire) != self.expected_generation
+    }
+
+    fn ensure_playback_current(&self) -> io::Result<()> {
+        if self.playback_cancelled() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "playback request superseded",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 struct CachedSegment {
@@ -155,12 +234,49 @@ impl RemoteAudioSource {
         referer: String,
         disk_cache: Option<RemoteAudioCache>,
         duration_hint_ms: u64,
+        playback_generation: Arc<AtomicU64>,
+        expected_generation: u64,
     ) -> AppResult<Self> {
-        let (total_len, initial_segment) = match probe_range_len(&client, &url, &referer).await {
+        if playback_generation.load(Ordering::Acquire) != expected_generation {
+            return Err(AppError::Audio("Playback request superseded".into()));
+        }
+        let access_mode = RemoteAccessMode::for_url(&url);
+        let range_result = {
+            let range_probe = probe_range_len(&client, &url, &referer);
+            tokio::pin!(range_probe);
+            tokio::select! {
+                result = &mut range_probe => result,
+                () = wait_for_generation_change(
+                    &playback_generation,
+                    expected_generation,
+                ) => {
+                    return Err(AppError::Audio("Playback request superseded".into()));
+                }
+            }
+        };
+        let (total_len, initial_segment) = match range_result {
             Ok((len, data)) => (Some(len), Some(CachedSegment { start: 0, data })),
             Err(range_error) => {
+                if playback_generation.load(Ordering::Acquire) != expected_generation {
+                    return Err(AppError::Audio("Playback request superseded".into()));
+                }
                 eprintln!("[remote-audio] range probe failed: {}", range_error);
-                (probe_head_len(&client, &url, &referer).await?, None)
+                let head_len = {
+                    let head_probe = probe_head_len(&client, &url, &referer);
+                    tokio::pin!(head_probe);
+                    tokio::select! {
+                        result = &mut head_probe => result?,
+                        () = wait_for_generation_change(
+                            &playback_generation,
+                            expected_generation,
+                        ) => {
+                            return Err(AppError::Audio(
+                                "Playback request superseded".into(),
+                            ));
+                        }
+                    }
+                };
+                (head_len, None)
             }
         };
 
@@ -186,10 +302,16 @@ impl RemoteAudioSource {
             cache: Mutex::new(cache),
             disk_ranges: Mutex::new(Vec::new()),
             in_flight: Mutex::new(HashSet::new()),
+            range_available: Condvar::new(),
             last_read_pos: Mutex::new(0),
             disk_cache,
             cache_finalize_started: AtomicBool::new(false),
+            playback_generation,
+            expected_generation,
         });
+        inner
+            .ensure_playback_current()
+            .map_err(|err| AppError::Audio(err.to_string()))?;
         if let Some((start, data)) = initial_disk_segment {
             write_disk_range(&inner, start, &data);
         }
@@ -198,11 +320,50 @@ impl RemoteAudioSource {
         Ok(Self {
             inner,
             pos: 0,
+            access_mode,
+            read_cancellation: None,
         })
     }
 
     pub fn byte_len(&self) -> u64 {
         self.inner.total_len
+    }
+
+    pub fn seekable_clone(&self) -> Self {
+        let access_mode = match self.access_mode {
+            RemoteAccessMode::FragmentedProgressive => RemoteAccessMode::FragmentedSeekable,
+            mode => mode,
+        };
+        Self {
+            inner: Arc::clone(&self.inner),
+            pos: 0,
+            access_mode,
+            read_cancellation: self.read_cancellation.clone(),
+        }
+    }
+
+    pub fn with_read_cancellation(mut self, cancellation: RemoteReadCancellation) -> Self {
+        self.read_cancellation = Some(cancellation);
+        self
+    }
+
+    fn read_cancelled(&self) -> bool {
+        self.inner.playback_cancelled()
+            || self
+                .read_cancellation
+                .as_ref()
+                .is_some_and(RemoteReadCancellation::is_cancelled)
+    }
+
+    fn ensure_read_current(&self) -> io::Result<()> {
+        if self.read_cancelled() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote read superseded",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn read_cached(&self, out: &mut [u8]) -> usize {
@@ -250,17 +411,37 @@ impl RemoteAudioSource {
     }
 
     fn fetch_from_current_position(&self, wanted_len: usize) -> io::Result<()> {
+        self.ensure_read_current()?;
         let start = self.pos;
         if start >= self.inner.total_len {
             return Ok(());
         }
+        if self.wait_for_prefetch(start) {
+            return Ok(());
+        }
+        if !claim_prefetch_start(&self.inner, start) {
+            if self.wait_for_prefetch(start) || self.has_cached_position() {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote range is already being fetched",
+            ));
+        }
 
-        let wanted = wanted_len.max(REMOTE_FETCH_BLOCK_BYTES as usize) as u64;
+        let wanted = wanted_len.max(self.access_mode.demand_fetch_block_bytes() as usize) as u64;
         let end = start
             .saturating_add(wanted)
             .saturating_sub(1)
             .min(self.inner.total_len.saturating_sub(1));
-        let data = fetch_range_block(&self.inner, start, end)?;
+        let fetched = fetch_range_block(
+            &self.inner,
+            start,
+            end,
+            self.read_cancellation.as_ref(),
+        );
+        release_prefetch_start(&self.inner, start);
+        let data = fetched?;
 
         if data.is_empty() {
             return Ok(());
@@ -278,16 +459,42 @@ impl RemoteAudioSource {
         replenish_prefetch_window(&self.inner, self.pos);
         Ok(())
     }
+
+    fn wait_for_prefetch(&self, start: u64) -> bool {
+        let started = Instant::now();
+        let Ok(mut in_flight) = self.inner.in_flight.lock() else {
+            return false;
+        };
+        while in_flight.contains(&start) && started.elapsed() < REMOTE_REQUEST_TIMEOUT {
+            if self.read_cancelled() {
+                return false;
+            }
+            in_flight = match self
+                .inner
+                .range_available
+                .wait_timeout(in_flight, Duration::from_millis(50))
+            {
+                Ok((guard, _)) => guard,
+                Err(error) => error.into_inner().0,
+            };
+        }
+        drop(in_flight);
+
+        self.has_cached_position()
+            || disk_cached_len(&self.inner, start, 1).is_some()
+    }
 }
 
 impl Read for RemoteAudioSource {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.ensure_read_current()?;
         if out.is_empty() || self.pos >= self.inner.total_len {
             return Ok(0);
         }
 
         let mut total_read = 0usize;
         while total_read < out.len() && self.pos < self.inner.total_len {
+            self.ensure_read_current()?;
             let read = self.read_cached(&mut out[total_read..]);
             if read > 0 {
                 self.pos += read as u64;
@@ -316,6 +523,7 @@ impl Read for RemoteAudioSource {
 
 impl Seek for RemoteAudioSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.ensure_read_current()?;
         let next = match pos {
             SeekFrom::Start(offset) => offset as i128,
             SeekFrom::Current(offset) => self.pos as i128 + offset as i128,
@@ -346,7 +554,6 @@ impl RemoteAudioCache {
         let digest = hex::encode(Sha256::digest(cache_key.as_bytes()));
         let shard = digest.get(0..2).unwrap_or("00");
         let dir = root.join(shard);
-        std::fs::create_dir_all(&dir).map_err(|err| AppError::Other(err.to_string()))?;
         Ok(Self {
             cache_root: root,
             cache_dir: dir.clone(),
@@ -369,13 +576,14 @@ impl RemoteAudioCache {
 
         let marker_text = std::fs::read_to_string(&self.ready_path).ok()?;
         let marker = parse_cache_marker(marker_text.trim())?;
-        let (path, marked_length, expected_sha256, needs_upgrade) = match &marker {
-            CacheMarker::Legacy { content_length } => (
-                self.legacy_data_path.clone(),
-                *content_length,
-                None,
-                true,
-            ),
+        let (path, marked_length, expected_sha256, file_name) = match &marker {
+            CacheMarker::Legacy { .. } => {
+                eprintln!(
+                    "[remote-audio] ignoring legacy cache marker: {}",
+                    self.ready_path.display()
+                );
+                return None;
+            }
             CacheMarker::Validated {
                 content_length,
                 sha256,
@@ -383,43 +591,25 @@ impl RemoteAudioCache {
             } => (
                 self.resolve_marker_file(file_name)?,
                 *content_length,
-                Some(sha256.as_str()),
-                false,
+                sha256.as_str(),
+                file_name.as_str(),
             ),
         };
 
-        let validated = match validate_cache_file(
+        if let Err(err) = validate_published_cache_file(
             &path,
             marked_length,
             self.expected_content_length,
             self.expected_duration_ms,
             expected_sha256,
+            file_name,
         ) {
-            Ok(validated) => validated,
-            Err(err) => {
-                eprintln!(
-                    "[remote-audio] ignoring invalid cache {}: {}",
-                    path.display(),
-                    err
-                );
-                return None;
-            }
-        };
-
-        if needs_upgrade {
-            let file_name = path.file_name().and_then(|value| value.to_str())?;
-            let upgraded = format_cache_marker(
-                validated.content_length,
-                &validated.sha256,
-                file_name,
+            eprintln!(
+                "[remote-audio] ignoring invalid cache {}: {}",
+                path.display(),
+                err
             );
-            if let Err(err) = atomic_write_cache_marker(&self.ready_path, &upgraded) {
-                eprintln!(
-                    "[remote-audio] legacy cache marker upgrade failed for {}: {}",
-                    path.display(),
-                    err
-                );
-            }
+            return None;
         }
 
         if let Ok(mut published) = self.published_path.lock() {
@@ -496,11 +686,6 @@ impl RemoteAudioCache {
                 return Ok(());
             }
         }
-        prune_disk_cache(
-            &self.cache_root,
-            self.max_cache_bytes.saturating_sub(total_len),
-            &self.digest,
-        );
         if let Ok(mut published) = self.published_path.lock() {
             *published = None;
         }
@@ -608,6 +793,12 @@ impl RemoteAudioCache {
         );
         atomic_write_cache_marker(&self.ready_path, &marker)?;
         sync_parent_directory(&self.ready_path)?;
+        prune_disk_cache(
+            &self.cache_root,
+            self.max_cache_bytes
+                .saturating_sub(validated.content_length),
+            &self.digest,
+        );
         Ok(())
     }
 
@@ -631,6 +822,7 @@ impl RemoteAudioCache {
 }
 
 fn create_cache_staging(directory: &Path, digest: &str) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(directory)?;
     let staging_file = tempfile::Builder::new()
         .prefix(&format!("{}.", digest))
         .suffix(".part")
@@ -721,6 +913,53 @@ fn validate_cache_file(
         sha256,
     };
     remember_validated_audio_cache(path, modified, &validated);
+    Ok(validated)
+}
+
+fn validate_published_cache_file(
+    path: &Path,
+    marked_length: u64,
+    expected_length: Option<u64>,
+    expected_duration_ms: Option<u64>,
+    expected_sha256: &str,
+    file_name: &str,
+) -> Result<ValidatedCacheFile, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("cache metadata unavailable: {}", err))?;
+    let content_length = metadata.len();
+    if !metadata.is_file() || content_length == 0 || content_length != marked_length {
+        return Err(format!(
+            "cache length mismatch: marked={}, actual={}",
+            marked_length, content_length
+        ));
+    }
+    if expected_length.is_some_and(|expected| expected != content_length) {
+        return Err(format!(
+            "cache length does not match source: expected={}, actual={}",
+            expected_length.unwrap_or_default(),
+            content_length
+        ));
+    }
+    let expected_suffix = format!(".{}.audio", expected_sha256);
+    if !file_name.ends_with(&expected_suffix) {
+        return Err("cache file name does not match published SHA-256".into());
+    }
+
+    if reuse_validated_audio_cache(
+        path,
+        content_length,
+        metadata.modified().ok(),
+        Some(expected_sha256),
+    )
+    .is_none()
+    {
+        validate_audio_file(path, expected_duration_ms)?;
+    }
+    let validated = ValidatedCacheFile {
+        content_length,
+        sha256: expected_sha256.to_string(),
+    };
+    remember_validated_audio_cache(path, metadata.modified().ok(), &validated);
     Ok(validated)
 }
 
@@ -934,12 +1173,26 @@ fn cache_file_digest(path: &Path) -> Option<&str> {
 
 impl MediaSource for RemoteAudioSource {
     fn is_seekable(&self) -> bool {
-        true
+        self.access_mode.is_seekable()
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.inner.total_len)
+        self.access_mode
+            .is_seekable()
+            .then_some(self.inner.total_len)
     }
+}
+
+fn is_fragmented_mp4_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .ok()
+        .map(|url| url.path().to_ascii_lowercase().ends_with(".m4s"))
+        .unwrap_or_else(|| {
+            value
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|path| path.to_ascii_lowercase().ends_with(".m4s"))
+        })
 }
 
 pub struct SymphoniaAudioDecoder {
@@ -948,7 +1201,7 @@ pub struct SymphoniaAudioDecoder {
     format: Box<dyn FormatReader>,
     track_id: u32,
     total_duration: Option<Time>,
-    buffer: SampleBuffer<i16>,
+    buffer: SampleBuffer<f32>,
     spec: SignalSpec,
 }
 
@@ -1036,14 +1289,14 @@ impl SymphoniaAudioDecoder {
         })
     }
 
-    fn copy_buffer(decoded: AudioBufferRef<'_>, spec: &SignalSpec) -> SampleBuffer<i16> {
+    fn copy_buffer(decoded: AudioBufferRef<'_>, spec: &SignalSpec) -> SampleBuffer<f32> {
         let duration = units::Duration::from(decoded.capacity() as u64);
-        let mut buffer = SampleBuffer::<i16>::new(duration, *spec);
+        let mut buffer = SampleBuffer::<f32>::new(duration, *spec);
         buffer.copy_interleaved_ref(decoded);
         buffer
     }
 
-    fn refine_position(&mut self, seek_res: SeekedTo) -> Result<(), RodioSeekError> {
+    fn refine_position(&mut self, seek_res: SeekedTo) -> Result<(), PcmSeekError> {
         let mut samples_to_pass = seek_res.required_ts.saturating_sub(seek_res.actual_ts);
         let packet = loop {
             let candidate = self
@@ -1077,9 +1330,9 @@ impl SymphoniaAudioDecoder {
 }
 
 impl Iterator for SymphoniaAudioDecoder {
-    type Item = i16;
+    type Item = f32;
 
-    fn next(&mut self) -> Option<i16> {
+    fn next(&mut self) -> Option<f32> {
         if self.current_frame_offset >= self.buffer.len() {
             let mut decode_errors = 0usize;
             let decoded = loop {
@@ -1107,11 +1360,7 @@ impl Iterator for SymphoniaAudioDecoder {
     }
 }
 
-impl Source for SymphoniaAudioDecoder {
-    fn current_frame_len(&self) -> Option<usize> {
-        Some(self.buffer.len().saturating_sub(self.current_frame_offset))
-    }
-
+impl PcmSource for SymphoniaAudioDecoder {
     fn channels(&self) -> u16 {
         self.spec.channels.count() as u16
     }
@@ -1124,7 +1373,7 @@ impl Source for SymphoniaAudioDecoder {
         self.total_duration.map(time_to_duration)
     }
 
-    fn try_seek(&mut self, pos: Duration) -> Result<(), RodioSeekError> {
+    fn try_seek(&mut self, pos: Duration) -> Result<(), PcmSeekError> {
         let time = seek_target_time(self.total_duration, pos);
 
         let channel_offset = self.current_frame_offset % self.channels() as usize;
@@ -1225,16 +1474,34 @@ async fn probe_range_len(
     Ok((content_range.total, data))
 }
 
-fn fetch_range_block(inner: &RemoteAudioInner, start: u64, end: u64) -> io::Result<Vec<u8>> {
-    tauri::async_runtime::block_on(fetch_range_block_async(inner, start, end))
+fn fetch_range_block(
+    inner: &RemoteAudioInner,
+    start: u64,
+    end: u64,
+    read_cancellation: Option<&RemoteReadCancellation>,
+) -> io::Result<Vec<u8>> {
+    tauri::async_runtime::block_on(fetch_range_block_async(
+        inner,
+        start,
+        end,
+        read_cancellation,
+    ))
 }
 
 async fn fetch_range_block_async(
     inner: &RemoteAudioInner,
     start: u64,
     end: u64,
+    read_cancellation: Option<&RemoteReadCancellation>,
 ) -> io::Result<Vec<u8>> {
-    let result = async {
+    inner.ensure_playback_current()?;
+    if read_cancellation.is_some_and(RemoteReadCancellation::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "remote read superseded",
+        ));
+    }
+    let request = async {
         let response = inner
             .client
             .get(&inner.url)
@@ -1251,9 +1518,19 @@ async fn fetch_range_block_async(
             .and_then(parse_content_range);
         let bytes = response.bytes().await?;
         Ok::<_, reqwest::Error>((status, content_range, bytes.to_vec()))
-    }
-    .await
-    .map_err(|err| io::Error::other(err.to_string()))?;
+    };
+    tokio::pin!(request);
+    let result = tokio::select! {
+        result = &mut request => {
+            result.map_err(|err| io::Error::other(err.to_string()))?
+        }
+        () = wait_for_remote_read_cancellation(inner, read_cancellation) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote read superseded",
+            ));
+        }
+    };
 
     let (status, content_range, data) = result;
     if status == StatusCode::PARTIAL_CONTENT {
@@ -1285,6 +1562,23 @@ async fn fetch_range_block_async(
         "unexpected remote range status: {}",
         status
     )))
+}
+
+async fn wait_for_remote_read_cancellation(
+    inner: &RemoteAudioInner,
+    read_cancellation: Option<&RemoteReadCancellation>,
+) {
+    while !inner.playback_cancelled()
+        && !read_cancellation.is_some_and(RemoteReadCancellation::is_cancelled)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_generation_change(generation: &AtomicU64, expected: u64) {
+    while generation.load(Ordering::Acquire) == expected {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn prefetch_window(total_len: u64, duration_hint_ms: u64) -> PrefetchWindow {
@@ -1358,6 +1652,9 @@ fn prefetch_plan(
 }
 
 fn replenish_prefetch_window(inner: &Arc<RemoteAudioInner>, read_pos: u64) {
+    if inner.playback_cancelled() {
+        return;
+    }
     let cached_end = contiguous_cached_end(inner, read_pos);
     if cached_end >= inner.total_len {
         try_mark_disk_cache_ready(inner);
@@ -1372,16 +1669,14 @@ fn replenish_prefetch_window(inner: &Arc<RemoteAudioInner>, read_pos: u64) {
 }
 
 fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
+    let Some(first_start) = claim_prefetch_sequence_start(&inner, plan) else {
+        return;
+    };
     tauri::async_runtime::spawn(async move {
-        let mut next_start = plan.start.min(inner.total_len);
+        let mut next_start = first_start;
         while next_start < inner.total_len && next_start < plan.target_end {
-            let cached_end = contiguous_cached_end(&inner, next_start);
-            if cached_end > next_start {
-                next_start = cached_end;
-                continue;
-            }
-
-            if !claim_prefetch_start(&inner, next_start) {
+            if inner.playback_cancelled() {
+                release_prefetch_start(&inner, next_start);
                 break;
             }
 
@@ -1391,11 +1686,10 @@ fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
                 .saturating_sub(1)
                 .min(plan.target_end.saturating_sub(1))
                 .min(inner.total_len.saturating_sub(1));
-            let result = fetch_range_block_async(&inner, fetch_start, end).await;
-            release_prefetch_start(&inner, fetch_start);
+            let result = fetch_range_block_async(&inner, fetch_start, end, None).await;
 
-            match result {
-                Ok(data) if data.is_empty() => break,
+            let should_stop = match result {
+                Ok(data) if data.is_empty() => true,
                 Ok(data) => {
                     let fetched_end = fetch_start.saturating_add(data.len() as u64);
                     if let Ok(mut cache) = inner.cache.lock() {
@@ -1409,20 +1703,42 @@ fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
                         }
                     }
                     next_start = fetched_end.max(fetch_start.saturating_add(1));
+                    false
                 }
                 Err(err) => {
                     eprintln!(
                         "[remote-audio] prefetch stopped at {}: {}",
                         fetch_start, err
                     );
-                    break;
+                    true
                 }
+            };
+            release_prefetch_start(&inner, fetch_start);
+            if should_stop {
+                break;
+            }
+            if next_start >= inner.total_len || next_start >= plan.target_end {
+                break;
+            }
+            if !claim_prefetch_start(&inner, next_start) {
+                break;
             }
         }
         if next_start >= inner.total_len {
             try_mark_disk_cache_ready(&inner);
         }
     });
+}
+
+fn claim_prefetch_sequence_start(
+    inner: &RemoteAudioInner,
+    plan: PrefetchPlan,
+) -> Option<u64> {
+    let start = plan.start.min(inner.total_len);
+    if start >= inner.total_len || start >= plan.target_end {
+        return None;
+    }
+    claim_prefetch_start(inner, start).then_some(start)
 }
 
 fn contiguous_cached_end(inner: &RemoteAudioInner, pos: u64) -> u64 {
@@ -1580,6 +1896,8 @@ fn claim_prefetch_start(inner: &RemoteAudioInner, start: u64) -> bool {
 fn release_prefetch_start(inner: &RemoteAudioInner, start: u64) {
     if let Ok(mut in_flight) = inner.in_flight.lock() {
         in_flight.remove(&start);
+        drop(in_flight);
+        inner.range_available.notify_all();
     }
 }
 
@@ -1690,22 +2008,30 @@ fn skip_back_tiny_bit(mut time: Time) -> Time {
     time
 }
 
-fn seek_error(message: String) -> RodioSeekError {
-    RodioSeekError::Other(Box::new(io::Error::other(message)))
+fn seek_error(message: String) -> PcmSeekError {
+    PcmSeekError::new(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_duration_is_suspicious, format_cache_marker, parse_cache_marker,
-        parse_content_range, prefetch_plan, prefetch_window, ranges_cover_source,
-        remember_validated_audio_cache, reuse_validated_audio_cache, seek_target_time,
-        track_duration, CacheMarker, CachedRange, HttpByteRange, PrefetchPlan, PrefetchWindow,
-        RemoteAudioCache, ValidatedCacheFile,
+        cache_duration_is_suspicious, format_cache_marker, is_fragmented_mp4_url,
+        claim_prefetch_sequence_start, parse_cache_marker, parse_content_range, prefetch_plan,
+        prefetch_window,
+        ranges_cover_source,
+        release_prefetch_start, remember_validated_audio_cache, reuse_validated_audio_cache,
+        seek_target_time, track_duration, CacheMarker, CachedRange, CachedSegment, HttpByteRange,
+        PrefetchPlan, PrefetchWindow, RemoteAccessMode, RemoteAudioCache, RemoteAudioInner,
+        RemoteAudioSource, RemoteReadCancellation, SymphoniaAudioDecoder, ValidatedCacheFile,
         REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES, REMOTE_PREFETCH_FALLBACK_TARGET_BYTES,
     };
     use reqwest::header::HeaderValue;
+    use std::collections::HashSet;
+    use std::io::{Cursor, Read};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
     use std::time::Duration;
     use symphonia::core::units::{Time, TimeBase};
 
@@ -1726,6 +2052,40 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         wav.resize(44 + data_len as usize, 0);
         wav
+    }
+
+    fn pcm_wav_24(samples: &[i32]) -> Vec<u8> {
+        let data_len = samples.len() as u32 * 3;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&24_000u32.to_le_bytes());
+        wav.extend_from_slice(&3u16.to_le_bytes());
+        wav.extend_from_slice(&24u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            let bytes = sample.to_le_bytes();
+            wav.extend_from_slice(&bytes[..3]);
+        }
+        wav
+    }
+
+    #[test]
+    fn decoder_preserves_pcm_below_sixteen_bit_resolution() {
+        let wav = pcm_wav_24(&[1, 256]);
+        let mut decoder = SymphoniaAudioDecoder::new(Box::new(Cursor::new(wav)), Some("wav"))
+            .expect("24-bit wav decoder");
+
+        let least_significant_sample = decoder.next().expect("first PCM sample");
+
+        assert!(least_significant_sample > 0.0);
+        assert!(least_significant_sample < 1.0 / 32_768.0);
     }
 
     #[test]
@@ -1779,6 +2139,211 @@ mod tests {
                 start: 4_900_000,
                 target_end: 5_000_000,
             })
+        );
+    }
+
+    #[test]
+    fn duplicate_prefetch_sequence_is_rejected_before_task_submission() {
+        let inner = RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 4,
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 4,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashSet::new()),
+            range_available: Condvar::new(),
+            last_read_pos: Mutex::new(0),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        };
+        let plan = PrefetchPlan {
+            start: 0,
+            target_end: 4,
+        };
+
+        assert_eq!(claim_prefetch_sequence_start(&inner, plan), Some(0));
+        assert_eq!(claim_prefetch_sequence_start(&inner, plan), None);
+        assert_eq!(inner.in_flight.lock().expect("in-flight lock").len(), 1);
+
+        release_prefetch_start(&inner, 0);
+        assert_eq!(claim_prefetch_sequence_start(&inner, plan), Some(0));
+        release_prefetch_start(&inner, 0);
+    }
+
+    #[test]
+    fn demand_read_waits_for_matching_prefetch_instead_of_downloading_twice() {
+        let playback_generation = Arc::new(AtomicU64::new(1));
+        let inner = Arc::new(RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 4,
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashSet::from([0])),
+            range_available: Condvar::new(),
+            last_read_pos: Mutex::new(0),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            playback_generation,
+            expected_generation: 1,
+        });
+        let producer_inner = Arc::clone(&inner);
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            producer_inner
+                .cache
+                .lock()
+                .expect("cache lock")
+                .push(CachedSegment {
+                    start: 0,
+                    data: vec![1, 2, 3, 4],
+                });
+            release_prefetch_start(&producer_inner, 0);
+        });
+        let mut source = RemoteAudioSource {
+            inner,
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+        let mut bytes = [0; 4];
+
+        source.read_exact(&mut bytes).expect("prefetched read");
+
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert!(producer.join().is_ok());
+    }
+
+    #[test]
+    fn superseded_remote_source_stops_before_network_or_cache_io() {
+        let playback_generation = Arc::new(AtomicU64::new(1));
+        let inner = Arc::new(RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 4,
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashSet::new()),
+            range_available: Condvar::new(),
+            last_read_pos: Mutex::new(0),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            playback_generation: Arc::clone(&playback_generation),
+            expected_generation: 1,
+        });
+        playback_generation.store(2, std::sync::atomic::Ordering::Release);
+        let mut source = RemoteAudioSource {
+            inner,
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+        let mut byte = [0];
+
+        let error = source.read(&mut byte).expect_err("superseded read");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn stopped_session_cancels_remote_read_without_changing_track_generation() {
+        let playback_generation = Arc::new(AtomicU64::new(1));
+        let session_cancelled = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 4,
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashSet::new()),
+            range_available: Condvar::new(),
+            last_read_pos: Mutex::new(0),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            playback_generation,
+            expected_generation: 1,
+        });
+        let mut source = RemoteAudioSource {
+            inner,
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: Some(RemoteReadCancellation::new(
+                Arc::clone(&session_cancelled),
+                None,
+            )),
+        };
+        session_cancelled.store(true, Ordering::Release);
+
+        let error = source
+            .read(&mut [0])
+            .expect_err("stopped session read");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn fragmented_mp4_starts_progressively_and_promotes_for_seek() {
+        assert!(is_fragmented_mp4_url(
+            "https://cdn.example/audio/track.M4S?deadline=123"
+        ));
+        assert!(!is_fragmented_mp4_url(
+            "https://cdn.example/audio/track.flac?deadline=123"
+        ));
+
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/track.m4s".into(),
+                referer: "https://example.com".into(),
+                total_len: 4,
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 1,
+                    target_bytes: 1,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::FragmentedProgressive,
+            read_cancellation: None,
+        };
+
+        assert!(!symphonia::core::io::MediaSource::is_seekable(&source));
+        assert!(symphonia::core::io::MediaSource::byte_len(&source).is_none());
+        let seekable = source.seekable_clone();
+        assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
+        assert_eq!(
+            seekable.access_mode.demand_fetch_block_bytes(),
+            super::REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES
         );
     }
 
@@ -2017,7 +2582,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_lookup_defers_capacity_scan_until_a_write_is_prepared() {
+    fn cache_lookup_miss_does_not_create_a_shard_directory() {
+        let root = tempfile::tempdir().expect("cache root");
+        let cache = RemoteAudioCache::new(
+            root.path().join("audio"),
+            "lookup-only",
+            512 * 1024 * 1024,
+            None,
+            1_000,
+        )
+        .expect("cache");
+
+        assert!(!cache.cache_dir.exists());
+        assert!(cache.ready_path().is_none());
+        assert!(!cache.cache_dir.exists());
+    }
+
+    #[test]
+    fn cache_capacity_scan_runs_only_after_a_complete_file_is_published() {
         let root = tempfile::tempdir().expect("temp cache root");
         let wav = pcm_wav(800);
         let existing = RemoteAudioCache::new(
@@ -2035,14 +2617,19 @@ mod tests {
         let lookup = RemoteAudioCache::new(
             root.path().to_path_buf(),
             "new-audio",
-            1,
-            None,
-            0,
+            wav.len() as u64,
+            Some(wav.len() as u64),
+            100,
         )
         .expect("new cache lookup");
         assert!(existing_path.exists());
 
-        lookup.prepare(1).expect("prepare cache miss");
+        lookup
+            .prepare(wav.len() as u64)
+            .expect("prepare cache miss");
+        assert!(existing_path.exists());
+        lookup.write_range(0, &wav).expect("write complete cache");
+        lookup.mark_ready().expect("publish complete cache");
         assert!(!existing_path.exists());
     }
 
@@ -2079,4 +2666,5 @@ mod tests {
         )
         .is_none());
     }
+
 }
