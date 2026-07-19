@@ -752,7 +752,7 @@ onUnmounted(() => {
     <div v-else-if="error" class="state-center">
       <span class="material-symbols-rounded" style="font-size: 48px; opacity: 0.3">error</span>
       <p>{{ error }}</p>
-      <button class="retry-btn" @click="loadDetail">{{ t('player.retry') }}</button>
+      <button class="retry-btn" @click="() => loadDetail()">{{ t('player.retry') }}</button>
     </div>
 
     <template v-else>

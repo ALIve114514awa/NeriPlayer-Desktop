@@ -21,6 +21,7 @@ import {
   playbackPrefetchCacheId,
   playbackUrlResolver,
   resolvePlaybackResult,
+  type PlaybackAudioSource,
   type PlaybackCacheReadCandidate,
   type PlaybackSourceSettings,
   type PlaybackResolution,
@@ -153,7 +154,7 @@ export interface AudioInfo {
   bitrate?: number  // kbps
   codec?: string    // e.g. "MP3", "FLAC", "AAC", "Opus"
   format?: string   // 原始格式标识
-  source?: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local'
+  source?: PlaybackAudioSource
   qualityKey?: string
   qualityLabel?: string
   qualityOptions?: Array<{ key: string; label: string }>
@@ -1085,7 +1086,9 @@ export const usePlayerStore = defineStore('player', () => {
         audioInfo.value = {
           // 不写 codec: Local，避免进度条下出现 Local · download
           format: formatFromExt,
-          source: getPlaybackSourceKind(track) || track.source || undefined,
+          // getPlaybackSourceKind 已覆盖远程源；仅当明确是 local 时回退
+          source: getPlaybackSourceKind(track)
+            ?? (track.source === 'local' ? 'local' : undefined),
           qualityKey: undefined,
         }
         lastUrlResolveTime = 0
