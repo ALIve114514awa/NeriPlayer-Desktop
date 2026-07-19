@@ -64,6 +64,81 @@ watch(() => route.query.tab, (tab) => {
 interface PlaylistInfo { id: number; name: string; track_count: number; modified_at: number; cover_url: string | null }
 const playlists = ref<PlaylistInfo[]>([])
 
+// 多选模式
+const isMultiSelectMode = ref(false)
+const selectedPlaylists = ref<Set<number>>(new Set())
+
+function enterMultiSelect() {
+  isMultiSelectMode.value = true
+  selectedPlaylists.value.clear()
+}
+function exitMultiSelect() {
+  isMultiSelectMode.value = false
+  selectedPlaylists.value.clear()
+}
+function togglePlaylistSelection(id: number) {
+  const set = selectedPlaylists.value
+  if (set.has(id)) set.delete(id)
+  else set.add(id)
+}
+function selectAll() {
+  for (const pl of playlists.value) {
+    if (!LIKED_NAMES.includes(pl.name) && !LOCAL_NAMES.includes(pl.name)) {
+      selectedPlaylists.value.add(pl.id)
+    }
+  }
+}
+function invertSelection() {
+  for (const pl of playlists.value) {
+    if (LIKED_NAMES.includes(pl.name) || LOCAL_NAMES.includes(pl.name)) continue
+    if (selectedPlaylists.value.has(pl.id)) selectedPlaylists.value.delete(pl.id)
+    else selectedPlaylists.value.add(pl.id)
+  }
+  log.info('invert selection ->', selectedPlaylists.value.size, 'selected')
+}
+
+// 拖拽排序
+const dragIndex = ref<number | null>(null)
+const dragOverIndex = ref<number | null>(null)
+
+function onDragStart(e: DragEvent, index: number) {
+  dragIndex.value = index
+  // 让拖拽 ghost 显示整行而非仅手柄，贴近 Android 抬起整行的手感
+  const handle = e.currentTarget as HTMLElement | null
+  const row = handle?.closest('.playlist-item') as HTMLElement | null
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    if (row) e.dataTransfer.setDragImage(row, 24, row.offsetHeight / 2)
+  }
+}
+function onDragOver(e: DragEvent, index: number) {
+  e.preventDefault()
+  dragOverIndex.value = index
+}
+function onDragEnd() {
+  if (dragIndex.value !== null && dragOverIndex.value !== null && dragIndex.value !== dragOverIndex.value) {
+    const arr = [...playlists.value]
+    const [moved] = arr.splice(dragIndex.value, 1)
+    arr.splice(dragOverIndex.value, 0, moved)
+    playlists.value = arr
+    savePlaylistOrder(arr)
+  }
+  dragIndex.value = null
+  dragOverIndex.value = null
+}
+
+function savePlaylistOrder(ordered: PlaylistInfo[]) {
+  const orderIds = ordered.map(p => p.id)
+  localStorage.setItem('neri:playlist-order', JSON.stringify(orderIds))
+  log.info('Playlist order saved:', orderIds)
+}
+function loadPlaylistOrder(): number[] | null {
+  try {
+    const raw = localStorage.getItem('neri:playlist-order')
+    return raw ? JSON.parse(raw) : null
+  } catch { return null }
+}
+
 function isBilibiliCover(url?: string | null): boolean {
   if (!url) return false
   return /\.(hdslb|biliimg)\.com/i.test(url)
@@ -80,6 +155,16 @@ async function loadPlaylists() {
       if (LIKED_NAMES.includes(pl.name)) liked.push(pl)
       else if (LOCAL_NAMES.includes(pl.name)) localFiles.push(pl)
       else normal.push(pl)
+    }
+    // 应用用户自定义排序
+    const savedOrder = loadPlaylistOrder()
+    if (savedOrder && savedOrder.length > 0) {
+      const orderMap = new Map(savedOrder.map((id, idx) => [id, idx]))
+      normal.sort((a, b) => {
+        const ai = orderMap.get(a.id) ?? Number.MAX_SAFE_INTEGER
+        const bi = orderMap.get(b.id) ?? Number.MAX_SAFE_INTEGER
+        return ai - bi
+      })
     }
     playlists.value = [...liked, ...normal, ...localFiles]
   } catch (e) {
@@ -307,6 +392,28 @@ async function confirmRename() {
     await loadPlaylists()
   } catch (e) {
     log.error('Rename playlist failed:', e)
+  }
+}
+
+// 批量删除确认
+const showBatchDeleteDialog = ref(false)
+
+function requestDeleteSelected() {
+  if (selectedPlaylists.value.size === 0) return
+  showBatchDeleteDialog.value = true
+}
+
+async function confirmDeleteSelected() {
+  const ids = [...selectedPlaylists.value]
+  try {
+    for (const id of ids) {
+      await invoke('delete_playlist', { id })
+    }
+    showBatchDeleteDialog.value = false
+    exitMultiSelect()
+    await loadPlaylists()
+  } catch (e) {
+    log.error('Batch delete playlists failed:', e)
   }
 }
 
@@ -545,9 +652,20 @@ onUnmounted(() => {
   <div class="library-view">
     <header class="lib-header">
       <h1 class="page-title">{{ t('library.title') }}</h1>
-      <button class="header-action">
-        <span class="material-symbols-rounded">sort</span>
-      </button>
+      <div class="header-actions">
+        <button v-if="activeTab === 0 && !isMultiSelectMode" class="header-action" @click="enterMultiSelect" :title="t('common.multi_select')">
+          <span class="material-symbols-rounded">checklist</span>
+        </button>
+        <button v-if="isMultiSelectMode" class="header-action" @click="selectAll" :title="t('common.select_all')">
+          <span class="material-symbols-rounded">select_all</span>
+        </button>
+        <button v-if="isMultiSelectMode" class="header-action" @click="invertSelection" :title="t('common.invert_selection')">
+          <span class="material-symbols-rounded">flip</span>
+        </button>
+        <button v-if="isMultiSelectMode" class="header-action" @click="exitMultiSelect" :title="t('common.exit_selection')">
+          <span class="material-symbols-rounded">close</span>
+        </button>
+      </div>
     </header>
 
     <div class="tab-bar">
@@ -584,12 +702,24 @@ onUnmounted(() => {
 
       <!-- 歌单列表 -->
       <div
-        v-for="pl in playlists"
+        v-for="(pl, index) in playlists"
         :key="pl.id"
         class="playlist-item"
-        @click="router.push({ name: 'local-playlist', params: { id: pl.id } })"
+        :class="{
+          'drag-over': dragOverIndex === index,
+          dragging: dragIndex === index,
+          selected: selectedPlaylists.has(pl.id),
+        }"
+        @dragover="onDragOver($event, index)"
+        @click="isMultiSelectMode ? togglePlaylistSelection(pl.id) : router.push({ name: 'local-playlist', params: { id: pl.id } })"
         @contextmenu.prevent.stop="openContextMenu($event, pl)"
       >
+        <!-- 多选模式下显示复选框 -->
+        <div v-if="isMultiSelectMode" class="pl-checkbox" @click.stop="togglePlaylistSelection(pl.id)">
+          <span class="material-symbols-rounded" :class="{ filled: selectedPlaylists.has(pl.id) }" style="font-size: 22px">
+            {{ selectedPlaylists.has(pl.id) ? 'check_circle' : 'radio_button_unchecked' }}
+          </span>
+        </div>
         <div class="pl-icon" :class="{ 'has-cover': pl.cover_url }">
           <BilibiliCoverImage v-if="isBilibiliCover(pl.cover_url)" :src="pl.cover_url!" class="pl-cover-img">
             <span class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
@@ -601,9 +731,29 @@ onUnmounted(() => {
           <div class="pl-name">{{ displayName(pl) }}</div>
           <div class="pl-count">{{ t('player.track_count', { count: pl.track_count }) }}</div>
         </div>
+        <!-- 多选模式下显示排序摇杆（对齐 Android：仅拖此手柄可排序） -->
+        <span
+          v-if="isMultiSelectMode && !isProtectedPlaylist(pl)"
+          class="pl-drag-handle material-symbols-rounded"
+          style="font-size: 22px"
+          draggable="true"
+          :title="t('common.drag_to_reorder')"
+          @dragstart.stop="onDragStart($event, index)"
+          @dragend.stop="onDragEnd()"
+          @click.stop
+        >drag_handle</span>
         <!-- 受保护歌单不显示三点菜单 -->
-        <button v-if="!isProtectedPlaylist(pl)" class="pl-more" @click.stop="openContextMenu($event, pl)">
+        <button v-else-if="!isProtectedPlaylist(pl) && !isMultiSelectMode" class="pl-more" @click.stop="openContextMenu($event, pl)">
           <span class="material-symbols-rounded" style="font-size: 20px">more_vert</span>
+        </button>
+      </div>
+
+      <!-- 多选模式底部操作栏 -->
+      <div v-if="isMultiSelectMode" class="multi-select-bar">
+        <span class="select-count">{{ t('common.selected_count', { count: selectedPlaylists.size }) }}</span>
+        <button class="multi-select-action danger" :disabled="selectedPlaylists.size === 0" @click="requestDeleteSelected">
+          <span class="material-symbols-rounded" style="font-size: 18px">delete</span>
+          <span>{{ t('common.delete_selected') }}</span>
         </button>
       </div>
 
@@ -927,6 +1077,18 @@ onUnmounted(() => {
         @enter="confirmRename"
       />
     </M3Dialog>
+
+    <!-- 批量删除歌单确认 -->
+    <M3Dialog
+      v-model:open="showBatchDeleteDialog"
+      :title="t('library.delete_confirm_title')"
+      icon="delete"
+      :confirm-text="t('common.delete_selected')"
+      confirm-danger
+      @confirm="confirmDeleteSelected"
+    >
+      <p class="dialog-msg">{{ t('library.batch_delete_playlists_msg', { count: selectedPlaylists.size }) }}</p>
+    </M3Dialog>
   </div>
 </template>
 
@@ -976,7 +1138,7 @@ onUnmounted(() => {
   font-weight: 500;
   color: var(--md-on-surface-variant);
   background: transparent;
-  border: 1px solid var(--md-outline-variant);
+  border: 1px solid transparent;
   transition: all var(--duration-short) var(--ease-standard);
 
   &:hover:not(.active) {
@@ -986,7 +1148,6 @@ onUnmounted(() => {
   &.active {
     background: var(--md-secondary-container);
     color: var(--md-on-secondary-container);
-    border-color: transparent;
     font-weight: 600;
   }
 }
@@ -1076,9 +1237,92 @@ onUnmounted(() => {
   padding: 10px 12px;
   border-radius: var(--radius-md);
   cursor: pointer;
-  transition: background var(--duration-short);
+  transition: background var(--duration-short), box-shadow var(--duration-short), opacity var(--duration-short);
 
   &:hover { background: var(--md-surface-container); }
+
+  &.selected { background: color-mix(in srgb, var(--md-primary) 12%, transparent); }
+  &.dragging { opacity: 0.4; }
+  &.drag-over { box-shadow: inset 0 2px 0 0 var(--md-primary); }
+}
+
+/* 多选：复选框 */
+.pl-checkbox {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--md-primary);
+
+  .material-symbols-rounded.filled { font-variation-settings: 'FILL' 1; }
+}
+
+/* 多选：排序摇杆（拖此手柄可排序，对齐 Android DragHandle） */
+.pl-drag-handle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-full);
+  color: var(--md-on-surface-variant);
+  opacity: 0.7;
+  cursor: grab;
+  touch-action: none;
+  transition: background var(--duration-short), opacity var(--duration-short);
+
+  &:hover { opacity: 1; background: var(--md-surface-container-high); }
+  &:active { cursor: grabbing; }
+}
+
+/* 多选：底部操作栏 */
+.multi-select-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--md-surface-container-high);
+}
+
+.select-count {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--md-on-surface);
+}
+
+.multi-select-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: var(--radius-full);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--duration-short), opacity var(--duration-short);
+
+  &.danger {
+    background: color-mix(in srgb, var(--md-error) 14%, transparent);
+    color: var(--md-error);
+
+    &:hover:not(:disabled) { background: color-mix(in srgb, var(--md-error) 22%, transparent); }
+  }
+
+  &:disabled { opacity: 0.4; cursor: not-allowed; }
+}
+
+/* 音乐库头部操作按钮容器 */
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .new-playlist {
