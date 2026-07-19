@@ -550,19 +550,20 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
   position: relative;
   text-align: left;
   color: white;
+  /* 底部提前淡出，避免歌词贴底难读 */
   mask-image: linear-gradient(
     to bottom,
     transparent 0%,
-    black 13%,
-    black 78%,
-    transparent 100%
+    black 10%,
+    black 72%,
+    transparent 94%
   );
   -webkit-mask-image: linear-gradient(
     to bottom,
     transparent 0%,
-    black 13%,
-    black 78%,
-    transparent 100%
+    black 10%,
+    black 72%,
+    transparent 94%
   );
   --amll-lp-color: white;
   --amll-lp-font-size: calc(max(max(5vh, 2.5vw), 12px) * var(--lyric-font-scale, 1));

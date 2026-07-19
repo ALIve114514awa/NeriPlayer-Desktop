@@ -118,6 +118,8 @@ function handleError(event: Event) {
     v-bind="$attrs"
     :src="resolvedSrc"
     :alt="alt"
+    loading="lazy"
+    decoding="async"
     referrerpolicy="no-referrer"
     @load="handleLoad"
     @error="handleError"

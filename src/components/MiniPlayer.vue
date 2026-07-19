@@ -229,7 +229,8 @@ defineExpose({
             <div :key="miniTrackKey" class="mp-meta">
               <div class="mp-title">{{ player.currentTrack?.title || t('player.not_playing') }}</div>
               <div class="mp-artist">{{ player.currentTrack?.artist || '' }}</div>
-              <div v-if="player.durationMs > 0" class="mp-time">{{ currentTimeFormatted }} / {{ durationFormatted }}</div>
+              <!-- 始终占位，避免切歌时时长行出现/消失导致上下跳动 -->
+              <div class="mp-time">{{ player.durationMs > 0 ? `${currentTimeFormatted} / ${durationFormatted}` : ' ' }}</div>
             </div>
           </transition>
         </div>
@@ -476,11 +477,14 @@ defineExpose({
   flex: 1;
   min-width: 0;
   position: relative;
-  transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
+  /* 固定三行信息高度，切歌时不上下弹 */
+  min-height: 48px;
+  transition: opacity 220ms ease;
 }
 
 .mp-meta {
   min-width: 0;
+  min-height: 48px;
 }
 
 .mp-title {
@@ -508,6 +512,7 @@ defineExpose({
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
   margin-top: 1px;
+  min-height: 1.45em;
 }
 
 /* ── 中：播放控制 ── */
@@ -684,15 +689,13 @@ defineExpose({
 
 .mp-meta-swap-enter-active,
 .mp-meta-swap-leave-active {
-  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: opacity 180ms ease;
 }
 .mp-meta-swap-enter-from {
   opacity: 0;
-  transform: translateY(8px);
 }
 .mp-meta-swap-leave-to {
   opacity: 0;
-  transform: translateY(-8px);
 }
 
 </style>

@@ -6,7 +6,7 @@
  *
  * 切歌时使用双缓冲交叉淡入淡出，消除闪烁
  */
-import { ref, watch, onUnmounted } from 'vue'
+import { ref, watch, computed, onUnmounted } from 'vue'
 
 const props = defineProps<{
   coverUrl: string
@@ -18,6 +18,19 @@ const props = defineProps<{
 const frontUrl = ref(props.coverUrl)
 const backUrl = ref('')
 const showBack = ref(false)
+
+// 外扩至少 2× 模糊核，避免滤镜在窗角采到透明像素露出方框
+const expandPx = computed(() => Math.max(140, Math.ceil(props.blurAmount * 2.5)))
+const imgGeometryStyle = computed(() => {
+  const e = expandPx.value
+  return {
+    width: `calc(100% + ${e * 2}px)`,
+    height: `calc(100% + ${e * 2}px)`,
+    top: `-${e}px`,
+    left: `-${e}px`,
+    filter: `blur(${props.blurAmount}px)`,
+  }
+})
 
 // in-flight 状态：用于取消迟到的 onload 与清理定时器，避免快速切歌时乱序覆盖
 let pendingImg: HTMLImageElement | null = null
@@ -82,7 +95,7 @@ onUnmounted(() => {
       :src="frontUrl"
       referrerpolicy="no-referrer"
       class="cover-blur-img front"
-      :style="{ filter: `blur(${blurAmount}px)` }"
+      :style="imgGeometryStyle"
     />
     <!-- Back 层：预加载完成后淡入覆盖 front -->
     <img
@@ -91,7 +104,7 @@ onUnmounted(() => {
       referrerpolicy="no-referrer"
       class="cover-blur-img back"
       :class="{ visible: showBack }"
-      :style="{ filter: `blur(${blurAmount}px)` }"
+      :style="imgGeometryStyle"
     />
     <div class="cover-blur-darken" :style="{ background: `rgba(0,0,0,${darkenAlpha})` }" />
   </div>
@@ -107,11 +120,6 @@ onUnmounted(() => {
 
 .cover-blur-img {
   position: absolute;
-  /* 超出边缘避免模糊白边 */
-  width: calc(100% + 80px);
-  height: calc(100% + 80px);
-  top: -40px;
-  left: -40px;
   object-fit: cover;
   will-change: filter, opacity;
 }
