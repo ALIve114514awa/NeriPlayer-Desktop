@@ -1612,7 +1612,7 @@ const sliderActiveColor = computed(() => {
         >
           <!-- Card 模式（圆角矩形，对齐 Android） -->
           <div v-if="settings.coverStyle === 'card'" ref="cardCoverRef" class="cover-card">
-            <transition :name="coverTransitionName" mode="out-in">
+            <transition :name="coverTransitionName">
               <img
                 v-if="coverUrl && !coverLoadError"
                 :key="`cover:${nowPlayingTrackKey}`"
@@ -1625,15 +1625,14 @@ const sliderActiveColor = computed(() => {
               <span
                 v-else
                 :key="`placeholder:${nowPlayingTrackKey}`"
-                class="material-symbols-rounded filled"
-                style="font-size: 48px; opacity: 0.35"
+                class="material-symbols-rounded filled cover-card-placeholder"
               >music_note</span>
             </transition>
           </div>
           <!-- Disc 模式（黑胶唱片） -->
           <div v-else ref="discRef" class="cover-disc">
             <div class="cover-inner">
-              <transition :name="coverTransitionName" mode="out-in">
+              <transition :name="coverTransitionName">
                 <img
                   v-if="coverUrl && !coverLoadError"
                   :key="`disc-cover:${nowPlayingTrackKey}`"
@@ -1646,8 +1645,7 @@ const sliderActiveColor = computed(() => {
                 <span
                   v-else
                   :key="`disc-placeholder:${nowPlayingTrackKey}`"
-                  class="material-symbols-rounded filled"
-                  style="font-size: 48px; opacity: 0.35"
+                  class="material-symbols-rounded filled cover-disc-placeholder"
                 >music_note</span>
               </transition>
             </div>
@@ -2896,6 +2894,7 @@ const sliderActiveColor = computed(() => {
 
 /* Card 模式（圆角矩形，对齐 Android） */
 .cover-card {
+  position: relative;
   width: 100%;
   height: 100%;
   border-radius: 24px;
@@ -2910,12 +2909,24 @@ const sliderActiveColor = computed(() => {
 }
 
 .cover-card-img {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
   border-radius: inherit;
   transform: scale(1.01);
+}
+
+.cover-card-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 48px;
+  opacity: 0.35;
 }
 
 /* Disc 模式（黑胶唱片） */
@@ -2940,6 +2951,7 @@ const sliderActiveColor = computed(() => {
 }
 
 .cover-inner {
+  position: relative;
   width: 78%;
   height: 78%;
   border-radius: 50%;
@@ -2956,10 +2968,22 @@ const sliderActiveColor = computed(() => {
 }
 
 .cover-img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
   border-radius: 50%;
+}
+
+.cover-disc-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 48px;
+  opacity: 0.35;
 }
 
 .cover-groove {
