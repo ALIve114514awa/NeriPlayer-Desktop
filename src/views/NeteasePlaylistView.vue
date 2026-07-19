@@ -114,6 +114,30 @@ function formatTotalDuration(ms: number): string {
   return `${totalMin}${t('common.minute_short')}`
 }
 
+/** 网易云封面字段兼容：picUrl / blurPicUrl / coverImgUrl / pic 数字 ID */
+function resolveNeteaseCover(...candidates: unknown[]): string {
+  for (const raw of candidates) {
+    if (raw == null) continue
+    if (typeof raw === 'string') {
+      const value = raw.trim()
+      if (!value) continue
+      if (value.startsWith('http://') || value.startsWith('https://') || value.startsWith('//')) {
+        return value.startsWith('//') ? `https:${value}` : value
+      }
+      // 少数接口只返回 pic 哈希/数字串
+      if (/^[A-Za-z0-9_-]+$/.test(value) && value.length >= 8) {
+        return `https://p1.music.126.net/${value}.jpg`
+      }
+      continue
+    }
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+      // 纯数字 pic 字段无法稳定还原 URL，跳过
+      continue
+    }
+  }
+  return ''
+}
+
 async function loadDetail() {
   const id = Number(route.params.id)
   if (!id) return
@@ -133,7 +157,14 @@ async function loadDetail() {
       const data = await invoke<any>('get_album_detail', { albumId: id })
       const album = data?.album || {}
       playlistName.value = album.name || ''
-      coverUrl.value = album.picUrl || album.blurPicUrl || ''
+      const albumCover = resolveNeteaseCover(
+        album.picUrl,
+        album.blurPicUrl,
+        album.picUrl_str,
+        album.coverImgUrl,
+        album.pic,
+      )
+      coverUrl.value = albumCover
       description.value = album.description || ''
       creator.value = album.artist?.name || ''
 
@@ -144,7 +175,8 @@ async function loadDetail() {
         artist: (s.ar || []).map((a: any) => a.name).join(', '),
         album: s.al?.name || album.name || '',
         durationMs: s.dt || 0,
-        coverUrl: s.al?.picUrl || album.picUrl || '',
+        // 专辑曲目 al.picUrl 常为空，回退到专辑封面
+        coverUrl: resolveNeteaseCover(s.al?.picUrl, s.al?.pic, albumCover) || albumCover,
         audioUrl: '',
       }))
       trackCount.value = tracks.value.length
@@ -152,7 +184,7 @@ async function loadDetail() {
       const data = await invoke<any>('get_netease_playlist_detail', { playlistId: id })
       const pl = data?.playlist || {}
       playlistName.value = pl.name || ''
-      coverUrl.value = pl.coverImgUrl || ''
+      coverUrl.value = resolveNeteaseCover(pl.coverImgUrl, pl.picUrl, pl.cover)
       trackCount.value = pl.trackCount || 0
       playCount.value = pl.playCount || 0
       description.value = pl.description || ''
@@ -165,7 +197,7 @@ async function loadDetail() {
         artist: (s.ar || []).map((a: any) => a.name).join(', '),
         album: s.al?.name || '',
         durationMs: s.dt || 0,
-        coverUrl: s.al?.picUrl || '',
+        coverUrl: resolveNeteaseCover(s.al?.picUrl, s.al?.pic),
         audioUrl: '',
       }))
     }
@@ -462,7 +494,11 @@ onMounted(() => {
             <span v-else class="index-num">{{ index + 1 }}</span>
           </div>
           <div class="track-cover">
-            <BilibiliCoverImage v-if="track.coverUrl && !props.isAlbum" :src="track.coverUrl" loading="lazy" />
+            <BilibiliCoverImage
+              v-if="track.coverUrl || (props.isAlbum && coverUrl)"
+              :src="track.coverUrl || coverUrl"
+              loading="lazy"
+            />
             <span v-else class="material-symbols-rounded filled">music_note</span>
           </div>
           <div class="track-info">

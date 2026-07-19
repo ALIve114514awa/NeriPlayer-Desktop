@@ -1,8 +1,14 @@
 // 歌单/专辑详情页共享样式
 .detail-view {
-  padding: 16px 28px 32px;
+  /* 底部只留选择栏余量；迷你播放器由 .content.has-mini-player 负责 */
+  padding: 16px 28px 72px;
   max-height: 100%;
   overflow-y: auto;
+  scroll-padding-bottom: 72px;
+  /* 快滑时避免底层透出白闪 */
+  background: var(--md-surface);
+  transform: translateZ(0);
+  -webkit-overflow-scrolling: touch;
 }
 
 .detail-header {
@@ -211,7 +217,9 @@
 .track-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 2px;
+  background: var(--md-surface);
+  min-height: 0;
 }
 
 .track-item {
@@ -222,7 +230,11 @@
   border-radius: var(--radius-sm);
   min-width: 0;
   cursor: pointer;
-  transition: background var(--duration-short);
+  content-visibility: auto;
+  contain-intrinsic-size: 56px;
+  contain: layout style paint;
+  background: var(--md-surface);
+  transition: background 120ms ease;
 
   &:hover,
   &.active {

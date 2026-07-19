@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   usePlayerStore,
@@ -12,6 +12,7 @@ import { useDownloadStore } from '@/stores/download'
 import { useToastStore } from '@/stores/toast'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
@@ -125,8 +126,33 @@ const filteredTracks = computed(() => {
   )
 })
 
+// 大歌单窗口渲染：首屏只画一批，滚动触底再扩，避免 800+ DOM 卡死
+const RENDER_CHUNK = 100
+const renderCount = ref(RENDER_CHUNK)
+const visibleTracks = computed(() => filteredTracks.value.slice(0, renderCount.value))
+const hasMoreTracks = computed(() => renderCount.value < filteredTracks.value.length)
+
+watch(filteredTracks, (list) => {
+  renderCount.value = Math.min(RENDER_CHUNK, list.length)
+})
+
+function expandVisibleTracks(extra = RENDER_CHUNK) {
+  if (!hasMoreTracks.value) return
+  renderCount.value = Math.min(filteredTracks.value.length, renderCount.value + extra)
+}
+
+function onDetailScroll(e: Event) {
+  const el = e.currentTarget as HTMLElement | null
+  if (!el || !hasMoreTracks.value) return
+  // 距底部 1200px 内预扩，保持滚动流畅
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 1200) {
+    expandVisibleTracks()
+  }
+}
+
 const selectedTracks = computed(() => tracks.value.filter(t => selectedIds.value.has(trackSelectionKey(t))))
 const selectedCount = computed(() => selectedIds.value.size)
+// 选择操作仍基于完整过滤结果，不限于当前窗口
 const visibleSelectedCount = computed(() => filteredTracks.value.filter(t => selectedIds.value.has(trackSelectionKey(t))).length)
 const allVisibleSelected = computed(() => filteredTracks.value.length > 0 && visibleSelectedCount.value === filteredTracks.value.length)
 
@@ -151,17 +177,22 @@ function formatTotalDuration(ms: number): string {
   return `${totalMin}${t('common.minute_short')}`
 }
 
-async function loadDetail() {
+async function loadDetail(options: { silent?: boolean } = {}) {
   const id = Number(route.params.id)
   if (!id) return
 
   const loadStarted = performance.now()
+  const silent = options.silent === true
   log.info('playlist load begin:', {
     playlistId: id,
+    silent,
     loadingAudio: player.isLoadingAudio,
     currentTrackId: player.currentTrack?.id || '',
   })
-  isLoading.value = true
+  // 收藏切换触发的静默刷新不闪 loading，避免列表跳动
+  if (!silent || tracks.value.length === 0) {
+    isLoading.value = true
+  }
   error.value = null
 
   try {
@@ -185,7 +216,10 @@ async function loadDetail() {
       loadingAudio: player.isLoadingAudio,
     })
     tracks.value = trackList.map(normalizeTrack)
-    player.prefetchPlaybackTracks(tracks.value)
+    // 静默刷新不重复预取，减少 IO
+    if (!silent) {
+      player.prefetchPlaybackTracks(tracks.value)
+    }
     log.info('playlist load committed:', {
       playlistId: id,
       count: tracks.value.length,
@@ -194,7 +228,9 @@ async function loadDetail() {
       currentTrackId: player.currentTrack?.id || '',
     })
   } catch (e: any) {
-    error.value = e?.toString() || t('player.load_failed')
+    if (!silent) {
+      error.value = e?.toString() || t('player.load_failed')
+    }
     log.error('playlist load failed:', {
       playlistId: id,
       totalMs: Math.round(performance.now() - loadStarted),
@@ -425,17 +461,47 @@ function onTrackDragPointerDown(e: PointerEvent, track: TrackInfo) {
 function onTrackDragPointerMove(e: PointerEvent) {
   if (dragPointerId.value !== e.pointerId) return
   e.preventDefault()
+  autoScrollWhileDragging(e)
+  // 滚动后重新采样行位置，保证目标插入点准确
+  captureTrackDragSnapshot()
   updateTrackDragOffset(e)
   updateDragUnderGlassKeys()
   updateTrackDragTarget(e)
 }
 
+function autoScrollWhileDragging(e: PointerEvent) {
+  // 优先滚详情页容器，找不到再滚主内容区
+  const scroller =
+    trackListRef.value?.closest('.detail-view') as HTMLElement | null
+    || document.querySelector('.content') as HTMLElement | null
+  if (!scroller) return
+
+  const rect = scroller.getBoundingClientRect()
+  const edge = 72
+  const maxStep = 28
+  let delta = 0
+  if (e.clientY < rect.top + edge) {
+    const t = 1 - Math.max(0, e.clientY - rect.top) / edge
+    delta = -Math.ceil(maxStep * t)
+  } else if (e.clientY > rect.bottom - edge) {
+    const t = 1 - Math.max(0, rect.bottom - e.clientY) / edge
+    delta = Math.ceil(maxStep * t)
+  }
+  if (delta === 0) return
+
+  const prev = scroller.scrollTop
+  scroller.scrollTop = prev + delta
+  const actual = scroller.scrollTop - prev
+  if (actual === 0) return
+  // 列表滚动后补偿拖拽起点，保持行跟随手指
+  dragStartPointerY.value -= actual
+  dragStartRowTop.value -= actual
+}
+
 function updateTrackDragOffset(e: PointerEvent) {
-  if (!dragListBounds) return
-  const minOffset = dragListBounds.top - dragStartRowTop.value
-  const maxOffset = dragListBounds.bottom - dragStartRowTop.value - dragRowHeight.value
+  // 允许拖出当前视口，配合自动滚动完成跨屏排序
   const requestedOffset = e.clientY - dragStartPointerY.value
-  dragOffsetY.value = Math.min(Math.max(requestedOffset, minOffset), maxOffset)
+  dragOffsetY.value = requestedOffset
 }
 
 function updateDragUnderGlassKeys() {
@@ -480,11 +546,9 @@ function captureTrackDragSnapshot() {
 }
 
 function resolveTrackInsertTarget(e: PointerEvent): { key: string; position: 'before' | 'after' } | null {
-  if (!dragListBounds || dragRowSnapshots.length === 0) return null
+  if (dragRowSnapshots.length === 0) return null
 
-  const insideListY = e.clientY >= dragListBounds.top && e.clientY <= dragListBounds.bottom
-  if (!insideListY) return null
-
+  // 允许拖到视口外时仍按最近行判定，配合自动滚动
   for (const row of dragRowSnapshots) {
     if (e.clientY < row.midpoint) {
       return { key: row.key, position: 'before' }
@@ -629,20 +693,47 @@ const playlistCover = computed(() => {
   return ''
 })
 
-onMounted(() => {
+let unlistenPlaylistsChanged: UnlistenFn | null = null
+let playlistRefreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function schedulePlaylistRefresh() {
+  // 收藏/移除会连发事件，合并刷新避免闪烁
+  if (playlistRefreshTimer) clearTimeout(playlistRefreshTimer)
+  playlistRefreshTimer = setTimeout(() => {
+    playlistRefreshTimer = null
+    void loadDetail({ silent: true })
+  }, 120)
+}
+
+onMounted(async () => {
   loadDetail()
   downloadStore.initEvents()
   downloadStore.loadDownloads()
+  try {
+    unlistenPlaylistsChanged = await listen('playlists-changed', () => {
+      schedulePlaylistRefresh()
+    })
+  } catch (e) {
+    log.error('listen playlists-changed failed:', e)
+  }
 })
 
 onUnmounted(() => {
   cleanupTrackDrag()
   clearDragLandingState()
+  if (playlistRefreshTimer) {
+    clearTimeout(playlistRefreshTimer)
+    playlistRefreshTimer = null
+  }
+  if (unlistenPlaylistsChanged) {
+    unlistenPlaylistsChanged()
+    unlistenPlaylistsChanged = null
+  }
 })
 </script>
 
 <template>
-  <div class="detail-view">
+  <div class="detail-view" @scroll.passive="onDetailScroll">
     <header class="detail-header">
       <button class="back-btn" @click="router.back()">
         <span class="material-symbols-rounded">arrow_back</span>
@@ -731,7 +822,7 @@ onUnmounted(() => {
         </div>
         <div ref="trackListRef" class="track-list">
         <div
-          v-for="(track, index) in filteredTracks"
+          v-for="(track, index) in visibleTracks"
           :key="trackSelectionKey(track)"
           class="track-item"
           :class="{
