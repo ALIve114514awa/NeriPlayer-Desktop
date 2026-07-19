@@ -9,6 +9,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { invoke } from '@tauri-apps/api/core'
 import { extractPalette, type PaletteResult } from '@/utils/paletteExtractor'
+import { shouldShowDynamicBackground } from '@/utils/nowPlayingBackground'
 import {
   normalizeCoverUrlForDisplay,
   normalizeProxiedCoverUrl,
@@ -1460,6 +1461,11 @@ const accentBgStyle = computed(() => {
   if (!bg) return { background: 'rgb(18, 18, 18)' }
   return { background: `rgb(${bg[0]}, ${bg[1]}, ${bg[2]})` }
 })
+const shouldRenderDynamicBackground = computed(() => shouldShowDynamicBackground(
+  player.hasPlaybackSession,
+  settings.dynamicBackground,
+  paletteResult.value,
+))
 
 // 动态主题 CSS 变量（对齐 Android M3 动态配色）
 const dynamicColorVars = computed(() => {
@@ -1556,7 +1562,7 @@ const sliderActiveColor = computed(() => {
       :darken-alpha="settings.coverBlurDarken"
     />
     <HyperBackground
-      v-else-if="player.hasPlaybackSession && settings.dynamicBackground"
+      v-else-if="shouldRenderDynamicBackground"
       :music-level="settings.audioReactive ? player.audioLevel : 0"
       :beat-impulse="settings.audioReactive ? player.beatImpulse : 0"
       :colors="extractedColors"
