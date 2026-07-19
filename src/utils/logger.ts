@@ -61,6 +61,18 @@ const consoleMethod: Record<LogLevel, (...data: unknown[]) => void> = {
   error: console.error.bind(console),
 }
 
+// 控制台分级配色（%c 样式），让 DevTools 日志按级别/作用域快速区分
+const LEVEL_STYLE: Record<LogLevel, string> = {
+  trace: 'color:#9e9e9e',
+  debug: 'color:#26c6da',
+  info: 'color:#66bb6a;font-weight:600',
+  warn: 'color:#ffa726;font-weight:600',
+  error: 'color:#ef5350;font-weight:700',
+}
+const TS_STYLE = 'color:#888'
+const SCOPE_STYLE = 'color:#4dd0e1;font-weight:600'
+const RESET_STYLE = 'color:inherit;font-weight:normal'
+
 export interface Logger {
   trace: (...args: unknown[]) => void
   debug: (...args: unknown[]) => void
@@ -77,9 +89,12 @@ export interface Logger {
  */
 export function createLogger(scope: string): Logger {
   const emit = (level: LogLevel, args: unknown[]) => {
-    const prefix = `${timestamp()} [${scope}] [${level.toUpperCase()}]`
-    // 控制台保留原始参数（对象可展开检视），仅加前缀
-    consoleMethod[level](prefix, ...args)
+    // 控制台用 %c 分级配色；原始参数原样追加，保留对象可展开检视
+    consoleMethod[level](
+      `%c${timestamp()} %c[${scope}] %c${level.toUpperCase()}%c`,
+      TS_STYLE, SCOPE_STYLE, LEVEL_STYLE[level], RESET_STYLE,
+      ...args,
+    )
 
     // 转发到后端统一日志；作用域拼进消息，失败静默降级
     const message = `[${scope}] ${stringifyArgs(args)}`

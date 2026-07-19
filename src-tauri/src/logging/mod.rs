@@ -124,6 +124,41 @@ fn format_record(
     ));
 }
 
+/// 级别对应的 ANSI 前景色（仅用于 stdout 彩色输出）
+fn level_ansi(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Error => "\x1b[31m", // 红
+        log::Level::Warn => "\x1b[33m",  // 黄
+        log::Level::Info => "\x1b[32m",  // 绿
+        log::Level::Debug => "\x1b[36m", // 青
+        log::Level::Trace => "\x1b[90m", // 亮黑（灰）
+    }
+}
+
+/// 彩色日志格式：时间戳灰、作用域青、级别按级配色。
+/// 仅用于 stdout；写文件时改用 `format_record` 以免 ANSI 转义污染日志文件。
+fn format_record_colored(
+    out: tauri_plugin_log::fern::FormatCallback,
+    message: &std::fmt::Arguments,
+    record: &log::Record,
+) {
+    const RESET: &str = "\x1b[0m";
+    const DIM: &str = "\x1b[90m";
+    const SCOPE: &str = "\x1b[36m";
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    out.finish(format_args!(
+        "{dim}{ts}{reset} {scope}[{target}]{reset} {lc}[{level}]{reset} {msg}",
+        dim = DIM,
+        reset = RESET,
+        scope = SCOPE,
+        ts = ts,
+        target = record.target(),
+        lc = level_ansi(record.level()),
+        level = record.level(),
+        msg = message,
+    ));
+}
+
 /// 构建日志插件。
 ///
 /// - `log_to_file`：为真时追加文件 target，否则仅输出到 stdout
@@ -140,7 +175,7 @@ pub fn build_plugin<R: Runtime>(
         }));
     }
 
-    tauri_plugin_log::Builder::new()
+    let builder = tauri_plugin_log::Builder::new()
         .level(level)
         // 降噪：第三方库的 target 前缀过滤到 Warn 以上，避免刷屏
         .level_for("hyper", LevelFilter::Warn)
@@ -151,8 +186,14 @@ pub fn build_plugin<R: Runtime>(
         .timezone_strategy(TimezoneStrategy::UseLocal)
         .max_file_size(MAX_LOG_FILE_SIZE)
         .rotation_strategy(RotationStrategy::KeepSome(KEEP_LOG_FILES))
-        .clear_format()
-        .format(format_record)
-        .targets(targets)
-        .build()
+        .clear_format();
+
+    // 写文件时用纯文本（避免 ANSI 转义落盘），仅 stdout 时用彩色输出
+    let builder = if log_to_file {
+        builder.format(format_record)
+    } else {
+        builder.format(format_record_colored)
+    };
+
+    builder.targets(targets).build()
 }

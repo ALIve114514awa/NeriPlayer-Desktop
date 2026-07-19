@@ -1468,6 +1468,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function togglePlayPause(commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
+    log.info('togglePlayPause:', { source: commandSource, wasPlaying: isPlaying.value, trackId: currentTrack.value?.id })
     if (isLoadingAudio.value && shouldDeferPlaybackSeek(
       playbackRequestToken,
       loadedPlaybackRequestToken,
@@ -1700,6 +1701,7 @@ export const usePlayerStore = defineStore('player', () => {
    */
   async function next(force: boolean = false, commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
+    log.info('next:', { source: commandSource, force, shuffle: shuffleEnabled.value, repeat: repeatMode.value, index: queueIndex.value, queueLen: queue.value.length })
     if (queue.value.length === 0) return
     // 用户手动操作重置失败计数（自动 skip 不重置）
     if (!_isAutoSkipping) consecutivePlayFailures = 0
@@ -1756,6 +1758,7 @@ export const usePlayerStore = defineStore('player', () => {
    */
   async function previous(commandSource: PlaybackCommandSource = 'local') {
     markCommandSource(commandSource)
+    log.info('previous:', { source: commandSource, shuffle: shuffleEnabled.value, positionMs: Math.round(positionMs.value) })
     consecutivePlayFailures = 0
     if (queue.value.length === 0) return
 
@@ -1795,6 +1798,7 @@ export const usePlayerStore = defineStore('player', () => {
       const idx = modes.indexOf(repeatMode.value)
       repeatMode.value = modes[(idx + 1) % modes.length]
     }
+    log.info('repeat mode ->', repeatMode.value)
     savePlayerState()
   }
 
@@ -1815,6 +1819,7 @@ export const usePlayerStore = defineStore('player', () => {
       shuffleHistory = []
       shuffleFuture = []
     }
+    log.info('shuffle ->', shuffleEnabled.value)
     savePlayerState()
   }
 
