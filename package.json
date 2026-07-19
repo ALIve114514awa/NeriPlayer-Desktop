@@ -9,6 +9,7 @@
     "build": "vue-tsc --build && vite build",
     "preview": "vite preview",
     "test:bilibili-cover-cache": "node scripts/test-bilibili-cover-cache.mjs",
+    "test:lyrics-request": "node scripts/test-lyrics-request.mjs",
     "test:playback-request": "node scripts/playback-request.test.mjs",
     "test:playback-source": "node scripts/test-playback-source.mjs",
     "test:player-state": "node scripts/test-player-state.mjs",

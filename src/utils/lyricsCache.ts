@@ -1,14 +1,10 @@
 import type { LyricLine, TrackInfo } from '@/stores/player'
 import { getCachedValue, removeCachedValue, setCachedValue } from './persistentCache'
+import { lyricsIdentity } from './lyricsRequest'
 
 const LYRICS_CACHE_KEY = 'neri:lyrics-cache:v1'
 const LYRICS_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 const LYRICS_CACHE_MAX_ENTRIES = 200
-
-function lyricsCacheKey(track: TrackInfo): string {
-  if (track.id) return track.id
-  return `${track.title.trim()}::${track.artist.trim()}::${track.durationMs || 0}`
-}
 
 function normalizeLyricLine(line: LyricLine): LyricLine {
   return {
@@ -36,7 +32,7 @@ function hasVisibleLyric(lines: LyricLine[]): boolean {
 export function getCachedLyrics(track: TrackInfo): LyricLine[] | null {
   const cached = getCachedValue<LyricLine[]>(
     LYRICS_CACHE_KEY,
-    lyricsCacheKey(track),
+    lyricsIdentity(track),
     LYRICS_CACHE_MAX_AGE_MS,
   )
   if (!Array.isArray(cached)) return null
@@ -52,12 +48,12 @@ export function saveCachedLyrics(track: TrackInfo, lines: LyricLine[]) {
     return
   }
 
-  setCachedValue(LYRICS_CACHE_KEY, lyricsCacheKey(track), normalized, {
+  setCachedValue(LYRICS_CACHE_KEY, lyricsIdentity(track), normalized, {
     maxAgeMs: LYRICS_CACHE_MAX_AGE_MS,
     maxEntries: LYRICS_CACHE_MAX_ENTRIES,
   })
 }
 
 export function clearCachedLyrics(track: TrackInfo) {
-  removeCachedValue(LYRICS_CACHE_KEY, lyricsCacheKey(track))
+  removeCachedValue(LYRICS_CACHE_KEY, lyricsIdentity(track))
 }

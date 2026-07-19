@@ -16,6 +16,7 @@ import {
   resolveCoverImage,
 } from '@/utils/bilibiliCover'
 import { clearCachedLyrics, getCachedLyrics, saveCachedLyrics } from '@/utils/lyricsCache'
+import { hasLyricsRequestInFlight, loadLyricsSingleFlight } from '@/utils/lyricsRequest'
 import HyperBackground from './HyperBackground.vue'
 import CoverBlurBackground from './CoverBlurBackground.vue'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
@@ -769,12 +770,21 @@ watch(nowPlayingTrackKey, async (trackKey) => {
   if (trackKey === 'empty' || !track) {
     fetchedLyrics.value = []
     isFetchingLyrics.value = false
+    log.info('lyrics cleared: no playback track')
     return
   }
 
+  const started = performance.now()
   const cachedLyrics = readCachedLyrics(track)
+  const reusedRequest = hasLyricsRequestInFlight(track)
   fetchedLyrics.value = cachedLyrics || []
   isFetchingLyrics.value = true
+  log.info('lyrics load begin:', {
+    requestId,
+    trackId: track.id,
+    cachedLines: cachedLyrics?.length || 0,
+    reusedRequest,
+  })
   try {
     const neteaseId = track.id.startsWith('netease:')
       ? parseInt(track.id.replace('netease:', ''))
@@ -783,31 +793,71 @@ watch(nowPlayingTrackKey, async (trackKey) => {
       ? track.id.replace('qq:', '')
       : undefined
 
-    const lyrics = await invoke<any[]>('fetch_lyrics', {
-      title: track.title,
-      artist: track.artist,
-      durationSecs: Math.floor(track.durationMs / 1000),
-      audioPath: track.audioUrl || null,
-      neteaseId: neteaseId || null,
-      qqSongMid: qqSongMid || null,
+    const nextLyrics = await loadLyricsSingleFlight(track, async () => {
+      const invokeStarted = performance.now()
+      log.info('lyrics backend invoke:', { requestId, trackId: track.id })
+      const lyrics = await invoke<any[]>('fetch_lyrics', {
+        title: track.title,
+        artist: track.artist,
+        durationSecs: Math.floor(track.durationMs / 1000),
+        audioPath: track.audioUrl || null,
+        neteaseId: neteaseId || null,
+        qqSongMid: qqSongMid || null,
+      })
+      const mapped = mapBackendLyrics(lyrics)
+      if (mapped.length > 0) cacheLyricsForTrack(track, mapped)
+      log.info('lyrics backend returned:', {
+        requestId,
+        trackId: track.id,
+        lines: mapped.length,
+        elapsedMs: Math.round(performance.now() - invokeStarted),
+      })
+      return mapped
     })
 
-    if (requestId !== lyricFetchRequestId) return
-    const nextLyrics = mapBackendLyrics(lyrics)
+    if (requestId !== lyricFetchRequestId) {
+      log.info('lyrics result ignored: stale request', {
+        requestId,
+        activeRequestId: lyricFetchRequestId,
+        trackId: track.id,
+        lines: nextLyrics.length,
+      })
+      return
+    }
     if (nextLyrics.length > 0) {
       fetchedLyrics.value = nextLyrics
-      cacheLyricsForTrack(track, nextLyrics)
     } else if (!cachedLyrics?.length) {
       fetchedLyrics.value = []
     }
+    log.info('lyrics load committed:', {
+      requestId,
+      trackId: track.id,
+      lines: fetchedLyrics.value.length,
+      elapsedMs: Math.round(performance.now() - started),
+    })
   } catch (e) {
-    log.error('Fetch lyrics failed:', e)
-    if (requestId === lyricFetchRequestId && !cachedLyrics?.length) {
-      fetchedLyrics.value = []
+    log.error('Fetch lyrics failed:', {
+      requestId,
+      trackId: track.id,
+      elapsedMs: Math.round(performance.now() - started),
+      error: summarizeLogError(e),
+    })
+    if (requestId === lyricFetchRequestId) {
+      fetchedLyrics.value = readCachedLyrics(track) || cachedLyrics || []
+      log.info('lyrics cache restored after failure:', {
+        requestId,
+        trackId: track.id,
+        lines: fetchedLyrics.value.length,
+      })
     }
   } finally {
     if (requestId === lyricFetchRequestId) {
       isFetchingLyrics.value = false
+      log.info('lyrics load finished:', {
+        requestId,
+        trackId: track.id,
+        elapsedMs: Math.round(performance.now() - started),
+      })
     }
   }
 }, { immediate: true })
