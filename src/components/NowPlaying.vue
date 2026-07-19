@@ -1348,7 +1348,9 @@ async function openCurrentAlbum() {
       return
     }
     hideMoreSheet()
-    router.push({ name: 'netease-album', params: { id: albumId } })
+    // 先收起正在播放页，再跳转专辑，避免详情盖在 NP 下面
+    emit('collapse')
+    await router.push({ name: 'netease-album', params: { id: String(albumId) } })
   } catch (e) {
     log.error('Open album failed:', e)
     toast.error(String(e))
@@ -1399,7 +1401,7 @@ const albumName = computed(() => {
 })
 const canViewNeteaseAlbum = computed(() => currentSource.value === 'netease' && !!albumName.value && !!currentNeteaseSongNumericId.value)
 
-// 进度条下方音质信息
+// 进度条下方音质信息（不展示 Local / download 占位）
 const audioInfoParts = computed(() => {
   const info = player.audioInfo
   if (!info) return []
@@ -1408,7 +1410,8 @@ const audioInfoParts = computed(() => {
   if (settings.showAudioCodec) addAudioInfoPart(parts, normalizeAudioDisplayToken(info.codec))
   if (settings.showAudioSpec && info.bitrate) addAudioInfoPart(parts, `${info.bitrate} kbps`)
   if (settings.showAudioSpec) addAudioInfoPart(parts, normalizeAudioDisplayToken(info.format))
-  return parts
+  // 本地下载占位词过滤：Local / download / file 等
+  return parts.filter(part => !isHiddenAudioInfoToken(part.text))
 })
 
 const audioInfoDisplay = computed(() => {
@@ -1436,18 +1439,34 @@ function normalizeAudioDisplayToken(value?: string) {
   if (!value) return ''
   const raw = value.trim()
   const lower = raw.toLowerCase()
+  // 占位词直接丢掉
+  if (isHiddenAudioInfoToken(raw)) return ''
   const tokenMap: Record<string, string> = {
     flac: 'FLAC',
     mp3: 'MP3',
     mpeg: 'MP3',
     aac: 'AAC',
     mp4a: 'AAC',
+    m4a: 'M4A',
     opus: 'Opus',
+    ogg: 'OGG',
     vorbis: 'Vorbis',
+    wav: 'WAV',
+    aiff: 'AIFF',
     'ec-3': 'EC-3',
     ac3: 'AC-3',
   }
   return tokenMap[lower] ?? tokenMap[lower.split('.')[0]] ?? raw
+}
+
+function isHiddenAudioInfoToken(value?: string) {
+  if (!value) return true
+  const lower = value.trim().toLowerCase()
+  return lower === 'local'
+    || lower === 'download'
+    || lower === 'file'
+    || lower === 'offline'
+    || lower === 'downloaded'
 }
 
 function isSameAudioInfoToken(left: string, right: string) {
@@ -1455,11 +1474,22 @@ function isSameAudioInfoToken(left: string, right: string) {
 }
 
 // AccentBackdrop 底色（对齐 Android：主色降饱和调暗后铺底）
+// 强制压暗，保证白字在亮封面/浅主题下仍可读
 const accentBgStyle = computed(() => {
   if (!player.hasPlaybackSession) return { background: 'rgb(18, 18, 18)' }
   const bg = paletteResult.value?.accentBg
   if (!bg) return { background: 'rgb(18, 18, 18)' }
-  return { background: `rgb(${bg[0]}, ${bg[1]}, ${bg[2]})` }
+  const [r, g, b] = bg
+  const luma = (r * 0.299 + g * 0.587 + b * 0.114) / 255
+  if (luma <= 0.34) {
+    return { background: `rgb(${r}, ${g}, ${b})` }
+  }
+  // 过亮时向中性深色混合，保留色相
+  const t = Math.min(1, (luma - 0.34) / 0.4)
+  const mix = 0.35 + t * 0.45
+  return {
+    background: `rgb(${Math.round(r * (1 - mix) + 18 * mix)}, ${Math.round(g * (1 - mix) + 18 * mix)}, ${Math.round(b * (1 - mix) + 18 * mix)})`,
+  }
 })
 const shouldRenderDynamicBackground = computed(() => shouldShowDynamicBackground(
   player.hasPlaybackSession,
@@ -1559,7 +1589,7 @@ const sliderActiveColor = computed(() => {
       v-if="player.hasPlaybackSession && settings.coverBlurBg"
       :cover-url="coverUrl"
       :blur-amount="settings.coverBlurAmount * 30"
-      :darken-alpha="settings.coverBlurDarken"
+      :darken-alpha="Math.max(settings.coverBlurDarken, 0.42)"
     />
     <HyperBackground
       v-else-if="shouldRenderDynamicBackground"
@@ -1604,15 +1634,15 @@ const sliderActiveColor = computed(() => {
 
     <!-- 双栏 -->
     <div v-else class="np-body" :class="[{ 'np-body--no-header': props.hideHeader }, playViewMode === 'lyrics' ? 'np-body--lyrics-mode' : 'np-body--cover-mode']">
-      <!-- 左侧 -->
-      <section class="np-left" :class="{ 'np-left--beat-active': isVisualBeatActive }">
+      <!-- 左侧：stack 固定内部高度，外层居中，切歌不上下重排 -->
+      <section class="np-left">
+        <div class="np-left-stack">
         <div
           class="cover-wrap"
           :class="{
             'cover-wrap--card': settings.coverStyle === 'card',
             'cover-wrap--disc': settings.coverStyle !== 'card',
             'cover-wrap--switching': isTrackSwitchAnimating,
-            'cover-wrap--beat-active': isVisualBeatActive,
           }"
           @contextmenu="openContextMenu($event, 'cover')"
         >
@@ -1672,8 +1702,9 @@ const sliderActiveColor = computed(() => {
           </transition>
         </div>
 
-        <div class="np-info" :class="{ 'np-info--beat-active': isVisualBeatActive }">
-          <transition :name="metaTransitionName" mode="out-in">
+        <!-- 固定高度叠层：切歌时不 out-in 塌高度，避免整列重居中上下跳 -->
+        <div class="np-info">
+          <transition :name="metaTransitionName">
             <div :key="nowPlayingTrackKey" class="np-meta">
               <h2 class="np-title" @contextmenu="openContextMenu($event, 'title')">{{ player.currentTrack?.title || t('player.not_playing') }}</h2>
               <p class="np-artist" @contextmenu="openContextMenu($event, 'artist')">{{ player.currentTrack?.artist || '' }}</p>
@@ -1681,7 +1712,7 @@ const sliderActiveColor = computed(() => {
           </transition>
         </div>
 
-        <div class="np-slider-area" :class="{ 'np-slider-area--switching': isTrackSwitchAnimating, 'np-slider-area--beat-active': isVisualBeatActive }">
+        <div class="np-slider-area">
           <WaveformSlider
             :progress="player.interpolatedProgress"
             :is-playing="player.isPlaying"
@@ -1690,35 +1721,31 @@ const sliderActiveColor = computed(() => {
             @preview="onSliderPreview"
             @preview-end="onSliderPreviewEnd"
           />
-          <transition name="np-detail-swap" mode="out-in">
-            <div :key="nowPlayingTimeKey" class="np-time">
-              <span>{{ player.currentTimeFormatted }}</span>
-              <span>{{ player.durationFormatted }}</span>
-            </div>
-          </transition>
-          <transition name="np-detail-swap" mode="out-in">
-            <div v-if="player.audioInfo || player.isPlayingFromDownload" :key="nowPlayingAudioInfoKey" class="np-audio-info">
-              <span v-if="player.isPlayingFromDownload" class="np-download-chip">
-                <span class="material-symbols-rounded">download_done</span>
-                {{ t('player.playing_from_download') }}
-              </span>
-              <span v-if="audioInfoParts.length" class="np-audio-detail" :class="{ separated: player.isPlayingFromDownload }">
-                <template v-for="(part, index) in audioInfoParts" :key="`${part.text}:${index}`">
-                  <span
-                    class="np-audio-detail-part"
-                    :class="{ 'np-audio-detail-part--accent': part.accent }"
-                  >{{ part.text }}</span>
-                  <span v-if="index < audioInfoParts.length - 1" class="np-audio-separator">·</span>
-                </template>
-              </span>
-            </div>
-          </transition>
+          <div class="np-time">
+            <span>{{ player.currentTimeFormatted }}</span>
+            <span>{{ player.durationFormatted }}</span>
+          </div>
+          <!-- 音质行始终占位，空内容也保留高度 -->
+          <div class="np-audio-info" :key="nowPlayingAudioInfoKey">
+            <span v-if="player.isPlayingFromDownload" class="np-download-chip">
+              <span class="material-symbols-rounded">download_done</span>
+              {{ t('player.playing_from_download') }}
+            </span>
+            <span v-if="audioInfoParts.length" class="np-audio-detail" :class="{ separated: player.isPlayingFromDownload }">
+              <template v-for="(part, index) in audioInfoParts" :key="`${part.text}:${index}`">
+                <span
+                  class="np-audio-detail-part"
+                  :class="{ 'np-audio-detail-part--accent': part.accent }"
+                >{{ part.text }}</span>
+                <span v-if="index < audioInfoParts.length - 1" class="np-audio-separator">·</span>
+              </template>
+            </span>
+          </div>
         </div>
 
         <div
           class="np-controls"
           :class="{
-            'np-controls--switching': isTrackSwitchAnimating,
             [controlsPulseClass]: !!controlFeedbackPulse,
             'np-controls--feedback-prev': lastControlDirection === 'prev',
             'np-controls--feedback-next': lastControlDirection === 'next',
@@ -1768,7 +1795,6 @@ const sliderActiveColor = computed(() => {
         <!-- 工具栏（对齐 Android 底部：Favorite → Queue → Sleep → Volume → Speed → Add） -->
         <div
           class="np-toolbar"
-          :class="{ 'np-toolbar--switching': isTrackSwitchAnimating, 'np-toolbar--beat-active': isVisualBeatActive }"
           @click.stop
         >
           <button
@@ -1980,6 +2006,7 @@ const sliderActiveColor = computed(() => {
           <button class="tool-btn tool-btn--feedback" @click="triggerControlFeedbackPulse(); toggleToolbarPanel('add')">
             <span class="material-symbols-rounded">playlist_add</span>
           </button>
+        </div>
         </div>
       </section>
 
@@ -2640,6 +2667,8 @@ const sliderActiveColor = computed(() => {
   // 确保完全不透明
   isolation: isolate;
   overflow: hidden;
+  /* 与窗体圆角一致，避免全屏层直角顶出 OS 圆角 */
+  border-radius: var(--radius-lg);
   user-select: none;
   -webkit-user-select: none;
   transition: transform 460ms cubic-bezier(0.22, 1, 0.36, 1), opacity 300ms ease;
@@ -2675,15 +2704,13 @@ const sliderActiveColor = computed(() => {
   height: 40px;
 }
 
-.np-shell--opening {
-  animation: np-shell-open 520ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
+/* 开/关由 App 层 slide-up 纯上滑负责，壳层不再二次缩放/位移 */
+.np-shell--opening,
 .np-shell--closing {
-  animation: np-shell-close 360ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
-.np-shell--beat-active .np-ambient-glow {
+.np-shell--beat-active .np-ambient-glow::before {
   animation: np-beat-shell-bloom 320ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -2700,32 +2727,46 @@ const sliderActiveColor = computed(() => {
   display: none;
 }
 
+/* 环境光：纯 radial 渐变，禁止 filter:blur（滤镜矩形盒会在窗角露出方框） */
 .np-ambient-glow {
   position: absolute;
-  inset: -12%;
+  inset: 0;
   z-index: 1;
   pointer-events: none;
+  overflow: hidden;
+}
+
+.np-ambient-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
   background:
-    radial-gradient(circle at 30% 22%, color-mix(in srgb, var(--np-primary, rgba(255,255,255,0.32)) 28%, transparent), transparent 36%),
-    radial-gradient(circle at 72% 80%, color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.28)) 22%, transparent), transparent 42%);
-  opacity: 0.42;
-  filter: blur(48px) saturate(1.05);
+    radial-gradient(ellipse 70% 58% at 28% 24%,
+      color-mix(in srgb, var(--np-primary, rgba(255,255,255,0.34)) 38%, transparent) 0%,
+      color-mix(in srgb, var(--np-primary, rgba(255,255,255,0.34)) 16%, transparent) 38%,
+      transparent 68%),
+    radial-gradient(ellipse 62% 54% at 78% 78%,
+      color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.30)) 30%, transparent) 0%,
+      color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.30)) 12%, transparent) 42%,
+      transparent 72%),
+    radial-gradient(ellipse 48% 40% at 55% 48%,
+      color-mix(in srgb, var(--np-primary, rgba(255,255,255,0.20)) 10%, transparent) 0%,
+      transparent 70%);
+  opacity: 0.48;
+  transform: scale(1);
   transition: opacity 420ms ease, transform 620ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.np-shell--opening .np-ambient-glow,
-.np-shell--track-switching .np-ambient-glow {
+.np-shell--track-switching .np-ambient-glow::before {
   animation: np-glow-breathe 620ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* 打开/关闭时内容不做 settle 位移或缩放，只跟随外壳上滑 */
 .np-shell--opening .np-header,
-.np-shell--opening .np-body {
-  animation: np-content-open-settle 420ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
+.np-shell--opening .np-body,
 .np-shell--closing .np-header,
 .np-shell--closing .np-body {
-  animation: np-content-close-settle 260ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
 /* 顶栏 */
@@ -2797,14 +2838,15 @@ const sliderActiveColor = computed(() => {
   z-index: 2;
   flex: 1;
   display: flex;
-  padding: 0 0 20px;
+  padding: 0 0 16px;
   gap: 0;
   overflow: hidden;
   min-height: 0;
   transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 300ms ease;
 
   &.np-body--no-header {
-    padding-top: 64px; /* 56px 播放器顶栏 + 8px 间距 */
+    /* 顶栏 36px + 呼吸空间，避免内容贴红绿灯/顶栏 */
+    padding-top: 52px;
   }
 
   &.np-body--lyrics-mode {
@@ -2820,7 +2862,7 @@ const sliderActiveColor = computed(() => {
 
     .np-right {
       flex: 1 1 100%;
-      padding: 0 40px;
+      padding: 0 48px 8px;
       transform: translateX(0);
       filter: none;
     }
@@ -2828,16 +2870,42 @@ const sliderActiveColor = computed(() => {
 
   &.np-body--cover-mode {
     .np-left {
-      flex: 1 1 50%;
+      flex: 1 1 46%;
+      max-width: 560px;
       opacity: 1;
-      transform: translateX(0) scale(1);
+      transform: none;
       pointer-events: auto;
-      padding: 0 20px 0 40px;
+      justify-content: center;
+      padding: 20px 36px 24px 52px;
     }
 
     .np-right {
-      flex: 1 1 50%;
-      padding: 0 40px 0 0;
+      flex: 1 1 54%;
+      padding: 8px 48px 16px 16px;
+    }
+  }
+}
+
+/* 大屏/全屏：封面更大、左右留白更均衡 */
+@media (min-height: 900px) {
+  .cover-wrap {
+    width: min(100%, 380px, 38vh);
+  }
+
+  .np-left-stack {
+    max-width: 420px;
+    gap: 14px;
+  }
+}
+
+@media (min-width: 1400px) {
+  .np-body.np-body--cover-mode {
+    .np-left {
+      padding: 24px 40px 28px 64px;
+    }
+
+    .np-right {
+      padding: 12px 64px 20px 24px;
     }
   }
 }
@@ -2848,14 +2916,24 @@ const sliderActiveColor = computed(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
+  /* 外层垂直居中整块 stack；stack 内部固定，切歌不重排 */
   justify-content: center;
-  gap: 10px;
-  padding: 0 20px 0 40px;
-  transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 280ms ease;
+  padding: 12px 28px 16px 40px;
+  transition: opacity 280ms ease;
+}
+
+.np-left-stack {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
 }
 
 .np-left--beat-active {
-  animation: np-left-beat-sway 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
 .np-right {
@@ -2865,17 +2943,18 @@ const sliderActiveColor = computed(() => {
   display: flex;
   align-items: stretch;
   overflow: hidden;
-  padding: 0 40px 0 0;
+  padding: 0 40px 8px 8px;
   transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 280ms ease, filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* 封面 */
+/* 封面：全屏时更大更稳 */
 .cover-wrap {
   position: relative;
-  width: min(60%, 280px);
+  width: min(100%, 340px, 40vh);
+  max-width: 100%;
   aspect-ratio: 1;
   flex-shrink: 0;
-  transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), filter 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
+  transition: filter 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
   overflow: visible;
 }
 
@@ -3010,29 +3089,42 @@ const sliderActiveColor = computed(() => {
   border: 2px solid rgba(255,255,255,0.06);
 }
 
-/* 曲目信息 */
+/* 曲目信息：固定高度 + 绝对叠层，切歌不塌布局 */
 .np-info {
   text-align: center;
   width: 100%;
-  padding: 2px 12px 0;
-  margin-bottom: 8px;
+  max-width: 100%;
+  padding: 0 8px;
+  margin: 0;
   position: relative;
-  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease, filter 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  height: 52px;
+  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .np-info--beat-active {
-  animation: np-info-beat-unison 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
 .np-meta {
+  position: absolute;
+  inset: 0;
   width: 100%;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  box-sizing: border-box;
+  padding: 0 4px;
 }
 
 .np-title {
   font-size: 22px;
   font-weight: 700;
   color: white;
-  line-height: 1.3;
+  line-height: 1.25;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3042,14 +3134,26 @@ const sliderActiveColor = computed(() => {
 .np-artist {
   font-size: 14px;
   color: rgba(255,255,255,0.78);
-  margin-top: 3px;
+  margin-top: 2px;
   font-weight: 500;
+  line-height: 1.25;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* 进度条区域 */
+/* 进度条区域：固定高度，音质行始终占位 */
 .np-slider-area {
   width: 100%;
-  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
+  max-width: 100%;
+  /* 进度条 + 时间 + 音质/下载 chip，留足高度避免裁切 */
+  height: 80px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  overflow: visible;
 }
 
 .np-slider-area--beat-active {
@@ -3062,7 +3166,7 @@ const sliderActiveColor = computed(() => {
   font-size: 11px;
   font-weight: 600;
   color: rgba(255,255,255,0.78);
-  padding: 2px 4px 0;
+  padding: 4px 4px 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -3070,14 +3174,21 @@ const sliderActiveColor = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-wrap: wrap;
   gap: 6px;
   text-align: center;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
-  color: rgba(255,255,255,0.60);
-  letter-spacing: 0;
-  margin-top: 0px;
-  min-height: 18px;
+  color: rgba(255,255,255,0.68);
+  letter-spacing: 0.2px;
+  margin-top: 6px;
+  /* 给下载 chip 完整高度，禁止裁切圆角 */
+  min-height: 24px;
+  height: auto;
+  flex-shrink: 0;
+  overflow: visible;
+  padding: 1px 2px;
+  box-sizing: border-box;
 }
 
 .np-audio-codec {
@@ -3090,7 +3201,7 @@ const sliderActiveColor = computed(() => {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  color: rgba(255,255,255,0.60);
+  color: rgba(255,255,255,0.68);
 
   &.separated::before {
     content: '·';
@@ -3100,13 +3211,15 @@ const sliderActiveColor = computed(() => {
 }
 
 .np-audio-detail-part {
-  color: rgba(255,255,255,0.62);
+  color: rgba(255,255,255,0.70);
   transition: color 0.45s ease;
 }
 
 .np-audio-detail-part--accent {
-  color: var(--np-primary, var(--md-primary, #D0BCFF));
-  text-shadow: 0 0 18px color-mix(in srgb, var(--np-primary, #D0BCFF) 28%, transparent);
+  /* 降低饱和与发光，避免「高清环绕声」等标签过于抢眼 */
+  color: color-mix(in srgb, var(--np-primary, var(--md-primary, #D0BCFF)) 58%, rgba(255,255,255,0.78));
+  text-shadow: none;
+  font-weight: 600;
 }
 
 .np-audio-separator {
@@ -3117,14 +3230,19 @@ const sliderActiveColor = computed(() => {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  padding: 2px 7px;
+  padding: 3px 9px;
   border-radius: 999px;
+  line-height: 1.2;
+  white-space: nowrap;
   color: var(--np-primary-container, var(--md-primary-container, #E8DEF8));
   background: rgba(255,255,255,0.10);
   border: 1px solid rgba(255,255,255,0.14);
+  box-sizing: border-box;
+  flex-shrink: 0;
 
   .material-symbols-rounded {
-    font-size: 12px;
+    font-size: 13px;
+    line-height: 1;
   }
 }
 
@@ -3133,14 +3251,15 @@ const sliderActiveColor = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: 12px;
   width: 100%;
-  margin-top: 50px;
-  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
+  margin-top: 4px;
+  flex-shrink: 0;
+  transition: opacity 240ms ease;
 }
 
 .np-controls--switching {
-  animation: np-controls-breathe 440ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
 .np-controls--feedback {
@@ -3245,53 +3364,46 @@ const sliderActiveColor = computed(() => {
 .play-btn {
   width: 52px;
   height: 52px;
-  border-radius: var(--radius-full);
-  background: var(--np-primary-container, white);
+  border-radius: 50%;
+  background: var(--np-primary-container, #f5f0ff);
   color: var(--np-on-primary, rgb(20, 18, 24));
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.35);
+  /* 轻阴影，不进 mask，避免中间发黑 / 四角 */
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+  filter: none;
   margin: 0 4px;
-  transition: transform 150ms var(--ease-standard), box-shadow 150ms, background 0.6s ease, color 0.6s ease;
+  transition: transform 150ms var(--ease-standard), background 0.6s ease, color 0.6s ease, box-shadow 150ms ease;
   overflow: hidden;
-  position: relative; /* 绝对定位子元素的容器 */
+  position: relative;
+  isolation: isolate;
 
-  &:hover { transform: scale(1.05); box-shadow: 0 6px 28px rgba(0,0,0,0.4); }
+  &:hover {
+    transform: scale(1.05);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
+  }
   &:active { transform: scale(0.94); }
 }
 
+.play-btn--transport {
+  overflow: hidden;
+}
+
+/* 去掉会盖住按钮中心的黑径向阴影 */
 .play-btn--transport::before {
-  content: '';
-  position: absolute;
-  inset: -16%;
-  background: radial-gradient(circle, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0.08) 32%, transparent 66%);
-  opacity: 0;
-  transform: scale(0.72);
-  transition: opacity 240ms ease, transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  content: none;
 }
 
 .play-btn--transport::after {
-  content: '';
-  position: absolute;
-  inset: 5px;
-  border-radius: inherit;
-  border: 1px solid color-mix(in srgb, var(--np-on-primary, rgba(255,255,255,0.8)) 18%, transparent);
-  opacity: 0;
-  transform: scale(0.88);
-  transition: opacity 220ms ease, transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  content: none;
 }
 
 .play-btn--transport:hover::before,
-.play-btn--transport:focus-visible::before {
-  opacity: 1;
-  transform: scale(1);
-}
-
+.play-btn--transport:focus-visible::before,
 .play-btn--transport:hover::after,
 .play-btn--transport:focus-visible::after {
-  opacity: 1;
-  transform: scale(1);
+  content: none;
 }
 
 .play-btn--switching {
@@ -3301,7 +3413,9 @@ const sliderActiveColor = computed(() => {
 .play-icon-inner {
   font-size: 28px;
   display: block;
-  position: absolute; /* 重叠过渡，避免 out-in 空窗 */
+  position: absolute;
+  z-index: 1;
+  color: inherit;
 
   &.spinning {
     animation: np-spin 1s linear infinite;
@@ -3323,62 +3437,20 @@ const sliderActiveColor = computed(() => {
   100% { transform: scale(1); }
 }
 
-@keyframes np-shell-open {
-  0% {
-    opacity: 0.72;
-    transform: translateY(22px) scale(0.992);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes np-shell-close {
-  0% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-  100% {
-    opacity: 0.84;
-    transform: translateY(10px) scale(0.994);
-  }
-}
-
-@keyframes np-content-open-settle {
-  0% {
-    opacity: 0.74;
-    transform: translateY(10px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes np-content-close-settle {
-  0% {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  100% {
-    opacity: 0.92;
-    transform: translateY(-4px);
-  }
-}
+/* 壳层/内容开合动画已禁用：仅保留 App.slide-up 的 translateY */
 
 @keyframes np-glow-breathe {
   0% {
-    opacity: 0.2;
-    transform: scale(1.06);
+    opacity: 0.28;
+    transform: scale(1.02);
   }
   48% {
-    opacity: 0.52;
-    transform: scale(1);
+    opacity: 0.58;
+    transform: scale(1.0);
   }
   100% {
-    opacity: 0.42;
-    transform: scale(1.02);
+    opacity: 0.48;
+    transform: scale(1);
   }
 }
 
@@ -3415,37 +3487,30 @@ const sliderActiveColor = computed(() => {
 @keyframes np-play-press-bounce {
   0% {
     transform: scale(1);
-    box-shadow: 0 4px 24px rgba(0,0,0,0.35);
   }
   24% {
     transform: scale(0.9);
-    box-shadow: 0 2px 12px rgba(0,0,0,0.28);
   }
   62% {
     transform: scale(1.08);
-    box-shadow: 0 10px 32px rgba(0,0,0,0.42);
   }
   100% {
     transform: scale(1);
-    box-shadow: 0 4px 24px rgba(0,0,0,0.35);
   }
 }
 
 @keyframes np-beat-shell-bloom {
   0% {
-    opacity: 0.42;
+    opacity: 0.48;
     transform: scale(1);
-    filter: blur(48px) saturate(1.05);
   }
   50% {
-    opacity: 0.6;
-    transform: scale(1.035);
-    filter: blur(42px) saturate(1.16);
+    opacity: 0.64;
+    transform: scale(1.03);
   }
   100% {
-    opacity: 0.42;
-    transform: scale(1.01);
-    filter: blur(48px) saturate(1.05);
+    opacity: 0.48;
+    transform: scale(1);
   }
 }
 
@@ -3574,23 +3639,18 @@ const sliderActiveColor = computed(() => {
 
 .np-meta-swap-enter-active,
 .np-meta-swap-leave-active {
-  transition: opacity 240ms ease, transform 420ms cubic-bezier(0.22, 1, 0.36, 1), filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: opacity 200ms ease;
 }
-.np-meta-swap-enter-from {
-  opacity: 0;
-  transform: translateY(9px);
-  filter: blur(2px);
-}
+.np-meta-swap-enter-from,
 .np-meta-swap-leave-to {
   opacity: 0;
-  transform: translateY(-9px);
-  filter: blur(2px);
+  /* 不再上下位移，避免标题区看起来「跳一大截」 */
+  transform: none;
+  filter: none;
 }
 
 .np-cover-static-enter-active,
-.np-cover-static-leave-active,
-.np-meta-static-enter-active,
-.np-meta-static-leave-active {
+.np-cover-static-leave-active {
   transition: none;
 }
 
@@ -3630,72 +3690,60 @@ const sliderActiveColor = computed(() => {
   filter: saturate(1.08) blur(4px);
 }
 
+/* 切歌标题：绝对叠层交叉淡入，不做位移，避免整列重排 */
 .np-meta-flow-prev-enter-active,
 .np-meta-flow-prev-leave-active,
 .np-meta-flow-next-enter-active,
-.np-meta-flow-next-leave-active {
-  transition:
-    opacity 240ms ease,
-    transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
-    filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
+.np-meta-flow-next-leave-active,
+.np-meta-static-enter-active,
+.np-meta-static-leave-active {
+  transition: opacity 220ms ease;
 }
 
-.np-meta-flow-prev-enter-from {
+.np-meta-flow-prev-enter-from,
+.np-meta-flow-prev-leave-to,
+.np-meta-flow-next-enter-from,
+.np-meta-flow-next-leave-to,
+.np-meta-static-enter-from,
+.np-meta-static-leave-to {
   opacity: 0;
-  transform: translateX(-14px) translateY(7px);
-  filter: blur(4px);
+  transform: none;
+  filter: none;
 }
 
-.np-meta-flow-prev-leave-to {
-  opacity: 0;
-  transform: translateX(12px) translateY(-5px);
-  filter: blur(5px);
-}
-
-.np-meta-flow-next-enter-from {
-  opacity: 0;
-  transform: translateX(14px) translateY(7px);
-  filter: blur(4px);
-}
-
-.np-meta-flow-next-leave-to {
-  opacity: 0;
-  transform: translateX(-12px) translateY(-5px);
-  filter: blur(5px);
+.np-meta-flow-prev-leave-active,
+.np-meta-flow-next-leave-active,
+.np-meta-static-leave-active {
+  position: absolute;
+  inset: 0;
 }
 
 .np-detail-swap-enter-active,
 .np-detail-swap-leave-active {
-  transition: opacity 180ms ease, transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: opacity 160ms ease;
 }
 
-.np-detail-swap-enter-from {
-  opacity: 0;
-  transform: translateY(6px);
-}
-
+.np-detail-swap-enter-from,
 .np-detail-swap-leave-to {
   opacity: 0;
-  transform: translateY(-6px);
+  transform: none;
 }
 
-/* 工具栏 */
+/* 工具栏：切歌时不上下呼吸，避免整列位移 */
 .np-toolbar {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 6px;
   width: 100%;
   margin-top: 4px;
-  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
+  flex-shrink: 0;
+  transition: opacity 240ms ease;
 }
 
-.np-toolbar--switching {
-  animation: np-toolbar-breathe 520ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
+.np-toolbar--switching,
 .np-toolbar--beat-active {
-  animation: np-toolbar-beat-bob 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
 .tool-btn {
@@ -3844,6 +3892,10 @@ const sliderActiveColor = computed(() => {
   position: absolute;
   overflow: hidden;
   isolation: isolate;
+  /* 统一毛玻璃：半透明底 + 强模糊 */
+  background: rgba(22, 20, 26, 0.62);
+  backdrop-filter: blur(28px) saturate(1.15);
+  -webkit-backdrop-filter: blur(28px) saturate(1.15);
   border-color: color-mix(in srgb, var(--np-primary-container, rgba(255,255,255,0.14)) 26%, rgba(255,255,255,0.08));
   box-shadow:
     0 14px 40px rgba(0,0,0,0.46),
@@ -3923,8 +3975,9 @@ const sliderActiveColor = computed(() => {
   bottom: 46px;
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(30, 28, 34, 0.96);
-  backdrop-filter: blur(24px);
+  background: rgba(22, 20, 26, 0.72);
+  backdrop-filter: blur(28px) saturate(1.15);
+  -webkit-backdrop-filter: blur(28px) saturate(1.15);
   border-radius: 16px;
   padding: 14px;
   display: flex;
@@ -3937,8 +3990,7 @@ const sliderActiveColor = computed(() => {
   max-height: 480px;
   overflow-y: auto;
 
-  &::-webkit-scrollbar { width: 4px; }
-  &::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+  &::-webkit-scrollbar { width: 0; height: 0; display: none; }
 }
 
 .audiofx-section :deep(.custom-select) {
@@ -4194,7 +4246,8 @@ const sliderActiveColor = computed(() => {
   font-size: 9px;
   font-weight: 700;
   background: var(--md-primary, #D0BCFF);
-  color: #1C1B1F;
+  /* 定时器倒计时文字白色 */
+  color: #fff;
   padding: 0 4px;
   border-radius: 999px;
   font-variant-numeric: tabular-nums;
@@ -4272,8 +4325,10 @@ const sliderActiveColor = computed(() => {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  background: rgba(0,0,0,0.35);
-  backdrop-filter: blur(4px);
+  /* 高斯模糊遮罩，避免生硬压暗 */
+  background: rgba(8, 8, 12, 0.28);
+  backdrop-filter: blur(22px) saturate(1.08);
+  -webkit-backdrop-filter: blur(22px) saturate(1.08);
   border-radius: var(--radius-lg);
   overflow: hidden;
   clip-path: inset(0 round var(--radius-lg));
@@ -4283,18 +4338,20 @@ const sliderActiveColor = computed(() => {
   width: min(380px, 100%);
   max-width: calc(100vw - 32px);
   max-height: min(80vh, calc(100vh - 32px));
+  /* 隐藏滚动条，仍允许内容滚动 */
   overflow-y: auto;
-  background: rgba(30, 28, 34, 0.95);
-  backdrop-filter: blur(20px);
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  background: rgba(30, 28, 34, 0.88);
+  backdrop-filter: blur(28px) saturate(1.12);
+  -webkit-backdrop-filter: blur(28px) saturate(1.12);
   border-radius: 24px;
   padding: 24px;
   box-shadow: 0 16px 48px rgba(0,0,0,0.5);
   border: 1px solid rgba(255,255,255,0.06);
 
-  /* 自定义滚动条 */
-  &::-webkit-scrollbar { width: 4px; }
-  &::-webkit-scrollbar-track { background: transparent; }
-  &::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+  /* 隐藏滚动条 */
+  &::-webkit-scrollbar { width: 0; height: 0; display: none; }
 }
 
 .np-more-sheet-content {

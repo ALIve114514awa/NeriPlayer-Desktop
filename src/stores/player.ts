@@ -679,11 +679,9 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     const renderedMs = clampPlaybackPosition(_interpRenderedMs)
+    // 倍速播放时后端时钟与插值都应按速度前进；仍拒绝明显回跳
     if (_interpIsPlaying && !forceRendered && safePositionMs < renderedMs - POSITION_BACKWARD_TOLERANCE_MS) {
-      positionMs.value = renderedMs
-      _interpAnchorMs = renderedMs
-      _interpAnchorTime = performance.now()
-      _interpDurationMs = Math.max(durationMs.value || _interpDurationMs, renderedMs)
+      // 仅忽略回跳，不把锚点锁死在旧渲染值（否则倍速歌词会落后）
       return
     }
 
@@ -691,7 +689,8 @@ export const usePlayerStore = defineStore('player', () => {
     _interpAnchorMs = safePositionMs
     _interpAnchorTime = performance.now()
     _interpDurationMs = Math.max(durationMs.value || _interpDurationMs, safePositionMs)
-    if (!_interpIsPlaying || forceRendered) {
+    // 播放中也允许后端时钟校准插值，保证歌词与倍速同步
+    if (!_interpIsPlaying || forceRendered || Math.abs(safePositionMs - renderedMs) > 80) {
       _interpRenderedMs = safePositionMs
       interpolatedPositionMs.value = safePositionMs
     }
@@ -1075,10 +1074,19 @@ export const usePlayerStore = defineStore('player', () => {
       }
 
       if (playedFromDownloadedFile) {
+        // 本地下载：不展示 Local/download 占位；格式从扩展名推断，码率有则显示
+        const ext = downloaded?.filePath
+          ?.split(/[\\/]/)
+          .pop()
+          ?.split('.')
+          .pop()
+          ?.toLowerCase()
+        const formatFromExt = ext && ext.length <= 5 ? ext : undefined
         audioInfo.value = {
-          codec: 'Local',
-          format: 'download',
-          source: 'local',
+          // 不写 codec: Local，避免进度条下出现 Local · download
+          format: formatFromExt,
+          source: getPlaybackSourceKind(track) || track.source || undefined,
+          qualityKey: undefined,
         }
         lastUrlResolveTime = 0
       } else if (isRemotePlaybackTrack(track)) {
@@ -1875,16 +1883,27 @@ export const usePlayerStore = defineStore('player', () => {
   // 播放速度
   const playbackSpeed = ref(settings.playbackSpeed)
   async function setSpeed(spd: number) {
-    playbackSpeed.value = Math.max(0.25, Math.min(3, spd))
-    settings.playbackSpeed = playbackSpeed.value
-    _interpSpeed = spd
-    // 重新锚定以反映速度变化
-    if (_interpIsPlaying) {
-      _interpAnchorMs = interpolatedPositionMs.value
-      _interpAnchorTime = performance.now()
-      _interpRenderedMs = interpolatedPositionMs.value
+    const next = Math.max(0.25, Math.min(3, spd))
+    const wasPlaying = _interpIsPlaying
+    // 先锚定当前渲染位置，立刻切换插值速度，歌词/进度同步跟手
+    const nowMs = currentRenderedPosition()
+    playbackSpeed.value = next
+    settings.playbackSpeed = next
+    _interpSpeed = next
+    _interpAnchorMs = nowMs
+    _interpAnchorTime = performance.now()
+    _interpRenderedMs = nowMs
+    interpolatedPositionMs.value = nowMs
+    // 通知歌词组件强制 seek 到当前点，避免倍速后视觉落后
+    if (wasPlaying) {
+      lastSeekCommand.value = {
+        seq: lastSeekCommand.value.seq + 1,
+        positionMs: nowMs,
+        source: 'local',
+        requestGeneration: playbackRequestToken,
+      }
     }
-    try { await invoke('set_speed', { speed: playbackSpeed.value }) } catch {}
+    try { await invoke('set_speed', { speed: next }) } catch {}
   }
 
   // ─── 音效参数（响度增益 + 均衡器） ───
