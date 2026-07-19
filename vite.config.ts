@@ -18,6 +18,11 @@ export default defineConfig({
     },
   },
   clearScreen: false,
+  // 仅以项目自身入口做依赖扫描，避免爬到 vendor 下 AMLL playground 的
+  // 多个 html 入口（它们会引用 react/jotai 等未安装的包，触发无关报错）
+  optimizeDeps: {
+    entries: ['index.html'],
+  },
   server: {
     port: 1420,
     strictPort: true,

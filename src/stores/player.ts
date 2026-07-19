@@ -146,6 +146,22 @@ export interface SeekCommandSnapshot {
   requestGeneration: number
 }
 
+// 当前音频质量信息
+export interface AudioInfo {
+  bitrate?: number  // kbps
+  codec?: string    // e.g. "MP3", "FLAC", "AAC", "Opus"
+  format?: string   // 原始格式标识
+  source?: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local'
+  qualityKey?: string
+  qualityLabel?: string
+  qualityOptions?: Array<{ key: string; label: string }>
+  mimeType?: string
+  sampleRateHz?: number
+  bitDepth?: number
+  channelCount?: number
+  specLabel?: string
+}
+
 interface PendingSeekState {
   targetMs: number
   issuedAt: number
@@ -256,20 +272,6 @@ export const usePlayerStore = defineStore('player', () => {
   const hasPlaybackSession = ref(false)
 
   // 当前音频质量信息
-  interface AudioInfo {
-    bitrate?: number  // kbps
-    codec?: string    // e.g. "MP3", "FLAC", "AAC", "Opus"
-    format?: string   // 原始格式标识
-    source?: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local'
-    qualityKey?: string
-    qualityLabel?: string
-    qualityOptions?: Array<{ key: string; label: string }>
-    mimeType?: string
-    sampleRateHz?: number
-    bitDepth?: number
-    channelCount?: number
-    specLabel?: string
-  }
   const audioInfo = ref<AudioInfo | null>(null)
   const isPlayingFromDownload = ref(false)
 

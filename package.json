@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --build && vite build",
     "preview": "vite preview",
     "test:bilibili-cover-cache": "node scripts/test-bilibili-cover-cache.mjs",
     "test:playback-request": "node scripts/playback-request.test.mjs",
@@ -31,6 +31,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.5.0",
     "@types/animejs": "^3.1.12",
+    "@types/node": "^26.1.1",
     "@vitejs/plugin-vue": "^5.2.4",
     "sass": "^1.89.0",
     "typescript": "^5.8.3",
