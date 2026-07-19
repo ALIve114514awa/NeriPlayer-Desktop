@@ -51,7 +51,7 @@ const {
   keepProgress, keepPlaybackMode,
   showTranslation, lyricBlur, lyricBlurAmount,
   cloudMusicOffset, qqMusicOffset,
-  advancedLyrics, dynamicBackground, audioReactive,
+  advancedLyrics, dynamicBackground, dynamicColor, audioReactive,
   coverBlurBg, coverBlurAmount, coverBlurDarken,
   neteaseQuality, youtubeQuality, biliQuality,
   bypassProxy, internationalizationEnabled,
@@ -1078,7 +1078,7 @@ function confirmDataSaverChange() {
       </div>
       <div class="setting-info">
         <div class="setting-title">{{ t('settings.theme_color') }}</div>
-        <div class="color-row">
+        <div class="color-row" :style="dynamicColor ? { opacity: 0.4, pointerEvents: 'none' } : undefined">
           <button
             v-for="c in presetColors" :key="c.key"
             class="color-dot"
@@ -1090,6 +1090,16 @@ function confirmDataSaverChange() {
           </button>
         </div>
       </div>
+    </div>
+
+    <!-- 动态取色 -->
+    <div class="setting-card">
+      <div class="setting-icon-wrap"><span class="material-symbols-rounded">colorize</span></div>
+      <div class="setting-info">
+        <div class="setting-title">{{ t('settings.dynamic_color') }}</div>
+        <div class="setting-desc">{{ t('settings.dynamic_color_desc') }}</div>
+      </div>
+      <label class="m3-switch"><input type="checkbox" v-model="dynamicColor" /><span class="track"><span class="thumb"><span v-if="dynamicColor" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
     </div>
 
     <!-- 个性化 -->

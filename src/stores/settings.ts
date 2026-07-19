@@ -36,6 +36,7 @@ export interface AppSettings {
   coverStyle: CoverStyle
   advancedLyrics: boolean
   dynamicBackground: boolean
+  dynamicColor: boolean
   audioReactive: boolean
   coverBlurBg: boolean
   coverBlurAmount: number
@@ -113,6 +114,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   coverStyle: 'card',
   advancedLyrics: true,
   dynamicBackground: true,
+  dynamicColor: false,
   audioReactive: true,
   coverBlurBg: false,
   coverBlurAmount: 1.5,
@@ -353,6 +355,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const coverStyle = ref<CoverStyle>(initial.coverStyle)
   const advancedLyrics = ref(initial.advancedLyrics)
   const dynamicBackground = ref(initial.dynamicBackground)
+  const dynamicColor = ref(initial.dynamicColor)
   const audioReactive = ref(initial.audioReactive)
   const coverBlurBg = ref(initial.coverBlurBg)
   const coverBlurAmount = ref(initial.coverBlurAmount)
@@ -391,7 +394,7 @@ export const useSettingsStore = defineStore('settings', () => {
     fadeInDuration, fadeOutDuration, crossfadeNext, crossfadeInDuration,
     crossfadeOutDuration, keepProgress, keepPlaybackMode, showTranslation,
     lyricBlur, lyricBlurAmount, cloudMusicOffset, qqMusicOffset, coverStyle,
-    advancedLyrics, dynamicBackground, audioReactive, coverBlurBg,
+    advancedLyrics, dynamicBackground, dynamicColor, audioReactive, coverBlurBg,
     coverBlurAmount, coverBlurDarken, neteaseQuality, qqMusicQuality,
     youtubeQuality, biliQuality, bypassProxy, internationalizationEnabled,
     backgroundImageUri, backgroundImageBlur, backgroundImageAlpha, devModeEnabled,
@@ -477,7 +480,7 @@ export const useSettingsStore = defineStore('settings', () => {
     crossfadeNext, crossfadeInDuration, crossfadeOutDuration,
     keepProgress, keepPlaybackMode, showTranslation, lyricBlur, lyricBlurAmount,
     cloudMusicOffset, qqMusicOffset, advancedLyrics, dynamicBackground,
-    audioReactive, coverBlurBg, coverBlurAmount, coverBlurDarken,
+    dynamicColor, audioReactive, coverBlurBg, coverBlurAmount, coverBlurDarken,
     neteaseQuality, qqMusicQuality, youtubeQuality, biliQuality, bypassProxy,
     internationalizationEnabled, backgroundImageUri, backgroundImageBlur,
     backgroundImageAlpha, devModeEnabled, logToFile, logLevel, maxCacheSize, downloadNameTemplate,

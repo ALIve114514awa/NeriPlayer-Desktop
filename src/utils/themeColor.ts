@@ -235,17 +235,10 @@ const SURFACE_PROPS = [
 ] as const
 
 /**
- * 仅视觉应用主题色 CSS 变量（不持久化）
- * @param isDark 直接传入避免 classList 读取导致强制 reflow
+ * 应用一套颜色令牌到 :root 行内样式（含深色 surface 微混）。
+ * 由预设主题与动态取色共用，避免重复实现
  */
-export function applyThemeColorVisual(key: string, isDark?: boolean) {
-  const scheme = THEME_COLORS.find(c => c.key === key)
-  if (!scheme) return
-
-  // 直接使用传入的 isDark，避免在 startViewTransition 回调内
-  // 读取 classList（写后读会触发强制 reflow，是卡顿的主因）
-  const dark = isDark ?? !document.documentElement.classList.contains('light-theme')
-  const vars = dark ? scheme.dark : scheme.light
+export function applyThemeVars(vars: Record<string, string>, seed: string, dark: boolean) {
   const root = document.documentElement.style
 
   // 先清除所有 surface 行内样式，确保 CSS class 的值能生效
@@ -256,7 +249,7 @@ export function applyThemeColorVisual(key: string, isDark?: boolean) {
   for (const [prop, value] of Object.entries(vars)) {
     root.setProperty(prop, value)
   }
-  root.setProperty('--md-seed', scheme.seed)
+  root.setProperty('--md-seed', seed)
 
   // 深色模式下给 surface 微混主题色 ~1.5%（浅色不动，保持中性白底）
   if (dark) {
@@ -273,6 +266,21 @@ export function applyThemeColorVisual(key: string, isDark?: boolean) {
       root.setProperty('--md-surface-container-highest', `rgb(${Math.round(54 + r * 0.02)}, ${Math.round(52 + g * 0.02)}, ${Math.round(59 + b * 0.02)})`)
     }
   }
+}
+
+/**
+ * 仅视觉应用主题色 CSS 变量（不持久化）
+ * @param isDark 直接传入避免 classList 读取导致强制 reflow
+ */
+export function applyThemeColorVisual(key: string, isDark?: boolean) {
+  const scheme = THEME_COLORS.find(c => c.key === key)
+  if (!scheme) return
+
+  // 直接使用传入的 isDark，避免在 startViewTransition 回调内
+  // 读取 classList（写后读会触发强制 reflow，是卡顿的主因）
+  const dark = isDark ?? !document.documentElement.classList.contains('light-theme')
+  const vars = dark ? scheme.dark : scheme.light
+  applyThemeVars(vars, scheme.seed, dark)
 }
 
 /** 应用主题色到 CSS 变量（含持久化） */
@@ -330,4 +338,9 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
 /** 获取已保存的主题色 */
 export function getSavedThemeColor(): string {
   return localStorage.getItem('theme-color') || 'purple'
+}
+
+/** 关闭动态取色时恢复到已保存的预设主题色（仅视觉，不持久化） */
+export function clearDynamicThemeColor(isDark?: boolean) {
+  applyThemeColorVisual(getSavedThemeColor(), isDark)
 }

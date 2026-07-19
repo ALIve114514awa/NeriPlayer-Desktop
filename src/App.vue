@@ -19,6 +19,8 @@ import TitleBar from '@/components/TitleBar.vue'
 import { setLocale } from '@/i18n'
 import { applyTheme } from '@/utils/theme'
 import { applyThemeColor } from '@/utils/themeColor'
+import { getTrackCoverUrl } from '@/utils/trackCover'
+import { applyDynamicColorFromCover, clearDynamicColor } from '@/utils/colorExtractor'
 import { hasVisiblePlaybackSession } from '@/utils/playbackRequest'
 
 type CoverSnapshot = {
@@ -226,6 +228,31 @@ watch(() => route.fullPath, async () => {
   })
 }, { flush: 'post' })
 
+// 动态取色：跟随封面主题色。解析当前深浅色，供令牌生成使用
+function resolveDynamicIsDark(): boolean {
+  const mode = settingsStore.darkMode
+  if (mode === 'dark') return true
+  if (mode === 'light') return false
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+}
+
+// 开关、深浅色或封面变化时重算；关闭或无封面则还原预设主题色
+watch(
+  () => [
+    settingsStore.dynamicColor,
+    settingsStore.darkMode,
+    player.hasPlaybackSession ? getTrackCoverUrl(player.currentTrack) : '',
+  ] as const,
+  ([enabled, , cover]) => {
+    const dark = resolveDynamicIsDark()
+    if (!enabled || !cover) {
+      clearDynamicColor(dark)
+      return
+    }
+    void applyDynamicColorFromCover(cover as string, dark)
+  },
+)
+
 // 启动时初始化：加载同步配置 + 检查登录状态 + 自动同步
 onMounted(async () => {
   const syncStore = useSyncStore()
@@ -242,6 +269,11 @@ onMounted(async () => {
   await settingsStore.hydrate()
   applyTheme(settingsStore.darkMode, false)
   applyThemeColor(settingsStore.themeColor, undefined, false)
+  // 首屏在预设主题之后应用动态取色，避免被 applyThemeColor 覆盖
+  if (settingsStore.dynamicColor) {
+    const cover = player.hasPlaybackSession ? getTrackCoverUrl(player.currentTrack) : ''
+    if (cover) void applyDynamicColorFromCover(cover, resolveDynamicIsDark())
+  }
   setLocale(settingsStore.locale, false)
   await player.applyPersistedSettings()
   if (route.name === 'home' && settingsStore.defaultScreen !== 'home') {

@@ -346,6 +346,8 @@
     "color_brown": "茶色",
     "color_orange": "オレンジ",
     "color_green": "緑",
+    "dynamic_color": "ダイナミックカラー",
+    "dynamic_color_desc": "カバーのテーマカラーに合わせて配色を自動調整",
 
     "personalization": "カスタマイズ",
     "nav_personalization_desc": "外観と再生画面を調整",
