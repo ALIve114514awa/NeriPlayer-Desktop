@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use crate::error::{AppError, AppResult};
 use crate::state::TrackInfo;
@@ -36,9 +37,34 @@ pub struct PlaylistInfo {
 
 #[tauri::command]
 pub async fn list_playlists() -> AppResult<Vec<PlaylistInfo>> {
-    tokio::task::spawn_blocking(|| list_playlists_blocking(playlists_path()))
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?
+    let started = Instant::now();
+    log::info!(target: "playlist-io", "list begin");
+    let queued_at = Instant::now();
+    let playlists = tokio::task::spawn_blocking(move || {
+        let worker_started = Instant::now();
+        log::info!(
+            target: "playlist-io",
+            "list worker started queued_ms={}",
+            queued_at.elapsed().as_millis(),
+        );
+        let result = list_playlists_blocking(playlists_path());
+        log::info!(
+            target: "playlist-io",
+            "list worker finished ok={}, worker_ms={}",
+            result.is_ok(),
+            worker_started.elapsed().as_millis(),
+        );
+        result
+    })
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))??;
+    log::info!(
+        target: "playlist-io",
+        "list end count={}, elapsed_ms={}",
+        playlists.len(),
+        started.elapsed().as_millis(),
+    );
+    Ok(playlists)
 }
 
 fn list_playlists_blocking(path: std::path::PathBuf) -> AppResult<Vec<PlaylistInfo>> {
@@ -141,19 +167,48 @@ pub async fn rename_playlist(app: AppHandle, id: i64, name: String) -> AppResult
 
 #[tauri::command]
 pub async fn get_playlist_tracks(id: i64) -> AppResult<Vec<TrackInfo>> {
-    let path = playlists_path();
-    let store = PlaylistStore::load(&path);
-    let pl = store.playlists.iter().find(|p| p.id == id)
-        .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
-    let mut seen = std::collections::HashSet::new();
-    let tracks: Vec<TrackInfo> = pl.tracks.iter()
-        .filter(|track| !track.id.is_empty() && seen.insert(playlist_track_key(track)))
-        .cloned()
-        .map(|mut track| {
-            track.playlist_key = Some(playlist_track_key(&track));
-            track
-        })
-        .collect();
+    let started = Instant::now();
+    log::info!(target: "playlist-io", "tracks begin playlist_id={}", id);
+    let queued_at = Instant::now();
+    let tracks = tokio::task::spawn_blocking(move || {
+        let worker_started = Instant::now();
+        log::info!(
+            target: "playlist-io",
+            "tracks worker started playlist_id={}, queued_ms={}",
+            id,
+            queued_at.elapsed().as_millis(),
+        );
+        let path = playlists_path();
+        let store = PlaylistStore::load(&path);
+        let pl = store.playlists.iter().find(|p| p.id == id)
+            .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
+        let mut seen = std::collections::HashSet::new();
+        let tracks: Vec<TrackInfo> = pl.tracks.iter()
+            .filter(|track| !track.id.is_empty() && seen.insert(playlist_track_key(track)))
+            .cloned()
+            .map(|mut track| {
+                track.playlist_key = Some(playlist_track_key(&track));
+                track
+            })
+            .collect();
+        log::info!(
+            target: "playlist-io",
+            "tracks worker finished playlist_id={}, count={}, worker_ms={}",
+            id,
+            tracks.len(),
+            worker_started.elapsed().as_millis(),
+        );
+        Ok::<Vec<TrackInfo>, AppError>(tracks)
+    })
+    .await
+    .map_err(|e| AppError::Other(e.to_string()))??;
+    log::info!(
+        target: "playlist-io",
+        "tracks end playlist_id={}, count={}, elapsed_ms={}",
+        id,
+        tracks.len(),
+        started.elapsed().as_millis(),
+    );
     Ok(tracks)
 }
 

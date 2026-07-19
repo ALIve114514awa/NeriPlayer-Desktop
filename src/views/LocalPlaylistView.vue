@@ -86,21 +86,60 @@ async function loadDetail() {
   const id = Number(route.params.id)
   if (!id) return
 
+  const loadStarted = performance.now()
+  log.info('playlist load begin:', {
+    playlistId: id,
+    loadingAudio: player.isLoadingAudio,
+    currentTrackId: player.currentTrack?.id || '',
+  })
   isLoading.value = true
   error.value = null
 
   try {
+    const listStarted = performance.now()
     const playlists = await invoke<{ id: number; name: string }[]>('list_playlists')
+    log.info('playlist list returned:', {
+      playlistId: id,
+      count: playlists.length,
+      elapsedMs: Math.round(performance.now() - listStarted),
+      loadingAudio: player.isLoadingAudio,
+    })
     const pl = playlists.find(p => p.id === id)
     playlistName.value = pl?.name || ''
 
+    const tracksStarted = performance.now()
     const trackList = await invoke<any[]>('get_playlist_tracks', { id })
+    log.info('playlist tracks returned:', {
+      playlistId: id,
+      count: trackList.length,
+      elapsedMs: Math.round(performance.now() - tracksStarted),
+      loadingAudio: player.isLoadingAudio,
+    })
     tracks.value = trackList.map(normalizeTrack)
     player.prefetchPlaybackTracks(tracks.value)
+    log.info('playlist load committed:', {
+      playlistId: id,
+      count: tracks.value.length,
+      totalMs: Math.round(performance.now() - loadStarted),
+      loadingAudio: player.isLoadingAudio,
+      currentTrackId: player.currentTrack?.id || '',
+    })
   } catch (e: any) {
     error.value = e?.toString() || t('player.load_failed')
+    log.error('playlist load failed:', {
+      playlistId: id,
+      totalMs: Math.round(performance.now() - loadStarted),
+      loadingAudio: player.isLoadingAudio,
+      currentTrackId: player.currentTrack?.id || '',
+      error: e,
+    })
   } finally {
     isLoading.value = false
+    log.info('playlist load finished:', {
+      playlistId: id,
+      totalMs: Math.round(performance.now() - loadStarted),
+      loadingAudio: player.isLoadingAudio,
+    })
   }
 }
 
