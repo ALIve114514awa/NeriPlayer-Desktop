@@ -35,13 +35,19 @@ const isLayoutReady = ref(false)
 let lyricPlayer: DomLyricPlayer | null = null
 let rafId = 0
 let layoutFrameId = 0
-let layoutSettleFrameId = 0
+let layoutSyncToken = 0
 let lastFrameAt = 0
 let lastSyncedTime = Number.NaN
+let resizeObserver: ResizeObserver | null = null
+let lastHostWidth = 0
+let lastHostHeight = 0
 
 const SPLIT_WHITESPACE_RE = /(\s+)/
 const WHITESPACE_RE = /\s/g
 const AMLL_WORD_FADE_WIDTH = 0.5
+const LAYOUT_SETTLE_PASSES = 4
+const LAYOUT_SETTLE_MAX_PASSES = 8
+const SIZE_EPSILON = 0.5
 
 interface PlayerRubyWord {
   startMs: number
@@ -320,39 +326,151 @@ function stopFrameLoop(): void {
 
 function cancelLayoutSync(): void {
   if (layoutFrameId) cancelAnimationFrame(layoutFrameId)
-  if (layoutSettleFrameId) cancelAnimationFrame(layoutSettleFrameId)
   layoutFrameId = 0
-  layoutSettleFrameId = 0
+  layoutSyncToken += 1
+}
+
+function syncPlayerElementSize(): boolean {
+  if (!lyricPlayer) return false
+  const playerElement = lyricPlayer.getElement()
+  const width = playerElement.clientWidth || hostRef.value?.clientWidth || 0
+  const height = playerElement.clientHeight || hostRef.value?.clientHeight || 0
+
+  if (width > 0) lyricPlayer.size[0] = width
+  if (height > 0) lyricPlayer.size[1] = height
+
+  return width > 0 && height > 0
+}
+
+function syncMountedGroupSizes(): boolean {
+  if (!lyricPlayer) return false
+  let changed = false
+
+  for (const group of lyricPlayer.currentLyricGroups) {
+    const element = group.element
+    if (!element.parentElement) continue
+
+    const width = element.clientWidth
+    const height = element.clientHeight
+    if (width <= 0 || height <= 0) continue
+
+    const previous = lyricPlayer.lyricGroupSize.get(group)
+    if (
+      !previous ||
+      Math.abs(previous[0] - width) > SIZE_EPSILON ||
+      Math.abs(previous[1] - height) > SIZE_EPSILON
+    ) {
+      const nextSize: [number, number] = [width, height]
+      lyricPlayer.lyricGroupSize.set(group, nextSize)
+      group.onLineSizeChange(nextSize)
+      changed = true
+    }
+  }
+
+  return changed
+}
+
+function forceLayoutAtCurrentTime(): boolean {
+  if (!lyricPlayer) return false
+  const hasPlayerSize = syncPlayerElementSize()
+  const time = Math.max(0, Math.round(amllTimeMs.value))
+
+  lyricPlayer.setCurrentTime(time, true)
+  const changedBeforeLayout = syncMountedGroupSizes()
+  void lyricPlayer.calcLayout(true, true)
+  lyricPlayer.update(0)
+  const changedAfterLayout = syncMountedGroupSizes()
+
+  if (changedBeforeLayout || changedAfterLayout) {
+    void lyricPlayer.calcLayout(true, true)
+    lyricPlayer.update(0)
+  }
+
+  lastSyncedTime = time
+  return hasPlayerSize
+}
+
+function finishLayoutSync(token: number): void {
+  if (!lyricPlayer || token !== layoutSyncToken) return
+  const settledTime = Math.max(0, Math.round(amllTimeMs.value))
+
+  lyricPlayer.setCurrentTime(settledTime, true)
+  forceLayoutAtCurrentTime()
+  lyricPlayer.setCurrentTime(settledTime, false)
+  syncPlayState()
+  lyricPlayer.update(0)
+  lastSyncedTime = settledTime
+  isLayoutReady.value = true
+}
+
+function scheduleFontReadyLayout(token: number): void {
+  const fonts = document.fonts
+  if (!fonts || fonts.status === 'loaded') return
+
+  void fonts.ready.then(() => {
+    if (!lyricPlayer || token !== layoutSyncToken) return
+    scheduleLayoutSync()
+  })
 }
 
 function scheduleLayoutSync(): void {
   if (!lyricPlayer) return
-  cancelLayoutSync()
+  if (layoutFrameId) cancelAnimationFrame(layoutFrameId)
+
+  const token = layoutSyncToken + 1
+  layoutSyncToken = token
   isLayoutReady.value = false
+  let pass = 0
 
-  layoutFrameId = requestAnimationFrame(() => {
-    layoutFrameId = 0
-    if (!lyricPlayer) return
-    const time = Math.max(0, Math.round(amllTimeMs.value))
-    lyricPlayer.setCurrentTime(time, true)
-    void lyricPlayer.calcLayout(true, true)
-    lyricPlayer.update(0)
-    lastSyncedTime = time
+  const runPass = () => {
+    layoutFrameId = requestAnimationFrame(() => {
+      layoutFrameId = 0
+      if (!lyricPlayer || token !== layoutSyncToken) return
 
-    layoutSettleFrameId = requestAnimationFrame(() => {
-      layoutSettleFrameId = 0
-      if (!lyricPlayer) return
-      const settledTime = Math.max(0, Math.round(amllTimeMs.value))
-      lyricPlayer.setCurrentTime(settledTime, true)
-      void lyricPlayer.calcLayout(true, true)
-      lyricPlayer.update(0)
-      lyricPlayer.setCurrentTime(settledTime, false)
-      syncPlayState()
-      lyricPlayer.update(0)
-      lastSyncedTime = settledTime
-      isLayoutReady.value = true
+      pass += 1
+      const hasPlayerSize = forceLayoutAtCurrentTime()
+      const needsMorePasses =
+        pass < LAYOUT_SETTLE_PASSES ||
+        (!hasPlayerSize && pass < LAYOUT_SETTLE_MAX_PASSES)
+
+      if (needsMorePasses) {
+        runPass()
+        return
+      }
+
+      finishLayoutSync(token)
     })
+  }
+
+  runPass()
+  scheduleFontReadyLayout(token)
+}
+
+function startResizeObserver(): void {
+  if (!hostRef.value || typeof ResizeObserver === 'undefined') return
+
+  resizeObserver = new ResizeObserver(entries => {
+    const entry = entries[0]
+    if (!entry) return
+
+    const width = entry.contentRect.width
+    const height = entry.contentRect.height
+    if (width <= 0 || height <= 0) return
+
+    const hasSizeChanged =
+      Math.abs(width - lastHostWidth) > SIZE_EPSILON ||
+      Math.abs(height - lastHostHeight) > SIZE_EPSILON
+    lastHostWidth = width
+    lastHostHeight = height
+
+    if (hasSizeChanged) scheduleLayoutSync()
   })
+  resizeObserver.observe(hostRef.value)
+}
+
+function stopResizeObserver(): void {
+  resizeObserver?.disconnect()
+  resizeObserver = null
 }
 
 onMounted(() => {
@@ -363,6 +481,7 @@ onMounted(() => {
     lyricPlayer.addEventListener('line-click', onLineClick as EventListener)
     hostRef.value.appendChild(lyricPlayer.getElement())
 
+    startResizeObserver()
     reloadLyrics()
     startFrameLoop()
   })
@@ -371,6 +490,7 @@ onMounted(() => {
 onUnmounted(() => {
   stopFrameLoop()
   cancelLayoutSync()
+  stopResizeObserver()
   if (!lyricPlayer) return
 
   lyricPlayer.removeEventListener('line-click', onLineClick as EventListener)
@@ -388,6 +508,10 @@ watch(() => settings.showTranslation, () => {
 
 watch([() => settings.lyricBlur, () => settings.lyricBlurAmount], () => {
   syncLyricOptions()
+})
+
+watch(() => settings.lyricFontScale, () => {
+  scheduleLayoutSync()
 })
 
 watch(() => props.isPlaying, () => {
