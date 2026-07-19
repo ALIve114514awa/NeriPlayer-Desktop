@@ -23,6 +23,8 @@ const LOCAL_PREBUFFER: Duration = Duration::from_millis(80);
 const GROWING_PREBUFFER: Duration = Duration::from_millis(800);
 const REMOTE_PREBUFFER: Duration = Duration::from_millis(400);
 const REBUFFER_TARGET: Duration = Duration::from_millis(1_500);
+// 音效/倍速切换后的短恢复目标：避免 underrun 后卡 1.5s
+const EFFECTS_RECOVER_TARGET: Duration = Duration::from_millis(120);
 const PCM_CAPACITY: Duration = Duration::from_secs(4);
 const DECODE_IDLE_SLEEP: Duration = Duration::from_millis(2);
 const READY_POLL: Duration = Duration::from_millis(20);
@@ -130,6 +132,8 @@ enum AudioCmd {
         reply: mpsc::Sender<Result<(), String>>,
     },
     QueryEmpty { reply: mpsc::Sender<bool> },
+    /// 丢掉 ring 中过期的已处理样本，使 EQ/响度/倍速近似实时
+    InvalidateProcessedBuffer,
     FadeOutPause {
         duration_ms: u32,
         transition_generation: u64,
@@ -141,6 +145,10 @@ enum AudioCmd {
         reply: mpsc::Sender<Result<(), String>>,
     },
 }
+
+/// 参数变更后保留的已缓冲时长：够连续播放，又足够实时
+// 保留极短已处理尾部，目标 <0.5s 内听到新音效/倍速
+const EFFECTS_KEEP_BUFFER: Duration = Duration::from_millis(40);
 
 #[derive(Clone)]
 pub struct PlaybackStarted {
@@ -206,6 +214,10 @@ impl PlaybackShared {
         duration_to_frames(REBUFFER_TARGET, self.sample_rate)
     }
 
+    fn soft_recover_frames(&self) -> usize {
+        duration_to_frames(EFFECTS_RECOVER_TARGET, self.sample_rate).max(1)
+    }
+
     fn update_buffering_state(&self) {
         if !self.buffering.load(Ordering::Acquire) {
             return;
@@ -213,6 +225,12 @@ impl PlaybackShared {
         let target = self.buffer_target_frames.load(Ordering::Acquire);
         if self.buffered_frames() >= target || self.finished.load(Ordering::Acquire) {
             self.buffering.store(false, Ordering::Release);
+            // 软恢复结束后恢复正常 underrun 目标，避免后续网络卡顿只缓冲 120ms
+            let soft = self.soft_recover_frames();
+            if target > 0 && target <= soft.saturating_mul(3) {
+                self.buffer_target_frames
+                    .store(self.rebuffer_frames(), Ordering::Release);
+            }
             self.wake.notify_all();
         }
     }
@@ -221,9 +239,42 @@ impl PlaybackShared {
         if self.finished.load(Ordering::Acquire) {
             return;
         }
+        // 音效/倍速刚切过（目标已是软恢复量级）时，underrun 不要拉回 1.5s
+        let soft = self.soft_recover_frames();
+        let current = self.buffer_target_frames.load(Ordering::Acquire);
+        let target = if current > 0 && current <= soft.saturating_mul(3) {
+            soft
+        } else {
+            self.rebuffer_frames()
+        };
         self.buffer_target_frames
-            .store(self.rebuffer_frames(), Ordering::Release);
+            .store(target, Ordering::Release);
         self.buffering.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    /// 丢弃 ring 中过旧的已处理 PCM，只留极短尾部；用于 EQ/响度/倍速即时生效
+    fn invalidate_processed_buffer(&self, clock_speed: f32) {
+        let keep_frames = duration_to_frames(EFFECTS_KEEP_BUFFER, self.sample_rate);
+        let keep_samples = keep_frames.saturating_mul(self.channels);
+        let before = self.ring.readable_samples();
+        self.ring.discard_keeping_tail(keep_samples);
+        let after = self.ring.readable_samples();
+        let dropped = before.saturating_sub(after);
+        if dropped > 0 {
+            let dropped_frames = dropped / self.channels.max(1);
+            let speed = clock_speed.clamp(0.25, 3.0);
+            let advance_us = ((dropped_frames as f64 * 1_000_000.0 / f64::from(self.sample_rate))
+                * f64::from(speed)) as u64;
+            self.clock
+                .position_us
+                .fetch_add(advance_us, Ordering::AcqRel);
+        }
+        // 软恢复目标：若 underrun 只补 ~120ms，不主动静音
+        let recover = self.soft_recover_frames().max(keep_frames).max(1);
+        self.buffer_target_frames
+            .store(recover, Ordering::Release);
+        self.buffering.store(false, Ordering::Release);
         self.wake.notify_all();
     }
 }
@@ -703,6 +754,7 @@ impl PlayerEngine {
 
     pub fn set_speed(&mut self, speed: f32) {
         self.speed = speed.clamp(0.25, 3.0);
+        // SetSpeed 内部按旧速丢 ring 并补时钟，无需再发 Invalidate
         let _ = self.cmd_tx.send(AudioCmd::SetSpeed(self.speed));
     }
 
@@ -710,6 +762,7 @@ impl PlayerEngine {
         if let Ok(mut params) = self.effects_params.lock() {
             params.loudness_gain_mb = millibels.clamp(0, 1_500);
         }
+        let _ = self.cmd_tx.send(AudioCmd::InvalidateProcessedBuffer);
     }
 
     pub fn set_equalizer(&self, enabled: bool, bands: &[i32]) {
@@ -719,12 +772,14 @@ impl PlayerEngine {
                 params.eq_band_levels_mb[index] = value.clamp(-1_500, 1_500);
             }
         }
+        let _ = self.cmd_tx.send(AudioCmd::InvalidateProcessedBuffer);
     }
 
     pub fn reset_effects(&self) {
         if let Ok(mut params) = self.effects_params.lock() {
             params.reset();
         }
+        let _ = self.cmd_tx.send(AudioCmd::InvalidateProcessedBuffer);
     }
 
     pub fn request_seek(
@@ -1277,9 +1332,14 @@ fn audio_control_loop(
                 }
             }
             AudioCmd::SetSpeed(next_speed) => {
+                // 先记下旧速：丢弃 ring 时按旧速补时钟，内容位置才对齐
+                let previous_speed = speed;
                 speed = next_speed.clamp(0.25, 3.0);
                 if let Some(session) = &current {
                     session.shared.speed.store(speed);
+                    session
+                        .shared
+                        .invalidate_processed_buffer(previous_speed);
                 }
             }
             AudioCmd::Seek {
@@ -1393,6 +1453,13 @@ fn audio_control_loop(
             }
             AudioCmd::QueryEmpty { reply } => {
                 let _ = reply.send(current.as_ref().is_none_or(PlaybackSession::is_empty));
+            }
+            AudioCmd::InvalidateProcessedBuffer => {
+                if let Some(session) = current.as_ref() {
+                    // EQ/响度已改 params；用当前倍速补时钟（丢的是输出帧）
+                    let clock_speed = session.shared.speed.load();
+                    session.shared.invalidate_processed_buffer(clock_speed);
+                }
             }
             AudioCmd::FadeOutPause {
                 duration_ms,

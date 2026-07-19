@@ -145,8 +145,9 @@ impl BiquadFilter {
 
 /// 5 频段均衡器中心频率
 const EQ_FREQS: [f64; 5] = [60.0, 230.0, 910.0, 3600.0, 14000.0];
-/// 参数更新检查间隔（样本数），约每 1024 个样本检查一次
-const PARAM_CHECK_INTERVAL: usize = 1024;
+/// 参数更新检查间隔（样本数）
+/// 解码线程每帧都会推进；配合 ring 尾部丢弃，开关体感 <100ms
+const PARAM_CHECK_INTERVAL: usize = 32;
 
 pub struct EqualizerSource<S> {
     inner: S,
@@ -201,11 +202,24 @@ where
             Err(_) => return,
         };
 
+        let was_enabled = self.enabled;
         self.enabled = p.eq_enabled;
+
+        // 关闭均衡器时清空延迟线，避免关闭后仍残留滤波状态
+        if was_enabled && !self.enabled {
+            for filter in self.filters.iter_mut() {
+                filter.reset();
+            }
+        }
 
         let sr = self.sample_rate as f64;
         for i in 0..5 {
-            let new_db = p.eq_band_levels_mb[i] as f64 / 100.0;
+            // 关闭时强制按 0dB 更新系数，重新开启前不会带着旧增益
+            let new_db = if self.enabled {
+                p.eq_band_levels_mb[i] as f64 / 100.0
+            } else {
+                0.0
+            };
             if (new_db - self.band_gains_db[i]).abs() > 0.01 {
                 self.band_gains_db[i] = new_db;
                 self.filters[i].compute_coefficients(EQ_FREQS[i], new_db, sr);
@@ -223,7 +237,7 @@ where
     fn next(&mut self) -> Option<f32> {
         let sample = self.inner.next()?;
 
-        // 周期性检查参数更新
+        // 周期性检查参数；开关边沿在 update_params 内立刻 reset 延迟线
         self.sample_counter += 1;
         if self.sample_counter >= PARAM_CHECK_INTERVAL {
             self.sample_counter = 0;
@@ -231,7 +245,7 @@ where
         }
 
         if !self.enabled {
-            // 跟踪声道即使 disabled（保持同步）
+            // 关闭时完全直通，不消耗滤波器状态
             self.current_channel = (self.current_channel + 1) % self.channels as usize;
             return Some(sample);
         }

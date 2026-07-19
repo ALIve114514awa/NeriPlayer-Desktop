@@ -44,6 +44,26 @@ impl PcmRing {
         self.capacity.saturating_sub(self.readable_samples())
     }
 
+    /// 丢弃当前可读缓冲，让后续重新填充
+    pub fn clear(&self) {
+        let write = self.write_position.load(Ordering::Acquire);
+        self.read_position.store(write, Ordering::Release);
+    }
+
+    /// 只保留尾部 keep_samples 个样本，丢掉更早的已处理音频
+    /// 用于 EQ/响度/倍速实时生效，同时避免 underrun 静音
+    pub fn discard_keeping_tail(&self, keep_samples: usize) {
+        let write = self.write_position.load(Ordering::Acquire);
+        let read = self.read_position.load(Ordering::Acquire);
+        let readable = write.wrapping_sub(read).min(self.capacity);
+        if readable <= keep_samples {
+            return;
+        }
+        let drop = readable - keep_samples;
+        self.read_position
+            .store(read.wrapping_add(drop), Ordering::Release);
+    }
+
     pub fn try_push_frame(&self, frame: &[f32]) -> bool {
         if frame.is_empty() || frame.len() > self.capacity {
             return false;
