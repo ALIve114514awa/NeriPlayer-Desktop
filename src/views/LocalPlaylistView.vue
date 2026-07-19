@@ -486,6 +486,11 @@ onMounted(() => {
             <div class="track-title">{{ track.title }}</div>
             <div class="track-meta">{{ track.artist }}<template v-if="track.album"> · {{ displayAlbum(track.album) }}</template></div>
           </div>
+          <span
+            v-if="downloadStore.isDownloaded(track.id)"
+            class="track-download-badge material-symbols-rounded filled"
+            :title="t('download.downloaded')"
+          >download_done</span>
           <div class="track-duration">{{ formatDuration(track.durationMs) }}</div>
           <button class="track-more" @click.stop="openTrackMenu($event, track, index)">
             <span class="material-symbols-rounded">more_vert</span>
@@ -607,6 +612,14 @@ onMounted(() => {
 
 .track-item.selection-mode .track-duration {
   opacity: 0.45;
+}
+
+/* 已下载标识：在音乐库列表中标记本地已缓存的曲目 */
+.track-download-badge {
+  flex-shrink: 0;
+  color: var(--md-primary);
+  opacity: 0.85;
+  font-size: 18px;
 }
 
 .track-more {

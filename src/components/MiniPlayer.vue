@@ -158,9 +158,6 @@ const displayCoverUrl = computed(() => {
     || getTrackCoverUrl(queuedTrack)
     || ''
 })
-const miniDownloadStateKey = computed(() =>
-  `${miniTrackKey.value}:${player.isPlayingFromDownload ? 'download' : 'stream'}`
-)
 const coverRef = ref<HTMLDivElement>()
 
 function getCoverSnapshot(): CoverSnapshot | null {
@@ -233,12 +230,6 @@ defineExpose({
               <div class="mp-title">{{ player.currentTrack?.title || t('player.not_playing') }}</div>
               <div class="mp-artist">{{ player.currentTrack?.artist || '' }}</div>
               <div v-if="player.durationMs > 0" class="mp-time">{{ currentTimeFormatted }} / {{ durationFormatted }}</div>
-              <transition name="mp-chip-fade" mode="out-in">
-                <div v-if="player.isPlayingFromDownload" :key="miniDownloadStateKey" class="mp-download-chip">
-                  <span class="material-symbols-rounded">download_done</span>
-                  {{ t('player.playing_from_download') }}
-                </div>
-              </transition>
             </div>
           </transition>
         </div>
@@ -519,26 +510,6 @@ defineExpose({
   margin-top: 1px;
 }
 
-.mp-download-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  width: fit-content;
-  max-width: 100%;
-  margin-top: 2px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--md-primary);
-  background: color-mix(in srgb, var(--md-primary) 12%, transparent);
-  white-space: nowrap;
-
-  .material-symbols-rounded {
-    font-size: 12px;
-  }
-}
-
 /* ── 中：播放控制 ── */
 .mp-center {
   display: flex;
@@ -724,16 +695,4 @@ defineExpose({
   transform: translateY(-8px);
 }
 
-.mp-chip-fade-enter-active,
-.mp-chip-fade-leave-active {
-  transition: opacity 180ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-.mp-chip-fade-enter-from {
-  opacity: 0;
-  transform: translateY(4px);
-}
-.mp-chip-fade-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
-}
 </style>
