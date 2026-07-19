@@ -47,8 +47,15 @@ pub struct SongUrlResult {
 pub async fn get_netease_song_url(
     song_id: u64,
     quality: String,
+    request_generation: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<SongUrlResult> {
+    // 快速切歌时，过期请求直接中止，释放连接池
+    if let Some(gen) = request_generation {
+        if state.playback_generation.load(std::sync::atomic::Ordering::Acquire) > gen {
+            return Err(AppError::Audio("Playback request superseded".into()));
+        }
+    }
     let client = NeteaseClient::new(&state.http());
     let result = client.get_song_url(song_id, &quality).await?;
     Ok(SongUrlResult {
@@ -65,8 +72,14 @@ pub async fn get_netease_song_url(
 pub async fn get_qq_song_url(
     song_mid: String,
     quality: String,
+    request_generation: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<SongUrlResult> {
+    if let Some(gen) = request_generation {
+        if state.playback_generation.load(std::sync::atomic::Ordering::Acquire) > gen {
+            return Err(AppError::Audio("Playback request superseded".into()));
+        }
+    }
     let client = QqMusicClient::new(&state.http());
     let result = client.get_song_url(&song_mid, &quality).await?;
     Ok(SongUrlResult {
@@ -109,8 +122,14 @@ pub async fn get_bili_audio_url(
     avid: Option<u64>,
     cid: Option<u64>,
     quality: Option<String>,
+    request_generation: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<BiliAudioResult> {
+    if let Some(gen) = request_generation {
+        if state.playback_generation.load(std::sync::atomic::Ordering::Acquire) > gen {
+            return Err(AppError::Audio("Playback request superseded".into()));
+        }
+    }
     let client = BiliClient::new(&state.http());
 
     // 确定 bvid 和 cid

@@ -10,6 +10,7 @@ import { useLikedSongsStore } from '@/stores/likedSongs'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { convertFileSrc } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import MiniPlayer from '@/components/MiniPlayer.vue'
 import NowPlaying from '@/components/NowPlaying.vue'
 import SideNav from '@/components/SideNav.vue'
@@ -171,6 +172,11 @@ let debounceSyncTimer: ReturnType<typeof setTimeout> | null = null
 let historyBatchedTimer: ReturnType<typeof setTimeout> | null = null
 let periodicSyncTimer: ReturnType<typeof setInterval> | null = null
 let unlistenPlaylistChanged: UnlistenFn | null = null
+let unlistenCloseRequested: UnlistenFn | null = null
+
+function handleBeforeUnload() {
+  player.flushPlayerState()
+}
 
 function scheduleDebouncedSync() {
   const syncStore = useSyncStore()
@@ -224,6 +230,13 @@ watch(() => route.fullPath, async () => {
 onMounted(async () => {
   const syncStore = useSyncStore()
   const authStore = useAuthStore()
+  window.addEventListener('beforeunload', handleBeforeUnload)
+  window.addEventListener('pagehide', handleBeforeUnload)
+  try {
+    unlistenCloseRequested = await getCurrentWindow().onCloseRequested(handleBeforeUnload)
+  } catch {
+    // 浏览器开发模式没有原生窗口事件时依赖 pagehide/beforeunload
+  }
 
   // Rust 配置是启动后的规范来源，本地影子只负责首屏快速显示
   await settingsStore.hydrate()
@@ -264,6 +277,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  player.flushPlayerState()
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+  window.removeEventListener('pagehide', handleBeforeUnload)
   resetFlipState()
   if (nowPlayingMotionTimer) clearTimeout(nowPlayingMotionTimer)
   if (debounceSyncTimer) clearTimeout(debounceSyncTimer)
@@ -272,6 +288,7 @@ onUnmounted(() => {
   likedSongs.stop()
   window.removeEventListener(HISTORY_CHANGED_EVENT, scheduleHistorySync as EventListener)
   if (unlistenPlaylistChanged) unlistenPlaylistChanged()
+  if (unlistenCloseRequested) unlistenCloseRequested()
 })
 </script>
 

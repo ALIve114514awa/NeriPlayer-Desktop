@@ -23,6 +23,24 @@ const {
   shouldResolvePlaybackSourceInParallel,
 } = await import(moduleUrl)
 
+const logSanitizerSourceUrl = new URL('../src/utils/logSanitizer.ts', import.meta.url)
+const logSanitizerSource = await readFile(logSanitizerSourceUrl, 'utf8')
+const logSanitizerTranspiled = ts.transpileModule(logSanitizerSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.ES2022,
+    target: ts.ScriptTarget.ES2022,
+  },
+  fileName: pathToFileURL(logSanitizerSourceUrl.pathname).href,
+})
+const logSanitizerModuleUrl = `data:text/javascript;base64,${Buffer.from(logSanitizerTranspiled.outputText).toString('base64')}`
+const { summarizeLogError } = await import(logSanitizerModuleUrl)
+
+const signedUrlError = summarizeLogError(
+  new Error('request failed: https://media.example/audio.flac?token=secret'),
+)
+assert.match(signedUrlError, /request failed: \[url\]/)
+assert.doesNotMatch(signedUrlError, /token=secret/)
+
 assert.equal(shouldDeferPlaybackSeek(8, 7), true)
 assert.equal(shouldDeferPlaybackSeek(8, 8), false)
 
@@ -58,7 +76,7 @@ assert.equal(playbackSessionTrackKey(false, 'playlist:1', 'netease:1'), 'empty')
 assert.equal(playbackSessionTrackKey(true, 'playlist:1', 'netease:1'), 'playlist:1')
 assert.equal(playbackSessionTrackKey(true, '', 'netease:1'), 'netease:1')
 assert.equal(shouldResolvePlaybackSourceInParallel(false, false), true)
-assert.equal(shouldResolvePlaybackSourceInParallel(true, false), false)
+assert.equal(shouldResolvePlaybackSourceInParallel(true, false), true)
 assert.equal(shouldResolvePlaybackSourceInParallel(false, true), false)
 
 const prefetchTracks = [{ id: 'first' }, { id: 'second' }, { id: 'third' }, { id: 'fourth' }]
@@ -76,6 +94,38 @@ assert.match(
   playerStoreSource,
   /commitTrack\(\)\s+isLoadingAudio\.value = true\s+hasPlaybackSession\.value = true/,
   'a user-initiated load must keep MiniPlayer visible while audio is preparing',
+)
+assert.match(
+  playerStoreSource,
+  /const restored = restorePersistedPlaybackQueue\([\s\S]*hasPlaybackSession\.value = restored\.hasPlaybackSession/,
+  'a restored track must keep MiniPlayer visible without auto-starting audio',
+)
+assert.match(
+  playerStoreSource,
+  /function flushPlayerState\(\)[\s\S]*localStorage\.setItem\(PLAYER_STATE_KEY/,
+  'player state must support an immediate close-time flush',
+)
+assert.match(
+  playerStoreSource,
+  /const compactState = persistedPlayerState\(true\)[\s\S]*localStorage\.setItem\(PLAYER_STATE_KEY, JSON\.stringify\(compactState\)\)/,
+  'an oversized queue must fall back to a compact current-track state',
+)
+
+const appSource = await readFile(new URL('../src/App.vue', import.meta.url), 'utf8')
+assert.match(
+  appSource,
+  /window\.addEventListener\('beforeunload', handleBeforeUnload\)/,
+  'the app must flush player state before the WebView closes',
+)
+assert.match(
+  appSource,
+  /getCurrentWindow\(\)\.onCloseRequested\(handleBeforeUnload\)/,
+  'the app must flush player state for a native Tauri window close',
+)
+assert.match(
+  appSource,
+  /window\.addEventListener\('pagehide', handleBeforeUnload\)/,
+  'the app must flush player state when the WebView page is hidden',
 )
 
 console.log('playback request tests passed')

@@ -11,6 +11,8 @@
     "test:bilibili-cover-cache": "node scripts/test-bilibili-cover-cache.mjs",
     "test:playback-request": "node scripts/playback-request.test.mjs",
     "test:playback-source": "node scripts/test-playback-source.mjs",
+    "test:player-state": "node scripts/test-player-state.mjs",
+    "test:track-cover": "node scripts/test-track-cover.mjs",
     "tauri": "node scripts/run-tauri.mjs"
   },
   "dependencies": {

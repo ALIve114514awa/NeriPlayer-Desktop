@@ -60,10 +60,11 @@ export function playbackSessionTrackKey(
 }
 
 export function shouldResolvePlaybackSourceInParallel(
-  hadPlaybackSession: boolean,
+  _hadPlaybackSession: boolean,
   hasPrefetchedResolution: boolean,
 ): boolean {
-  return !hadPlaybackSession && !hasPrefetchedResolution
+  // 缓存检查与 URL 解析并行，避免缓存未命中后才开始网络请求
+  return !hasPrefetchedResolution
 }
 
 export function initialPlaybackPrefetchWindow<T>(

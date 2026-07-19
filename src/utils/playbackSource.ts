@@ -59,6 +59,7 @@ export type PlaybackResolution =
 export interface PlaybackResolveOptions {
   forceRefresh?: boolean
   qualityOverride?: string
+  requestGeneration?: number
 }
 
 export interface PlaybackCacheWriteOptions {
@@ -503,12 +504,14 @@ function createAudioInfo(
 function resolveNetease(
   track: TrackInfo,
   settings: PlaybackSourceSettings,
+  options: PlaybackResolveOptions,
 ): Promise<ResolvedPlaybackSource | null> {
   const songId = Number.parseInt(trackValue(track, 'netease'), 10)
   const preferred = settings.neteaseQuality.trim().toLowerCase() || 'exhigh'
   const qualities = neteaseQualityFallbacks(preferred)
   let lastError: unknown = null
   let previewFallback: ResolvedPlaybackSource | null = null
+  const requestGeneration = options.requestGeneration
 
   return (async () => {
     for (const quality of qualities) {
@@ -522,7 +525,7 @@ function resolveNetease(
           unavailable_reason?: 'requires_login' | 'no_permission' | 'no_play_url' | 'unknown' | null
         }>(
           'get_netease_song_url',
-          { songId, quality },
+          { songId, quality, requestGeneration },
         )
         if (result.unavailable_reason === 'requires_login') {
           throw new Error('Playback requires login')
@@ -572,12 +575,13 @@ function resolveNetease(
 function resolveQq(
   track: TrackInfo,
   settings: PlaybackSourceSettings,
+  options: PlaybackResolveOptions = {},
 ): Promise<ResolvedPlaybackSource | null> {
   const songMid = trackValue(track, 'qq')
   const quality = settings.qqMusicQuality
   return invoke<{ url: string | null; bitrate: number; format: string }>(
     'get_qq_song_url',
-    { songMid, quality },
+    { songMid, quality, requestGeneration: options.requestGeneration },
   ).then(result => {
     if (!result.url) return null
     const mimeType = normalizeMimeType(result.format)
@@ -605,6 +609,7 @@ interface BiliAudioCandidate {
 function resolveBilibili(
   track: TrackInfo,
   settings: PlaybackSourceSettings,
+  options: PlaybackResolveOptions = {},
 ): Promise<ResolvedPlaybackSource | null> {
   const biliId = trackValue(track, 'bilibili')
   const isAvid = /^\d+$/.test(biliId)
@@ -621,6 +626,7 @@ function resolveBilibili(
     avid: isAvid ? Number.parseInt(biliId, 10) : null,
     cid: cid ? Number.parseInt(cid, 10) : null,
     quality,
+    requestGeneration: options.requestGeneration,
   }).then(result => {
     if (!result.url) return null
     const candidates = (result.candidates ?? [])
@@ -665,10 +671,14 @@ interface YoutubeAudioStream {
 function resolveYoutube(
   track: TrackInfo,
   settings: PlaybackSourceSettings,
+  options: PlaybackResolveOptions = {},
 ): Promise<ResolvedPlaybackSource | null> {
   const videoId = trackValue(track, 'youtube')
   const quality = settings.youtubeQuality
-  return invoke<YoutubeAudioStream[]>('get_youtube_audio_url', { videoId })
+  return invoke<YoutubeAudioStream[]>('get_youtube_audio_url', {
+    videoId,
+    requestGeneration: options.requestGeneration,
+  })
     .then(streams => {
       const ordered = orderYoutubeStreams(streams ?? [], quality)
       const primary = ordered[0]

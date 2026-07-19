@@ -1,5 +1,5 @@
 use crate::audio::growing::GrowingAudioBuffer;
-use crate::audio::player::{wait_for_seek_result, PlayerEngine};
+use crate::audio::player::{wait_for_play_result, wait_for_seek_result, PlayRequest, PlayerEngine};
 use crate::audio::remote::{RemoteAudioCache, RemoteAudioSource};
 use crate::error::{AppError, AppResult};
 use crate::settings::store::{MAX_MEDIA_CACHE_SIZE_MB, MIN_MEDIA_CACHE_SIZE_MB};
@@ -13,12 +13,44 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
+use tokio::io::AsyncWriteExt;
 
 const STREAM_START_BUFFER_BYTES: usize = 64 * 1024;
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(80);
 const MAX_CACHE_LOOKUP_CANDIDATES: usize = 16;
 const PLAYBACK_SUPERSEDED_ERROR: &str = "Playback request superseded";
+
+fn playback_url_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|value| value.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn summarize_playback_error(error: &dyn std::fmt::Display) -> String {
+    let mut message = error.to_string();
+    for scheme in ["https://", "http://"] {
+        while let Some(start) = message.find(scheme) {
+            let tail = &message[start..];
+            let end = tail
+                .find(|value: char| value.is_whitespace() || matches!(value, ')' | ']' | '}'))
+                .map(|offset| start + offset)
+                .unwrap_or(message.len());
+            message.replace_range(start..end, "[url]");
+        }
+    }
+    message
+}
+
+fn playback_path_kind(path: &str) -> &'static str {
+    match path {
+        "__remote__" => "remote",
+        "__growing__" => "growing",
+        "__bytes__" => "bytes",
+        _ => "file",
+    }
+}
 
 async fn run_player_blocking<T>(
     player: Arc<Mutex<PlayerEngine>>,
@@ -35,6 +67,114 @@ where
     .map_err(|error| AppError::Other(error.to_string()))?
 }
 
+async fn lookup_ready_playback_cache(
+    cache: Option<&RemoteAudioCache>,
+    request_generation: u64,
+) -> AppResult<Option<PathBuf>> {
+    let Some(cache) = cache.cloned() else {
+        return Ok(None);
+    };
+    let queued_at = std::time::Instant::now();
+    log::info!(
+        target: "playback-cache",
+        "ready lookup queued generation={}",
+        request_generation,
+    );
+    let path = tokio::task::spawn_blocking(move || {
+        log::info!(
+            target: "playback-cache",
+            "ready lookup worker started generation={}, queued_ms={}",
+            request_generation,
+            queued_at.elapsed().as_millis(),
+        );
+        cache.ready_path()
+    })
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))?;
+    log::info!(
+        target: "playback-cache",
+        "ready lookup finished generation={}, hit={}, total_ms={}",
+        request_generation,
+        path.is_some(),
+        queued_at.elapsed().as_millis(),
+    );
+    Ok(path)
+}
+
+/// 两阶段播放：短锁发命令 → 锁外等待 → 短锁更新状态。不阻塞其他命令。
+async fn run_player_play(
+    player: Arc<Mutex<PlayerEngine>>,
+    action: impl FnOnce(&mut PlayerEngine) -> AppResult<PlayRequest> + Send + 'static,
+) -> AppResult<u64> {
+    let dispatch_started = std::time::Instant::now();
+    let dispatch_queued_at = std::time::Instant::now();
+    let player2 = Arc::clone(&player);
+    let request = tokio::task::spawn_blocking(move || {
+        log::info!(
+            target: "player-command",
+            "dispatch worker started queued_ms={}",
+            dispatch_queued_at.elapsed().as_millis(),
+        );
+        let mut p = player2.lock();
+        action(&mut p)
+    })
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))??;
+
+    let source_kind = playback_path_kind(&request.current_path);
+    log::info!(
+        target: "player-command",
+        "queued source={}, generation={}, dispatch_ms={}",
+        source_kind,
+        request.expected_generation,
+        dispatch_started.elapsed().as_millis(),
+    );
+
+    let wait_started = std::time::Instant::now();
+    let wait_queued_at = std::time::Instant::now();
+    let (started, generation, path) = tokio::task::spawn_blocking(move || {
+        log::info!(
+            target: "player-command",
+            "wait worker started generation={}, queued_ms={}",
+            request.expected_generation,
+            wait_queued_at.elapsed().as_millis(),
+        );
+        let result = wait_for_play_result(&request)?;
+        Ok::<_, AppError>((
+            result,
+            request.expected_generation,
+            request.current_path.clone(),
+        ))
+    })
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))??;
+
+    log::info!(
+        target: "player-command",
+        "audio ready source={}, generation={}, duration_ms={}, wait_ms={}",
+        playback_path_kind(&path),
+        generation,
+        started.duration_ms,
+        wait_started.elapsed().as_millis(),
+    );
+
+    let commit_started = std::time::Instant::now();
+    let duration = tokio::task::spawn_blocking(move || {
+        let mut p = player.lock();
+        p.complete_start(started, generation, path)
+    })
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))??;
+    log::info!(
+        target: "player-command",
+        "state committed generation={}, duration_ms={}, commit_ms={}",
+        generation,
+        duration,
+        commit_started.elapsed().as_millis(),
+    );
+    Ok(duration)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackUiTraceRequest {
@@ -46,8 +186,7 @@ pub struct PlaybackUiTraceRequest {
 }
 
 fn playback_trace_field(value: Option<&str>) -> String {
-    value
-        .unwrap_or("-")
+    summarize_playback_error(&value.unwrap_or("-"))
         .chars()
         .map(|character| {
             if character == '\n' || character == '\r' {
@@ -63,7 +202,7 @@ fn playback_trace_field(value: Option<&str>) -> String {
 #[tauri::command]
 pub fn trace_playback_ui(request: PlaybackUiTraceRequest) {
     if cfg!(debug_assertions) {
-        log::debug!(
+        log::info!(
             target: "playback-ui",
             "stage={}, generation={}, id={}, source={}, detail={}",
             playback_trace_field(Some(&request.stage)),
@@ -148,8 +287,8 @@ pub async fn play_file(
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     claim_playback_request(&state, request_generation)?;
-    run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.play_file_at_with_hint(
+    run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_play_file_at_with_hint(
             &path,
             duration_hint_ms.unwrap_or(0),
             start_position_ms.unwrap_or(0),
@@ -216,9 +355,9 @@ pub async fn play_cached_audio(
     );
 
     let path = path.to_string_lossy().into_owned();
-    let duration_ms = run_player_blocking(Arc::clone(&state.player), move |player| {
+    let duration_ms = run_player_play(Arc::clone(&state.player), move |player| {
         if use_crossfade {
-            player.crossfade_file_with_hint(
+            player.request_crossfade_file_with_hint(
                 &path,
                 duration_hint_ms,
                 fade_out_ms,
@@ -226,7 +365,7 @@ pub async fn play_cached_audio(
                 request_generation,
             )
         } else {
-            player.play_file_at_with_hint(
+            player.request_play_file_at_with_hint(
                 &path,
                 duration_hint_ms,
                 start_position_ms.unwrap_or(0),
@@ -316,23 +455,53 @@ pub async fn play_cached_audio_candidates(
 
     let validation_started = std::time::Instant::now();
     let candidate_count = caches.len();
-    log::debug!(
+    let validation_queued_at = std::time::Instant::now();
+    log::info!(
         target: "play_cached_audio_candidates",
-        "checking {} candidates",
-        candidate_count
+        "validation queued candidates={}, timeout_ms={}",
+        candidate_count,
+        CACHE_LOOKUP_TIMEOUT.as_millis(),
     );
     let validation = tokio::task::spawn_blocking(move || {
-        caches.into_iter().find_map(|(candidate, cache)| {
-            cache.ready_path().map(|path| (candidate, path))
-        })
+        log::info!(
+            target: "play_cached_audio_candidates",
+            "validation worker started queued_ms={}",
+            validation_queued_at.elapsed().as_millis(),
+        );
+        for (index, (candidate, cache)) in caches.into_iter().enumerate() {
+            let candidate_started = std::time::Instant::now();
+            let quality = candidate.quality_key.clone();
+            let source = candidate.source.clone();
+            log::info!(
+                target: "play_cached_audio_candidates",
+                "candidate start index={}, quality={}, source={}",
+                index,
+                quality,
+                source,
+            );
+            let path = cache.ready_path();
+            log::info!(
+                target: "play_cached_audio_candidates",
+                "candidate end index={}, quality={}, hit={}, elapsed_ms={}",
+                index,
+                quality,
+                path.is_some(),
+                candidate_started.elapsed().as_millis(),
+            );
+            if let Some(path) = path {
+                return Some((candidate, path));
+            }
+        }
+        None
     });
     let found = match tokio::time::timeout(CACHE_LOOKUP_TIMEOUT, validation).await {
         Ok(result) => result.map_err(|err| AppError::Other(err.to_string()))?,
         Err(_) => {
             log::warn!(
                 target: "play_cached_audio_candidates",
-                "timed out after {}ms",
+                "timed out configured_ms={}, actual_ms={}",
                 CACHE_LOOKUP_TIMEOUT.as_millis(),
+                validation_started.elapsed().as_millis(),
             );
             return Ok(None);
         }
@@ -354,11 +523,18 @@ pub async fn play_cached_audio_candidates(
         validation_started.elapsed().as_millis(),
         path.display()
     );
+    log::info!(
+        target: "play_cached_audio_candidates",
+        "starting cached player source={}, start_position_ms={}, crossfade={}",
+        candidate.source,
+        start_position_ms.unwrap_or(0),
+        use_crossfade,
+    );
 
     let path = path.to_string_lossy().into_owned();
-    let duration_ms = run_player_blocking(Arc::clone(&state.player), move |player| {
+    let duration_ms = run_player_play(Arc::clone(&state.player), move |player| {
         if use_crossfade {
-            player.crossfade_file_with_hint(
+            player.request_crossfade_file_with_hint(
                 &path,
                 duration_hint_ms,
                 fade_out_ms,
@@ -366,7 +542,7 @@ pub async fn play_cached_audio_candidates(
                 request_generation,
             )
         } else {
-            player.play_file_at_with_hint(
+            player.request_play_file_at_with_hint(
                 &path,
                 duration_hint_ms,
                 start_position_ms.unwrap_or(0),
@@ -420,7 +596,11 @@ pub async fn play_url(
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .send().await
         .map_err(|e| {
-            log::error!(target: "play_url", "HTTP send error: {}", e);
+            log::error!(
+                target: "play_url",
+                "HTTP send error: {}",
+                summarize_playback_error(&e),
+            );
             AppError::Network(e)
         })?;
 
@@ -435,7 +615,11 @@ pub async fn play_url(
     }
 
     let bytes = resp.bytes().await.map_err(|e| {
-        log::error!(target: "play_url", "body read error: {}", e);
+        log::error!(
+            target: "play_url",
+            "body read error: {}",
+            summarize_playback_error(&e),
+        );
         AppError::Network(e)
     })?;
 
@@ -452,8 +636,8 @@ pub async fn play_url(
 
     ensure_playback_request(&state, request_generation)?;
     let data = bytes.to_vec();
-    run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.play_bytes_at(
+    run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_play_bytes_at(
             data,
             duration_hint_ms,
             start_position_ms.unwrap_or(0),
@@ -505,8 +689,8 @@ pub async fn play_url_fast(
     };
     ensure_playback_request(&state, request_generation)?;
     log::info!(target: "play_url_fast", "temp ready: {}", path);
-    let dur = run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.play_file_at_with_hint(
+    let dur = run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_play_file_at_with_hint(
             &path,
             duration_hint_ms,
             start_position_ms.unwrap_or(0),
@@ -530,12 +714,18 @@ pub async fn play_url_streaming(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
+    let command_started = std::time::Instant::now();
+    let host = playback_url_host(&url);
     claim_playback_request(&state, request_generation)?;
     log::info!(
         target: "play_url_streaming",
-        "start: url_len={}, hint={}ms",
+        "start generation={}, host={}, url_len={}, hint_ms={}, start_ms={}, cache={}",
+        request_generation,
+        host,
         url.len(),
-        duration_hint_ms
+        duration_hint_ms,
+        start_position_ms.unwrap_or(0),
+        cache_key.is_some(),
     );
     let start_position_ms = start_position_ms.unwrap_or(0);
     let cache = playback_cache(
@@ -546,12 +736,17 @@ pub async fn play_url_streaming(
         duration_hint_ms,
     );
 
-    if let Some(path) = cache.as_ref().and_then(RemoteAudioCache::ready_path) {
-        log::info!(target: "play_url_streaming", "playback cache hit: {}", path.display());
+    if let Some(path) = lookup_ready_playback_cache(cache.as_ref(), request_generation).await? {
+        log::info!(
+            target: "play_url_streaming",
+            "playback cache hit generation={}, elapsed_ms={}",
+            request_generation,
+            command_started.elapsed().as_millis(),
+        );
         ensure_playback_request(&state, request_generation)?;
         let cached_path = path.to_string_lossy().to_string();
-        let result = run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.play_file_at_with_hint(
+        let result = run_player_play(Arc::clone(&state.player), move |player| {
+            player.request_play_file_at_with_hint(
                 &cached_path,
                 duration_hint_ms,
                 start_position_ms,
@@ -566,7 +761,7 @@ pub async fn play_url_streaming(
                 log::warn!(
                     target: "play_url_streaming",
                     "cache playback failed, bypassing for this request: {}",
-                    err
+                    summarize_playback_error(&err),
                 );
                 if let Some(cache) = &cache {
                     cache.bypass_ready_for_session();
@@ -583,6 +778,14 @@ pub async fn play_url_streaming(
         }
     });
 
+    let remote_open_started = std::time::Instant::now();
+    log::info!(
+        target: "play_url_streaming",
+        "remote open begin generation={}, host={}, elapsed_ms={}",
+        request_generation,
+        host,
+        command_started.elapsed().as_millis(),
+    );
     match open_remote_audio_source(
         &url,
         duration_hint_ms,
@@ -593,9 +796,17 @@ pub async fn play_url_streaming(
     .await
     {
         Ok(reader) => {
+            log::info!(
+                target: "play_url_streaming",
+                "remote open ready generation={}, host={}, open_ms={}, elapsed_ms={}",
+                request_generation,
+                host,
+                remote_open_started.elapsed().as_millis(),
+                command_started.elapsed().as_millis(),
+            );
             ensure_playback_request(&state, request_generation)?;
-            let result = run_player_blocking(Arc::clone(&state.player), move |player| {
-                player.play_remote_at(
+            let result = run_player_play(Arc::clone(&state.player), move |player| {
+                player.request_play_remote_at(
                     reader,
                     duration_hint_ms,
                     start_position_ms,
@@ -607,16 +818,34 @@ pub async fn play_url_streaming(
                 Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
                 Err(err) => {
                     ensure_playback_request(&state, request_generation)?;
-                    log::warn!(target: "play_url_streaming", "remote playback failed: {}", err);
+                    log::warn!(
+                        target: "play_url_streaming",
+                        "remote playback failed: {}",
+                        summarize_playback_error(&err),
+                    );
                 }
             }
         }
         Err(err) => {
             ensure_playback_request(&state, request_generation)?;
-            log::warn!(target: "play_url_streaming", "remote source unavailable: {}", err);
+            log::warn!(
+                target: "play_url_streaming",
+                "remote source unavailable generation={}, host={}, open_ms={}, error={}",
+                request_generation,
+                host,
+                remote_open_started.elapsed().as_millis(),
+                summarize_playback_error(&err),
+            );
         }
     }
 
+    log::info!(
+        target: "play_url_streaming",
+        "fallback begin generation={}, host={}, elapsed_ms={}",
+        request_generation,
+        host,
+        command_started.elapsed().as_millis(),
+    );
     play_url_streaming_fallback(
         &url,
         duration_hint_ms,
@@ -637,33 +866,11 @@ async fn play_url_streaming_fallback(
     state: &State<'_, AppState>,
 ) -> AppResult<u64> {
     ensure_playback_request(state, request_generation)?;
-    if let Some(cache) = cache {
-        let path = download_url_to_playback_cache(
-            url,
-            state,
-            cache,
-            request_generation,
-        )
-        .await?;
-        ensure_playback_request(state, request_generation)?;
-        let cached_path = path.to_string_lossy().to_string();
-        let dur = run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.play_file_at_with_hint(
-                &cached_path,
-                duration_hint_ms,
-                start_position_ms,
-                request_generation,
-            )
-        })
-        .await?;
-        return Ok(if dur > 0 { dur } else { duration_hint_ms });
-    }
-
     if start_position_ms > 0 {
         let path = download_url_to_temp_audio(url, state, request_generation).await?;
         ensure_playback_request(state, request_generation)?;
-        let dur = run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.play_file_at_with_hint(
+        let dur = run_player_play(Arc::clone(&state.player), move |player| {
+            player.request_play_file_at_with_hint(
                 &path,
                 duration_hint_ms,
                 start_position_ms,
@@ -679,8 +886,16 @@ async fn play_url_streaming_fallback(
         state,
         "play_url_streaming",
         request_generation,
+        cache,
     )
     .await?;
+    let buffer_wait_started = std::time::Instant::now();
+    log::info!(
+        target: "play_url_streaming",
+        "startup buffer wait generation={}, target_bytes={}",
+        request_generation,
+        STREAM_START_BUFFER_BYTES,
+    );
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
         Err(err) => {
@@ -690,8 +905,10 @@ async fn play_url_streaming_fallback(
     };
     log::info!(
         target: "play_url_streaming",
-        "startup buffer ready: {} bytes",
-        buffered
+        "startup buffer ready generation={}, bytes={}, wait_ms={}",
+        request_generation,
+        buffered,
+        buffer_wait_started.elapsed().as_millis(),
     );
 
     let reader = buffer.reader();
@@ -699,8 +916,8 @@ async fn play_url_streaming_fallback(
         buffer.abort();
         return Err(err);
     }
-    let dur = match run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.play_stream_at(
+    let dur = match run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_play_stream_at(
             reader,
             duration_hint_ms,
             start_position_ms,
@@ -830,8 +1047,8 @@ pub async fn crossfade_url(
     )
     .await?;
     ensure_playback_request(&state, request_generation)?;
-    run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.crossfade_bytes(
+    run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_crossfade_bytes(
             data,
             duration_hint_ms,
             fade_out_ms,
@@ -876,8 +1093,8 @@ pub async fn crossfade_url_fast(
         None => download_url_to_temp_audio(&url, &state, request_generation).await?,
     };
     ensure_playback_request(&state, request_generation)?;
-    let dur = run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.crossfade_file_with_hint(
+    let dur = run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_crossfade_file_with_hint(
             &path,
             duration_hint_ms,
             fade_out_ms,
@@ -917,16 +1134,16 @@ pub async fn crossfade_url_streaming(
         duration_hint_ms,
     );
 
-    if let Some(path) = cache.as_ref().and_then(RemoteAudioCache::ready_path) {
+    if let Some(path) = lookup_ready_playback_cache(cache.as_ref(), request_generation).await? {
         log::info!(
             target: "crossfade_url_streaming",
-            "playback cache hit: {}",
-            path.display()
+            "playback cache hit generation={}",
+            request_generation,
         );
         ensure_playback_request(&state, request_generation)?;
         let cached_path = path.to_string_lossy().to_string();
-        let result = run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.crossfade_file_with_hint(
+        let result = run_player_play(Arc::clone(&state.player), move |player| {
+            player.request_crossfade_file_with_hint(
                 &cached_path,
                 duration_hint_ms,
                 fade_out_ms,
@@ -942,7 +1159,7 @@ pub async fn crossfade_url_streaming(
                 log::warn!(
                     target: "crossfade_url_streaming",
                     "cache playback failed, bypassing for this request: {}",
-                    err
+                    summarize_playback_error(&err),
                 );
                 if let Some(cache) = &cache {
                     cache.bypass_ready_for_session();
@@ -974,8 +1191,8 @@ pub async fn crossfade_url_streaming(
     {
         Ok(reader) => {
             ensure_playback_request(&state, request_generation)?;
-            let result = run_player_blocking(Arc::clone(&state.player), move |player| {
-                player.crossfade_remote(
+            let result = run_player_play(Arc::clone(&state.player), move |player| {
+                player.request_crossfade_remote(
                     reader,
                     duration_hint_ms,
                     fade_out_ms,
@@ -988,13 +1205,21 @@ pub async fn crossfade_url_streaming(
                 Ok(dur) => return Ok(if dur > 0 { dur } else { duration_hint_ms }),
                 Err(err) => {
                     ensure_playback_request(&state, request_generation)?;
-                    log::warn!(target: "crossfade_url_streaming", "remote playback failed: {}", err)
+                    log::warn!(
+                        target: "crossfade_url_streaming",
+                        "remote playback failed: {}",
+                        summarize_playback_error(&err),
+                    )
                 }
             }
         }
         Err(err) => {
             ensure_playback_request(&state, request_generation)?;
-            log::warn!(target: "crossfade_url_streaming", "remote source unavailable: {}", err);
+            log::warn!(
+                target: "crossfade_url_streaming",
+                "remote source unavailable: {}",
+                summarize_playback_error(&err),
+            );
         }
     }
 
@@ -1020,36 +1245,21 @@ async fn crossfade_url_streaming_fallback(
     state: &State<'_, AppState>,
 ) -> AppResult<u64> {
     ensure_playback_request(state, request_generation)?;
-    if let Some(cache) = cache {
-        let path = download_url_to_playback_cache(
-            url,
-            state,
-            cache,
-            request_generation,
-        )
-        .await?;
-        ensure_playback_request(state, request_generation)?;
-        let cached_path = path.to_string_lossy().to_string();
-        let dur = run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.crossfade_file_with_hint(
-                &cached_path,
-                duration_hint_ms,
-                fade_out_ms,
-                fade_in_ms,
-                request_generation,
-            )
-        })
-        .await?;
-        return Ok(if dur > 0 { dur } else { duration_hint_ms });
-    }
-
     let buffer = start_streaming_download(
         url,
         state,
         "crossfade_url_streaming",
         request_generation,
+        cache,
     )
     .await?;
+    let buffer_wait_started = std::time::Instant::now();
+    log::info!(
+        target: "crossfade_url_streaming",
+        "startup buffer wait generation={}, target_bytes={}",
+        request_generation,
+        STREAM_START_BUFFER_BYTES,
+    );
     let buffered = match wait_for_stream_start(buffer.clone()).await {
         Ok(buffered) => buffered,
         Err(err) => {
@@ -1059,8 +1269,10 @@ async fn crossfade_url_streaming_fallback(
     };
     log::info!(
         target: "crossfade_url_streaming",
-        "startup buffer ready: {} bytes",
-        buffered
+        "startup buffer ready generation={}, bytes={}, wait_ms={}",
+        request_generation,
+        buffered,
+        buffer_wait_started.elapsed().as_millis(),
     );
 
     let reader = buffer.reader();
@@ -1068,8 +1280,8 @@ async fn crossfade_url_streaming_fallback(
         buffer.abort();
         return Err(err);
     }
-    let dur = match run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.crossfade_stream(
+    let dur = match run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_crossfade_stream(
             reader,
             duration_hint_ms,
             fade_out_ms,
@@ -1098,8 +1310,8 @@ pub async fn crossfade_file(
     state: State<'_, AppState>,
 ) -> AppResult<u64> {
     claim_playback_request(&state, request_generation)?;
-    run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.crossfade_file_with_hint(
+    run_player_play(Arc::clone(&state.player), move |player| {
+        player.request_crossfade_file_with_hint(
             &path,
             duration_hint_ms.unwrap_or(0),
             fade_out_ms,
@@ -1271,9 +1483,18 @@ async fn start_streaming_download(
     state: &State<'_, AppState>,
     tag: &'static str,
     request_generation: u64,
+    cache: Option<RemoteAudioCache>,
 ) -> AppResult<GrowingAudioBuffer> {
     let start = std::time::Instant::now();
+    let host = playback_url_host(url);
     ensure_playback_request(state, request_generation)?;
+    log::info!(
+        target: tag,
+        "HTTP stream begin generation={}, host={}, cache={}",
+        request_generation,
+        host,
+        cache.is_some(),
+    );
     let request = state.http().get(url)
         .header("Referer", playback_referer(url))
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -1281,7 +1502,11 @@ async fn start_streaming_download(
     tokio::pin!(request);
     let resp = tokio::select! {
         result = &mut request => result.map_err(|error| {
-            log::error!(target: tag, "HTTP send error: {}", error);
+            log::error!(
+                target: tag,
+                "HTTP send error: {}",
+                summarize_playback_error(&error),
+            );
             AppError::Network(error)
         })?,
         () = wait_for_playback_superseded(
@@ -1293,7 +1518,15 @@ async fn start_streaming_download(
     };
 
     let status = resp.status();
-    log::info!(target: tag, "HTTP status: {}", status);
+    log::info!(
+        target: tag,
+        "HTTP headers generation={}, host={}, status={}, content_length={:?}, elapsed_ms={}",
+        request_generation,
+        host,
+        status,
+        resp.content_length(),
+        start.elapsed().as_millis(),
+    );
     if !status.is_success() {
         return Err(AppError::Api(format!(
             "HTTP {}: stream fetch failed",
@@ -1308,8 +1541,38 @@ async fn start_streaming_download(
     let mut stream = resp.bytes_stream();
     let playback_generation = Arc::clone(&state.playback_generation);
 
+    let mut cache_file = match (cache.as_ref(), total_len) {
+        (Some(cache), Some(total_len)) => {
+            let cache = cache.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                cache.prepare_sequential_write(total_len)
+            })
+            .await;
+            match prepared {
+                Ok(Ok(path)) => match tokio::fs::OpenOptions::new().write(true).open(path).await {
+                    Ok(file) => Some(file),
+                    Err(error) => {
+                        log::warn!(target: tag, "sequential cache unavailable: {}", error);
+                        None
+                    }
+                },
+                Ok(Err(error)) => {
+                    log::warn!(target: tag, "sequential cache unavailable: {}", error);
+                    None
+                }
+                Err(error) => {
+                    log::warn!(target: tag, "sequential cache task unavailable: {}", error);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     tauri::async_runtime::spawn(async move {
         let mut downloaded: usize = 0;
+        let mut cache = cache;
+        let mut first_chunk_logged = false;
         loop {
             let item = tokio::select! {
                 item = stream.next() => item,
@@ -1332,10 +1595,31 @@ async fn start_streaming_download(
             match item {
                 Ok(chunk) => {
                     downloaded += chunk.len();
+                    if !first_chunk_logged {
+                        first_chunk_logged = true;
+                        log::info!(
+                            target: tag,
+                            "first chunk generation={}, bytes={}, elapsed_ms={}",
+                            request_generation,
+                            chunk.len(),
+                            start.elapsed().as_millis(),
+                        );
+                    }
                     writer.append(&chunk);
+                    if let Some(file) = cache_file.as_mut() {
+                        if let Err(error) = file.write_all(&chunk).await {
+                            log::warn!(target: tag, "sequential cache write failed: {}", error);
+                            cache_file = None;
+                            cache = None;
+                        }
+                    }
                 }
                 Err(e) => {
-                    log::error!(target: tag, "body stream error: {}", e);
+                    log::error!(
+                        target: tag,
+                        "body stream error: {}",
+                        summarize_playback_error(&e),
+                    );
                     writer.fail(e.to_string());
                     return;
                 }
@@ -1348,6 +1632,18 @@ async fn start_streaming_download(
             start.elapsed().as_millis()
         );
         writer.finish();
+        if let (Some(mut file), Some(cache)) = (cache_file, cache) {
+            if let Err(error) = file.flush().await {
+                log::warn!(target: tag, "sequential cache flush failed: {}", error);
+                return;
+            }
+            drop(file);
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = cache.publish_sequential_write() {
+                    log::warn!(target: tag, "sequential cache publish failed: {}", error);
+                }
+            });
+        }
     });
 
     Ok(buffer)
@@ -1393,8 +1689,8 @@ pub async fn next_track(state: State<'_, AppState>) -> AppResult<Option<crate::s
     if let Some(ref t) = track {
         let url = t.url.clone();
         let duration_ms = t.duration_ms;
-        run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.play_file_with_hint(&url, duration_ms, request_generation)
+        run_player_play(Arc::clone(&state.player), move |player| {
+            player.request_play_file_with_hint(&url, duration_ms, request_generation)
         })
         .await?;
     }
@@ -1411,8 +1707,8 @@ pub async fn prev_track(state: State<'_, AppState>) -> AppResult<Option<crate::s
     if let Some(ref t) = track {
         let url = t.url.clone();
         let duration_ms = t.duration_ms;
-        run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.play_file_with_hint(&url, duration_ms, request_generation)
+        run_player_play(Arc::clone(&state.player), move |player| {
+            player.request_play_file_with_hint(&url, duration_ms, request_generation)
         })
         .await?;
     }
@@ -1434,8 +1730,8 @@ pub async fn set_queue(
     if let Some(track) = track {
         let url = track.url.clone();
         let duration_ms = track.duration_ms;
-        run_player_blocking(Arc::clone(&state.player), move |player| {
-            player.play_file_with_hint(&url, duration_ms, request_generation)
+        run_player_play(Arc::clone(&state.player), move |player| {
+            player.request_play_file_with_hint(&url, duration_ms, request_generation)
         })
         .await?;
     }
@@ -1508,5 +1804,9 @@ mod tests {
         assert_eq!(request.track_id.as_deref(), Some("netease:42"));
         assert_eq!(request.request_generation, Some(9));
         assert_eq!(playback_trace_field(request.detail.as_deref()), "first second");
+        assert_eq!(
+            playback_trace_field(Some("failed https://media.example/audio?id=secret")),
+            "failed [url]",
+        );
     }
 }

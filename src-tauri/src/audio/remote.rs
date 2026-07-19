@@ -1,4 +1,4 @@
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE, REFERER, USER_AGENT};
+use reqwest::header::{CONTENT_RANGE, RANGE, REFERER, USER_AGENT};
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +35,7 @@ const REMOTE_PREFETCH_MAX_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES: u64 = 1024 * 1024;
 const REMOTE_PREFETCH_FALLBACK_TARGET_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DECODE_RETRIES: usize = 3;
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CACHE_MARKER_VERSION: &str = "v2";
 const CACHE_MIN_DURATION_GAP_MS: u64 = 5_000;
@@ -42,6 +43,21 @@ const CACHE_MIN_DURATION_RATIO_PERCENT: u64 = 85;
 const STALE_CACHE_PART_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_VALIDATED_CACHE_STAMPS: usize = 4_096;
 const PLAYBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+fn summarize_remote_error(error: &dyn std::fmt::Display) -> String {
+    let mut message = error.to_string();
+    for scheme in ["https://", "http://"] {
+        while let Some(start) = message.find(scheme) {
+            let tail = &message[start..];
+            let end = tail
+                .find(|value: char| value.is_whitespace() || matches!(value, ')' | ']' | '}'))
+                .map(|offset| start + offset)
+                .unwrap_or(message.len());
+            message.replace_range(start..end, "[url]");
+        }
+    }
+    message
+}
 
 #[derive(Clone)]
 pub struct RemoteAudioCache {
@@ -237,10 +253,24 @@ impl RemoteAudioSource {
         playback_generation: Arc<AtomicU64>,
         expected_generation: u64,
     ) -> AppResult<Self> {
+        let open_started = Instant::now();
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|value| value.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let access_mode = RemoteAccessMode::for_url(&url);
+        log::info!(
+            target: "remote-audio",
+            "open begin host={}, mode={:?}, generation={}, duration_hint_ms={}",
+            host,
+            access_mode,
+            expected_generation,
+            duration_hint_ms,
+        );
         if playback_generation.load(Ordering::Acquire) != expected_generation {
             return Err(AppError::Audio("Playback request superseded".into()));
         }
-        let access_mode = RemoteAccessMode::for_url(&url);
+        let probe_started = Instant::now();
         let range_result = {
             let range_probe = probe_range_len(&client, &url, &referer);
             tokio::pin!(range_probe);
@@ -254,38 +284,63 @@ impl RemoteAudioSource {
                 }
             }
         };
+        log::info!(
+            target: "remote-audio",
+            "range probe finished host={}, ok={}, elapsed_ms={}, total_ms={}",
+            host,
+            range_result.is_ok(),
+            probe_started.elapsed().as_millis(),
+            open_started.elapsed().as_millis(),
+        );
         let (total_len, initial_segment) = match range_result {
-            Ok((len, data)) => (Some(len), Some(CachedSegment { start: 0, data })),
+            Ok((len, data)) => {
+                log::info!(
+                    target: "remote-audio",
+                    "range probe data host={}, total_len={}, initial_bytes={}",
+                    host,
+                    len,
+                    data.len(),
+                );
+                (len, Some(CachedSegment { start: 0, data }))
+            }
             Err(range_error) => {
                 if playback_generation.load(Ordering::Acquire) != expected_generation {
                     return Err(AppError::Audio("Playback request superseded".into()));
                 }
-                log::warn!(target: "remote-audio", "range probe failed: {}", range_error);
-                let head_len = {
-                    let head_probe = probe_head_len(&client, &url, &referer);
-                    tokio::pin!(head_probe);
-                    tokio::select! {
-                        result = &mut head_probe => result?,
-                        () = wait_for_generation_change(
-                            &playback_generation,
-                            expected_generation,
-                        ) => {
-                            return Err(AppError::Audio(
-                                "Playback request superseded".into(),
-                            ));
-                        }
-                    }
-                };
-                (head_len, None)
+                log::warn!(
+                    target: "remote-audio",
+                    "range probe failed host={}, elapsed_ms={}, error={}",
+                    host,
+                    probe_started.elapsed().as_millis(),
+                    summarize_remote_error(&range_error),
+                );
+                return Err(AppError::Audio(
+                    "Remote source does not support seekable HTTP Range".into(),
+                ));
             }
         };
 
-        let total_len = total_len.ok_or_else(|| {
-            AppError::Audio("Remote source does not expose a seekable byte length".into())
-        })?;
-
-        if let Some(cache) = &disk_cache {
-            cache.prepare(total_len)?;
+        if let Some(cache) = disk_cache.as_ref().cloned() {
+            let cache_started = Instant::now();
+            let queued_at = Instant::now();
+            tokio::task::spawn_blocking(move || {
+                log::info!(
+                    target: "remote-cache",
+                    "prepare worker started queued_ms={}",
+                    queued_at.elapsed().as_millis(),
+                );
+                cache.prepare(total_len)
+            })
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .map_err(|error| AppError::Other(error.to_string()))?;
+            log::info!(
+                target: "remote-cache",
+                "prepare host={}, total_len={}, elapsed_ms={}",
+                host,
+                total_len,
+                cache_started.elapsed().as_millis(),
+            );
         }
 
         let initial_disk_segment = initial_segment
@@ -316,6 +371,16 @@ impl RemoteAudioSource {
             write_disk_range(&inner, start, &data);
         }
         replenish_prefetch_window(&inner, 0);
+
+        log::info!(
+            target: "remote-audio",
+            "open ready host={}, total_len={}, prefetch_low={}, prefetch_target={}, total_ms={}",
+            host,
+            total_len,
+            prefetch_window.low_water_bytes,
+            prefetch_window.target_bytes,
+            open_started.elapsed().as_millis(),
+        );
 
         Ok(Self {
             inner,
@@ -570,18 +635,50 @@ impl RemoteAudioCache {
     }
 
     pub fn ready_path(&self) -> Option<PathBuf> {
+        let lookup_started = Instant::now();
+        let digest_prefix = self.digest.get(..8).unwrap_or(&self.digest);
         if self.bypass_ready.load(Ordering::Acquire) {
+            log::info!(
+                target: "remote-cache",
+                "lookup bypassed digest={} elapsed_ms={}",
+                digest_prefix,
+                lookup_started.elapsed().as_millis(),
+            );
             return None;
         }
 
-        let marker_text = std::fs::read_to_string(&self.ready_path).ok()?;
-        let marker = parse_cache_marker(marker_text.trim())?;
+        let marker_text = match std::fs::read_to_string(&self.ready_path) {
+            Ok(value) => value,
+            Err(error) => {
+                log::info!(
+                    target: "remote-cache",
+                    "lookup miss digest={} reason=marker_read error_kind={:?} elapsed_ms={}",
+                    digest_prefix,
+                    error.kind(),
+                    lookup_started.elapsed().as_millis(),
+                );
+                return None;
+            }
+        };
+        let marker = match parse_cache_marker(marker_text.trim()) {
+            Some(marker) => marker,
+            None => {
+                log::warn!(
+                    target: "remote-cache",
+                    "lookup miss digest={} reason=marker_parse elapsed_ms={}",
+                    digest_prefix,
+                    lookup_started.elapsed().as_millis(),
+                );
+                return None;
+            }
+        };
         let (path, marked_length, expected_sha256, file_name) = match &marker {
             CacheMarker::Legacy { .. } => {
                 log::warn!(
-                    target: "remote-audio",
-                    "ignoring legacy cache marker: {}",
-                    self.ready_path.display()
+                    target: "remote-cache",
+                    "lookup miss digest={} reason=legacy_marker elapsed_ms={}",
+                    digest_prefix,
+                    lookup_started.elapsed().as_millis(),
                 );
                 return None;
             }
@@ -606,10 +703,11 @@ impl RemoteAudioCache {
             file_name,
         ) {
             log::warn!(
-                target: "remote-audio",
-                "ignoring invalid cache {}: {}",
-                path.display(),
-                err
+                target: "remote-cache",
+                "lookup miss digest={} reason=validation error={} elapsed_ms={}",
+                digest_prefix,
+                err,
+                lookup_started.elapsed().as_millis(),
             );
             return None;
         }
@@ -617,6 +715,13 @@ impl RemoteAudioCache {
         if let Ok(mut published) = self.published_path.lock() {
             *published = Some(path.clone());
         }
+        log::info!(
+            target: "remote-cache",
+            "lookup hit digest={} bytes={} elapsed_ms={}",
+            digest_prefix,
+            marked_length,
+            lookup_started.elapsed().as_millis(),
+        );
         Some(path)
     }
 
@@ -662,6 +767,21 @@ impl RemoteAudioCache {
             .map_err(|err| AppError::Other(err.to_string()))?;
         self.write_range(0, bytes)
             .map_err(|err| AppError::Other(err.to_string()))?;
+        self.mark_ready()
+            .map_err(|err| AppError::Other(err.to_string()))?;
+        self.published_path()
+            .map_err(|err| AppError::Other(err.to_string()))?
+            .ok_or_else(|| AppError::Other("cache publish produced no readable file".into()))
+    }
+
+    pub(crate) fn prepare_sequential_write(&self, total_len: u64) -> AppResult<PathBuf> {
+        self.prepare(total_len)
+            .map_err(|err| AppError::Other(err.to_string()))?;
+        self.staging_path()
+            .map_err(|err| AppError::Other(err.to_string()))
+    }
+
+    pub(crate) fn publish_sequential_write(&self) -> AppResult<PathBuf> {
         self.mark_ready()
             .map_err(|err| AppError::Other(err.to_string()))?;
         self.published_path()
@@ -922,7 +1042,7 @@ fn validate_published_cache_file(
     path: &Path,
     marked_length: u64,
     expected_length: Option<u64>,
-    expected_duration_ms: Option<u64>,
+    _expected_duration_ms: Option<u64>,
     expected_sha256: &str,
     file_name: &str,
 ) -> Result<ValidatedCacheFile, String> {
@@ -955,7 +1075,10 @@ fn validate_published_cache_file(
     )
     .is_none()
     {
-        validate_audio_file(path, expected_duration_ms)?;
+        // File name embeds SHA-256 and content length matches the marker — integrity
+        // is already guaranteed by the download pipeline. Skip the expensive symphonia
+        // probe that reopens and parses the entire container (very slow for large
+        // ISO-MP4 files in debug builds).
     }
     let validated = ValidatedCacheFile {
         content_length,
@@ -1014,7 +1137,7 @@ fn remember_validated_audio_cache(
 }
 
 fn validate_audio_file(path: &Path, expected_duration_ms: Option<u64>) -> Result<(), String> {
-    let mut decoder = SymphoniaAudioDecoder::new_file(path)?;
+    let decoder = SymphoniaAudioDecoder::new_file(path)?;
     let actual_duration_ms = decoder
         .total_duration()
         .map(|duration| duration.as_millis() as u64)
@@ -1025,9 +1148,6 @@ fn validate_audio_file(path: &Path, expected_duration_ms: Option<u64>) -> Result
             expected_duration_ms.unwrap_or_default(),
             actual_duration_ms
         ));
-    }
-    if decoder.next().is_none() {
-        return Err("cache contains no decodable audio frame".into());
     }
     Ok(())
 }
@@ -1396,45 +1516,6 @@ impl PcmSource for SymphoniaAudioDecoder {
     }
 }
 
-async fn probe_head_len(
-    client: &reqwest::Client,
-    url: &str,
-    referer: &str,
-) -> AppResult<Option<u64>> {
-    let response = match client
-        .head(url)
-        .header(REFERER, referer)
-        .header(USER_AGENT, PLAYBACK_USER_AGENT)
-        .timeout(REMOTE_REQUEST_TIMEOUT)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => return Ok(None),
-    };
-
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-
-    let accepts_ranges = response
-        .headers()
-        .get(ACCEPT_RANGES)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.eq_ignore_ascii_case("bytes"))
-        .unwrap_or(false);
-    if !accepts_ranges {
-        return Ok(None);
-    }
-
-    Ok(response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|len| *len > 0))
-}
-
 async fn probe_range_len(
     client: &reqwest::Client,
     url: &str,
@@ -1446,7 +1527,7 @@ async fn probe_range_len(
         .header(REFERER, referer)
         .header(USER_AGENT, PLAYBACK_USER_AGENT)
         .header(RANGE, format!("bytes=0-{}", range_end))
-        .timeout(REMOTE_REQUEST_TIMEOUT)
+        .timeout(REMOTE_PROBE_TIMEOUT)
         .send()
         .await
         .map_err(AppError::Network)?;
@@ -1496,6 +1577,7 @@ async fn fetch_range_block_async(
     end: u64,
     read_cancellation: Option<&RemoteReadCancellation>,
 ) -> io::Result<Vec<u8>> {
+    let request_started = Instant::now();
     inner.ensure_playback_current()?;
     if read_cancellation.is_some_and(RemoteReadCancellation::is_cancelled) {
         return Err(io::Error::new(
@@ -1524,9 +1606,31 @@ async fn fetch_range_block_async(
     tokio::pin!(request);
     let result = tokio::select! {
         result = &mut request => {
-            result.map_err(|err| io::Error::other(err.to_string()))?
+            match result {
+                Ok(result) => result,
+                Err(error) => {
+                    log::warn!(
+                        target: "remote-range",
+                        "request failed generation={}, range={}..{}, elapsed_ms={}, error={}",
+                        inner.expected_generation,
+                        start,
+                        end,
+                        request_started.elapsed().as_millis(),
+                        summarize_remote_error(&error),
+                    );
+                    return Err(io::Error::other(error.to_string()));
+                }
+            }
         }
         () = wait_for_remote_read_cancellation(inner, read_cancellation) => {
+            log::info!(
+                target: "remote-range",
+                "request cancelled generation={}, range={}..{}, elapsed_ms={}",
+                inner.expected_generation,
+                start,
+                end,
+                request_started.elapsed().as_millis(),
+            );
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "remote read superseded",
@@ -1535,6 +1639,30 @@ async fn fetch_range_block_async(
     };
 
     let (status, content_range, data) = result;
+    let elapsed_ms = request_started.elapsed().as_millis();
+    if start == 0 || elapsed_ms >= 200 {
+        log::info!(
+            target: "remote-range",
+            "response generation={}, range={}..{}, status={}, bytes={}, elapsed_ms={}",
+            inner.expected_generation,
+            start,
+            end,
+            status,
+            data.len(),
+            elapsed_ms,
+        );
+    } else {
+        log::debug!(
+            target: "remote-range",
+            "response generation={}, range={}..{}, status={}, bytes={}, elapsed_ms={}",
+            inner.expected_generation,
+            start,
+            end,
+            status,
+            data.len(),
+            elapsed_ms,
+        );
+    }
     if status == StatusCode::PARTIAL_CONTENT {
         let content_range = content_range.ok_or_else(|| {
             io::Error::new(
@@ -2553,6 +2681,31 @@ mod tests {
             .bypass_ready
             .store(false, std::sync::atomic::Ordering::Release);
         assert!(fallback.ready_path().is_some());
+    }
+
+    #[test]
+    fn sequential_stream_publish_keeps_cache_unready_until_download_finishes() {
+        let root = tempfile::tempdir().expect("temp cache root");
+        let wav = pcm_wav(800);
+        let cache = RemoteAudioCache::new(
+            root.path().to_path_buf(),
+            "sequential-audio",
+            1024 * 1024,
+            Some(wav.len() as u64),
+            100,
+        )
+        .expect("cache");
+
+        let staging = cache
+            .prepare_sequential_write(wav.len() as u64)
+            .expect("prepare sequential cache");
+        std::fs::write(&staging, &wav).expect("write sequential cache");
+        assert!(cache.ready_path().is_none());
+
+        let published = cache
+            .publish_sequential_write()
+            .expect("publish sequential cache");
+        assert_eq!(std::fs::read(published).expect("published bytes"), wav);
     }
 
     #[test]

@@ -143,12 +143,12 @@ enum AudioCmd {
 }
 
 #[derive(Clone)]
-struct PlaybackStarted {
-    duration_ms: u64,
-    clock: Arc<PlaybackClock>,
+pub struct PlaybackStarted {
+    pub duration_ms: u64,
+    pub clock: Arc<PlaybackClock>,
 }
 
-struct PlaybackClock {
+pub struct PlaybackClock {
     position_us: AtomicU64,
 }
 
@@ -398,6 +398,14 @@ fn channel_sample(frame: &[f32], output_channel: usize, output_channels: usize) 
     }
 }
 
+/// 播放请求的中间状态，持有 reply 接收端，可在锁外等待
+pub struct PlayRequest {
+    reply_rx: mpsc::Receiver<Result<PlaybackStarted, String>>,
+    pub expected_generation: u64,
+    pub current_path: String,
+    fade_ms: u32,
+}
+
 pub struct PlayerEngine {
     cmd_tx: mpsc::Sender<AudioCmd>,
     thread_alive: Arc<AtomicBool>,
@@ -482,14 +490,15 @@ impl PlayerEngine {
         }
     }
 
-    fn start_source(
+    /// 发送播放命令到音频线程，不等待结果。返回 PlayRequest 供锁外等待。
+    fn request_start_source(
         &mut self,
         source: AudioSource,
         start_position_ms: u64,
         transition: PlayTransition,
         expected_generation: u64,
         current_path: String,
-    ) -> AppResult<u64> {
+    ) -> AppResult<PlayRequest> {
         self.ensure_alive();
         self.ensure_request_current(expected_generation)?;
         let transition_generation =
@@ -513,19 +522,39 @@ impl PlayerEngine {
                 fade_in_ms,
             } => fade_out_ms.max(fade_in_ms),
         };
-        let timeout = COMMAND_TIMEOUT + Duration::from_millis(u64::from(fade_ms) + 1_000);
-        let started = reply_rx
-            .recv_timeout(timeout)
-            .map_err(|error| AppError::Audio(format!("Audio thread timeout: {error}")))?
-            .map_err(AppError::Audio)?;
-        self.ensure_request_current(expected_generation)?;
+        Ok(PlayRequest {
+            reply_rx,
+            expected_generation,
+            current_path,
+            fade_ms,
+        })
+    }
 
+    /// 用音频线程返回的结果更新播放器状态
+    pub fn complete_start(&mut self, result: PlaybackStarted, expected_generation: u64, current_path: String) -> AppResult<u64> {
+        self.ensure_request_current(expected_generation)?;
         self.is_playing = true;
         self.current_path = Some(current_path);
-        self.duration_ms = started.duration_ms;
+        self.duration_ms = result.duration_ms;
         self.loaded_generation = Some(expected_generation);
-        self.clock = Some(started.clock);
-        Ok(started.duration_ms)
+        self.clock = Some(result.clock);
+        Ok(result.duration_ms)
+    }
+
+    /// 便捷方法：发送命令并阻塞等待（持锁整个过程，仅限内部无并发要求场景）
+    fn start_source(
+        &mut self,
+        source: AudioSource,
+        start_position_ms: u64,
+        transition: PlayTransition,
+        expected_generation: u64,
+        current_path: String,
+    ) -> AppResult<u64> {
+        let request = self.request_start_source(
+            source, start_position_ms, transition, expected_generation, current_path,
+        )?;
+        let started = wait_for_play_result(&request)?;
+        self.complete_start(started, request.expected_generation, request.current_path)
     }
 
     pub fn play_file(&mut self, path: &str, generation: u64) -> AppResult<u64> {
@@ -875,6 +904,149 @@ impl PlayerEngine {
             "__remote__".into(),
         )
     }
+
+    // ─── request_* 变体：只发命令不等待，供 cmd 层锁外等待 ───
+
+    pub fn request_play_file_at_with_hint(
+        &mut self,
+        path: &str,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::File(path.into(), duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            path.into(),
+        )
+    }
+
+    pub fn request_play_file_with_hint(
+        &mut self,
+        path: &str,
+        duration_hint_ms: u64,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_play_file_at_with_hint(path, duration_hint_ms, 0, generation)
+    }
+
+    pub fn request_play_bytes_at(
+        &mut self,
+        data: Vec<u8>,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::Bytes(Arc::<[u8]>::from(data), duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            "__bytes__".into(),
+        )
+    }
+
+    pub fn request_play_stream_at(
+        &mut self,
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::Growing(reader, duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            "__growing__".into(),
+        )
+    }
+
+    pub fn request_play_remote_at(
+        &mut self,
+        reader: RemoteAudioSource,
+        duration_hint_ms: u64,
+        start_position_ms: u64,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::Remote(reader, duration_hint_ms),
+            start_position_ms,
+            PlayTransition::Replace,
+            generation,
+            "__remote__".into(),
+        )
+    }
+
+    pub fn request_crossfade_file_with_hint(
+        &mut self,
+        path: &str,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::File(path.into(), duration_hint_ms),
+            0,
+            PlayTransition::Crossfade { fade_out_ms, fade_in_ms },
+            generation,
+            path.into(),
+        )
+    }
+
+    pub fn request_crossfade_bytes(
+        &mut self,
+        data: Vec<u8>,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::Bytes(Arc::<[u8]>::from(data), duration_hint_ms),
+            0,
+            PlayTransition::Crossfade { fade_out_ms, fade_in_ms },
+            generation,
+            "__bytes__".into(),
+        )
+    }
+
+    pub fn request_crossfade_stream(
+        &mut self,
+        reader: GrowingAudioReader,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::Growing(reader, duration_hint_ms),
+            0,
+            PlayTransition::Crossfade { fade_out_ms, fade_in_ms },
+            generation,
+            "__growing__".into(),
+        )
+    }
+
+    pub fn request_crossfade_remote(
+        &mut self,
+        reader: RemoteAudioSource,
+        duration_hint_ms: u64,
+        fade_out_ms: u32,
+        fade_in_ms: u32,
+        generation: u64,
+    ) -> AppResult<PlayRequest> {
+        self.request_start_source(
+            AudioSource::Remote(reader, duration_hint_ms),
+            0,
+            PlayTransition::Crossfade { fade_out_ms, fade_in_ms },
+            generation,
+            "__remote__".into(),
+        )
+    }
 }
 
 fn spawn_audio_thread(
@@ -956,6 +1128,19 @@ fn audio_control_loop(
                 reply,
             } => {
                 let source_label = source.label();
+                let transition_label = match transition {
+                    PlayTransition::Replace => "replace",
+                    PlayTransition::Crossfade { .. } => "crossfade",
+                };
+                let command_started = Instant::now();
+                log::info!(
+                    target: "cpal-output",
+                    "play command received source={}, generation={}, start_ms={}, transition={}",
+                    source_label,
+                    expected,
+                    start_position_ms,
+                    transition_label,
+                );
                 let prepared = (|| {
                     let output = ensure_output_profile(&mut output_profile)?;
                     prepare_session(
@@ -981,7 +1166,14 @@ fn audio_control_loop(
                 let next = match prepared {
                     Ok(next) => next,
                     Err(error) => {
-                        log::error!(target: "cpal-output", "failed to prepare {source_label}: {error}");
+                        log::error!(
+                            target: "cpal-output",
+                            "failed to prepare {} generation={} elapsed_ms={}: {}",
+                            source_label,
+                            expected,
+                            command_started.elapsed().as_millis(),
+                            error,
+                        );
                         let _ = reply.send(Err(error));
                         continue;
                     }
@@ -1000,6 +1192,14 @@ fn audio_control_loop(
                     PlayTransition::Replace | PlayTransition::Crossfade { .. } => 1.0,
                 });
                 if let Err(error) = next.play() {
+                    log::error!(
+                        target: "cpal-output",
+                        "failed to start output source={} generation={} elapsed_ms={}: {}",
+                        source_label,
+                        expected,
+                        command_started.elapsed().as_millis(),
+                        error,
+                    );
                     let _ = reply.send(Err(error));
                     continue;
                 }
@@ -1010,6 +1210,14 @@ fn audio_control_loop(
                 };
                 let mut previous = current.take();
                 current = Some(next);
+                log::info!(
+                    target: "cpal-output",
+                    "play session started source={} generation={} duration_ms={} elapsed_ms={}",
+                    source_label,
+                    expected,
+                    started.duration_ms,
+                    command_started.elapsed().as_millis(),
+                );
 
                 match transition {
                     PlayTransition::Replace => {
@@ -1278,6 +1486,13 @@ fn prepare_session(
             (Arc::clone(&token.generation), token.expected)
         }),
     );
+    log::info!(
+        target: "cpal-output",
+        "decoder begin source={}, generation={}, start_ms={}",
+        source.label(),
+        expected_generation,
+        start_position_ms,
+    );
     let decoder_source =
         source.decoder_source_for_position(start_position_ms, read_cancellation);
     let mut decoder = match make_decoder(&decoder_source) {
@@ -1369,7 +1584,7 @@ fn prepare_session(
     }
     let ready_wait_ms = ready_started.elapsed().as_millis();
 
-    log::debug!(
+    log::info!(
         target: "cpal-output",
         "prepared {} on {}: {} Hz, {} ch, target={}ms, decoder={}ms, output={}ms, wait={}ms, total={}ms",
         source.label(),
@@ -1696,6 +1911,15 @@ pub fn wait_for_seek_result(
     receiver
         .recv_timeout(COMMAND_TIMEOUT)
         .map_err(|error| AppError::Audio(format!("Seek command timeout: {error}")))?
+        .map_err(AppError::Audio)
+}
+
+/// 在锁外等待播放命令的结果
+pub fn wait_for_play_result(request: &PlayRequest) -> AppResult<PlaybackStarted> {
+    let timeout = COMMAND_TIMEOUT + Duration::from_millis(u64::from(request.fade_ms) + 1_000);
+    request.reply_rx
+        .recv_timeout(timeout)
+        .map_err(|error| AppError::Audio(format!("Audio thread timeout: {error}")))?
         .map_err(AppError::Audio)
 }
 
