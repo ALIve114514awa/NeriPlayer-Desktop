@@ -53,6 +53,7 @@ const {
   leaveSelectionMode,
   toggleSelected,
   toggleSelectAllVisible,
+  invertSelectionVisible,
 } = useTrackSelection(allHistoryTracks, visibleHistoryTracks)
 
 function formatDuration(ms: number): string {
@@ -237,6 +238,7 @@ function handleTrackMenuClick(item: ContextMenuActionItem) {
         :visible-selected-count="visibleSelectedCount"
         :all-visible-selected="allVisibleSelected"
         @select-all="toggleSelectAllVisible"
+        @invert-selection="invertSelectionVisible"
         @play="playSelected"
         @queue="queueSelected"
         @playlist="openBatchAddToPlaylist"

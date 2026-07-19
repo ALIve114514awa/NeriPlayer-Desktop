@@ -20,6 +20,7 @@ withDefaults(defineProps<{
 
 const emit = defineEmits<{
   selectAll: []
+  invertSelection: []
   play: []
   queue: []
   playlist: []
@@ -37,6 +38,9 @@ const { t } = useI18n()
     <div class="selection-actions">
       <button class="selection-btn" type="button" :title="allVisibleSelected ? t('common.deselect_all') : t('common.select_all')" @click="emit('selectAll')">
         <span class="material-symbols-rounded">{{ allVisibleSelected ? 'deselect' : 'select_all' }}</span>
+      </button>
+      <button class="selection-btn" type="button" :title="t('common.invert_selection')" @click="emit('invertSelection')">
+        <span class="material-symbols-rounded">flip</span>
       </button>
       <button v-if="showPlay" class="selection-btn" type="button" :disabled="selectedCount === 0" :title="t('common.play_selected')" @click="emit('play')">
         <span class="material-symbols-rounded">play_arrow</span>

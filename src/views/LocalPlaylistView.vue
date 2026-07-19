@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   usePlayerStore,
@@ -39,11 +39,80 @@ const searchQuery = ref('')
 const selectionMode = ref(false)
 const selectedIds = ref<Set<string>>(new Set())
 const isBatchRemoving = ref(false)
+const dragTrackKey = ref<string | null>(null)
+const dragOverTrackKey = ref<string | null>(null)
+const dragInsertPosition = ref<'before' | 'after' | null>(null)
+const dragLandingTrackKey = ref<string | null>(null)
+const dragUnderGlassKeys = ref<Set<string>>(new Set())
+const dragGlassActive = ref(false)
+const isPersistingTrackOrder = ref(false)
+const dragPointerId = ref<number | null>(null)
+const trackListRef = ref<HTMLElement | null>(null)
+const dragStartPointerY = ref(0)
+const dragStartRowTop = ref(0)
+const dragRowHeight = ref(0)
+const dragOffsetY = ref(0)
+let dragHandleElement: HTMLElement | null = null
+let dragRowSnapshots: Array<{ key: string; top: number; bottom: number; midpoint: number }> = []
+let dragListBounds: { top: number; bottom: number } | null = null
+let dragLandingTimer: ReturnType<typeof window.setTimeout> | null = null
+let dragGlassStartFrame: number | null = null
+let dragGlassActiveFrame: number | null = null
 
 const tracks = ref<TrackInfo[]>([])
 
 function trackSelectionKey(track: TrackInfo): string {
   return track.playlistKey || `${track.id}|${track.album}`
+}
+
+function trackOrderKey(track: TrackInfo): string {
+  return track.playlistKey || track.id || trackSelectionKey(track)
+}
+
+function trackDragStyle(track: TrackInfo) {
+  if (dragTrackKey.value !== trackSelectionKey(track)) return undefined
+  return { '--track-drag-offset': `${dragOffsetY.value}px` }
+}
+
+function clearDragLandingState() {
+  if (dragLandingTimer !== null) {
+    window.clearTimeout(dragLandingTimer)
+    dragLandingTimer = null
+  }
+  dragLandingTrackKey.value = null
+}
+
+function startDragLandingState(trackKey: string | null) {
+  clearDragLandingState()
+  if (!trackKey) return
+  dragLandingTrackKey.value = trackKey
+  dragLandingTimer = window.setTimeout(() => {
+    dragLandingTrackKey.value = null
+    dragLandingTimer = null
+  }, 320)
+}
+
+function cancelDragGlassActivation() {
+  if (dragGlassStartFrame !== null) {
+    window.cancelAnimationFrame(dragGlassStartFrame)
+    dragGlassStartFrame = null
+  }
+  if (dragGlassActiveFrame !== null) {
+    window.cancelAnimationFrame(dragGlassActiveFrame)
+    dragGlassActiveFrame = null
+  }
+}
+
+function scheduleDragGlassActivation() {
+  cancelDragGlassActivation()
+  dragGlassActive.value = false
+  dragGlassStartFrame = window.requestAnimationFrame(() => {
+    dragGlassStartFrame = null
+    dragGlassActiveFrame = window.requestAnimationFrame(() => {
+      dragGlassActiveFrame = null
+      dragGlassActive.value = dragTrackKey.value !== null
+    })
+  })
 }
 
 const filteredTracks = computed(() => {
@@ -292,6 +361,7 @@ function enterSelectionMode(track?: TrackInfo) {
 }
 
 function leaveSelectionMode() {
+  cancelTrackDrag()
   selectionMode.value = false
   selectedIds.value = new Set()
 }
@@ -316,6 +386,198 @@ function toggleSelectAllVisible() {
   for (const track of filteredTracks.value) next.add(trackSelectionKey(track))
   selectedIds.value = next
   if (next.size > 0) selectionMode.value = true
+}
+
+function invertSelectionVisible() {
+  const next = new Set(selectedIds.value)
+  for (const track of filteredTracks.value) {
+    const key = trackSelectionKey(track)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+  }
+  selectedIds.value = next
+  selectionMode.value = next.size > 0
+}
+
+function onTrackDragPointerDown(e: PointerEvent, track: TrackInfo) {
+  if (!selectionMode.value || isPersistingTrackOrder.value) return
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  e.preventDefault()
+  clearDragLandingState()
+  dragTrackKey.value = trackSelectionKey(track)
+  scheduleDragGlassActivation()
+  dragPointerId.value = e.pointerId
+  dragHandleElement = e.currentTarget as HTMLElement
+  const row = dragHandleElement.closest('.track-item') as HTMLElement | null
+  const rowRect = row?.getBoundingClientRect()
+  dragStartPointerY.value = e.clientY
+  dragStartRowTop.value = rowRect?.top ?? e.clientY
+  dragRowHeight.value = rowRect?.height ?? 0
+  dragOffsetY.value = 0
+  captureTrackDragSnapshot()
+  dragHandleElement.setPointerCapture?.(e.pointerId)
+  updateTrackDragTarget(e)
+  window.addEventListener('pointermove', onTrackDragPointerMove)
+  window.addEventListener('pointerup', onTrackDragPointerUp)
+  window.addEventListener('pointercancel', cancelTrackDrag)
+}
+
+function onTrackDragPointerMove(e: PointerEvent) {
+  if (dragPointerId.value !== e.pointerId) return
+  e.preventDefault()
+  updateTrackDragOffset(e)
+  updateDragUnderGlassKeys()
+  updateTrackDragTarget(e)
+}
+
+function updateTrackDragOffset(e: PointerEvent) {
+  if (!dragListBounds) return
+  const minOffset = dragListBounds.top - dragStartRowTop.value
+  const maxOffset = dragListBounds.bottom - dragStartRowTop.value - dragRowHeight.value
+  const requestedOffset = e.clientY - dragStartPointerY.value
+  dragOffsetY.value = Math.min(Math.max(requestedOffset, minOffset), maxOffset)
+}
+
+function updateDragUnderGlassKeys() {
+  const draggedKey = dragTrackKey.value
+  if (!draggedKey || dragRowHeight.value <= 0) {
+    dragUnderGlassKeys.value = new Set()
+    return
+  }
+
+  const top = dragStartRowTop.value + dragOffsetY.value
+  const bottom = top + dragRowHeight.value
+  const overlapInset = 8
+  dragUnderGlassKeys.value = new Set(
+    dragRowSnapshots
+      .filter(row => row.bottom > top + overlapInset && row.top < bottom - overlapInset)
+      .map(row => row.key),
+  )
+}
+
+function captureTrackDragSnapshot() {
+  const list = trackListRef.value
+  const draggedKey = dragTrackKey.value
+  if (!list || !draggedKey) {
+    dragRowSnapshots = []
+    dragListBounds = null
+    return
+  }
+
+  const listRect = list.getBoundingClientRect()
+  dragListBounds = { top: listRect.top, bottom: listRect.bottom }
+  dragRowSnapshots = [...list.querySelectorAll<HTMLElement>('.track-item')]
+    .map(row => {
+      const rect = row.getBoundingClientRect()
+      return {
+        key: row.dataset.trackKey || '',
+        top: rect.top,
+        bottom: rect.bottom,
+        midpoint: rect.top + rect.height / 2,
+      }
+    })
+    .filter(row => row.key && row.key !== draggedKey)
+}
+
+function resolveTrackInsertTarget(e: PointerEvent): { key: string; position: 'before' | 'after' } | null {
+  if (!dragListBounds || dragRowSnapshots.length === 0) return null
+
+  const insideListY = e.clientY >= dragListBounds.top && e.clientY <= dragListBounds.bottom
+  if (!insideListY) return null
+
+  for (const row of dragRowSnapshots) {
+    if (e.clientY < row.midpoint) {
+      return { key: row.key, position: 'before' }
+    }
+  }
+
+  const lastRow = dragRowSnapshots[dragRowSnapshots.length - 1]
+  return lastRow ? { key: lastRow.key, position: 'after' } : null
+}
+
+function updateTrackDragTarget(e: PointerEvent) {
+  const target = resolveTrackInsertTarget(e)
+  if (!target || target.key === dragTrackKey.value) {
+    dragOverTrackKey.value = null
+    dragInsertPosition.value = null
+    return
+  }
+  dragOverTrackKey.value = target.key
+  dragInsertPosition.value = target.position
+}
+
+function cleanupTrackDrag() {
+  window.removeEventListener('pointermove', onTrackDragPointerMove)
+  window.removeEventListener('pointerup', onTrackDragPointerUp)
+  window.removeEventListener('pointercancel', cancelTrackDrag)
+  if (dragHandleElement && dragPointerId.value !== null) {
+    if (dragHandleElement.hasPointerCapture?.(dragPointerId.value)) {
+      dragHandleElement.releasePointerCapture(dragPointerId.value)
+    }
+  }
+  dragHandleElement = null
+  dragPointerId.value = null
+  dragTrackKey.value = null
+  dragOverTrackKey.value = null
+  dragInsertPosition.value = null
+  cancelDragGlassActivation()
+  dragGlassActive.value = false
+  dragUnderGlassKeys.value = new Set()
+  dragStartPointerY.value = 0
+  dragStartRowTop.value = 0
+  dragRowHeight.value = 0
+  dragOffsetY.value = 0
+  dragRowSnapshots = []
+  dragListBounds = null
+}
+
+function cancelTrackDrag() {
+  startDragLandingState(dragTrackKey.value)
+  cleanupTrackDrag()
+}
+
+async function onTrackDragPointerUp(e: PointerEvent) {
+  if (dragPointerId.value !== e.pointerId) return
+  e.preventDefault()
+  const fromKey = dragTrackKey.value
+  const toKey = dragOverTrackKey.value
+  const insertPosition = dragInsertPosition.value
+  startDragLandingState(fromKey)
+  cleanupTrackDrag()
+
+  if (!fromKey || !toKey || !insertPosition || fromKey === toKey) return
+
+  const previousTracks = tracks.value
+  const nextTracks = [...tracks.value]
+  const fromIndex = nextTracks.findIndex(track => trackSelectionKey(track) === fromKey)
+  let toIndex = nextTracks.findIndex(track => trackSelectionKey(track) === toKey)
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return
+
+  const [moved] = nextTracks.splice(fromIndex, 1)
+  if (toIndex > fromIndex) toIndex -= 1
+  const insertIndex = insertPosition === 'after' ? toIndex + 1 : toIndex
+  nextTracks.splice(insertIndex, 0, moved)
+
+  const previousOrder = previousTracks.map(trackSelectionKey).join('\n')
+  const nextOrder = nextTracks.map(trackSelectionKey).join('\n')
+  if (previousOrder === nextOrder) return
+
+  tracks.value = nextTracks
+
+  try {
+    isPersistingTrackOrder.value = true
+    await invoke('reorder_playlist_tracks', {
+      playlistId: Number(route.params.id),
+      orderedKeys: nextTracks.map(trackOrderKey),
+    })
+    player.prefetchPlaybackTracks(tracks.value)
+  } catch (e) {
+    tracks.value = previousTracks
+    log.error('Reorder playlist tracks failed:', e)
+    toast.error(t('player.load_failed'))
+  } finally {
+    isPersistingTrackOrder.value = false
+  }
 }
 
 function playSelected() {
@@ -371,6 +633,11 @@ onMounted(() => {
   loadDetail()
   downloadStore.initEvents()
   downloadStore.loadDownloads()
+})
+
+onUnmounted(() => {
+  cleanupTrackDrag()
+  clearDragLandingState()
 })
 </script>
 
@@ -436,6 +703,10 @@ onMounted(() => {
             <span class="material-symbols-rounded">{{ allVisibleSelected ? 'deselect' : 'select_all' }}</span>
             {{ allVisibleSelected ? '取消全选' : '全选当前' }}
           </button>
+          <button class="selection-btn" @click="invertSelectionVisible">
+            <span class="material-symbols-rounded">flip</span>
+            {{ t('common.invert_selection') }}
+          </button>
           <button class="selection-btn" :disabled="selectedCount === 0" @click="playSelected">
             <span class="material-symbols-rounded filled">play_arrow</span>
             播放
@@ -458,12 +729,25 @@ onMounted(() => {
           </button>
           <button class="selection-btn ghost" @click="leaveSelectionMode">取消</button>
         </div>
-        <div class="track-list">
+        <div ref="trackListRef" class="track-list">
         <div
           v-for="(track, index) in filteredTracks"
           :key="trackSelectionKey(track)"
           class="track-item"
-          :class="{ active: player.currentTrack && trackSelectionKey(player.currentTrack) === trackSelectionKey(track), selected: selectedIds.has(trackSelectionKey(track)), 'selection-mode': selectionMode }"
+          :class="{
+            active: player.currentTrack && trackSelectionKey(player.currentTrack) === trackSelectionKey(track),
+            selected: selectedIds.has(trackSelectionKey(track)),
+            'selection-mode': selectionMode,
+            dragging: dragTrackKey === trackSelectionKey(track),
+            'glass-active': dragGlassActive && dragTrackKey === trackSelectionKey(track),
+            landing: dragLandingTrackKey === trackSelectionKey(track),
+            'drag-under-glass': dragUnderGlassKeys.has(trackSelectionKey(track)),
+            'drag-under-glass-active': dragGlassActive && dragUnderGlassKeys.has(trackSelectionKey(track)),
+            'drag-over-before': dragOverTrackKey === trackSelectionKey(track) && dragInsertPosition === 'before',
+            'drag-over-after': dragOverTrackKey === trackSelectionKey(track) && dragInsertPosition === 'after',
+          }"
+          :data-track-key="trackSelectionKey(track)"
+          :style="trackDragStyle(track)"
           @click="playTrack(track)"
           @pointerenter="prefetchTrack(track)"
           @focusin="prefetchTrack(track)"
@@ -491,8 +775,17 @@ onMounted(() => {
             class="track-download-badge material-symbols-rounded filled"
             :title="t('download.downloaded')"
           >download_done</span>
-          <div class="track-duration">{{ formatDuration(track.durationMs) }}</div>
-          <button class="track-more" @click.stop="openTrackMenu($event, track, index)">
+          <button
+            v-if="selectionMode"
+            class="track-drag-handle material-symbols-rounded"
+            type="button"
+            :disabled="isPersistingTrackOrder"
+            :title="t('common.drag_to_reorder')"
+            @pointerdown.stop="onTrackDragPointerDown($event, track)"
+            @click.stop
+          >drag_handle</button>
+          <div v-else class="track-duration">{{ formatDuration(track.durationMs) }}</div>
+          <button v-if="!selectionMode" class="track-more" @click.stop="openTrackMenu($event, track, index)">
             <span class="material-symbols-rounded">more_vert</span>
           </button>
         </div>
@@ -542,7 +835,6 @@ onMounted(() => {
   margin: 0 0 10px;
   border-radius: 18px;
   background: color-mix(in srgb, var(--md-surface-container-high) 92%, transparent);
-  border: 1px solid color-mix(in srgb, var(--md-primary) 18%, var(--md-outline-variant));
   backdrop-filter: blur(18px);
 }
 /* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
@@ -605,6 +897,47 @@ onMounted(() => {
   background: color-mix(in srgb, var(--md-primary) 14%, transparent);
 }
 
+:deep(.track-item),
+.track-item {
+  position: relative;
+  transform: translate3d(0, 0, 0);
+  filter: blur(0) saturate(1);
+  isolation: isolate;
+  transition:
+    filter 240ms cubic-bezier(0.2, 0, 0, 1),
+    transform 180ms cubic-bezier(0.2, 0, 0, 1),
+    background 180ms cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 180ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 220ms cubic-bezier(0.2, 0, 0, 1);
+  will-change: transform;
+}
+
+.track-item > * {
+  position: relative;
+  z-index: 1;
+}
+
+.track-item::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: color-mix(in srgb, var(--md-surface-container-highest) 36%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(0) saturate(1);
+  -webkit-backdrop-filter: blur(0) saturate(1);
+  transition:
+    opacity 180ms cubic-bezier(0.2, 0, 0, 1),
+    background 180ms cubic-bezier(0.2, 0, 0, 1),
+    backdrop-filter 180ms cubic-bezier(0.2, 0, 0, 1),
+    -webkit-backdrop-filter 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
 .track-item.selection-mode .track-more {
   opacity: 0;
   pointer-events: none;
@@ -614,12 +947,144 @@ onMounted(() => {
   opacity: 0.45;
 }
 
+.track-item.dragging {
+  z-index: 6;
+  opacity: 0.96;
+  transform: translate3d(0, var(--track-drag-offset, 0px), 0) scale(1.012);
+  background: color-mix(in srgb, var(--md-surface-container-highest) 18%, transparent);
+  box-shadow:
+    0 18px 38px rgba(0, 0, 0, 0.18),
+    0 4px 10px color-mix(in srgb, var(--md-primary) 10%, transparent);
+  transition:
+    background 180ms cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 180ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.track-item.dragging.glass-active::before {
+  opacity: 1;
+  background: color-mix(in srgb, var(--md-surface-container-highest) 34%, transparent);
+  backdrop-filter: blur(28px) saturate(1.42);
+  -webkit-backdrop-filter: blur(28px) saturate(1.42);
+}
+
+.track-item.drag-under-glass {
+  filter: blur(0) saturate(1);
+  opacity: 1;
+  will-change: filter, opacity;
+}
+
+.track-item.drag-under-glass-active {
+  filter: blur(2.8px) saturate(0.82);
+  opacity: 0.72;
+}
+
+.track-item.landing {
+  animation: track-glass-shadow-release 320ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.track-item.landing::before {
+  animation: track-glass-release 320ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.track-item.drag-over-before {
+  transform: translate3d(0, 5px, 0);
+}
+
+.track-item.drag-over-after {
+  transform: translate3d(0, -5px, 0);
+}
+
+.track-item::after {
+  content: '';
+  position: absolute;
+  left: 44px;
+  right: 44px;
+  z-index: 2;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--md-primary) 88%, white);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--md-primary) 12%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease-out, transform 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.track-item.drag-over-before::after {
+  top: -5px;
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.track-item.drag-over-after::after {
+  bottom: -5px;
+  opacity: 1;
+  transform: translateY(1px);
+}
+
+@keyframes track-glass-release {
+  0% {
+    opacity: 1;
+    background: color-mix(in srgb, var(--md-surface-container-highest) 34%, transparent);
+    backdrop-filter: blur(28px) saturate(1.42);
+    -webkit-backdrop-filter: blur(28px) saturate(1.42);
+  }
+  100% {
+    opacity: 0;
+    background: color-mix(in srgb, var(--md-surface-container-highest) 16%, transparent);
+    backdrop-filter: blur(0) saturate(1);
+    -webkit-backdrop-filter: blur(0) saturate(1);
+  }
+}
+
+@keyframes track-glass-shadow-release {
+  0% {
+    box-shadow:
+      0 18px 38px rgba(0, 0, 0, 0.18),
+      0 4px 10px color-mix(in srgb, var(--md-primary) 10%, transparent);
+  }
+  100% {
+    box-shadow: none;
+  }
+}
+
 /* 已下载标识：在音乐库列表中标记本地已缓存的曲目 */
 .track-download-badge {
   flex-shrink: 0;
   color: var(--md-primary);
   opacity: 0.85;
   font-size: 18px;
+}
+
+.track-drag-handle {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-full);
+  color: var(--md-on-surface-variant);
+  opacity: 0.72;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition: background var(--duration-short), opacity var(--duration-short), transform var(--duration-short);
+
+  &:hover:not(:disabled) {
+    opacity: 1;
+    background: var(--md-surface-container-high);
+  }
+
+  &:active:not(:disabled) {
+    cursor: grabbing;
+    transform: scale(0.97);
+  }
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.36;
+  }
 }
 
 .track-more {

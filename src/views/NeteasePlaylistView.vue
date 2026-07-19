@@ -90,6 +90,7 @@ const {
   leaveSelectionMode,
   toggleSelected,
   toggleSelectAllVisible,
+  invertSelectionVisible,
 } = useTrackSelection(tracks, filteredTracks)
 
 // 总时长
@@ -437,6 +438,7 @@ onMounted(() => {
           :visible-selected-count="visibleSelectedCount"
           :all-visible-selected="allVisibleSelected"
           @select-all="toggleSelectAllVisible"
+          @invert-selection="invertSelectionVisible"
           @play="playSelected"
           @queue="queueSelected"
           @playlist="openBatchAddToPlaylist"

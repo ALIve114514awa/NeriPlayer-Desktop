@@ -42,6 +42,16 @@ export function useTrackSelection<T extends { id: string }>(
     else selectionMode.value = false
   }
 
+  function invertSelectionVisible() {
+    const next = new Set(selectedIds.value)
+    for (const item of visibleItems.value) {
+      if (next.has(item.id)) next.delete(item.id)
+      else next.add(item.id)
+    }
+    selectedIds.value = next
+    selectionMode.value = next.size > 0
+  }
+
   function pruneSelection() {
     const validIds = new Set(allItems.value.map(item => item.id))
     selectedIds.value = new Set([...selectedIds.value].filter(id => validIds.has(id)))
@@ -58,6 +68,7 @@ export function useTrackSelection<T extends { id: string }>(
     leaveSelectionMode,
     toggleSelected,
     toggleSelectAllVisible,
+    invertSelectionVisible,
     pruneSelection,
   }
 }

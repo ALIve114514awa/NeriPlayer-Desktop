@@ -270,6 +270,7 @@ fn main() {
             library_cmd::add_tracks_to_playlist,
             library_cmd::remove_from_playlist,
             library_cmd::remove_tracks_from_playlist,
+            library_cmd::reorder_playlist_tracks,
             library_cmd::list_favorite_playlists,
             search_cmd::search,
             image_cmd::fetch_bilibili_cover,

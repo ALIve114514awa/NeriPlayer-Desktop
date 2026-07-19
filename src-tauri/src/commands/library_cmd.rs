@@ -415,6 +415,119 @@ pub async fn remove_tracks_from_playlist(app: AppHandle, playlist_id: i64, track
     Ok(removed)
 }
 
+/// 重排本地歌单内歌曲顺序（仅本地歌单支持）
+///
+/// 前端传入按新顺序排列的 playlist_key 列表；未包含的歌曲保持相对顺序追加到末尾。
+/// 重排后按递减序列重新戳 added_at（对齐 Android stampSongsForDisplayOrder；桌面同步
+/// 按 added_at 排序，这样自定义顺序才能跨端持久化）
+#[tauri::command]
+pub async fn reorder_playlist_tracks(
+    app: AppHandle,
+    playlist_id: i64,
+    ordered_keys: Vec<String>,
+) -> AppResult<usize> {
+    let path = playlists_path();
+    let mut store = PlaylistStore::load(&path);
+
+    let count = {
+        let pl = store
+            .playlists
+            .iter_mut()
+            .find(|p| p.id == playlist_id)
+            .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
+
+        let order_index: std::collections::HashMap<String, usize> = ordered_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| (key.clone(), idx))
+            .collect();
+
+        // 稳定排序：命中 key 用目标位次，未命中用末位并保留原相对序，保证不丢歌
+        let fallback = ordered_keys.len();
+        let mut indexed: Vec<(usize, usize, TrackInfo)> = std::mem::take(&mut pl.tracks)
+            .into_iter()
+            .enumerate()
+            .map(|(orig_idx, track)| {
+                let rank = playlist_track_order_aliases(&track)
+                    .iter()
+                    .find_map(|key| order_index.get(key).copied())
+                    .unwrap_or(fallback);
+                (rank, orig_idx, track)
+            })
+            .collect();
+        indexed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let count = indexed.len();
+        pl.tracks = indexed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (_, _, mut track))| {
+                track.added_at = (now - idx as i64).max(1);
+                track
+            })
+            .collect();
+        pl.modified_at = now as u64;
+        count
+    };
+
+    store.save(&path)?;
+    let _ = app.emit("playlists-changed", ());
+    log::info!(
+        target: "playlist-io",
+        "reorder end playlist_id={}, count={}",
+        playlist_id,
+        count,
+    );
+    Ok(count)
+}
+
+fn playlist_track_order_aliases(track: &TrackInfo) -> Vec<String> {
+    let mut aliases = vec![playlist_track_key(track)];
+    if let Some(key) = track.playlist_key.as_ref().filter(|key| !key.trim().is_empty()) {
+        aliases.push(key.clone());
+    }
+    if !track.id.is_empty() {
+        aliases.push(track.id.clone());
+        aliases.push(format!("{}|{}", track.id, track.album));
+        aliases.push(format!("{}|{}|", track.id, track.album));
+    }
+    aliases
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::TrackSource;
+
+    fn track(id: &str, album: &str, playlist_key: Option<&str>) -> TrackInfo {
+        TrackInfo {
+            id: id.to_string(),
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: album.to_string(),
+            duration_ms: 0,
+            source: TrackSource::Local,
+            url: String::new(),
+            cover_url: None,
+            added_at: 0,
+            sync_payload: None,
+            playlist_key: playlist_key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn playlist_track_order_aliases_cover_current_and_legacy_keys() {
+        let track = track("local-file-id", "Album", Some("stable|playlist|key"));
+        let aliases = playlist_track_order_aliases(&track);
+
+        assert!(aliases.iter().any(|key| key == "stable|playlist|key"));
+        assert!(aliases.iter().any(|key| key == "local-file-id"));
+        assert!(aliases.iter().any(|key| key == "local-file-id|Album"));
+        assert!(aliases.iter().any(|key| key == "local-file-id|Album|"));
+    }
+}
+
 /// 获取收藏歌单列表
 #[tauri::command]
 pub async fn list_favorite_playlists() -> AppResult<Vec<SyncFavoritePlaylist>> {
