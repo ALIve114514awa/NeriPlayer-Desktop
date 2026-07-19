@@ -10,7 +10,7 @@ import { useRecommendStore } from '@/stores/recommend'
 import { useAuthStore } from '@/stores/auth'
 import { useDownloadStore } from '@/stores/download'
 import { useToastStore } from '@/stores/toast'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import M3Dialog from '@/components/ui/M3Dialog.vue'
@@ -139,9 +139,31 @@ function loadPlaylistOrder(): number[] | null {
   } catch { return null }
 }
 
+const failedLibraryCoverKeys = ref<Set<string>>(new Set())
+
 function isBilibiliCover(url?: string | null): boolean {
   if (!url) return false
   return /\.(hdslb|biliimg)\.com/i.test(url)
+}
+
+function toDisplayableLibraryCoverUrl(value?: string | null): string {
+  if (!value) return ''
+  if (/^(https?:|asset:|data:|blob:)/i.test(value)) return value
+  return convertFileSrc(value)
+}
+
+function libraryCoverKey(scope: string, id: string | number, url?: string | null): string {
+  return `${scope}:${id}:${url || ''}`
+}
+
+function isLibraryCoverFailed(scope: string, id: string | number, url?: string | null): boolean {
+  if (!url) return false
+  return failedLibraryCoverKeys.value.has(libraryCoverKey(scope, id, url))
+}
+
+function markLibraryCoverFailed(scope: string, id: string | number, url?: string | null) {
+  if (!url) return
+  failedLibraryCoverKeys.value = new Set(failedLibraryCoverKeys.value).add(libraryCoverKey(scope, id, url))
 }
 
 async function loadPlaylists() {
@@ -720,12 +742,18 @@ onUnmounted(() => {
             {{ selectedPlaylists.has(pl.id) ? 'check_circle' : 'radio_button_unchecked' }}
           </span>
         </div>
-        <div class="pl-icon" :class="{ 'has-cover': pl.cover_url }">
-          <BilibiliCoverImage v-if="isBilibiliCover(pl.cover_url)" :src="pl.cover_url!" class="pl-cover-img">
-            <span class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
+        <div class="pl-icon" :class="{ 'has-cover': pl.cover_url && !isLibraryCoverFailed('local', pl.id, pl.cover_url) }">
+          <BilibiliCoverImage v-if="isBilibiliCover(pl.cover_url) && !isLibraryCoverFailed('local', pl.id, pl.cover_url)" :src="pl.cover_url!" class="pl-cover-img">
+            <span class="material-symbols-rounded filled" style="font-size: 22px">library_music</span>
           </BilibiliCoverImage>
-          <img v-else-if="pl.cover_url" :src="pl.cover_url" referrerpolicy="no-referrer" class="pl-cover-img" @error="($event.target as HTMLImageElement).style.display = 'none'" />
-          <span v-else class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
+          <img
+            v-else-if="pl.cover_url && !isLibraryCoverFailed('local', pl.id, pl.cover_url)"
+            :src="toDisplayableLibraryCoverUrl(pl.cover_url)"
+            referrerpolicy="no-referrer"
+            class="pl-cover-img"
+            @error="markLibraryCoverFailed('local', pl.id, pl.cover_url)"
+          />
+          <span v-else class="material-symbols-rounded filled" style="font-size: 22px">library_music</span>
         </div>
         <div class="pl-info">
           <div class="pl-name">{{ displayName(pl) }}</div>
@@ -758,7 +786,7 @@ onUnmounted(() => {
       </div>
 
       <div v-if="playlists.length === 0" class="empty-tab">
-        <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">queue_music</span></div>
+        <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">library_music</span></div>
         <p class="empty-title">{{ t('library.playlist_empty_title') }}</p>
         <p class="empty-desc">{{ t('library.playlist_empty_desc') }}</p>
       </div>
@@ -772,8 +800,13 @@ onUnmounted(() => {
           :key="'fav-' + fpl.id"
           class="playlist-item"
         >
-          <div class="pl-icon has-cover" v-if="fpl.coverUrl">
-            <img :src="fpl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
+          <div class="pl-icon has-cover" v-if="fpl.coverUrl && !isLibraryCoverFailed('favorite', fpl.id, fpl.coverUrl)">
+            <img
+              :src="toDisplayableLibraryCoverUrl(fpl.coverUrl)"
+              referrerpolicy="no-referrer"
+              class="pl-cover-img"
+              @error="markLibraryCoverFailed('favorite', fpl.id, fpl.coverUrl)"
+            />
           </div>
           <div class="pl-icon" v-else>
             <span class="material-symbols-rounded filled" style="font-size: 22px">bookmark</span>
@@ -848,8 +881,13 @@ onUnmounted(() => {
           @click="playDownloadedTrack(dl)"
           @contextmenu.prevent.stop="openDlContextMenu($event, dl)"
         >
-          <div class="pl-icon has-cover" v-if="dl.coverUrl">
-            <img :src="dl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
+          <div class="pl-icon has-cover" v-if="dl.coverUrl && !isLibraryCoverFailed('download', dl.id, dl.coverUrl)">
+            <img
+              :src="toDisplayableLibraryCoverUrl(dl.coverUrl)"
+              referrerpolicy="no-referrer"
+              class="pl-cover-img"
+              @error="markLibraryCoverFailed('download', dl.id, dl.coverUrl)"
+            />
           </div>
           <div class="pl-icon" v-else>
             <span class="material-symbols-rounded filled" style="font-size: 22px">music_note</span>
@@ -880,8 +918,14 @@ onUnmounted(() => {
           @click="router.push({ name: 'netease-playlist', params: { id: npl.id } })"
         >
           <div class="pl-icon netease">
-            <img v-if="npl.coverUrl" :src="npl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
-            <span v-else class="material-symbols-rounded filled" style="font-size: 22px">queue_music</span>
+            <img
+              v-if="npl.coverUrl && !isLibraryCoverFailed('netease-playlist', npl.id, npl.coverUrl)"
+              :src="toDisplayableLibraryCoverUrl(npl.coverUrl)"
+              referrerpolicy="no-referrer"
+              class="pl-cover-img"
+              @error="markLibraryCoverFailed('netease-playlist', npl.id, npl.coverUrl)"
+            />
+            <span v-else class="material-symbols-rounded filled" style="font-size: 22px">library_music</span>
           </div>
           <div class="pl-info">
             <div class="pl-name">{{ npl.name }}</div>
@@ -949,8 +993,14 @@ onUnmounted(() => {
           class="playlist-item"
           @click="router.push({ name: 'youtube-playlist', params: { browseId: ypl.id } })"
         >
-          <div class="pl-icon youtube" :class="{ 'has-cover': ypl.coverUrl }">
-            <img v-if="ypl.coverUrl" :src="ypl.coverUrl" referrerpolicy="no-referrer" class="pl-cover-img" />
+          <div class="pl-icon youtube" :class="{ 'has-cover': ypl.coverUrl && !isLibraryCoverFailed('youtube', ypl.id, ypl.coverUrl) }">
+            <img
+              v-if="ypl.coverUrl && !isLibraryCoverFailed('youtube', ypl.id, ypl.coverUrl)"
+              :src="toDisplayableLibraryCoverUrl(ypl.coverUrl)"
+              referrerpolicy="no-referrer"
+              class="pl-cover-img"
+              @error="markLibraryCoverFailed('youtube', ypl.id, ypl.coverUrl)"
+            />
             <span v-else class="material-symbols-rounded filled" style="font-size: 22px">subscriptions</span>
           </div>
           <div class="pl-info">
@@ -976,13 +1026,14 @@ onUnmounted(() => {
           class="playlist-item"
           @click="router.push({ name: 'netease-album', params: { id: album.id } })"
         >
-          <div class="pl-icon has-cover">
+          <div class="pl-icon" :class="{ 'has-cover': album.coverUrl && !isLibraryCoverFailed('netease-album', album.id, album.coverUrl) }">
             <img
-              v-if="album.coverUrl"
-              :src="album.coverUrl"
+              v-if="album.coverUrl && !isLibraryCoverFailed('netease-album', album.id, album.coverUrl)"
+              :src="toDisplayableLibraryCoverUrl(album.coverUrl)"
               class="pl-cover-img"
               loading="lazy"
               referrerpolicy="no-referrer"
+              @error="markLibraryCoverFailed('netease-album', album.id, album.coverUrl)"
             />
             <span v-else class="material-symbols-rounded filled" style="font-size: 22px">album</span>
           </div>

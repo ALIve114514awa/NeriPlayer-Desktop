@@ -105,6 +105,7 @@ function handleError(event: Event) {
     return
   }
 
+  resolvedSrc.value = ''
   const forceRefresh = renderRetryCount > 0
   renderRetryCount++
   void loadCover(proxiedUrl, forceRefresh)
