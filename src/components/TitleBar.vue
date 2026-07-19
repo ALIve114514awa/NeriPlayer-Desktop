@@ -27,7 +27,6 @@ const titleBarLabel = computed(() => (
   props.hasPlaybackSession ? t('player.now_playing') : t('player.not_playing')
 ))
 const titleBarTrackKey = computed(() => `${props.nowPlaying ? 'np' : 'base'}:${titleBarTrackText.value || 'empty'}`)
-const titleBarSideKey = computed(() => props.nowPlaying ? 'np' : 'brand')
 
 const isMaximized = ref(false)
 let unlistenResize: UnlistenFn | null = null
@@ -89,23 +88,25 @@ onUnmounted(() => {
     <div v-if="isMac" class="tb-traffic-safe-area" data-tauri-drag-region></div>
 
     <div class="tb-left-slot">
-      <transition name="tb-side-swap" mode="out-in">
-        <!-- 普通模式：logo + 名称 -->
-        <div v-if="!nowPlaying" :key="titleBarSideKey" class="tb-brand" data-tauri-drag-region>
-          <img src="/app-icon.png" alt="logo" class="tb-icon" />
-          <span class="tb-title">NeriPlayer</span>
-        </div>
-
-        <!-- 播放器模式：折叠按钮（覆盖 logo 区域） -->
-        <div v-else :key="titleBarSideKey" class="tb-np-left">
-          <button class="tb-np-btn tb-np-collapse" type="button" data-tauri-drag-region="false" @click="emit('collapse')">
-            <span class="material-symbols-rounded">keyboard_arrow_down</span>
-          </button>
-        </div>
-      </transition>
+      <!-- 同槽绝对叠层：宽度固定，避免品牌/箭头切换时整栏右移 -->
+      <div class="tb-left-stack" data-tauri-drag-region>
+        <transition name="tb-brand-fade">
+          <div v-if="!nowPlaying" key="brand" class="tb-brand" data-tauri-drag-region>
+            <img src="/app-icon.png" alt="logo" class="tb-icon" />
+            <span class="tb-title">NeriPlayer</span>
+          </div>
+        </transition>
+        <transition name="tb-arrow-fade">
+          <div v-if="nowPlaying" key="np-left" class="tb-np-left">
+            <button class="tb-np-btn tb-np-collapse" type="button" data-tauri-drag-region="false" @click="emit('collapse')">
+              <span class="material-symbols-rounded">keyboard_arrow_down</span>
+            </button>
+          </div>
+        </transition>
+      </div>
     </div>
 
-    <!-- 播放器模式：居中播放信息 -->
+    <!-- 播放器模式：居中播放信息（等品牌淡完再出现） -->
     <transition name="tb-center-fade">
       <div v-if="nowPlaying" class="tb-np-center" data-tauri-drag-region>
         <span class="tb-np-label">{{ titleBarLabel }}</span>
@@ -120,13 +121,21 @@ onUnmounted(() => {
     <div v-if="isMac" class="tb-drag" data-tauri-drag-region></div>
 
     <div class="tb-right-slot">
-      <transition name="tb-side-swap" mode="out-in">
-        <!-- 播放器模式：更多按钮 -->
-        <button v-if="nowPlaying && hasPlaybackSession" :key="`more:${titleBarSideKey}`" class="tb-np-btn tb-np-more" type="button" data-tauri-drag-region="false" @click="emit('toggleMore')">
-          <span class="material-symbols-rounded">more_vert</span>
-        </button>
-        <div v-else :key="`spacer:${titleBarSideKey}`" class="tb-np-more-spacer" aria-hidden="true"></div>
-      </transition>
+      <!-- 固定宽度槽，避免 more 显隐时右侧跳动 -->
+      <div class="tb-right-stack">
+        <transition name="tb-arrow-fade">
+          <button
+            v-if="nowPlaying && hasPlaybackSession"
+            key="more"
+            class="tb-np-btn tb-np-more"
+            type="button"
+            data-tauri-drag-region="false"
+            @click="emit('toggleMore')"
+          >
+            <span class="material-symbols-rounded">more_vert</span>
+          </button>
+        </transition>
+      </div>
     </div>
 
     <!-- 窗口控制（macOS 使用系统原生红绿灯，此处隐藏） -->
@@ -161,6 +170,7 @@ onUnmounted(() => {
   top: 0;
   left: 0;
   right: 0;
+  /* 固定 36px：对齐 macOS 红绿灯垂直中心，开关 NP 不改高度避免位移 */
   height: 36px;
   display: flex;
   align-items: stretch;
@@ -169,39 +179,94 @@ onUnmounted(() => {
   user-select: none;
   z-index: 1000;
   pointer-events: none;
-  transition: color 300ms var(--ease-standard),
-              height 300ms var(--ease-standard),
-              background 320ms var(--ease-standard),
-              backdrop-filter 320ms var(--ease-standard),
-              padding 320ms var(--ease-standard);
+  transition: color 280ms var(--ease-standard);
 
   &.tb-np-mode {
-    height: 56px;
-    padding-top: 8px;
+    /* 与普通模式同高，只做透明度交叉 */
+    height: 36px;
+    padding-top: 0;
   }
 }
 
 .title-bar.tb-transitioning {
-  background: linear-gradient(to bottom, rgba(14, 13, 18, 0.26), rgba(14, 13, 18, 0));
-  backdrop-filter: blur(14px) saturate(1.08);
-}
-/* Linux WebKitGTK 无 backdrop-filter 时给更实的底色，避免标题栏近乎透明 */
-@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .title-bar.tb-transitioning {
-    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.82), rgba(14, 13, 18, 0.32));
-  }
+  background: transparent;
+  backdrop-filter: none;
 }
 
-.title-bar.tb-opening {
-  animation: tb-shell-breathe-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
+.title-bar.tb-opening,
 .title-bar.tb-closing {
-  animation: tb-shell-breathe-out 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  animation: none;
 }
 
 .title-bar.tb-force-light {
   color: rgba(255, 255, 255, 0.9);
+}
+
+.tb-transitioning .tb-np-center {
+  animation: none;
+}
+
+.tb-transitioning .tb-np-btn,
+.tb-transitioning .tb-ctrl {
+  transition:
+    background var(--duration-short) var(--ease-standard),
+    opacity var(--duration-short) var(--ease-standard);
+  transform: none;
+}
+
+.tb-opening .tb-np-btn,
+.tb-opening .tb-ctrl,
+.tb-closing .tb-np-btn,
+.tb-closing .tb-ctrl {
+  transform: none;
+}
+
+/* 品牌：慢淡出（约半秒），不位移 */
+.tb-brand-fade-enter-active {
+  transition: opacity 320ms cubic-bezier(0.2, 0, 0, 1);
+  transition-delay: 180ms;
+}
+.tb-brand-fade-leave-active {
+  transition: opacity 520ms cubic-bezier(0.2, 0, 0, 1);
+}
+.tb-brand-fade-enter-from,
+.tb-brand-fade-leave-to {
+  opacity: 0;
+}
+
+/* 箭头/更多：等品牌淡完大半再出现 */
+.tb-arrow-fade-enter-active {
+  transition: opacity 300ms cubic-bezier(0.2, 0, 0, 1);
+  transition-delay: 360ms;
+}
+.tb-arrow-fade-leave-active {
+  transition: opacity 240ms cubic-bezier(0.2, 0, 0, 1);
+}
+.tb-arrow-fade-enter-from,
+.tb-arrow-fade-leave-to {
+  opacity: 0;
+}
+
+/* 中间信息：等左侧淡完再出 */
+.tb-center-fade-enter-active {
+  transition: opacity 320ms cubic-bezier(0.2, 0, 0, 1);
+  transition-delay: 380ms;
+}
+.tb-center-fade-leave-active {
+  transition: opacity 240ms cubic-bezier(0.2, 0, 0, 1);
+}
+.tb-center-fade-enter-from,
+.tb-center-fade-leave-to {
+  opacity: 0;
+}
+
+.tb-track-swap-enter-active,
+.tb-track-swap-leave-active {
+  transition: opacity 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+.tb-track-swap-enter-from,
+.tb-track-swap-leave-to {
+  opacity: 0;
 }
 
 .tb-brand,
@@ -215,10 +280,47 @@ onUnmounted(() => {
   pointer-events: auto;
 }
 
-.tb-left-slot,
+/* 左右槽固定宽度，切换内容绝对叠层 → 整栏不左右跳 */
+.tb-left-slot {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  width: 128px;
+  min-width: 128px;
+  position: relative;
+}
+
 .tb-right-slot {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  width: 40px;
+  min-width: 40px;
+  position: relative;
+}
+
+.tb-left-stack,
+.tb-right-stack {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 36px;
+}
+
+.tb-left-stack > .tb-brand,
+.tb-left-stack > .tb-np-left {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+}
+
+.tb-right-stack > .tb-np-btn {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
 }
 
 /* ========== 普通模式 ========== */
@@ -226,8 +328,10 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 14px;
+  padding: 0 10px;
   -webkit-app-region: drag;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .tb-icon {
@@ -257,8 +361,8 @@ onUnmounted(() => {
 }
 
 .tb-np-btn {
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -304,9 +408,15 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 1px;
+  /* 水平留白；高度锁在 36px 内与红绿灯对齐，不做垂直撑高 */
+  padding: 0 24px;
+  box-sizing: border-box;
+  width: min(56vw, 560px);
+  max-width: calc(100% - 200px);
+  height: 36px;
   pointer-events: auto;
   -webkit-app-region: drag;
-  min-width: 0;
+  min-width: 180px;
 }
 
 .tb-np-label {
@@ -315,8 +425,9 @@ onUnmounted(() => {
   color: inherit;
   opacity: 0.45;
   text-transform: uppercase;
-  letter-spacing: 1px;
-  line-height: 1.4;
+  letter-spacing: 1.2px;
+  line-height: 1.2;
+  padding: 0 8px;
 }
 
 .tb-np-track {
@@ -327,101 +438,36 @@ onUnmounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 300px;
-  line-height: 1.4;
+  width: 100%;
+  max-width: 100%;
+  line-height: 1.25;
+  text-align: center;
+  padding: 0 8px;
+  box-sizing: border-box;
 }
 
-.tb-transitioning .tb-np-center {
-  animation: tb-center-float 420ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.tb-transitioning .tb-np-btn,
-.tb-transitioning .tb-ctrl {
-  transition:
-    background var(--duration-short) var(--ease-standard),
-    opacity var(--duration-short) var(--ease-standard),
-    transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
-    box-shadow 220ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.tb-opening .tb-np-btn,
-.tb-opening .tb-ctrl {
-  transform: translateY(1px) scale(0.98);
-}
-
-.tb-closing .tb-np-btn,
-.tb-closing .tb-ctrl {
-  transform: translateY(-1px) scale(0.985);
-}
-
-.tb-track-swap-enter-active,
-.tb-track-swap-leave-active {
-  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.tb-track-swap-enter-from {
-  opacity: 0;
-  transform: translateY(8px);
-}
-
-.tb-track-swap-leave-to {
-  opacity: 0;
-  transform: translateY(-8px);
-}
-
-.tb-side-swap-enter-active,
-.tb-side-swap-leave-active {
-  transition: opacity 220ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.tb-side-swap-enter-from {
-  opacity: 0;
-  transform: translateX(-10px) scale(0.96);
-}
-
-.tb-side-swap-leave-to {
-  opacity: 0;
-  transform: translateX(10px) scale(0.96);
-}
-
-.tb-center-fade-enter-active,
-.tb-center-fade-leave-active {
-  transition: opacity 240ms ease, transform 300ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.tb-center-fade-enter-from,
-.tb-center-fade-leave-to {
-  opacity: 0;
-  transform: translate(-50%, calc(-50% + 8px));
-}
-
-.tb-np-more-spacer {
-  width: 40px;
-  height: 40px;
-}
 
 .tb-np-more {
-  align-self: center;
-  margin-right: 4px;
+  margin: 0;
 }
 
-/* 播放器模式下窗口控制按钮适配更高的顶栏 */
+/* 播放器模式保持与普通顶栏同高，避免位移 */
 .tb-np-mode .tb-ctrl {
-  width: 40px;
-  height: 40px;
-  align-self: center;
-  border-radius: var(--radius-full);
+  width: 46px;
+  height: 100%;
+  align-self: stretch;
+  border-radius: 0;
 }
 
 .tb-np-mode .tb-ctrl svg {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
 }
 
 .tb-np-mode .tb-controls {
-  align-items: center;
-  gap: 2px;
-  padding-right: 8px;
+  align-items: stretch;
+  gap: 0;
+  padding-right: 0;
 }
 
 /* ========== 公共 ========== */
@@ -440,35 +486,13 @@ onUnmounted(() => {
   pointer-events: auto;
 }
 
-/* mac 下普通模式左侧品牌区右移，避免压住系统红绿灯 */
-.tb-mac.title-bar:not(.tb-np-mode) .tb-brand {
-  padding-left: 4px;
-}
-
-/* macOS np 模式：56px 高 + padding-top 会把控制行下压，
-   与系统固定在顶部的红绿灯错位。此处将左右控制行顶部对齐，
-   使折叠/收藏/更多按钮与红绿灯同高。 */
-.tb-mac.tb-np-mode .tb-left-slot,
-.tb-mac.tb-np-mode .tb-right-slot,
-.tb-mac.tb-np-mode .tb-controls {
-  align-self: flex-start;
-}
-
+/* mac：左槽已固定宽度，品牌/箭头不再改 padding 造成水平跳 */
 .tb-mac.tb-np-mode {
   padding-top: 0;
 }
 
-.tb-mac.tb-np-mode .tb-np-left {
-  transform: translate(-10px, -2px);
-}
-
-.tb-mac.tb-np-mode .tb-right-slot {
-  transform: translateY(3px);
-}
-
-/* np 模式下 mac 安全区跟随 56px 栏高 */
 .tb-mac.tb-np-mode .tb-traffic-safe-area {
-  height: 56px;
+  height: 36px;
 }
 
 .tb-controls {
@@ -510,36 +534,4 @@ onUnmounted(() => {
   opacity: 1;
 }
 
-@keyframes tb-shell-breathe-in {
-  0% {
-    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.12), rgba(14, 13, 18, 0));
-    backdrop-filter: blur(6px) saturate(1.02);
-  }
-  100% {
-    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.26), rgba(14, 13, 18, 0));
-    backdrop-filter: blur(14px) saturate(1.08);
-  }
-}
-
-@keyframes tb-shell-breathe-out {
-  0% {
-    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.24), rgba(14, 13, 18, 0));
-    backdrop-filter: blur(14px) saturate(1.08);
-  }
-  100% {
-    background: linear-gradient(to bottom, rgba(14, 13, 18, 0.08), rgba(14, 13, 18, 0));
-    backdrop-filter: blur(4px) saturate(1.02);
-  }
-}
-
-@keyframes tb-center-float {
-  0% {
-    opacity: 0.72;
-    transform: translate(-50%, calc(-50% + 8px)) scale(0.985);
-  }
-  100% {
-    opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
-  }
-}
 </style>

@@ -126,13 +126,16 @@ function runFlipTransition(from: CoverSnapshot, to: CoverSnapshot, mode: 'openin
 
 async function openNowPlaying() {
   if (!hasMiniPlayer.value) return
+  // 动画进行中允许打断，避免连点卡住
   resetFlipState()
-  nowPlayingMotionState.value = null
+  nowPlayingMotionState.value = 'opening'
+  scheduleNowPlayingMotionCleanup(520)
   playerTransitionPulse.value = Date.now()
   isNowPlayingOpen.value = true
 }
 
 async function closeNowPlaying() {
+  if (!isNowPlayingOpen.value && nowPlayingMotionState.value !== 'opening') return
   const from = nowPlayingRef.value?.getCoverSnapshot?.() as CoverSnapshot | null
   if (from?.src && player.currentTrack?.id) {
     lastCoverSnapshot.value = {
@@ -142,7 +145,7 @@ async function closeNowPlaying() {
   }
   resetFlipState()
   nowPlayingMotionState.value = 'closing'
-  scheduleNowPlayingMotionCleanup()
+  scheduleNowPlayingMotionCleanup(520)
   skipMiniEnter.value = true
   isNowPlayingOpen.value = false
   await nextTick()
@@ -244,6 +247,8 @@ watch(
     player.hasPlaybackSession ? getTrackCoverUrl(player.currentTrack) : '',
   ] as const,
   ([enabled, , cover]) => {
+    // 圆形扩散中由 theme 路径同步重算，避免圆外提前换色
+    if (document.documentElement.classList.contains('theme-ripple-active')) return
     const dark = resolveDynamicIsDark()
     if (!enabled || !cover) {
       clearDynamicColor(dark)
@@ -415,7 +420,7 @@ onUnmounted(() => {
   overflow: hidden;
   position: relative;
   border-radius: var(--radius-lg);
-  padding-top: 36px; /* 让出顶栏高度 */
+  padding-top: 36px; /* 让出顶栏高度（与 TitleBar / mac 红绿灯对齐） */
   isolation: isolate;
 }
 
@@ -434,19 +439,12 @@ onUnmounted(() => {
 .app-side-nav {
   position: relative;
   z-index: 2;
-  transition:
-    transform 280ms cubic-bezier(0.2, 0, 0, 1),
-    opacity 200ms ease,
-    filter 250ms cubic-bezier(0.2, 0, 0, 1);
+  transition: opacity 200ms ease;
 
   &.app-side-nav--dimmed {
-    transition:
-      transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
-      opacity 320ms ease,
-      filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
-    transform: scale(0.94) translateY(12px);
-    filter: blur(6px);
-    opacity: 0.7;
+    /* 仅透明度，避免背景缩放干扰详情页纯上滑 */
+    transition: opacity 320ms ease;
+    opacity: 0.55;
     pointer-events: none;
   }
 }
@@ -457,26 +455,20 @@ onUnmounted(() => {
   overflow-x: hidden;
   position: relative;
   z-index: 2;
-  transform-origin: center top;
   /* 恢复态用较快的 transition */
   transition:
     padding-bottom 300ms var(--ease-standard),
-    transform 280ms cubic-bezier(0.2, 0, 0, 1),
-    opacity 200ms ease,
-    filter 250ms cubic-bezier(0.2, 0, 0, 1);
+    opacity 200ms ease;
 
+  /* 仅预留迷你播放器高度；详情页自身再处理选择栏 */
   &.has-mini-player { padding-bottom: 76px; }
 
   &.content--np-dimmed {
-    /* 进入景深用较慢的 emphasized decelerate */
+    /* 仅透明度，禁止缩放/位移 */
     transition:
       padding-bottom 300ms var(--ease-standard),
-      transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
-      opacity 320ms ease,
-      filter 420ms cubic-bezier(0.22, 1, 0.36, 1);
-    transform: scale(0.94) translateY(12px);
-    filter: blur(6px);
-    opacity: 0.7;
+      opacity 320ms ease;
+    opacity: 0.55;
     pointer-events: none;
   }
 }
