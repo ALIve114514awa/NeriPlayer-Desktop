@@ -141,6 +141,26 @@ function loadImageData(src: string): Promise<ImageData | null> {
 // generation token 防竞态：快速切歌/切换深浅色时作废旧请求
 let activeToken = 0
 let isActive = false
+// 缓存最近一次种子色，供深浅色瞬时切换时同步重算令牌，避免被预设主题色覆盖
+let lastSeed: RGB | null = null
+
+/** 动态取色是否正在覆盖全局主题色 */
+export function isDynamicColorActive(): boolean {
+  return isActive
+}
+
+/**
+ * 用缓存种子按新的深浅色重算并应用令牌。
+ * 供主题切换的视觉路径同步调用，避免闪回预设色。
+ * @returns 是否成功重算
+ */
+export function reapplyDynamicColorForTheme(isDark: boolean): boolean {
+  if (!isActive || !lastSeed) return false
+  const seed = lastSeed
+  const vars = buildDynamicVars(seed, isDark)
+  applyThemeVars(vars, `${seed[0]}, ${seed[1]}, ${seed[2]}`, isDark)
+  return true
+}
 
 /**
  * 从封面提取主色并应用为全局动态主题色。
@@ -181,6 +201,7 @@ export async function applyDynamicColorFromCover(rawUrl: string, isDark: boolean
   const seed = palette.primaryColor
   const vars = buildDynamicVars(seed, isDark)
   applyThemeVars(vars, `${seed[0]}, ${seed[1]}, ${seed[2]}`, isDark)
+  lastSeed = seed
   isActive = true
 
   log.info('动态取色已应用:', {
@@ -198,6 +219,7 @@ export function clearDynamicColor(isDark?: boolean): void {
   activeToken++
   if (!isActive) return
   isActive = false
+  lastSeed = null
   clearDynamicThemeColor(isDark)
   log.info('动态取色已清除，恢复预设主题')
 }

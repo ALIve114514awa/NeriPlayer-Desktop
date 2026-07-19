@@ -306,6 +306,7 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
 
   // 预计算当前 dark/light 状态，避免 transition 回调中读 classList
   const isDark = !document.documentElement.classList.contains('light-theme')
+  document.documentElement.classList.add('theme-ripple-active')
 
   const transition = (document as any).startViewTransition(() => {
     // 仅做视觉切换，不含 localStorage 写入
@@ -317,7 +318,7 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
 
   try {
     await transition.ready
-    document.documentElement.animate(
+    const anim = document.documentElement.animate(
       {
         clipPath: [
           `circle(0px at ${x}px ${y}px)`,
@@ -330,8 +331,12 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
         pseudoElement: '::view-transition-new(root)',
       },
     )
+    await anim.finished.catch(() => {})
+    await transition.finished.catch(() => {})
   } catch {
     // 中断无影响
+  } finally {
+    document.documentElement.classList.remove('theme-ripple-active')
   }
 }
 

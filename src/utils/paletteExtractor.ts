@@ -417,8 +417,15 @@ export function extractPalette(
   const buckets = medianCut(pixels, maxColors)
   const swatches = classifySwatches(buckets)
 
-  // --- 对齐 Android buildDynamicBackgroundPalette 的角色选取 ---
-  const baseColor = pickColor(swatches.muted, swatches.dominant, swatches.darkMuted, swatches.vibrant)
+  // 主色优先 dominant/vibrant，避免线稿黄封面被 muted 粉灰抢走
+  // Android 虽先 muted，但桌面端大面积纯色封面用 dominant 更稳
+  const baseColor = pickColor(
+    swatches.dominant,
+    swatches.vibrant,
+    swatches.muted,
+    swatches.darkMuted,
+    swatches.lightMuted,
+  )
   const accentColor = pickAccentColor(
     baseColor,
     swatches.vibrant,
@@ -480,12 +487,19 @@ export function extractPalette(
 }
 
 function computeAccentBg(dominant: RGB, isDark: boolean): RGB {
-  const [h, s, l] = rgbToHsl(dominant[0], dominant[1], dominant[2])
-  const targetS = isDark ? Math.min(s * 0.38, 0.30) : Math.min(s * 0.32, 0.24)
-  const targetL = isDark ? clamp(l, 0.22, 0.30) : 0.90
+  let [h, s, l] = rgbToHsl(dominant[0], dominant[1], dominant[2])
+  // 抑制无意义的低饱和粉偏（常见于线稿/皮肤噪点），保留高饱和主色
+  if (s < 0.18 && (h < 0.05 || h > 0.90 || (h > 0.85 && h < 0.98))) {
+    s = 0
+  }
+  // 提升主色饱和参与度，让黄封面更接近黄色而不是粉紫
+  const targetS = isDark
+    ? Math.min(Math.max(s, 0.12) * 0.55, 0.42)
+    : Math.min(Math.max(s, 0.10) * 0.42, 0.32)
+  const targetL = isDark ? clamp(l * 0.55 + 0.12, 0.18, 0.32) : 0.90
   const adjusted = hslToRgb(h, targetS, targetL)
   const neutral: RGB = isDark ? [18, 18, 18] : [255, 255, 255]
-  const blend = isDark ? 0.22 : 0.28
+  const blend = isDark ? 0.18 : 0.28
   return [
     Math.round(adjusted[0] * (1 - blend) + neutral[0] * blend),
     Math.round(adjusted[1] * (1 - blend) + neutral[1] * blend),

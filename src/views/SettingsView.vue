@@ -169,12 +169,24 @@ const darkModeOptions = computed(() => [
   { value: 'light', label: t('settings.dark_mode_off'), icon: 'light_mode' },
 ])
 
+const darkModeThumbIndex = computed(() => {
+  const idx = darkModeOptions.value.findIndex(o => o.value === darkMode.value)
+  return idx < 0 ? 0 : idx
+})
+
+// 拇指位移：36px 宽 + 2px gap
+const darkModeThumbStyle = computed(() => ({
+  transform: `translateX(${darkModeThumbIndex.value * 38}px)`,
+}))
+
 function handleDarkModeSwitch(mode: ThemeMode, event: MouseEvent) {
-  darkMode.value = mode as any
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const x = rect.left + rect.width / 2
   const y = rect.top + rect.height / 2
-  switchThemeWithRipple(mode, x, y, false)
+  // 同步改 mode：拇指 650ms 滑动；ripple 不再禁用 .pill-thumb 的 transition
+  darkMode.value = mode as any
+  document.documentElement.classList.add('theme-ripple-active')
+  void switchThemeWithRipple(mode, x, y, false)
 }
 
 function handleLocaleSwitch(code: string, event: MouseEvent) {
@@ -1060,6 +1072,11 @@ function confirmDataSaverChange() {
         <div class="setting-desc">{{ darkModeOptions.find(o => o.value === darkMode)?.label }}</div>
       </div>
       <div class="dark-mode-pills">
+        <span
+          class="pill-thumb"
+          :style="darkModeThumbStyle"
+          aria-hidden="true"
+        />
         <button
           v-for="opt in darkModeOptions"
           :key="opt.value"
@@ -2733,13 +2750,31 @@ function confirmDataSaverChange() {
   100% { transform: translateX(280%); }
 }
 
-/* 深色模式切换胶囊 */
+/* 深色模式切换胶囊 — 滑动拇指 */
 .dark-mode-pills {
-  display: flex;
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 36px);
   background: var(--md-surface-container-highest);
   border-radius: var(--radius-full);
   padding: 3px;
   gap: 2px;
+}
+
+.pill-thumb {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: 36px;
+  border-radius: var(--radius-full);
+  background: var(--md-primary);
+  /* 650ms 非线性 emphasized：先快后慢，滑动更有一贯性 */
+  transition: transform 650ms cubic-bezier(0.2, 0, 0, 1);
+  pointer-events: none;
+  z-index: 0;
+  will-change: transform;
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--md-primary) 35%, transparent);
 }
 
 .pill {
@@ -2750,13 +2785,14 @@ function confirmDataSaverChange() {
   align-items: center;
   justify-content: center;
   color: var(--md-on-surface-variant);
-  transition: all var(--duration-short) var(--ease-standard);
+  position: relative;
+  z-index: 1;
+  transition: color 650ms cubic-bezier(0.2, 0, 0, 1);
 
   &.active {
-    background: var(--md-primary);
     color: var(--md-on-primary);
   }
-  &:hover:not(.active) { background: var(--md-surface-variant); }
+  &:hover:not(.active) { color: var(--md-on-surface); }
 }
 
 /* 主题色选择 */

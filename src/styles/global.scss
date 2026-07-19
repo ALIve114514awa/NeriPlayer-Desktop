@@ -125,16 +125,17 @@ select,
 .fade-enter-from { opacity: 0; transform: translateY(8px) scale(0.98); }
 .fade-leave-to { opacity: 0; transform: scale(0.99); }
 
-/* NowPlaying 覆盖层过渡 — emphasized decelerate 滑入，accelerate 滑出 */
+/* NowPlaying 覆盖层过渡 — 仅向上位移，禁止缩放 */
 .slide-up-enter-active {
-  transition: transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
-              opacity 120ms var(--ease-decelerate);
+  transition: transform 460ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 .slide-up-leave-active {
   transition: transform 400ms var(--ease-emphasized-accel);
 }
-.slide-up-enter-from { transform: translateY(100%); opacity: 0; }
+.slide-up-enter-from { transform: translateY(100%); }
 .slide-up-leave-to { transform: translateY(100%); }
+.slide-up-enter-to,
+.slide-up-leave-from { transform: translateY(0); }
 
 /* 按钮重置 */
 button {
@@ -200,4 +201,25 @@ a { color: inherit; text-decoration: none; }
 
 ::view-transition-new(root) {
   z-index: 9999;
+  /* CSS 变量驱动圆形遮罩，确保圆外仍显示旧视图 */
+  clip-path: circle(var(--theme-ripple-r, 0px) at var(--theme-ripple-x, 50%) var(--theme-ripple-y, 50%));
+  transition: clip-path 500ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* 扩散过程中禁用 color/background 过渡，但保留深浅色拇指滑动 */
+html.theme-ripple-active,
+html.theme-ripple-active *:not(.pill-thumb):not(.dark-mode-pills):not(.pill) {
+  transition: none !important;
+}
+
+html.theme-ripple-active .pill-thumb {
+  transition: transform 650ms cubic-bezier(0.2, 0, 0, 1) !important;
+}
+
+html.theme-ripple-active .pill {
+  transition: color 650ms cubic-bezier(0.2, 0, 0, 1) !important;
+}
+
+html.theme-ripple-active::view-transition-new(root) {
+  transition: clip-path 500ms cubic-bezier(0.2, 0, 0, 1) !important;
 }

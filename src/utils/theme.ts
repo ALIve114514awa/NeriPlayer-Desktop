@@ -1,5 +1,6 @@
 // 深色/浅色模式管理 + 圆形扩散过渡动画
 // 参考 Android 端 pending state 模式：视觉切换与持久化解耦，消除卡顿
+import { reapplyDynamicColorForTheme } from './colorExtractor'
 import { applyThemeColor, applyThemeColorVisual, getSavedThemeColor } from './themeColor'
 
 export type ThemeMode = 'system' | 'dark' | 'light'
@@ -26,8 +27,10 @@ function applyThemeVisual(mode: ThemeMode) {
   const dark = resolvedIsDark(mode)
   document.documentElement.classList.toggle('light-theme', !dark)
   document.documentElement.classList.toggle('dark-theme', dark)
-  // 直接传入 dark 状态，跳过 classList 二次读取
-  applyThemeColorVisual(getSavedThemeColor(), dark)
+  // 动态取色激活时同步用缓存种子重算，避免闪回预设主题色
+  if (!reapplyDynamicColorForTheme(dark)) {
+    applyThemeColorVisual(getSavedThemeColor(), dark)
+  }
 }
 
 /** 无动画直接应用（含持久化，用于初始化和 fallback） */
@@ -54,6 +57,14 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
     Math.max(y, window.innerHeight - y),
   )
 
+  // 禁用 CSS color 过渡，避免圆外区域文字提前变色
+  const root = document.documentElement
+  root.classList.add('theme-ripple-active')
+  // 用 CSS 变量驱动 clip-path，兼容 WebView2 对 WAAPI pseudoElement 支持不全的情况
+  root.style.setProperty('--theme-ripple-x', `${x}px`)
+  root.style.setProperty('--theme-ripple-y', `${y}px`)
+  root.style.setProperty('--theme-ripple-r', '0px')
+
   const transition = (document as any).startViewTransition(() => {
     // 仅视觉切换，不含 localStorage 写入
     applyThemeVisual(mode)
@@ -64,9 +75,10 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
 
   try {
     await transition.ready
+    root.style.setProperty('--theme-ripple-r', `${maxRadius}px`)
 
-    // 新视图从 clip-path: circle(0) 扩散到 circle(maxRadius)
-    document.documentElement.animate(
+    // 双通道：CSS 变量动画 + WAAPI，谁先可用谁生效
+    const anim = root.animate(
       {
         clipPath: [
           `circle(0px at ${x}px ${y}px)`,
@@ -79,8 +91,18 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
         pseudoElement: '::view-transition-new(root)',
       },
     )
+    await Promise.race([
+      anim.finished.catch(() => {}),
+      new Promise<void>(resolve => setTimeout(resolve, 520)),
+    ])
+    await transition.finished.catch(() => {})
   } catch {
     // transition 被中断也没关系
+  } finally {
+    root.classList.remove('theme-ripple-active')
+    root.style.removeProperty('--theme-ripple-x')
+    root.style.removeProperty('--theme-ripple-y')
+    root.style.removeProperty('--theme-ripple-r')
   }
 }
 
