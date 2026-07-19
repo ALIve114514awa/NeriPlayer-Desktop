@@ -7,6 +7,7 @@ import QueuePanel from './QueuePanel.vue'
 import ListenTogetherPanel from './ListenTogetherPanel.vue'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
 import EditableRangeValue from './ui/EditableRangeValue.vue'
+import { getTrackCoverUrl } from '@/utils/trackCover'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }
@@ -146,25 +147,17 @@ const miniTrackKey = computed(() => (
   player.currentTrack?.playlistKey || player.currentTrack?.id || 'empty'
 ))
 
-function trackCoverUrl(track: typeof player.currentTrack): string {
-  const raw = track?.coverUrl
-    || track?.syncPayload?.customCoverUrl
-    || track?.syncPayload?.custom_cover_url
-    || track?.syncPayload?.coverUrl
-    || track?.syncPayload?.cover_url
-  return typeof raw === 'string' ? raw.trim() : ''
-}
-
-const displayCoverUrl = computed(() =>
-  props.coverFallbackSrc
-    || trackCoverUrl(player.currentTrack)
-    || player.queue.find(track => (
-      player.currentTrack?.playlistKey
-        ? track.playlistKey === player.currentTrack.playlistKey
-        : track.id === player.currentTrack?.id
-    ))?.coverUrl
-    || '',
-)
+const displayCoverUrl = computed(() => {
+  const queuedTrack = player.queue.find(track => (
+    player.currentTrack?.playlistKey
+      ? track.playlistKey === player.currentTrack.playlistKey
+      : track.id === player.currentTrack?.id
+  ))
+  return props.coverFallbackSrc
+    || getTrackCoverUrl(player.currentTrack)
+    || getTrackCoverUrl(queuedTrack)
+    || ''
+})
 const miniDownloadStateKey = computed(() =>
   `${miniTrackKey.value}:${player.isPlayingFromDownload ? 'download' : 'stream'}`
 )
@@ -221,22 +214,18 @@ defineExpose({
       <!-- 左：封面 + 歌曲信息 -->
       <div class="mp-left" @click="emit('expand')">
         <div ref="coverRef" class="mp-cover" :class="{ playing: player.isPlaying, 'mp-cover-hidden': props.coverHiddenByFlip }">
-          <transition name="mp-cover-swap" mode="out-in">
-            <BilibiliCoverImage
-              v-if="displayCoverUrl"
-              :key="`cover:${miniTrackKey}`"
-              :src="displayCoverUrl"
-              class="mp-cover-img"
-            >
-              <span class="material-symbols-rounded filled" style="font-size: 20px; opacity: 0.6">music_note</span>
-            </BilibiliCoverImage>
-            <span
-              v-else
-              :key="`placeholder:${miniTrackKey}`"
-              class="material-symbols-rounded filled"
-              style="font-size: 20px; opacity: 0.6"
-            >music_note</span>
-          </transition>
+          <BilibiliCoverImage
+            v-if="displayCoverUrl"
+            :src="displayCoverUrl"
+            class="mp-cover-img"
+          >
+            <span class="material-symbols-rounded filled" style="font-size: 20px; opacity: 0.6">music_note</span>
+          </BilibiliCoverImage>
+          <span
+            v-else
+            class="material-symbols-rounded filled"
+            style="font-size: 20px; opacity: 0.6"
+          >music_note</span>
         </div>
         <div class="mp-info">
           <transition name="mp-meta-swap" mode="out-in">

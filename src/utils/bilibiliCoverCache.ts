@@ -11,9 +11,9 @@ const PROXIED_COVER_IMAGE_DOMAINS = [
 ] as const
 const DATA_URL_PATTERN = /^data:(image\/(?:avif|gif|jpe?g|png|webp));base64,([a-z0-9+/]+={0,2})$/i
 
-const DEFAULT_MAX_ENTRIES = 24
-const DEFAULT_MAX_DATA_URL_CHARS = 24 * 1024 * 1024
-const DEFAULT_TTL_MS = 30 * 60 * 1000
+const DEFAULT_MAX_ENTRIES = 200
+const DEFAULT_MAX_DATA_URL_CHARS = 48 * 1024 * 1024
+const DEFAULT_TTL_MS = 60 * 60 * 1000
 
 interface CoverCacheEntry {
   dataUrl: string

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tauri::{AppHandle, Manager, State};
 use url::Url;
 
@@ -26,6 +27,7 @@ struct CachedCover {
     mime_type: &'static str,
 }
 
+#[derive(Clone)]
 struct CoverDiskCache {
     root: PathBuf,
     directory: PathBuf,
@@ -50,22 +52,79 @@ pub async fn fetch_bilibili_cover(
     state: State<'_, AppState>,
 ) -> AppResult<String> {
     let cover_url = normalize_cover_url(&url)?;
-    let settings = store::load_settings(&app)?.settings;
-    let cache_limit_mb = settings.max_cache_size as u64;
-    let cache_limit_bytes = cache_limit_mb.saturating_mul(1024 * 1024);
-    let cache_root = app
-        .path()
-        .app_cache_dir()
-        .map_err(|err| AppError::Other(err.to_string()))?
-        .join(IMAGE_CACHE_DIRECTORY);
-    let cache = CoverDiskCache::new(cache_root, cover_url.as_str(), cache_limit_bytes)?;
+    let cover_host = cover_url.host_str().unwrap_or("unknown").to_string();
+    let cache_setup_started = Instant::now();
+    let cache_setup_queued_at = Instant::now();
+    let app_for_setup = app.clone();
+    let cache_key_url = cover_url.clone();
+    let setup_host = cover_host.clone();
+    let (settings, cache) = tokio::task::spawn_blocking(move || {
+        log::info!(
+            target: "cover-cache",
+            "setup worker started host={}, queued_ms={}",
+            setup_host,
+            cache_setup_queued_at.elapsed().as_millis(),
+        );
+        let settings = store::load_settings(&app_for_setup)?.settings;
+        let cache_limit_mb = settings.max_cache_size as u64;
+        let cache_limit_bytes = cache_limit_mb.saturating_mul(1024 * 1024);
+        let cache_root = app_for_setup
+            .path()
+            .app_cache_dir()
+            .map_err(|err| AppError::Other(err.to_string()))?
+            .join(IMAGE_CACHE_DIRECTORY);
+        let cache = CoverDiskCache::new(cache_root, cache_key_url.as_str(), cache_limit_bytes)?;
+        Ok::<_, AppError>((settings, cache))
+    })
+    .await
+    .map_err(|err| AppError::Other(err.to_string()))??;
+    log::info!(
+        target: "cover-fetch",
+        "cache ready host={}, setup_ms={}, force_refresh={}",
+        cover_host,
+        cache_setup_started.elapsed().as_millis(),
+        force_refresh == Some(true),
+    );
 
     if force_refresh != Some(true) {
-        if let Some(cached) = cache.read() {
-            return Ok(cover_data_url(&cached.bytes, cached.mime_type));
+        let lookup_started = Instant::now();
+        let cache_for_lookup = cache.clone();
+        let cached = tokio::task::spawn_blocking(move || {
+            cache_for_lookup.read().map(|cached| {
+                (
+                    cover_data_url(&cached.bytes, cached.mime_type),
+                    cached.bytes.len(),
+                )
+            })
+        })
+        .await
+        .map_err(|err| AppError::Other(err.to_string()))?;
+        log::info!(
+            target: "cover-cache",
+            "lookup host={}, hit={}, elapsed_ms={}",
+            cover_host,
+            cached.is_some(),
+            lookup_started.elapsed().as_millis(),
+        );
+        if let Some((data_url, bytes)) = cached {
+            log::info!(
+                target: "cover-cache",
+                "hit host={}, bytes={}, data_url_chars={}",
+                cover_host,
+                bytes,
+                data_url.len(),
+            );
+            return Ok(data_url);
         }
     }
 
+    let request_started = Instant::now();
+    log::info!(
+        target: "cover-fetch",
+        "request start host={}, force_refresh={}",
+        cover_host,
+        force_refresh == Some(true),
+    );
     let mut client_builder = reqwest::Client::builder()
         .cookie_provider(state.cookie_jar.clone())
         .user_agent(COVER_USER_AGENT)
@@ -94,6 +153,15 @@ pub async fn fetch_bilibili_cover(
         .await?
         .error_for_status()?;
 
+    log::info!(
+        target: "cover-fetch",
+        "response host={}, status={}, content_length={:?}, elapsed_ms={}",
+        cover_host,
+        response.status(),
+        response.content_length(),
+        request_started.elapsed().as_millis(),
+    );
+
     validate_cover_url(response.url())?;
 
     if response
@@ -112,9 +180,44 @@ pub async fn fetch_bilibili_cover(
     }
     let mime_type = detect_image_mime(&bytes)
         .ok_or_else(|| AppError::Api("Cover response is not a supported image".into()))?;
-    cache.publish(&bytes, mime_type)?;
+    log::info!(
+        target: "cover-fetch",
+        "body ready host={}, bytes={}, mime={}, elapsed_ms={}",
+        cover_host,
+        bytes.len(),
+        mime_type,
+        request_started.elapsed().as_millis(),
+    );
 
-    Ok(cover_data_url(&bytes, mime_type))
+    let publish_started = Instant::now();
+    let cache_for_publish = cache.clone();
+    let body_bytes = bytes.len();
+    let publish_bytes = bytes;
+    let (data_url, publish_worker_ms) = tokio::task::spawn_blocking(move || {
+        let worker_started = Instant::now();
+        cache_for_publish.publish(&publish_bytes, mime_type)?;
+        let data_url = cover_data_url(&publish_bytes, mime_type);
+        Ok::<_, AppError>((data_url, worker_started.elapsed().as_millis()))
+    })
+    .await
+    .map_err(|err| AppError::Other(err.to_string()))??;
+    log::info!(
+        target: "cover-cache",
+        "published host={}, bytes={}, elapsed_ms={}, total_ms={}",
+        cover_host,
+        body_bytes,
+        publish_started.elapsed().as_millis(),
+        request_started.elapsed().as_millis(),
+    );
+    log::info!(
+        target: "cover-cache",
+        "publish worker host={}, worker_ms={}, data_url_chars={}",
+        cover_host,
+        publish_worker_ms,
+        data_url.len(),
+    );
+
+    Ok(data_url)
 }
 
 fn normalize_cover_url(raw_url: &str) -> AppResult<Url> {

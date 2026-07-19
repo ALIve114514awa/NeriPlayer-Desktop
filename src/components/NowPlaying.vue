@@ -30,6 +30,8 @@ import ContextMenu from './ui/ContextMenu.vue'
 import type { ContextMenuActionItem } from '@/utils/contextMenu'
 import { playbackSessionTrackKey } from '@/utils/playbackRequest'
 import { createLogger } from '@/utils/logger'
+import { getTrackCoverUrl } from '@/utils/trackCover'
+import { summarizeLogError } from '@/utils/logSanitizer'
 
 const log = createLogger('now-playing')
 
@@ -63,6 +65,16 @@ let trackSwitchAnimTimer: ReturnType<typeof setTimeout> | null = null
 let controlFeedbackPulseTimer: ReturnType<typeof setTimeout> | null = null
 let moreSheetSwitchTimer: ReturnType<typeof setTimeout> | null = null
 let coverRenderRetryCount = 0
+
+function coverSourceLabel(rawUrl: string): string {
+  if (!rawUrl) return 'empty'
+  if (rawUrl.startsWith('data:')) return `data-url(${rawUrl.length})`
+  try {
+    return new URL(rawUrl).hostname || 'url'
+  } catch {
+    return `invalid(${rawUrl.length})`
+  }
+}
 
 function hideMoreSheet() {
   showMoreSheet.value = false
@@ -393,8 +405,7 @@ function extractColorsFromCover(url: string): Promise<boolean> {
     img.onerror = () => {
       if (requestToken === paletteRequestToken) {
         resetExtractedPalette()
-        const sourceLabel = url.startsWith('data:') ? 'proxied image data' : url
-        log.error('cover image load failed:', sourceLabel)
+        log.error('cover image load failed:', coverSourceLabel(url))
       }
       resolve(false)
     }
@@ -406,7 +417,7 @@ function extractColorsFromCover(url: string): Promise<boolean> {
 watch(
   () => [
     player.hasPlaybackSession,
-    player.hasPlaybackSession ? player.currentTrack?.coverUrl || '' : '',
+    player.hasPlaybackSession ? getTrackCoverUrl(player.currentTrack) : '',
     player.hasPlaybackSession ? player.currentTrack?.id || '' : '',
   ] as const,
   async ([, rawUrl], _, onCleanup) => {
@@ -419,77 +430,146 @@ watch(
 
     const proxiedUrl = normalizeProxiedCoverUrl(rawUrl)
     const normalizedUrl = proxiedUrl || normalizeCoverUrlForDisplay(rawUrl)
+    log.info('cover resolve begin:', {
+      trackId: player.currentTrack?.id,
+      rawSource: coverSourceLabel(rawUrl),
+      proxied: !!proxiedUrl,
+      rawChars: rawUrl.length,
+    })
     if (!normalizedUrl) {
       coverUrl.value = ''
       resetExtractedPalette()
+      log.warn('cover resolve skipped: no usable URL')
       return
     }
 
-    // 命中缓存时同步显示，避免切歌瞬间封面被清空导致的占位图闪烁
+    // 先显示原始地址，代理解析在后台替换，避免详情页首帧出现占位符
     const cachedUrl = proxiedUrl ? peekCoverImage(proxiedUrl) : ''
-    if (cachedUrl) {
-      coverUrl.value = cachedUrl
-    } else if (!proxiedUrl) {
-      coverUrl.value = normalizedUrl
-    } else {
-      coverUrl.value = ''
-    }
+    coverUrl.value = cachedUrl || normalizedUrl
+    log.info('cover fallback displayed:', {
+      trackId: player.currentTrack?.id,
+      source: coverSourceLabel(coverUrl.value),
+      cacheHit: !!cachedUrl,
+    })
 
     let displayUrl = cachedUrl || normalizedUrl
     if (proxiedUrl && !cachedUrl) {
+      const proxyStarted = performance.now()
       try {
         displayUrl = await resolveCoverImage(proxiedUrl)
+        log.info('cover proxy resolved:', {
+          trackId: player.currentTrack?.id,
+          elapsedMs: Math.round(performance.now() - proxyStarted),
+          dataUrlChars: displayUrl.length,
+        })
       } catch (error) {
-        if (active) {
-          coverUrl.value = ''
-          resetExtractedPalette()
-          log.error('failed to resolve proxied cover:', error)
-        }
-        return
+        log.error('failed to resolve proxied cover:', {
+          trackId: player.currentTrack?.id,
+          source: coverSourceLabel(proxiedUrl),
+          elapsedMs: Math.round(performance.now() - proxyStarted),
+          error: summarizeLogError(error),
+        })
+        if (!active) return
+        // 代理封面解析失败时回退到原始 URL 直接显示，而非清空封面
+        displayUrl = normalizedUrl
       }
     }
 
-    if (!active) return
+    if (!active) {
+      log.info('cover proxy result ignored: stale track')
+      return
+    }
     // 封面解析成功即显示，取色仅作背景调色板的尽力而为，不再阻塞封面渲染
     // 否则取色失败（canvas 读取异常/token 竞态）会让已解析封面永远显示不出来
     coverUrl.value = displayUrl
+    coverLoadError.value = false
+    log.info('cover display committed:', {
+      trackId: player.currentTrack?.id,
+      source: coverSourceLabel(displayUrl),
+      chars: displayUrl.length,
+    })
     void extractColorsFromCover(displayUrl)
   },
   { immediate: true },
 )
 
+function handleNowPlayingCoverLoad(event: Event) {
+  if (!player.hasPlaybackSession) return
+  const src = (event.currentTarget as HTMLImageElement).src
+  coverLoadError.value = false
+  log.info('cover img loaded:', {
+    trackId: player.currentTrack?.id,
+    source: coverSourceLabel(src),
+    chars: src.length,
+  })
+}
+
 async function handleNowPlayingCoverError(event: Event) {
   if (!player.hasPlaybackSession) return
-  const failedSrc = (event.currentTarget as HTMLImageElement).src
+  const image = event.currentTarget as HTMLImageElement
+  const failedSrc = image.getAttribute('src') || image.src
   const track = player.currentTrack
-  const proxiedUrl = normalizeProxiedCoverUrl(track?.coverUrl || '')
-  coverLoadError.value = true
+  const rawUrl = getTrackCoverUrl(track)
+  const proxiedUrl = normalizeProxiedCoverUrl(rawUrl)
   if (
     !track
     || !proxiedUrl
     || failedSrc !== coverUrl.value
     || coverRenderRetryCount >= 1
-  ) return
+  ) {
+    coverLoadError.value = true
+    log.warn('cover img failed:', {
+      trackId: track?.id,
+      source: coverSourceLabel(failedSrc),
+      retry: coverRenderRetryCount,
+      hasProxy: !!proxiedUrl,
+    })
+    return
+  }
 
   coverRenderRetryCount++
   paletteRequestToken++
   resetExtractedPalette()
   const expectedTrackId = track.id
-  const expectedRawUrl = track.coverUrl
+  const expectedRawUrl = rawUrl
+  const fallbackUrl = normalizeCoverUrlForDisplay(rawUrl)
+  coverLoadError.value = false
+  log.warn('cover img failed, refreshing proxy:', {
+    trackId: expectedTrackId,
+    source: coverSourceLabel(failedSrc),
+    fallbackSource: coverSourceLabel(fallbackUrl),
+  })
 
   try {
     const refreshedUrl = await resolveCoverImage(proxiedUrl, { forceRefresh: true })
     if (
       player.currentTrack?.id !== expectedTrackId
-      || player.currentTrack?.coverUrl !== expectedRawUrl
-    ) return
+      || getTrackCoverUrl(player.currentTrack) !== expectedRawUrl
+    ) {
+      log.info('cover refresh ignored: stale track')
+      return
+    }
 
     // 重新解析成功即恢复封面显示，取色失败不应再次把封面隐藏
     coverUrl.value = refreshedUrl
     coverLoadError.value = false
+    log.info('cover refresh committed:', {
+      trackId: expectedTrackId,
+      dataUrlChars: refreshedUrl.length,
+    })
     void extractColorsFromCover(refreshedUrl)
   } catch (error) {
-    log.error('failed to refresh proxied cover:', error)
+    log.error('failed to refresh proxied cover:', summarizeLogError(error))
+    if (fallbackUrl) {
+      coverUrl.value = fallbackUrl
+      coverLoadError.value = false
+      log.info('cover refresh fallback committed:', {
+        trackId: expectedTrackId,
+        source: coverSourceLabel(fallbackUrl),
+      })
+    } else {
+      coverLoadError.value = true
+    }
   }
 }
 
@@ -1489,6 +1569,7 @@ const sliderActiveColor = computed(() => {
                 :src="coverUrl"
                 referrerpolicy="no-referrer"
                 class="cover-card-img"
+                @load="handleNowPlayingCoverLoad"
                 @error="handleNowPlayingCoverError"
               />
               <span
@@ -1509,6 +1590,7 @@ const sliderActiveColor = computed(() => {
                   :src="coverUrl"
                   referrerpolicy="no-referrer"
                   class="cover-img"
+                  @load="handleNowPlayingCoverLoad"
                   @error="handleNowPlayingCoverError"
                 />
                 <span

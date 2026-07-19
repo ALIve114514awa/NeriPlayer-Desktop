@@ -217,3 +217,14 @@ await run('forwards force refresh to the persistent backend cache', async () => 
 
   assert.deepEqual(refreshFlags, [false, true])
 })
+
+await run('defers backend proxy work until a rendered image fails', async () => {
+  const componentSource = await readFile(
+    new URL('../src/components/BilibiliCoverImage.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(componentSource, /resolvedSrc\.value = cachedSrc \|\| normalizedSrc/)
+  assert.doesNotMatch(componentSource, /void loadCover\(proxiedUrl, false\)/)
+  assert.match(componentSource, /const forceRefresh = renderRetryCount > 0/)
+  assert.match(componentSource, /void loadCover\(proxiedUrl, forceRefresh\)/)
+})

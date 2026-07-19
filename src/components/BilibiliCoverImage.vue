@@ -6,6 +6,8 @@ import {
   peekCoverImage,
   resolveCoverImage,
 } from '@/utils/bilibiliCover'
+import { createLogger } from '@/utils/logger'
+import { summarizeLogError } from '@/utils/logSanitizer'
 
 defineOptions({ inheritAttrs: false })
 
@@ -17,46 +19,95 @@ const props = withDefaults(defineProps<{
   alt: '',
 })
 
+const log = createLogger('cover-image')
+
 const resolvedSrc = ref('')
 let resolveRequestToken = 0
 let renderRetryCount = 0
 
 watch(() => props.src, (src) => {
   resolveRequestToken++
-  resolvedSrc.value = peekCoverImage(src || '')
+  const proxiedUrl = normalizeProxiedCoverUrl(src || '')
+  const cachedSrc = peekCoverImage(src || '')
+  const normalizedSrc = proxiedUrl || normalizeCoverUrlForDisplay(src || '')
+  resolvedSrc.value = cachedSrc || normalizedSrc
   renderRetryCount = 0
   if (!src) return
 
-  if (resolvedSrc.value) return
-
-  const proxiedUrl = normalizeProxiedCoverUrl(src)
-  if (!proxiedUrl) {
-    resolvedSrc.value = normalizeCoverUrlForDisplay(src)
-    return
+  if (cachedSrc) {
+    log.info('memory cache displayed:', {
+      source: describeSource(cachedSrc),
+      chars: cachedSrc.length,
+    })
   }
-  void loadCover(proxiedUrl, false)
 }, { immediate: true })
+
+function describeSource(src: string): string {
+  if (src.startsWith('data:')) return `data-url(${src.length})`
+  try {
+    return new URL(src).hostname || 'url'
+  } catch {
+    return `invalid(${src.length})`
+  }
+}
 
 async function loadCover(src: string, forceRefresh: boolean) {
   const requestToken = ++resolveRequestToken
+  const started = performance.now()
+  log.info('proxy resolve begin:', {
+    source: describeSource(src),
+    forceRefresh,
+  })
   try {
     const nextSrc = await resolveCoverImage(src, { forceRefresh })
-    if (requestToken === resolveRequestToken) resolvedSrc.value = nextSrc
-  } catch {
-    if (requestToken === resolveRequestToken) resolvedSrc.value = ''
+    if (requestToken === resolveRequestToken) {
+      resolvedSrc.value = nextSrc
+      log.info('proxy resolve committed:', {
+        source: describeSource(nextSrc),
+        chars: nextSrc.length,
+        elapsedMs: Math.round(performance.now() - started),
+      })
+    } else {
+      log.info('proxy resolve ignored: stale source')
+    }
+  } catch (error) {
+    if (requestToken === resolveRequestToken) {
+      resolvedSrc.value = ''
+      log.warn('proxy resolve failed:', {
+        source: describeSource(src),
+        elapsedMs: Math.round(performance.now() - started),
+        error: summarizeLogError(error),
+      })
+    }
+  }
+}
+
+function handleLoad(event: Event) {
+  const src = (event.currentTarget as HTMLImageElement).src
+  if (src.startsWith('data:')) {
+    log.info('proxied image loaded:', { source: describeSource(src), chars: src.length })
   }
 }
 
 function handleError(event: Event) {
-  const failedSrc = (event.currentTarget as HTMLImageElement).src
+  const image = event.currentTarget as HTMLImageElement
+  const failedSrc = image.getAttribute('src') || image.src
   const proxiedUrl = normalizeProxiedCoverUrl(props.src || '')
-  if (!proxiedUrl || failedSrc !== resolvedSrc.value) return
+  if (failedSrc !== resolvedSrc.value) return
 
-  resolvedSrc.value = ''
-  if (renderRetryCount >= 1) return
+  log.warn('image failed:', {
+    source: describeSource(failedSrc),
+    hasProxy: !!proxiedUrl,
+    retry: renderRetryCount,
+  })
+  if (!proxiedUrl || renderRetryCount >= 2) {
+    resolvedSrc.value = ''
+    return
+  }
 
+  const forceRefresh = renderRetryCount > 0
   renderRetryCount++
-  void loadCover(proxiedUrl, true)
+  void loadCover(proxiedUrl, forceRefresh)
 }
 </script>
 
@@ -67,6 +118,7 @@ function handleError(event: Event) {
     :src="resolvedSrc"
     :alt="alt"
     referrerpolicy="no-referrer"
+    @load="handleLoad"
     @error="handleError"
   />
   <slot v-else />
