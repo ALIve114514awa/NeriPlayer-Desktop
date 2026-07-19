@@ -4,6 +4,9 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { TrackInfo } from '@/stores/player'
 import { useRecommendStore } from '@/stores/recommend'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('liked-songs')
 
 interface PlaylistInfo {
   id: number
@@ -86,7 +89,7 @@ export const useLikedSongsStore = defineStore('likedSongs', () => {
         const tracks = await invoke<Array<{ id?: string }>>('get_playlist_tracks', { id: liked.id })
         likedTrackIds.value = new Set(tracks.map(t => t.id || '').filter(Boolean))
       } catch (e) {
-        console.error('loadLikedPlaylist:', e)
+        log.error('loadLikedPlaylist:', e)
       } finally {
         isReady.value = true
         isLoading.value = false
@@ -136,7 +139,7 @@ export const useLikedSongsStore = defineStore('likedSongs', () => {
       }
       return true
     } catch (e) {
-      console.error('toggleLikedTrack:', e)
+      log.error('toggleLikedTrack:', e)
       await loadLikedPlaylist()
       return false
     }
@@ -149,7 +152,7 @@ export const useLikedSongsStore = defineStore('likedSongs', () => {
           loadLikedPlaylist()
         })
       } catch (e) {
-        console.error('listen playlists-changed for liked songs:', e)
+        log.error('listen playlists-changed for liked songs:', e)
       }
     }
     await loadLikedPlaylist()

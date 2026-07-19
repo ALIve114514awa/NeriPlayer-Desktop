@@ -15,6 +15,7 @@ const transpiled = ts.transpileModule(source, {
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled.outputText).toString('base64')}`
 const {
   hasVisiblePlaybackSession,
+  initialPlaybackPrefetchWindow,
   isPlaybackSeekCompletionCurrent,
   playbackSessionTrackKey,
   resolvePlaybackLoadStart,
@@ -59,6 +60,11 @@ assert.equal(playbackSessionTrackKey(true, '', 'netease:1'), 'netease:1')
 assert.equal(shouldResolvePlaybackSourceInParallel(false, false), true)
 assert.equal(shouldResolvePlaybackSourceInParallel(true, false), false)
 assert.equal(shouldResolvePlaybackSourceInParallel(false, true), false)
+
+const prefetchTracks = [{ id: 'first' }, { id: 'second' }, { id: 'third' }, { id: 'fourth' }]
+assert.deepEqual(initialPlaybackPrefetchWindow(prefetchTracks), prefetchTracks.slice(0, 3))
+assert.deepEqual(initialPlaybackPrefetchWindow(prefetchTracks, 1), prefetchTracks.slice(0, 1))
+assert.deepEqual(initialPlaybackPrefetchWindow(prefetchTracks, 0), [])
 
 const playerStoreSource = await readFile(new URL('../src/stores/player.ts', import.meta.url), 'utf8')
 assert.match(

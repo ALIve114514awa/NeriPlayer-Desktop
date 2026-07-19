@@ -2,6 +2,9 @@
 import { useToastStore } from '@/stores/toast'
 import type { ToastMessage } from '@/stores/toast'
 import { ref } from 'vue'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('app-toast')
 
 const toast = useToastStore()
 
@@ -19,7 +22,7 @@ function onDismiss(id: number) {
 function onAction(msg: ToastMessage) {
   if (!msg.action) return
   void Promise.resolve(msg.action.handler()).catch((e) => {
-    console.error('Toast action failed:', e)
+    log.error('Toast action failed:', e)
   })
   onDismiss(msg.id)
 }

@@ -1,6 +1,9 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('search')
 
 export interface SearchResult {
   id: string
@@ -38,7 +41,7 @@ export const useSearchStore = defineStore('search', () => {
       })
       results.value = r
     } catch (e) {
-      console.error('Search failed:', e)
+      log.error('Search failed:', e)
       results.value = []
     } finally {
       isSearching.value = false

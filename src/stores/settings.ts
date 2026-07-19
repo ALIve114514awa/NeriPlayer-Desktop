@@ -50,6 +50,8 @@ export interface AppSettings {
   backgroundImageBlur: number
   backgroundImageAlpha: number
   devModeEnabled: boolean
+  logToFile: boolean
+  logLevel: string
   maxCacheSize: number
   downloadNameTemplate: string
   downloadDir: string
@@ -125,6 +127,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   backgroundImageBlur: 20,
   backgroundImageAlpha: 0.3,
   devModeEnabled: false,
+  logToFile: false,
+  logLevel: 'info',
   maxCacheSize: 1024,
   downloadNameTemplate: DEFAULT_DOWNLOAD_NAME_TEMPLATE,
   downloadDir: '',
@@ -184,6 +188,8 @@ const LEGACY_KEYS: Partial<Record<SettingKey, string>> = {
   backgroundImageBlur: 'bg_image_blur',
   backgroundImageAlpha: 'bg_image_alpha',
   devModeEnabled: 'dev_mode',
+  logToFile: 'log_to_file',
+  logLevel: 'log_level',
   maxCacheSize: 'cache_size',
   downloadNameTemplate: 'download_template',
   downloadDir: 'download_dir',
@@ -273,6 +279,7 @@ function normalizeSnapshot(input: unknown): AppSettings {
   if (!['disc', 'card'].includes(result.coverStyle)) result.coverStyle = DEFAULT_SETTINGS.coverStyle
   if (!['home', 'explore', 'library'].includes(result.defaultScreen)) result.defaultScreen = DEFAULT_SETTINGS.defaultScreen
   if (!['zh-CN', 'zh-TW', 'en', 'ja'].includes(result.locale)) result.locale = DEFAULT_SETTINGS.locale
+  if (!['off', 'error', 'warn', 'info', 'debug', 'trace'].includes(result.logLevel)) result.logLevel = DEFAULT_SETTINGS.logLevel
   if (result.themeColor.startsWith('#')) result.themeColor = result.themeColor === '#6750A4' ? 'purple' : DEFAULT_SETTINGS.themeColor
 
   result.lyricFontScale = clamp(result.lyricFontScale, 0.5, 1.5)
@@ -360,6 +367,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const backgroundImageBlur = ref(initial.backgroundImageBlur)
   const backgroundImageAlpha = ref(initial.backgroundImageAlpha)
   const devModeEnabled = ref(initial.devModeEnabled)
+  const logToFile = ref(initial.logToFile)
+  const logLevel = ref(initial.logLevel)
   const maxCacheSize = ref(initial.maxCacheSize)
   const downloadNameTemplate = ref(initial.downloadNameTemplate)
   const downloadDir = ref(initial.downloadDir)
@@ -386,6 +395,7 @@ export const useSettingsStore = defineStore('settings', () => {
     coverBlurAmount, coverBlurDarken, neteaseQuality, qqMusicQuality,
     youtubeQuality, biliQuality, bypassProxy, internationalizationEnabled,
     backgroundImageUri, backgroundImageBlur, backgroundImageAlpha, devModeEnabled,
+    logToFile, logLevel,
     maxCacheSize, downloadNameTemplate, downloadDir, ltServerUrl, ltNickname,
     ltAllowMemberControl, ltAutoPauseOnMemberChange, ltShareAudioLinks, volume,
     playbackSpeed, loudnessGainMb, equalizerEnabled, equalizerPresetId,
@@ -470,7 +480,7 @@ export const useSettingsStore = defineStore('settings', () => {
     audioReactive, coverBlurBg, coverBlurAmount, coverBlurDarken,
     neteaseQuality, qqMusicQuality, youtubeQuality, biliQuality, bypassProxy,
     internationalizationEnabled, backgroundImageUri, backgroundImageBlur,
-    backgroundImageAlpha, devModeEnabled, maxCacheSize, downloadNameTemplate,
+    backgroundImageAlpha, devModeEnabled, logToFile, logLevel, maxCacheSize, downloadNameTemplate,
     downloadDir, ltServerUrl, ltNickname, ltAllowMemberControl,
     ltAutoPauseOnMemberChange, ltShareAudioLinks, volume, playbackSpeed,
     loudnessGainMb, equalizerEnabled, equalizerPresetId, equalizerBands,

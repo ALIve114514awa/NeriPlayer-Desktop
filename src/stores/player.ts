@@ -36,9 +36,14 @@ import {
   isPlaybackSeekCompletionCurrent,
   resolvePlaybackLoadStart,
   shouldDeferPlaybackSeek,
+  initialPlaybackPrefetchWindow,
   shouldResolvePlaybackSourceInParallel,
   type DeferredPlaybackSeek,
 } from '@/utils/playbackRequest'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('player')
+const uiLog = createLogger('playback-ui')
 
 export interface TrackInfo {
   id: string
@@ -92,8 +97,8 @@ export function tracePlaybackUi(
   requestGeneration?: number,
 ) {
   const source = track ? getPlaybackSourceKind(track) || track.source || 'local' : undefined
-  console.info(
-    `[playback-ui] stage=${stage}`,
+  uiLog.info(
+    `stage=${stage}`,
     { generation: requestGeneration, id: track?.id, source, detail },
   )
   if (!import.meta.env.DEV) return
@@ -106,7 +111,7 @@ export function tracePlaybackUi(
       requestGeneration,
     },
   }).catch((error) => {
-    console.warn('[playback-ui] backend trace unavailable:', error)
+    uiLog.warn('backend trace unavailable:', error)
   })
 }
 
@@ -548,6 +553,17 @@ export const usePlayerStore = defineStore('player', () => {
     )
   }
 
+  function prefetchPlaybackTracks(tracks: readonly TrackInfo[]) {
+    const candidates = initialPlaybackPrefetchWindow(tracks)
+      .filter(track => isRemotePlaybackTrack(track))
+    if (candidates.length === 0) return
+    playbackPrefetchManager.prefetchWindow(
+      [...candidates],
+      playbackSourceSettings(),
+      playbackUrlResolver,
+    )
+  }
+
   async function resolvePlaybackUrl(
     track: TrackInfo,
     forceRefresh = false,
@@ -860,7 +876,7 @@ export const usePlayerStore = defineStore('player', () => {
       hasSyncPayload: !!track.syncPayload,
     }).catch((error) => {
       if (token === playbackRequestToken) {
-        console.warn('[player] playback request preclaim failed:', error)
+        log.warn('playback request preclaim failed:', error)
       }
     })
     replacePlaybackDemand(track)
@@ -988,7 +1004,7 @@ export const usePlayerStore = defineStore('player', () => {
           isPlayingFromDownload.value = true
         } catch (e) {
           if (token !== playbackRequestToken) return
-          console.warn('[player] downloaded file unavailable, falling back to online source:', e)
+          log.warn('downloaded file unavailable, falling back to online source:', e)
           _currentLoadedFromDownloadPath = null
           isPlayingFromDownload.value = false
         }
@@ -1061,7 +1077,7 @@ export const usePlayerStore = defineStore('player', () => {
           }
         } catch (error) {
           if (token !== playbackRequestToken) return
-          console.warn('[player] persistent cache unavailable, resolving online source:', error)
+          log.warn('persistent cache unavailable, resolving online source:', error)
         }
 
         if (!playedFromPlaybackCache) {
@@ -1229,7 +1245,7 @@ export const usePlayerStore = defineStore('player', () => {
             pendingSeek = null
             seekGuardUntil = 0
             lastSeekedMs = null
-            console.warn('[player] deferred seek failed after media load:', error)
+            log.warn('deferred seek failed after media load:', error)
           }
         }
       }
@@ -1305,7 +1321,7 @@ export const usePlayerStore = defineStore('player', () => {
       }
 
       const msg = e instanceof Error ? e.message : String(e)
-      console.error('Play failed:', msg)
+      log.error('Play failed:', msg)
       tracePlaybackUi('play_failed', track, msg, token)
       playError.value = msg
       isPlayingFromDownload.value = false
@@ -1527,7 +1543,7 @@ export const usePlayerStore = defineStore('player', () => {
       )) return
       pendingSeek = null
       seekGuardUntil = 0
-      console.error('Seek failed:', e)
+      log.error('Seek failed:', e)
     })
   }
 
@@ -2026,6 +2042,7 @@ export const usePlayerStore = defineStore('player', () => {
     applyPersistedSettings,
     startSleepTimer, startSleepTimerEndOfTrack, startSleepTimerEndOfQueue, cancelSleepTimer,
     playAll, shufflePlay, addToQueueNext, addToQueueEnd, removeFromQueue, clearQueue,
+    prefetchPlaybackTracks,
     updateCurrentTrackInfo, restoreOriginalTrackInfo, hasOriginalTrackInfo,
     handleDownloadedFileRemoved, replayWithQuality,
   }
@@ -2084,7 +2101,7 @@ async function playRemoteUrl(
       })
     } catch (streamError) {
       if (requestGeneration !== playbackRequestToken) throw streamError
-      console.warn('[player] streaming playback failed, falling back to temp-file playback:', streamError)
+      log.warn('streaming playback failed, falling back to temp-file playback:', streamError)
       return invoke<number>('crossfade_url_fast', {
         url,
         durationHintMs,
@@ -2110,7 +2127,7 @@ async function playRemoteUrl(
     })
   } catch (streamError) {
     if (requestGeneration !== playbackRequestToken) throw streamError
-    console.warn('[player] streaming playback failed, falling back to temp-file playback:', streamError)
+    log.warn('streaming playback failed, falling back to temp-file playback:', streamError)
     return invoke<number>('play_url_fast', {
       url,
       durationHintMs,

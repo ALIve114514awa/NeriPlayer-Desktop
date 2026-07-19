@@ -15,6 +15,9 @@ import {
   type ContextMenuItem,
   type ContextMenuPosition,
 } from '@/utils/contextMenu'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('downloads-view')
 
 const { t } = useI18n()
 const downloadStore = useDownloadStore()
@@ -364,7 +367,7 @@ async function revealDownloadFile(track: DownloadedTrack) {
   try {
     await invoke('reveal_file', { path: track.filePath })
   } catch (e) {
-    console.error('Failed to reveal file:', e)
+    log.error('Failed to reveal file:', e)
     toast.error(t('download.reveal_failed'))
   }
 }

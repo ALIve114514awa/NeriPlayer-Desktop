@@ -3,6 +3,7 @@ import { ref, watch } from 'vue'
 import {
   normalizeCoverUrlForDisplay,
   normalizeProxiedCoverUrl,
+  peekCoverImage,
   resolveCoverImage,
 } from '@/utils/bilibiliCover'
 
@@ -22,9 +23,11 @@ let renderRetryCount = 0
 
 watch(() => props.src, (src) => {
   resolveRequestToken++
-  resolvedSrc.value = ''
+  resolvedSrc.value = peekCoverImage(src || '')
   renderRetryCount = 0
   if (!src) return
+
+  if (resolvedSrc.value) return
 
   const proxiedUrl = normalizeProxiedCoverUrl(src)
   if (!proxiedUrl) {

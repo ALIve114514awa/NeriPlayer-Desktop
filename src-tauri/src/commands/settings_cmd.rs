@@ -27,6 +27,11 @@ pub async fn get_app_data_dir(app: tauri::AppHandle) -> AppResult<String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub async fn get_log_dir() -> AppResult<String> {
+    Ok(crate::logging::log_dir().to_string_lossy().to_string())
+}
+
 /// 获取网易云歌曲播放 URL
 #[derive(Serialize)]
 pub struct SongUrlResult {

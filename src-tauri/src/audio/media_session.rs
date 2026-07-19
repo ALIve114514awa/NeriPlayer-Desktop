@@ -63,7 +63,7 @@ impl MediaSessionController {
                 let mut controls = match MediaControls::new(config) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("[media-session] Failed to create MediaControls: {:?}", e);
+                        log::error!(target: "media-session", "Failed to create MediaControls: {:?}", e);
                         return;
                     }
                 };
@@ -86,11 +86,11 @@ impl MediaSessionController {
                         let _ = tx.send(a);
                     }
                 }) {
-                    eprintln!("[media-session] Failed to attach handler: {:?}", e);
+                    log::error!(target: "media-session", "Failed to attach handler: {:?}", e);
                     return;
                 }
 
-                eprintln!("[media-session] MediaControls initialized");
+                log::info!(target: "media-session", "MediaControls initialized");
 
                 // 命令循环
                 loop {
@@ -133,7 +133,7 @@ impl MediaSessionController {
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            eprintln!("[media-session] channel disconnected, exiting");
+                            log::warn!(target: "media-session", "channel disconnected, exiting");
                             break;
                         }
                     }

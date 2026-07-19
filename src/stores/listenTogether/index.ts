@@ -21,6 +21,9 @@ import type {
   ListenTogetherInitialSnapshot,
 } from './protocol'
 import { trackInfoToLtTrack, ltTrackToTrackInfo, toShareableQueueSnapshot } from './mapper'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('listen-together')
 
 const LT_UUID_KEY = 'neri:lt-uuid'
 const DEFAULT_BASE_URL = 'https://neriplayer.hancat.work'
@@ -313,7 +316,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         // 事件确认，忽略
         break
       default:
-        console.log('[lt] unknown message type:', envelope.type)
+        log.debug('unknown message type:', envelope.type)
     }
   }
 
@@ -585,7 +588,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     try {
       await invoke('lt_send_event', { event })
     } catch (e) {
-      console.error('[lt] send event failed:', e)
+      log.error('send event failed:', e)
     }
   }
 

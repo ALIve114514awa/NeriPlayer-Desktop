@@ -5,6 +5,7 @@ pub mod commands;
 pub mod error;
 pub mod library;
 pub mod listen_together;
+pub mod logging;
 pub mod lyrics;
 pub mod security;
 pub mod settings;

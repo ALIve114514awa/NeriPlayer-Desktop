@@ -7,6 +7,9 @@ import { useSettingsStore } from './settings'
 import { useAuthStore } from './auth'
 import i18n from '@/i18n'
 import { setLocale } from '@/i18n'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('sync')
 
 // 全局 i18n 翻译（非组件上下文）
 const t = (key: string, params?: Record<string, any>) =>
@@ -111,7 +114,7 @@ export const useSyncStore = defineStore('sync', () => {
         historyUpdateMode: legacyFrequency,
       }
     } catch (e) {
-      console.error('loadGitHubConfig:', e)
+      log.error('loadGitHubConfig:', e)
     }
 
     try {
@@ -124,7 +127,7 @@ export const useSyncStore = defineStore('sync', () => {
         lastSyncTime: wd.lastSyncTime ?? 0,
       }
     } catch (e) {
-      console.error('loadWebDavConfig:', e)
+      log.error('loadWebDavConfig:', e)
     }
 
     try {
@@ -147,7 +150,7 @@ export const useSyncStore = defineStore('sync', () => {
       try {
         await invoke('update_sync_preferences', { historyUpdateMode: value })
       } catch (e) {
-        console.error('Failed to save sync frequency:', e)
+        log.error('Failed to save sync frequency:', e)
       }
     },
   )
@@ -168,7 +171,7 @@ export const useSyncStore = defineStore('sync', () => {
           silentFailures: val.silentFailures,
         })
       } catch (e) {
-        console.error('Failed to save GitHub sync settings:', e)
+        log.error('Failed to save GitHub sync settings:', e)
       }
     },
     { deep: true },
@@ -182,7 +185,7 @@ export const useSyncStore = defineStore('sync', () => {
       try {
         await invoke('update_webdav_sync_settings', { autoSync: val })
       } catch (e) {
-        console.error('Failed to save WebDAV sync settings:', e)
+        log.error('Failed to save WebDAV sync settings:', e)
       }
     },
   )
@@ -299,7 +302,7 @@ export const useSyncStore = defineStore('sync', () => {
       }
       toast.success(t('settings.github_disconnected'))
     } catch (e) {
-      console.error('disconnectGitHub:', e)
+      log.error('disconnectGitHub:', e)
     }
   }
 
@@ -360,7 +363,7 @@ export const useSyncStore = defineStore('sync', () => {
       webdav.value = { configured: false, serverUrl: '', basePath: '', autoSync: false, lastSyncTime: 0 }
       toast.success(t('settings.webdav_disconnected'))
     } catch (e) {
-      console.error('disconnectWebDav:', e)
+      log.error('disconnectWebDav:', e)
     }
   }
 

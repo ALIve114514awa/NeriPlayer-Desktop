@@ -22,6 +22,9 @@ import {
   type ContextMenuActionItem,
   type ContextMenuItem,
 } from '@/utils/contextMenu'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('library-view')
 
 const router = useRouter()
 const route = useRoute()
@@ -80,7 +83,7 @@ async function loadPlaylists() {
     }
     playlists.value = [...liked, ...normal, ...localFiles]
   } catch (e) {
-    console.error('Load playlists failed:', e)
+    log.error('Load playlists failed:', e)
   }
 }
 
@@ -137,7 +140,7 @@ async function confirmCreate() {
     showCreateDialog.value = false
     await loadPlaylists()
   } catch (e) {
-    console.error('Create playlist failed:', e)
+    log.error('Create playlist failed:', e)
   }
 }
 
@@ -203,7 +206,7 @@ async function selectAndScanLocalMusic() {
     await syncScannedTracksToLocalPlaylist(library.tracks)
     toast.success(t('library.scan_success', { count: library.tracks.length }))
   } catch (e) {
-    console.error('Scan local music failed:', e)
+    log.error('Scan local music failed:', e)
     toast.error(t('library.scan_failed'))
   }
 }
@@ -250,7 +253,7 @@ async function confirmDelete() {
     deleteTarget.value = null
     await loadPlaylists()
   } catch (e) {
-    console.error('Delete playlist failed:', e)
+    log.error('Delete playlist failed:', e)
   }
 }
 
@@ -303,7 +306,7 @@ async function confirmRename() {
     renameTarget.value = null
     await loadPlaylists()
   } catch (e) {
-    console.error('Rename playlist failed:', e)
+    log.error('Rename playlist failed:', e)
   }
 }
 
@@ -336,7 +339,7 @@ async function loadFavorites() {
       isDeleted: f.is_deleted ?? false,
     }))
   } catch (e) {
-    console.error('Load favorites failed:', e)
+    log.error('Load favorites failed:', e)
   }
 }
 
@@ -437,7 +440,7 @@ async function revealDownloadFile(track: any) {
   try {
     await invoke('reveal_file', { path: track.filePath })
   } catch (e) {
-    console.error('Failed to reveal file:', e)
+    log.error('Failed to reveal file:', e)
   }
 }
 

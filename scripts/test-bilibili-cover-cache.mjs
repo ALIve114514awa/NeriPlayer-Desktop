@@ -81,6 +81,21 @@ await run('deduplicates canonical and concurrent requests', async () => {
   assert.equal(fetchCount, 1)
 })
 
+await run('exposes resolved covers synchronously to newly mounted consumers', async () => {
+  const value = dataUrl('shared-display-cover')
+  const cache = new BilibiliCoverCache(
+    async () => value,
+    async () => {},
+  )
+
+  assert.equal(cache.peek(coverUrl('shared-display')), '')
+  await cache.resolve(coverUrl('shared-display'))
+  assert.equal(
+    cache.peek(`${coverUrl('shared-display')}#ignored`),
+    value,
+  )
+})
+
 await run('does not cache fetch, validation, or decode failures', async () => {
   let fetchCount = 0
   let decodeCount = 0

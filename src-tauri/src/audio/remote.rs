@@ -260,7 +260,7 @@ impl RemoteAudioSource {
                 if playback_generation.load(Ordering::Acquire) != expected_generation {
                     return Err(AppError::Audio("Playback request superseded".into()));
                 }
-                eprintln!("[remote-audio] range probe failed: {}", range_error);
+                log::warn!(target: "remote-audio", "range probe failed: {}", range_error);
                 let head_len = {
                     let head_probe = probe_head_len(&client, &url, &referer);
                     tokio::pin!(head_probe);
@@ -578,8 +578,9 @@ impl RemoteAudioCache {
         let marker = parse_cache_marker(marker_text.trim())?;
         let (path, marked_length, expected_sha256, file_name) = match &marker {
             CacheMarker::Legacy { .. } => {
-                eprintln!(
-                    "[remote-audio] ignoring legacy cache marker: {}",
+                log::warn!(
+                    target: "remote-audio",
+                    "ignoring legacy cache marker: {}",
                     self.ready_path.display()
                 );
                 return None;
@@ -604,8 +605,9 @@ impl RemoteAudioCache {
             expected_sha256,
             file_name,
         ) {
-            eprintln!(
-                "[remote-audio] ignoring invalid cache {}: {}",
+            log::warn!(
+                target: "remote-audio",
+                "ignoring invalid cache {}: {}",
                 path.display(),
                 err
             );
@@ -1706,8 +1708,9 @@ fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
                     false
                 }
                 Err(err) => {
-                    eprintln!(
-                        "[remote-audio] prefetch stopped at {}: {}",
+                    log::warn!(
+                        target: "remote-audio",
+                        "prefetch stopped at {}: {}",
                         fetch_start, err
                     );
                     true
@@ -1837,12 +1840,13 @@ fn try_mark_disk_cache_ready(inner: &RemoteAudioInner) {
         .name("audio-cache-finalize".into())
         .spawn(move || {
             if let Err(err) = cache.mark_ready() {
-                eprintln!("[remote-audio] cache finalize rejected: {}", err);
+                log::warn!(target: "remote-audio", "cache finalize rejected: {}", err);
             }
         })
     {
-        eprintln!(
-            "[remote-audio] cache finalize worker unavailable: {}",
+        log::warn!(
+            target: "remote-audio",
+            "cache finalize worker unavailable: {}",
             spawn_error
         );
     }

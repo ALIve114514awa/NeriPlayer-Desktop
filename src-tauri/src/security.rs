@@ -138,9 +138,9 @@ mod debug_secret_storage {
         match read_secret_from_root(&root) {
             Ok(value) => value,
             Err(error) => {
-                log::error!("调试凭据存储读取失败: {error}");
+                log::error!(target: "security", "调试凭据存储读取失败: {error}");
                 if let Err(cleanup_error) = delete_store_root(&root) {
-                    log::error!("损坏的调试凭据存储清理失败: {cleanup_error}");
+                    log::error!(target: "security", "损坏的调试凭据存储清理失败: {cleanup_error}");
                 }
                 None
             }
@@ -155,7 +155,7 @@ mod debug_secret_storage {
         match write_secret_to_root(&root, value) {
             Ok(()) => true,
             Err(error) => {
-                log::error!("调试凭据存储写入失败: {error}");
+                log::error!(target: "security", "调试凭据存储写入失败: {error}");
                 false
             }
         }
@@ -169,7 +169,7 @@ mod debug_secret_storage {
         match delete_store_root(&root) {
             Ok(()) => true,
             Err(error) => {
-                log::error!("调试凭据存储删除失败: {error}");
+                log::error!(target: "security", "调试凭据存储删除失败: {error}");
                 false
             }
         }

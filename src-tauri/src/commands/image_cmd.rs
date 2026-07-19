@@ -183,8 +183,9 @@ impl CoverDiskCache {
         match validate_cached_cover(&path, &marker) {
             Ok(cached) => Some(cached),
             Err(err) => {
-                eprintln!(
-                    "[cover-cache] ignoring invalid cache {}: {}",
+                log::warn!(
+                    target: "cover-cache",
+                    "ignoring invalid cache {}: {}",
                     path.display(),
                     err
                 );

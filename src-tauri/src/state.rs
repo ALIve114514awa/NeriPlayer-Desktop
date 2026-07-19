@@ -21,7 +21,7 @@ pub struct DownloadTaskControl {
 
 /// 全局应用状态，通过 tauri::State 注入
 pub struct AppState {
-    pub player: Mutex<PlayerEngine>,
+    pub player: Arc<Mutex<PlayerEngine>>,
     pub playback_generation: Arc<AtomicU64>,
     pub queue: Mutex<PlayQueue>,
     pub http: parking_lot::RwLock<reqwest::Client>,
@@ -47,9 +47,9 @@ impl AppState {
 
         let playback_generation = Arc::new(AtomicU64::new(0));
         Self {
-            player: Mutex::new(PlayerEngine::with_playback_generation(
+            player: Arc::new(Mutex::new(PlayerEngine::with_playback_generation(
                 playback_generation.clone(),
-            )),
+            ))),
             playback_generation,
             queue: Mutex::new(PlayQueue::new()),
             http: parking_lot::RwLock::new(http),

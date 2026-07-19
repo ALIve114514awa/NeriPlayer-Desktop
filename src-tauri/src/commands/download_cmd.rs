@@ -567,8 +567,9 @@ async fn perform_download(
     )
     .await
     {
-        eprintln!(
-            "[download] write sidecars failed: track_id={}, title={}, error={}",
+        log::warn!(
+            target: "download",
+            "write sidecars failed: track_id={}, title={}, error={}",
             track_id, title, e
         );
     }

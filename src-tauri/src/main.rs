@@ -19,7 +19,15 @@ fn main() {
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--enable-gpu --enable-gpu-rasterization --enable-zero-copy --enable-features=CanvasOopRasterization");
 
+    // 在其余插件之前初始化统一日志：启动期直接读取持久化设置决定
+    // 是否写文件与日志级别（此时尚无 app handle）
+    let log_cfg = neri_player_desktop::logging::load_bootstrap_config();
+
     tauri::Builder::default()
+        .plugin(neri_player_desktop::logging::build_plugin(
+            log_cfg.log_to_file,
+            log_cfg.level,
+        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
@@ -73,7 +81,7 @@ fn main() {
 
             let media_session = MediaSessionController::new(hwnd, media_action_tx);
             if media_session.is_none() {
-                eprintln!("[main] Media session not available (non-fatal)");
+                log::warn!(target: "media_session", "系统媒体会话不可用（非致命）");
             }
 
             // 后台定时器：每 200ms 推送播放位置 + 媒体会话同步
@@ -271,6 +279,7 @@ fn main() {
             settings_cmd::get_settings,
             settings_cmd::save_settings,
             settings_cmd::get_app_data_dir,
+            settings_cmd::get_log_dir,
             settings_cmd::get_netease_song_url,
             settings_cmd::get_qq_song_url,
             settings_cmd::get_bili_audio_url,

@@ -4,7 +4,7 @@ import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { SUPPORTED_LOCALES, setLocaleWithTransition } from '@/i18n'
-import { openUrl } from '@tauri-apps/plugin-opener'
+import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
 import {
@@ -29,6 +29,9 @@ import {
 } from '@/utils/storage'
 import { switchThemeWithRipple, type ThemeMode } from '@/utils/theme'
 import { THEME_COLORS, getSwatchColor, applyThemeColor, getSavedThemeColor, switchThemeColorWithRipple } from '@/utils/themeColor'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('settings-view')
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -53,7 +56,7 @@ const {
   neteaseQuality, youtubeQuality, biliQuality,
   bypassProxy, internationalizationEnabled,
   backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
-  devModeEnabled,
+  devModeEnabled, logToFile, logLevel,
   maxCacheSize, downloadNameTemplate, downloadDir,
   ltServerUrl, ltNickname, ltAllowMemberControl, ltAutoPauseOnMemberChange, ltShareAudioLinks,
   locale: settingLocale,
@@ -65,6 +68,25 @@ const syncFrequencyOptions = computed<Array<{ value: SyncFrequency; label: strin
   { value: 'every_15_minutes', label: t('settings.sync_every_15_minutes') },
   { value: 'every_30_minutes', label: t('settings.sync_every_30_minutes') },
 ])
+
+const logLevelOptions = computed<Array<{ value: string; label: string }>>(() => [
+  { value: 'off', label: t('settings.log_level_off') },
+  { value: 'error', label: t('settings.log_level_error') },
+  { value: 'warn', label: t('settings.log_level_warn') },
+  { value: 'info', label: t('settings.log_level_info') },
+  { value: 'debug', label: t('settings.log_level_debug') },
+  { value: 'trace', label: t('settings.log_level_trace') },
+])
+
+async function openLogDir() {
+  try {
+    const dir = await invoke<string>('get_log_dir')
+    await revealItemInDir(dir)
+  } catch (error) {
+    log.error('failed to open log dir:', error)
+    toast.error(t('settings.open_log_dir_failed'))
+  }
+}
 
 // 折叠过渡 hooks
 function onExpandEnter(el: Element) {
@@ -466,7 +488,7 @@ async function handleBypassProxyChange(val: boolean) {
   try {
     await invoke('set_bypass_proxy', { bypass: val })
   } catch (e) {
-    console.error('Failed to set bypass proxy:', e)
+    log.error('Failed to set bypass proxy:', e)
   }
 }
 
@@ -546,7 +568,7 @@ async function loadDefaultDownloadDir() {
   try {
     defaultDownloadDir.value = await invoke<string>('get_default_download_dir')
   } catch (e) {
-    console.error('Failed to get default download dir:', e)
+    log.error('Failed to get default download dir:', e)
   }
 }
 
@@ -562,7 +584,7 @@ async function selectDownloadDir() {
       toast.success(t('settings.download_dir_changed'))
     }
   } catch (e: any) {
-    console.error('Failed to set download dir:', e)
+    log.error('Failed to set download dir:', e)
     toast.error(t('settings.download_dir_invalid'))
   }
 }
@@ -633,7 +655,7 @@ async function loadStorageUsage() {
     })
     storageSummary.value = mergeBrowserCacheUsage(result)
   } catch (error) {
-    console.error('Failed to read storage usage:', error)
+    log.error('Failed to read storage usage:', error)
     toast.error(t('settings.storage_load_failed'))
   } finally {
     storageLoading.value = false
@@ -663,7 +685,7 @@ async function clearStorageCache(options: StorageCacheClearOptions) {
     }
     await loadStorageUsage()
   } catch (error) {
-    console.error('Failed to clear storage cache:', error)
+    log.error('Failed to clear storage cache:', error)
     toast.error(t('settings.storage_cache_failed'))
   } finally {
     storageClearing.value = false
@@ -708,7 +730,7 @@ async function selectBackgroundImage() {
       backgroundImageUri.value = typeof result === 'string' ? result : (result as any).path || String(result)
     }
   } catch (e) {
-    console.error('Failed to select image:', e)
+    log.error('Failed to select image:', e)
   }
 }
 
@@ -750,7 +772,7 @@ async function loadBuildInfo() {
   try {
     buildInfo.value = await invoke('get_build_info')
   } catch (e) {
-    console.error('Failed to load build info:', e)
+    log.error('Failed to load build info:', e)
   }
 }
 
@@ -813,7 +835,7 @@ async function openExternalUrl(url: string) {
   try {
     await openUrl(url)
   } catch (error) {
-    console.error('Failed to open external URL', error)
+    log.error('Failed to open external URL', error)
     toast.error(t('settings.open_external_link_failed'))
   }
 }
@@ -1794,6 +1816,40 @@ function confirmDataSaverChange() {
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.storage_usage_title') }}</div>
           <div class="setting-desc">{{ t('settings.storage_usage_desc') }}</div>
+        </div>
+        <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
+      </div>
+
+      <div class="section-label" style="margin-top: 8px">
+        <span class="material-symbols-rounded" style="font-size: 18px">description</span>
+        <span>{{ t('settings.logs_title') }}</span>
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">edit_note</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.log_to_file') }}</div>
+          <div class="setting-desc">{{ t('settings.log_to_file_desc') }}</div>
+        </div>
+        <label class="m3-switch"><input type="checkbox" v-model="logToFile" /><span class="track"><span class="thumb"><span v-if="logToFile" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
+      </div>
+
+      <div class="setting-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">tune</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.log_level') }}</div>
+          <div class="setting-desc">{{ t('settings.log_level_desc') }}</div>
+          <div class="chip-row" style="margin-top: 8px">
+            <button v-for="opt in logLevelOptions" :key="opt.value" class="m3-chip sm" :class="{ active: logLevel === opt.value }" @click="logLevel = opt.value">{{ opt.label }}</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting-card" style="cursor: pointer" @click="openLogDir">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">folder_open</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.open_log_dir') }}</div>
+          <div class="setting-desc">{{ t('settings.open_log_dir_desc') }}</div>
         </div>
         <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">chevron_right</span>
       </div>

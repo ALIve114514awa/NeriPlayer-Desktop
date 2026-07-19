@@ -230,7 +230,7 @@ fn load_github_config(app: &AppHandle) -> GitHubSyncConfig {
         save_github_config(app, &config);
     } else {
         // 安全存储不可用时清除旧明文，不让凭据继续留在配置文件
-        log::error!("旧版 GitHub Token 迁移到凭据存储失败，已清除明文凭据");
+        log::error!(target: "sync", "旧版 GitHub Token 迁移到凭据存储失败，已清除明文凭据");
         config.token.clear();
         save_github_config(app, &config);
     }
@@ -241,7 +241,7 @@ fn save_github_config(app: &AppHandle, config: &GitHubSyncConfig) {
     if config.token.is_empty() {
         let _ = security::delete_secret(security::GITHUB_TOKEN_KEY);
     } else if !security::set_secret(security::GITHUB_TOKEN_KEY, &config.token) {
-        log::error!("凭据存储不可用，GitHub Token 未持久化");
+        log::error!(target: "sync", "凭据存储不可用，GitHub Token 未持久化");
     }
 
     if let Ok(s) = app.store(SYNC_STORE) {
@@ -274,7 +274,7 @@ fn load_webdav_config(app: &AppHandle) -> WebDavSyncConfig {
         save_webdav_config(app, &config);
     } else {
         // 安全存储不可用时清除旧明文，不让凭据继续留在配置文件
-        log::error!("旧版 WebDAV 密码迁移到凭据存储失败，已清除明文凭据");
+        log::error!(target: "sync", "旧版 WebDAV 密码迁移到凭据存储失败，已清除明文凭据");
         config.password.clear();
         save_webdav_config(app, &config);
     }
@@ -285,7 +285,7 @@ fn save_webdav_config(app: &AppHandle, config: &WebDavSyncConfig) {
     if config.password.is_empty() {
         let _ = security::delete_secret(security::WEBDAV_PASSWORD_KEY);
     } else if !security::set_secret(security::WEBDAV_PASSWORD_KEY, &config.password) {
-        log::error!("凭据存储不可用，WebDAV 密码未持久化");
+        log::error!(target: "sync", "凭据存储不可用，WebDAV 密码未持久化");
     }
 
     if let Ok(s) = app.store(SYNC_STORE) {
@@ -682,7 +682,7 @@ pub async fn clear_app_cache(app: AppHandle) -> AppResult<Value> {
         }
     }
 
-    log::info!("clear_app_cache: cleared {} bytes, {} failures", cleared, failed);
+    log::info!(target: "sync", "clear_app_cache: cleared {} bytes, {} failures", cleared, failed);
     Ok(serde_json::json!({ "clearedBytes": cleared, "failedCount": failed }))
 }
 

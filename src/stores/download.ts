@@ -6,6 +6,9 @@ import type { TrackInfo } from './player'
 import { useSettingsStore } from './settings'
 import { useToastStore } from './toast'
 import i18n from '@/i18n'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('download')
 
 export interface DownloadedTrack {
   id: string
@@ -182,7 +185,7 @@ export const useDownloadStore = defineStore('download', () => {
         toast.show((i18n.global as any).t('download.missing_cleaned', { count: removedCount }), 'info')
       }
     } catch (e) {
-      console.error('Load downloads failed:', e)
+      log.error('Load downloads failed:', e)
     }
   }
 
@@ -282,7 +285,7 @@ export const useDownloadStore = defineStore('download', () => {
         nameTemplate: useSettingsStore().downloadNameTemplate || null,
       })
     } catch (e: any) {
-      console.error('Download failed:', e)
+      log.error('Download failed:', e)
       downloading.value.delete(track.id)
       downloading.value = new Map(downloading.value)
       const msg = typeof e === 'string' ? e : e?.message || String(e)
@@ -302,7 +305,7 @@ export const useDownloadStore = defineStore('download', () => {
         toast.success((i18n.global as any).t('download.deleted'))
       }
     } catch (e) {
-      console.error('Delete download failed:', e)
+      log.error('Delete download failed:', e)
     }
   }
 
@@ -342,7 +345,7 @@ export const useDownloadStore = defineStore('download', () => {
         setTaskTerminalStatus(trackId, 'error', (i18n.global as any).t('download.cancel_failed'))
       }
     } catch (e) {
-      console.error('Cancel download failed:', e)
+      log.error('Cancel download failed:', e)
       if (current) {
         setTaskTerminalStatus(trackId, 'error', (i18n.global as any).t('download.cancel_failed'))
       }
@@ -370,7 +373,7 @@ export const useDownloadStore = defineStore('download', () => {
         'info',
       )
     } catch (e) {
-      console.error('Cancel downloads failed:', e)
+      log.error('Cancel downloads failed:', e)
       toast.error((i18n.global as any).t('download.cancel_failed'))
     }
   }

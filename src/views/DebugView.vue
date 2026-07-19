@@ -8,6 +8,9 @@ import { useSyncStore } from '@/stores/sync'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('debug-view')
 
 const router = useRouter()
 const { t } = useI18n()
@@ -126,7 +129,7 @@ async function clearDebugCookies() {
     await loadDebugCookieStorageStatus()
     toast.success(t('settings.debug_cookie_clear_success'))
   } catch (error) {
-    console.error('Failed to clear debug cookies:', error)
+    log.error('Failed to clear debug cookies:', error)
     toast.error(t('settings.debug_cookie_clear_failed'))
   } finally {
     clearingDebugCookies.value = false

@@ -16,18 +16,18 @@ const STORE_KEY: &str = "auth_state";
 pub fn save_auth(app: &AppHandle, auth: &AuthState) {
     if !has_any_auth(auth) {
         if !delete_persisted_auth(app) {
-            log::error!("登录凭据存储不可用，无法清除登录凭据");
+            log::error!(target: "auth", "登录凭据存储不可用，无法清除登录凭据");
         }
         return;
     }
 
     let Ok(serialized) = serde_json::to_string(auth) else {
-        log::error!("登录凭据序列化失败，已跳过持久化");
+        log::error!(target: "auth", "登录凭据序列化失败，已跳过持久化");
         return;
     };
 
     if !security::set_secret(security::AUTH_STATE_KEY, &serialized) {
-        log::error!("登录凭据存储不可用，已跳过登录凭据持久化");
+        log::error!(target: "auth", "登录凭据存储不可用，已跳过登录凭据持久化");
         clear_legacy_auth(app);
         return;
     }
@@ -42,7 +42,7 @@ pub fn load_auth(app: &AppHandle) -> AuthState {
         return match serde_json::from_str(&serialized) {
             Ok(auth) => auth,
             Err(_) => {
-                log::error!("登录凭据格式无效，已清除");
+                log::error!(target: "auth", "登录凭据格式无效，已清除");
                 let _ = security::delete_secret(security::AUTH_STATE_KEY);
                 AuthState::default()
             }
@@ -66,7 +66,7 @@ pub fn load_auth(app: &AppHandle) -> AuthState {
     }
 
     // 目标存储不可用时不继续使用旧明文凭据，避免下次启动再次暴露
-    log::error!("旧版登录凭据迁移失败，已清除明文凭据");
+    log::error!(target: "auth", "旧版登录凭据迁移失败，已清除明文凭据");
     clear_legacy_auth(app);
     AuthState::default()
 }

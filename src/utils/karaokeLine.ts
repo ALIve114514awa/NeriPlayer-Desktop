@@ -3,6 +3,9 @@
  */
 
 import type { LyricWord } from '@/stores/player'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('karaoke-line')
 
 interface InternalWord {
   source: LyricWord
@@ -540,7 +543,7 @@ export class KaraokeLine {
         animation.pause()
         word.maskAnimations = [animation]
       } catch (error) {
-        console.warn('[KaraokeLine] mask animation error:', error)
+        log.warn('mask animation error:', error)
       }
     })
   }

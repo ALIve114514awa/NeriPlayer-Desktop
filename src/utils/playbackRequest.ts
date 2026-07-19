@@ -65,3 +65,10 @@ export function shouldResolvePlaybackSourceInParallel(
 ): boolean {
   return !hadPlaybackSession && !hasPrefetchedResolution
 }
+
+export function initialPlaybackPrefetchWindow<T>(
+  tracks: readonly T[],
+  limit = 3,
+): T[] {
+  return tracks.slice(0, Math.max(0, Math.min(limit, tracks.length)))
+}

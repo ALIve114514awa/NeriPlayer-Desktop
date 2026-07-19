@@ -38,7 +38,7 @@ impl LtWsClient {
                         match msg {
                             Some(text) => {
                                 if let Err(e) = ws_write.send(Message::Text(text.into())).await {
-                                    eprintln!("[lt-ws] write error: {e}");
+                                    log::error!(target: "lt-ws", "write error: {e}");
                                     break;
                                 }
                             }
@@ -71,7 +71,7 @@ impl LtWsClient {
                                 let _ = handle_r.emit("lt:message", &envelope);
                             }
                             Err(e) => {
-                                eprintln!("[lt-ws] parse error: {e}, raw: {text}");
+                                log::warn!(target: "lt-ws", "parse error: {e}, raw: {text}");
                             }
                         }
                     }

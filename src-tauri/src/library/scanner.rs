@@ -39,7 +39,7 @@ pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<Vec<T
 
         match read_track_info(path, name_template) {
             Ok(track) => tracks.push(track),
-            Err(e) => log::warn!("Skip {}: {}", path.display(), e),
+            Err(e) => log::warn!(target: "scanner", "Skip {}: {}", path.display(), e),
         }
     }
 

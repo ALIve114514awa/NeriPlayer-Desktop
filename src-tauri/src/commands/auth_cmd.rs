@@ -158,7 +158,7 @@ fn apply_youtube_profile(auth: &mut YouTubeAuth, profile: YouTubeAccountProfile)
 async fn apply_youtube_profile_best_effort(state: &AppState, auth: &mut YouTubeAuth) {
     match fetch_youtube_profile(state, auth).await {
         Ok(profile) => apply_youtube_profile(auth, profile),
-        Err(e) => log::warn!("YouTube 账号资料获取失败: {}", e),
+        Err(e) => log::warn!(target: "auth", "YouTube 账号资料获取失败: {}", e),
     }
 }
 
@@ -419,12 +419,12 @@ pub async fn login_bilibili(app: AppHandle, state: State<'_, AppState>) -> AppRe
                     data["face"].as_str().map(String::from),
                 )
             } else {
-                log::warn!("Bilibili nav API 返回 isLogin=false，cookie 可能未生效");
+                log::warn!(target: "auth", "Bilibili nav API 返回 isLogin=false，cookie 可能未生效");
                 (None, None)
             }
         }
         Err(e) => {
-            log::warn!("Bilibili get_user_info 失败: {}", e);
+            log::warn!(target: "auth", "Bilibili get_user_info 失败: {}", e);
             (None, None)
         }
     };
@@ -726,7 +726,7 @@ pub async fn logout(platform: String, app: AppHandle, state: State<'_, AppState>
     let jar = state.cookie_jar.clone();
     tokio::task::spawn(async move {
         if let Err(e) = clear_and_reinject_webview_cookies(&app_clone, &jar, &remaining_auth).await {
-            log::warn!("清除 WebView cookie 失败: {}", e);
+            log::warn!(target: "auth", "清除 WebView cookie 失败: {}", e);
         }
     });
 

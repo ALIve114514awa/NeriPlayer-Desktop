@@ -67,6 +67,8 @@ pub struct AppSettings {
     pub background_image_blur: f32,
     pub background_image_alpha: f32,
     pub dev_mode_enabled: bool,
+    pub log_to_file: bool,
+    pub log_level: String,
     pub max_cache_size: i32,
     pub download_name_template: String,
     pub download_dir: String,
@@ -130,6 +132,8 @@ impl Default for AppSettings {
             background_image_blur: 20.0,
             background_image_alpha: 0.3,
             dev_mode_enabled: false,
+            log_to_file: false,
+            log_level: "info".into(),
             max_cache_size: 1024,
             download_name_template: DEFAULT_DOWNLOAD_NAME_TEMPLATE.into(),
             download_dir: String::new(),
@@ -219,6 +223,11 @@ impl AppSettings {
             "high",
         );
         self.equalizer_preset_id = normalize_equalizer_preset(&self.equalizer_preset_id);
+        self.log_level = normalize_choice(
+            &self.log_level,
+            &["off", "error", "warn", "info", "debug", "trace"],
+            "info",
+        );
 
         self.background_image_uri = self.background_image_uri.trim().into();
         self.download_name_template = non_empty_or_default(
@@ -258,7 +267,7 @@ pub fn load_settings(app: &AppHandle) -> AppResult<SettingsLoadResult> {
     let mut settings = match serde_json::from_value::<AppSettings>(value) {
         Ok(settings) => settings,
         Err(error) => {
-            log::warn!("普通设置格式无效，回退到默认值: {}", error);
+            log::warn!(target: "settings", "普通设置格式无效，回退到默认值: {}", error);
             return Ok(SettingsLoadResult {
                 settings: AppSettings::default(),
                 persisted: false,
@@ -282,6 +291,8 @@ pub fn save_settings(app: &AppHandle, settings: AppSettings) -> AppResult<AppSet
         .store(SETTINGS_STORE_FILE)
         .map_err(|error| AppError::Other(error.to_string()))?;
     persist_settings(&store, &normalized)?;
+    // 日志级别可运行时即时调整；文件开关受插件限制需重启生效
+    log::set_max_level(crate::logging::parse_level(&normalized.log_level));
     Ok(normalized)
 }
 

@@ -21,6 +21,9 @@ import {
   type ContextMenuActionItem,
   type ContextMenuItem,
 } from '@/utils/contextMenu'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('local-playlist-view')
 
 const route = useRoute()
 const router = useRouter()
@@ -93,6 +96,7 @@ async function loadDetail() {
 
     const trackList = await invoke<any[]>('get_playlist_tracks', { id })
     tracks.value = trackList.map(normalizeTrack)
+    player.prefetchPlaybackTracks(tracks.value)
   } catch (e: any) {
     error.value = e?.toString() || t('player.load_failed')
   } finally {
@@ -189,7 +193,7 @@ async function confirmRemove() {
       tracks.value = tracks.value.filter(t => trackSelectionKey(t) !== trackKey)
     }
   } catch (e) {
-    console.error('Remove failed:', e)
+    log.error('Remove failed:', e)
   } finally {
     isBatchRemoving.value = false
     showRemoveDialog.value = false
@@ -312,6 +316,10 @@ function playTrack(track: TrackInfo) {
   player.playAll(filteredTracks.value, track.id, trackSelectionKey(track))
 }
 
+function prefetchTrack(track: TrackInfo) {
+  player.prefetchPlaybackTracks([track])
+}
+
 // 歌单封面：取第一首有 cover 的曲目
 const playlistCover = computed(() => {
   for (const t of tracks.value) {
@@ -418,6 +426,8 @@ onMounted(() => {
           class="track-item"
           :class="{ active: player.currentTrack && trackSelectionKey(player.currentTrack) === trackSelectionKey(track), selected: selectedIds.has(trackSelectionKey(track)), 'selection-mode': selectionMode }"
           @click="playTrack(track)"
+          @pointerenter="prefetchTrack(track)"
+          @focusin="prefetchTrack(track)"
           @contextmenu.prevent.stop="openTrackContextMenu($event, track, index)"
         >
           <button v-if="selectionMode" class="track-select" @click.stop="toggleSelected(trackSelectionKey(track))">

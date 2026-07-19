@@ -3,6 +3,9 @@ import { ref } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import type { TrackInfo } from './player'
 import { useSettingsStore } from './settings'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('library')
 
 export const useLibraryStore = defineStore('library', () => {
   const tracks = ref<TrackInfo[]>([])
@@ -37,7 +40,7 @@ export const useLibraryStore = defineStore('library', () => {
       localStorage.setItem('neri:last_scan_dir', dir)
     } catch (e: any) {
       scanError.value = String(e)
-      console.error('Scan failed:', e)
+      log.error('Scan failed:', e)
     } finally {
       isScanning.value = false
     }

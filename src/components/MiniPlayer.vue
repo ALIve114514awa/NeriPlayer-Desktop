@@ -145,8 +145,25 @@ const durationFormatted = computed(() => formatTime(player.durationMs))
 const miniTrackKey = computed(() => (
   player.currentTrack?.playlistKey || player.currentTrack?.id || 'empty'
 ))
+
+function trackCoverUrl(track: typeof player.currentTrack): string {
+  const raw = track?.coverUrl
+    || track?.syncPayload?.customCoverUrl
+    || track?.syncPayload?.custom_cover_url
+    || track?.syncPayload?.coverUrl
+    || track?.syncPayload?.cover_url
+  return typeof raw === 'string' ? raw.trim() : ''
+}
+
 const displayCoverUrl = computed(() =>
-  props.coverFallbackSrc || player.currentTrack?.coverUrl || '',
+  props.coverFallbackSrc
+    || trackCoverUrl(player.currentTrack)
+    || player.queue.find(track => (
+      player.currentTrack?.playlistKey
+        ? track.playlistKey === player.currentTrack.playlistKey
+        : track.id === player.currentTrack?.id
+    ))?.coverUrl
+    || '',
 )
 const miniDownloadStateKey = computed(() =>
   `${miniTrackKey.value}:${player.isPlayingFromDownload ? 'download' : 'stream'}`

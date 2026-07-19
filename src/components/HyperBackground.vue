@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { hyperBackgroundVertexShader, hyperBackgroundFragmentShader } from '@/shaders/hyperBackground'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('hyper-background')
 
 const props = withDefaults(defineProps<{
   musicLevel?: number
@@ -109,7 +112,7 @@ function compileShader(gl: WebGLRenderingContext, src: string, type: number): We
   gl.shaderSource(shader, src)
   gl.compileShader(shader)
   if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    console.error('Shader compile error:', gl.getShaderInfoLog(shader))
+    log.error('Shader compile error:', gl.getShaderInfoLog(shader))
     gl.deleteShader(shader)
     return null
   }
@@ -119,7 +122,7 @@ function compileShader(gl: WebGLRenderingContext, src: string, type: number): We
 function initGL() {
   if (!canvas.value) return
   gl = canvas.value.getContext('webgl', { alpha: true, antialias: false, premultipliedAlpha: false })
-  if (!gl) { console.error('WebGL not supported'); return }
+  if (!gl) { log.error('WebGL not supported'); return }
 
   const vs = compileShader(gl, hyperBackgroundVertexShader, gl.VERTEX_SHADER)
   const fs = compileShader(gl, hyperBackgroundFragmentShader, gl.FRAGMENT_SHADER)
@@ -130,7 +133,7 @@ function initGL() {
   gl.attachShader(program, fs)
   gl.linkProgram(program)
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    console.error('Program link error:', gl.getProgramInfoLog(program))
+    log.error('Program link error:', gl.getProgramInfoLog(program))
     return
   }
   gl.useProgram(program)

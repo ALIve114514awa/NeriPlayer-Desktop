@@ -1,6 +1,9 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('recommend')
 
 export interface PlaylistInfo {
   id: string | number
@@ -134,7 +137,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       saveCache()
     } catch (e: any) {
       error.value = e?.toString() || 'Failed to fetch recommendations'
-      console.error('fetchRecommendedPlaylists:', e)
+      log.error('fetchRecommendedPlaylists:', e)
     } finally {
       isLoading.value = false
     }
@@ -147,7 +150,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       const data = await invoke<any>('get_recommended_songs')
       recommendedSongs.value = data?.data?.dailySongs || []
     } catch (e) {
-      console.error('fetchRecommendedSongs:', e)
+      log.error('fetchRecommendedSongs:', e)
     } finally {
       isLoading.value = false
     }
@@ -177,7 +180,7 @@ export const useRecommendStore = defineStore('recommend', () => {
         loading: false,
         error: e?.toString() || 'Failed to fetch home recommendations',
       }
-      console.error(`fetchHomeSearchSection(${section}):`, e)
+      log.error(`fetchHomeSearchSection(${section}):`, e)
     } finally {
       isLoading.value = false
     }
@@ -233,7 +236,7 @@ export const useRecommendStore = defineStore('recommend', () => {
                   p.coverUrl = cover
                 }
               } catch (err) {
-                console.warn('[bili-cover] failed for', p.id, err)
+                log.warn('cover failed for', p.id, err)
               }
             })
           )
@@ -246,7 +249,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       userPlaylists.value[platform] = playlists
       saveCache()
     } catch (e) {
-      console.error(`fetchUserPlaylists(${platform}):`, e)
+      log.error(`fetchUserPlaylists(${platform}):`, e)
     } finally {
       isLoading.value = false
     }
@@ -260,7 +263,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       homeFeedShelves.value = parseYouTubeHomeFeed(data)
       saveCache()
     } catch (e) {
-      console.error('fetchHomeFeed:', e)
+      log.error('fetchHomeFeed:', e)
     } finally {
       isLoading.value = false
     }
@@ -281,7 +284,7 @@ export const useRecommendStore = defineStore('recommend', () => {
         creator: p.creator?.nickname || '',
       }))
     } catch (e) {
-      console.error('fetchHighQualityPlaylists:', e)
+      log.error('fetchHighQualityPlaylists:', e)
       return []
     } finally {
       isLoading.value = false
@@ -295,7 +298,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       const tags = data?.tags || []
       return tags.map((t: any) => t.name || t)
     } catch (e) {
-      console.error('fetchHighQualityTags:', e)
+      log.error('fetchHighQualityTags:', e)
       return []
     }
   }
@@ -307,7 +310,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       const ids: number[] = data?.ids || []
       likedSongIds.value = new Set(ids)
     } catch (e) {
-      console.error('fetchLikedSongIds:', e)
+      log.error('fetchLikedSongIds:', e)
     }
   }
 
@@ -325,7 +328,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       }
       return false
     } catch (e) {
-      console.error('toggleLikeSong:', e)
+      log.error('toggleLikeSong:', e)
       return false
     }
   }
@@ -335,7 +338,7 @@ export const useRecommendStore = defineStore('recommend', () => {
     try {
       return await invoke<any>('get_album_detail', { albumId })
     } catch (e) {
-      console.error('fetchAlbumDetail:', e)
+      log.error('fetchAlbumDetail:', e)
       return null
     }
   }
@@ -353,7 +356,7 @@ export const useRecommendStore = defineStore('recommend', () => {
         trackCount: a.size || 0,
       }))
     } catch (e) {
-      console.error('fetchUserAlbums:', e)
+      log.error('fetchUserAlbums:', e)
     }
   }
 
@@ -362,7 +365,7 @@ export const useRecommendStore = defineStore('recommend', () => {
     try {
       return await invoke<any>('get_bili_favorite_items', { mediaId, page })
     } catch (e) {
-      console.error('fetchBiliFavoriteItems:', e)
+      log.error('fetchBiliFavoriteItems:', e)
       return null
     }
   }

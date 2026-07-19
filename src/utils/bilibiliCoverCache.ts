@@ -130,6 +130,12 @@ export class BilibiliCoverCache {
     return promise
   }
 
+  peek(rawUrl: string): string {
+    const key = normalizeProxiedCoverUrl(rawUrl)
+    if (!key) return ''
+    return this.readCached(key) ?? ''
+  }
+
   private readCached(key: string): string | null {
     const entry = this.cache.get(key)
     if (!entry) return null

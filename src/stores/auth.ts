@@ -3,6 +3,9 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useToastStore } from './toast'
 import i18n from '@/i18n'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('auth')
 
 export interface PlatformAuth {
   loggedIn: boolean
@@ -52,7 +55,7 @@ export const useAuthStore = defineStore('auth', () => {
         void refreshYoutubeProfile()
       }
     } catch (e) {
-      console.error('Failed to check auth status:', e)
+      log.error('Failed to check auth status:', e)
     }
   }
 
@@ -76,7 +79,7 @@ export const useAuthStore = defineStore('auth', () => {
         youtube.value = mapped
       }
     } catch (e) {
-      console.warn('Failed to refresh YouTube profile:', e)
+      log.warn('Failed to refresh YouTube profile:', e)
     } finally {
       youtubeProfileRefreshing.value = false
     }
@@ -120,7 +123,7 @@ export const useAuthStore = defineStore('auth', () => {
       } else {
         toast.error(t('settings.login_failed', { platform: platformLabel(key) }))
       }
-      console.error(`${key} login failed:`, e)
+      log.error(`${key} login failed:`, e)
     } finally {
       loggingIn.value = null
     }
@@ -153,7 +156,7 @@ export const useAuthStore = defineStore('auth', () => {
       }
       toast.success(t('settings.logout_success', { platform: platformLabel(platform) }))
     } catch (e) {
-      console.error(`Logout ${platform} failed:`, e)
+      log.error(`Logout ${platform} failed:`, e)
     }
   }
 
@@ -175,7 +178,7 @@ export const useAuthStore = defineStore('auth', () => {
       }
     } catch (e: any) {
       toast.error(String(e))
-      console.error(`${platform} cookie login failed:`, e)
+      log.error(`${platform} cookie login failed:`, e)
     } finally {
       loggingIn.value = null
     }

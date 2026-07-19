@@ -5,6 +5,9 @@ import { useI18n } from 'vue-i18n'
 import type { TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import M3Input from '@/components/ui/M3Input.vue'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('add-to-playlist')
 
 const props = defineProps<{
   open: boolean
@@ -46,7 +49,7 @@ async function loadPlaylists() {
       playlists.value = result
     })
     .catch(e => {
-      console.error('Load local playlists failed:', e)
+      log.error('Load local playlists failed:', e)
     })
     .finally(() => {
       isLoading.value = false
@@ -75,7 +78,7 @@ async function addToPlaylist(playlistId: number) {
     toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
-    console.error('Add to playlist failed:', e)
+    log.error('Add to playlist failed:', e)
   } finally {
     isSubmitting.value = false
   }
@@ -102,7 +105,7 @@ async function createAndAdd() {
     toast.success(t('library.added_to_playlist'))
     emit('update:open', false)
   } catch (e) {
-    console.error('Create & add failed:', e)
+    log.error('Create & add failed:', e)
   } finally {
     isSubmitting.value = false
   }

@@ -24,6 +24,10 @@ export function resolveCoverImage(
   return coverCache.resolve(rawUrl, options)
 }
 
+export function peekCoverImage(rawUrl: string): string {
+  return coverCache.peek(rawUrl)
+}
+
 export const resolveBilibiliCover = resolveCoverImage
 
 function decodeBilibiliCover(dataUrl: string): Promise<void> {

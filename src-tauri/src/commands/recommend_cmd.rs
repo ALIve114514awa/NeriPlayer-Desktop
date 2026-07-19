@@ -259,7 +259,7 @@ pub async fn get_netease_playlist_detail(
                     }
                 }
                 Err(e) => {
-                    eprintln!("get_song_detail batch failed: {}", e);
+                    log::warn!(target: "recommend", "get_song_detail batch failed: {}", e);
                 }
             }
         }

@@ -25,15 +25,16 @@ impl LyricsManager {
         netease_id: Option<u64>,
         qq_song_mid: Option<&str>,
     ) -> AppResult<Vec<LyricLine>> {
-        eprintln!(
-            "[lyrics] fetch: title={}, artist={}, dur={}s, netease_id={:?}, qq_song_mid={:?}",
+        log::info!(
+            target: "lyrics",
+            "fetch: title={}, artist={}, dur={}s, netease_id={:?}, qq_song_mid={:?}",
             track_title, track_artist, duration_secs, netease_id, qq_song_mid
         );
 
         // 尝试本地 sidecar 歌词（对齐 Android LocalMediaSupport.findNearbyLyrics）
         if let Some(path) = audio_path {
             if let Some(lines) = load_local_sidecar_lyrics(path) {
-                eprintln!("[lyrics] found local sidecar: {} lines", lines.len());
+                log::info!(target: "lyrics", "found local sidecar: {} lines", lines.len());
                 return Ok(lines);
             }
         }
@@ -43,9 +44,10 @@ impl LyricsManager {
             let qq = QqMusicClient::new(&self.http);
             match self.parse_qq_lyrics(&qq, song_mid).await {
                 Ok(Some(lines)) => return Ok(lines),
-                Ok(None) => eprintln!("[lyrics] QQ lyrics empty for song_mid={}", song_mid),
-                Err(e) => eprintln!(
-                    "[lyrics] QQ get_lyrics failed for song_mid={}: {}",
+                Ok(None) => log::info!(target: "lyrics", "QQ lyrics empty for song_mid={}", song_mid),
+                Err(e) => log::warn!(
+                    target: "lyrics",
+                    "QQ get_lyrics failed for song_mid={}: {}",
                     song_mid, e
                 ),
             }
@@ -59,14 +61,16 @@ impl LyricsManager {
             {
                 Some(song_mid) => match self.parse_qq_lyrics(&qq, &song_mid).await {
                     Ok(Some(lines)) => return Ok(lines),
-                    Ok(None) => eprintln!("[lyrics] matched QQ lyrics empty for song_mid={}", song_mid),
-                    Err(e) => eprintln!(
-                        "[lyrics] matched QQ get_lyrics failed for song_mid={}: {}",
+                    Ok(None) => log::info!(target: "lyrics", "matched QQ lyrics empty for song_mid={}", song_mid),
+                    Err(e) => log::warn!(
+                        target: "lyrics",
+                        "matched QQ get_lyrics failed for song_mid={}: {}",
                         song_mid, e
                     ),
                 },
-                None => eprintln!(
-                    "[lyrics] QQ candidate not found for {} / {}",
+                None => log::info!(
+                    target: "lyrics",
+                    "QQ candidate not found for {} / {}",
                     track_title, track_artist
                 ),
             }
@@ -76,14 +80,14 @@ impl LyricsManager {
 
         // 确定网易云歌曲 ID：直接提供或通过搜索获取
         let resolved_id = if let Some(id) = netease_id {
-            eprintln!("[lyrics] using provided netease_id={}", id);
+            log::info!(target: "lyrics", "using provided netease_id={}", id);
             Some(id)
         } else {
             // 用 title + artist 搜索网易云，取最匹配的结果
             let id = self
                 .search_netease_id(&client, track_title, track_artist)
                 .await;
-            eprintln!("[lyrics] search_netease_id result: {:?}", id);
+            log::info!(target: "lyrics", "search_netease_id result: {:?}", id);
             id
         };
 
@@ -91,8 +95,9 @@ impl LyricsManager {
         if let Some(id) = resolved_id {
             match client.get_lyrics(id).await {
                 Ok(lyrics_data) => {
-                    eprintln!(
-                        "[lyrics] netease lyrics for id={}: lrc={}, tlyric={}, yrc={}",
+                    log::info!(
+                        target: "lyrics",
+                        "netease lyrics for id={}: lrc={}, tlyric={}, yrc={}",
                         id,
                         lyrics_data.lrc.as_ref().map_or(0, |s| s.len()),
                         lyrics_data.tlyric.as_ref().map_or(0, |s| s.len()),
@@ -114,8 +119,9 @@ impl LyricsManager {
                                 if let Some(tl) = translation {
                                     parser::merge_translation(&mut lines, tl);
                                 }
-                                eprintln!(
-                                    "[lyrics] using netease YRC: {} lines, {} with words",
+                                log::info!(
+                                    target: "lyrics",
+                                    "using netease YRC: {} lines, {} with words",
                                     lines.len(),
                                     lines.iter().filter(|l| !l.words.is_empty()).count()
                                 );
@@ -131,13 +137,13 @@ impl LyricsManager {
                             if let Some(tl) = translation {
                                 parser::merge_translation(&mut lines, tl);
                             }
-                            eprintln!("[lyrics] using netease LRC: {} lines", lines.len());
+                            log::info!(target: "lyrics", "using netease LRC: {} lines", lines.len());
                             return Ok(lines);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[lyrics] netease get_lyrics failed for id={}: {}", id, e);
+                    log::warn!(target: "lyrics", "netease get_lyrics failed for id={}: {}", id, e);
                 }
             }
         }
@@ -151,7 +157,7 @@ impl LyricsManager {
             if let Some(synced) = result.synced_lyrics {
                 let lines = parser::parse_lrc(&synced);
                 if !lines.is_empty() {
-                    eprintln!("[lyrics] using LRCLIB exact: {} lines", lines.len());
+                    log::info!(target: "lyrics", "using LRCLIB exact: {} lines", lines.len());
                     return Ok(lines);
                 }
             }
@@ -164,15 +170,16 @@ impl LyricsManager {
                 if let Some(synced) = r.synced_lyrics {
                     let lines = parser::parse_lrc(&synced);
                     if !lines.is_empty() {
-                        eprintln!("[lyrics] using LRCLIB search: {} lines", lines.len());
+                        log::info!(target: "lyrics", "using LRCLIB search: {} lines", lines.len());
                         return Ok(lines);
                     }
                 }
             }
         }
 
-        eprintln!(
-            "[lyrics] no lyrics found for: {} - {}",
+        log::info!(
+            target: "lyrics",
+            "no lyrics found for: {} - {}",
             track_title, track_artist
         );
         Ok(Vec::new())
@@ -194,7 +201,7 @@ impl LyricsManager {
         if let Some(tl) = translated.as_deref() {
             parser::merge_translation(&mut lines, tl);
         }
-        eprintln!("[lyrics] using QQ LRC: {} lines", lines.len());
+        log::info!(target: "lyrics", "using QQ LRC: {} lines", lines.len());
         Ok(Some(lines))
     }
 
@@ -226,15 +233,17 @@ impl LyricsManager {
             .max_by_key(|(_, score)| *score)?;
 
         if best.1 < MINIMUM_MATCH_SCORE {
-            eprintln!(
-                "[lyrics] no confident QQ match for {} / {}, best_score={}",
+            log::info!(
+                target: "lyrics",
+                "no confident QQ match for {} / {}, best_score={}",
                 title, artist, best.1
             );
             return None;
         }
 
-        eprintln!(
-            "[lyrics] matched QQ song_mid={}, score={}, name={}",
+        log::info!(
+            target: "lyrics",
+            "matched QQ song_mid={}, score={}, name={}",
             best.0.song_mid, best.1, best.0.song_name
         );
         Some(best.0.song_mid)

@@ -20,7 +20,8 @@ use crate::error::{AppError, AppResult};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_PREBUFFER: Duration = Duration::from_millis(80);
-const REMOTE_PREBUFFER: Duration = Duration::from_millis(800);
+const GROWING_PREBUFFER: Duration = Duration::from_millis(800);
+const REMOTE_PREBUFFER: Duration = Duration::from_millis(400);
 const REBUFFER_TARGET: Duration = Duration::from_millis(1_500);
 const PCM_CAPACITY: Duration = Duration::from_secs(4);
 const DECODE_IDLE_SLEEP: Duration = Duration::from_millis(2);
@@ -62,7 +63,8 @@ impl AudioSource {
 
     fn prebuffer_duration(&self) -> Duration {
         match self {
-            Self::Growing(_, _) | Self::Remote(_, _) => REMOTE_PREBUFFER,
+            Self::Growing(_, _) => GROWING_PREBUFFER,
+            Self::Remote(_, _) => REMOTE_PREBUFFER,
             Self::Bytes(_, _) | Self::File(_, _) => LOCAL_PREBUFFER,
         }
     }
@@ -276,7 +278,7 @@ impl PlaybackSession {
     fn pause(&self) {
         self.shared.paused.store(true, Ordering::Release);
         if let Err(error) = self.stream.pause() {
-            eprintln!("[cpal-output] pause failed: {error}");
+            log::warn!(target: "cpal-output", "pause failed: {error}");
         }
     }
 
@@ -458,7 +460,7 @@ impl PlayerEngine {
         if self.thread_alive.load(Ordering::Acquire) {
             return;
         }
-        eprintln!("[cpal-output] audio thread stopped, restarting");
+        log::warn!(target: "cpal-output", "audio thread stopped, restarting");
         let (cmd_tx, thread_alive) = spawn_audio_thread(
             Arc::clone(&self.shared_audio_level),
             Arc::clone(&self.effects_params),
@@ -899,7 +901,7 @@ fn spawn_audio_thread(
                 );
             }));
             if let Err(error) = result {
-                eprintln!("[cpal-output] control thread panicked: {error:?}");
+                log::error!(target: "cpal-output", "control thread panicked: {error:?}");
             }
             alive_for_thread.store(false, Ordering::Release);
         })
@@ -921,8 +923,9 @@ fn audio_control_loop(
     let mut deferred = None;
     let mut output_profile = match OutputDeviceProfile::open_default() {
         Ok(profile) => {
-            eprintln!(
-                "[cpal-output] prewarmed {}: {} Hz, {} ch",
+            log::info!(
+                target: "cpal-output",
+                "prewarmed {}: {} Hz, {} ch",
                 profile.name,
                 profile.config.sample_rate.0,
                 profile.config.channels
@@ -930,7 +933,7 @@ fn audio_control_loop(
             Some(profile)
         }
         Err(error) => {
-            eprintln!("[cpal-output] device prewarm deferred: {error}");
+            log::warn!(target: "cpal-output", "device prewarm deferred: {error}");
             None
         }
     };
@@ -978,7 +981,7 @@ fn audio_control_loop(
                 let next = match prepared {
                     Ok(next) => next,
                     Err(error) => {
-                        eprintln!("[cpal-output] failed to prepare {source_label}: {error}");
+                        log::error!(target: "cpal-output", "failed to prepare {source_label}: {error}");
                         let _ = reply.send(Err(error));
                         continue;
                     }
@@ -1038,7 +1041,7 @@ fn audio_control_loop(
                             previous.stop();
                         }
                         if let Err(error) = fade_result {
-                            eprintln!("[cpal-output] crossfade interrupted: {error}");
+                            log::warn!(target: "cpal-output", "crossfade interrupted: {error}");
                         }
                     }
                 }
@@ -1171,7 +1174,7 @@ fn audio_control_loop(
                                 let _ = session.stream.play();
                             }
                         }
-                        eprintln!("[cpal-output] seek failed: {error}");
+                        log::warn!(target: "cpal-output", "seek failed: {error}");
                         let _ = latest_reply.send(Err(if superseded {
                             SEEK_SUPERSEDED.into()
                         } else {
@@ -1366,8 +1369,9 @@ fn prepare_session(
     }
     let ready_wait_ms = ready_started.elapsed().as_millis();
 
-    eprintln!(
-        "[cpal-output] prepared {} on {}: {} Hz, {} ch, target={}ms, decoder={}ms, output={}ms, wait={}ms, total={}ms",
+    log::debug!(
+        target: "cpal-output",
+        "prepared {} on {}: {} Hz, {} ch, target={}ms, decoder={}ms, output={}ms, wait={}ms, total={}ms",
         source.label(),
         output.name,
         sample_rate,
@@ -1575,7 +1579,7 @@ where
                 }
             },
             move |error| {
-                eprintln!("[cpal-output] stream error: {error}");
+                log::error!(target: "cpal-output", "stream error: {error}");
                 shared.begin_rebuffering();
             },
             None,

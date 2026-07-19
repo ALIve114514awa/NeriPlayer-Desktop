@@ -130,17 +130,17 @@ impl NeteaseClient {
             "csrf_token": ""
         });
 
-        eprintln!("[netease] get_song_url: id={}, level={}", song_id, level);
+        log::debug!(target: "netease", "get_song_url: id={}, level={}", song_id, level);
 
         let body = self.weapi_post(
             &format!("{}/weapi/song/enhance/player/url/v1", BASE_URL),
             &params,
         ).await?;
 
-        eprintln!("[netease] song url response code: {:?}", body["code"]);
+        log::debug!(target: "netease", "song url response code: {:?}", body["code"]);
 
         let result = parse_song_url_response(&body);
-        eprintln!("[netease] song url result: url={}, br={}",
+        log::debug!(target: "netease", "song url result: url={}, br={}",
             result.url.as_deref().unwrap_or("null"), result.br);
         Ok(result)
     }
@@ -151,7 +151,7 @@ impl NeteaseClient {
         let url = format!("{}/api/song/lyric/v1?id={}&cp=false&lv=0&tv=0&rv=0&kv=0&yv=0&ytv=0&yrv=0",
             BASE_URL, song_id);
 
-        eprintln!("[netease] get_lyrics: id={}", song_id);
+        log::debug!(target: "netease", "get_lyrics: id={}", song_id);
 
         let resp = self.http
             .get(&url)
@@ -162,12 +162,12 @@ impl NeteaseClient {
 
         let body: Value = resp.json().await
             .map_err(|e| {
-                eprintln!("[netease] lyrics JSON parse failed: {}", e);
+                log::error!(target: "netease", "lyrics JSON parse failed: {}", e);
                 AppError::Api(format!("Lyrics parse error: {}", e))
             })?;
 
         let code = body["code"].as_i64().unwrap_or(-1);
-        eprintln!("[netease] lyrics response code={}, has_lrc={}, has_tlyric={}, has_yrc={}",
+        log::debug!(target: "netease", "lyrics response code={}, has_lrc={}, has_tlyric={}, has_yrc={}",
             code,
             body["lrc"]["lyric"].is_string(),
             body["tlyric"]["lyric"].is_string(),

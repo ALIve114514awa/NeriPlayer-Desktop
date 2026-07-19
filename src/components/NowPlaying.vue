@@ -12,6 +12,7 @@ import { extractPalette, type PaletteResult } from '@/utils/paletteExtractor'
 import {
   normalizeCoverUrlForDisplay,
   normalizeProxiedCoverUrl,
+  peekCoverImage,
   resolveCoverImage,
 } from '@/utils/bilibiliCover'
 import { clearCachedLyrics, getCachedLyrics, saveCachedLyrics } from '@/utils/lyricsCache'
@@ -28,6 +29,9 @@ import EditableRangeValue from './ui/EditableRangeValue.vue'
 import ContextMenu from './ui/ContextMenu.vue'
 import type { ContextMenuActionItem } from '@/utils/contextMenu'
 import { playbackSessionTrackKey } from '@/utils/playbackRequest'
+import { createLogger } from '@/utils/logger'
+
+const log = createLogger('now-playing')
 
 const emit = defineEmits<{ collapse: [] }>()
 const props = defineProps<{
@@ -185,7 +189,7 @@ async function applyLyricsFromEditor() {
       try {
         parsedTranslations = await invoke<any[]>('parse_lrc_content', { content: translationText })
       } catch (e) {
-        console.warn('Parse translation LRC failed, applying original only:', e)
+        log.warn('Parse translation LRC failed, applying original only:', e)
       }
     }
     const translationByTime = new Map(
@@ -207,7 +211,7 @@ async function applyLyricsFromEditor() {
     cacheLyricsForTrack(player.currentTrack, nextLyrics)
     toast.success(t('player.lyrics_applied'))
   } catch (e) {
-    console.error('Parse LRC failed:', e)
+    log.error('Parse LRC failed:', e)
     toast.error(String(e))
   }
   goBackToMain()
@@ -272,7 +276,7 @@ async function doLyricFillSearch() {
     })
     lyricFillResults.value = results
   } catch (e) {
-    console.error('Lyric fill search failed:', e)
+    log.error('Lyric fill search failed:', e)
   } finally {
     isLyricFilling.value = false
   }
@@ -305,7 +309,7 @@ async function applyLyricFill(result: any) {
     toast.success(t('player.lyrics_fill_applied'))
     goBackToMain()
   } catch (e) {
-    console.error('Lyric fill failed:', e)
+    log.error('Lyric fill failed:', e)
     toast.error(String(e))
   }
 }
@@ -382,7 +386,7 @@ function extractColorsFromCover(url: string): Promise<boolean> {
         resolve(true)
       } catch (error) {
         if (requestToken === paletteRequestToken) resetExtractedPalette()
-        console.error('[NowPlaying] color extraction failed:', error)
+        log.error('color extraction failed:', error)
         resolve(false)
       }
     }
@@ -390,7 +394,7 @@ function extractColorsFromCover(url: string): Promise<boolean> {
       if (requestToken === paletteRequestToken) {
         resetExtractedPalette()
         const sourceLabel = url.startsWith('data:') ? 'proxied image data' : url
-        console.error('[NowPlaying] cover image load failed:', sourceLabel)
+        log.error('cover image load failed:', sourceLabel)
       }
       resolve(false)
     }
@@ -412,23 +416,34 @@ watch(
     paletteRequestToken++
     coverRenderRetryCount = 0
     coverLoadError.value = false
-    coverUrl.value = ''
 
     const proxiedUrl = normalizeProxiedCoverUrl(rawUrl)
     const normalizedUrl = proxiedUrl || normalizeCoverUrlForDisplay(rawUrl)
     if (!normalizedUrl) {
+      coverUrl.value = ''
       resetExtractedPalette()
       return
     }
 
-    let displayUrl = normalizedUrl
-    if (proxiedUrl) {
+    // 命中缓存时同步显示，避免切歌瞬间封面被清空导致的占位图闪烁
+    const cachedUrl = proxiedUrl ? peekCoverImage(proxiedUrl) : ''
+    if (cachedUrl) {
+      coverUrl.value = cachedUrl
+    } else if (!proxiedUrl) {
+      coverUrl.value = normalizedUrl
+    } else {
+      coverUrl.value = ''
+    }
+
+    let displayUrl = cachedUrl || normalizedUrl
+    if (proxiedUrl && !cachedUrl) {
       try {
         displayUrl = await resolveCoverImage(proxiedUrl)
       } catch (error) {
         if (active) {
+          coverUrl.value = ''
           resetExtractedPalette()
-          console.error('[NowPlaying] failed to resolve proxied cover:', error)
+          log.error('failed to resolve proxied cover:', error)
         }
         return
       }
@@ -474,7 +489,7 @@ async function handleNowPlayingCoverError(event: Event) {
     coverLoadError.value = false
     void extractColorsFromCover(refreshedUrl)
   } catch (error) {
-    console.error('[NowPlaying] failed to refresh proxied cover:', error)
+    log.error('failed to refresh proxied cover:', error)
   }
 }
 
@@ -706,7 +721,7 @@ watch(nowPlayingTrackKey, async (trackKey) => {
       fetchedLyrics.value = []
     }
   } catch (e) {
-    console.error('Fetch lyrics failed:', e)
+    log.error('Fetch lyrics failed:', e)
     if (requestId === lyricFetchRequestId && !cachedLyrics?.length) {
       fetchedLyrics.value = []
     }
@@ -831,7 +846,7 @@ async function saveCoverArt() {
     })
     toast.success(t('player.cover_saved'))
   } catch (e) {
-    console.error('Save cover failed:', e)
+    log.error('Save cover failed:', e)
     toast.error(t('player.cover_save_failed'))
   }
 }
@@ -896,7 +911,7 @@ async function doSearch() {
     })
     searchResults.value = results
   } catch (e) {
-    console.error('Search failed:', e)
+    log.error('Search failed:', e)
   } finally {
     isSearching.value = false
   }
@@ -945,7 +960,7 @@ async function confirmApplySearchResult() {
         }
       }
     } catch (e) {
-      console.warn('Apply info lyrics failed:', e)
+      log.warn('Apply info lyrics failed:', e)
     }
   }
   toast.success(t('player.info_applied'))
@@ -1204,7 +1219,7 @@ async function openCurrentAlbum() {
     hideMoreSheet()
     router.push({ name: 'netease-album', params: { id: albumId } })
   } catch (e) {
-    console.error('Open album failed:', e)
+    log.error('Open album failed:', e)
     toast.error(String(e))
   }
 }
