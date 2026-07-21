@@ -52,10 +52,19 @@ fn main() {
                 *state.auth.lock() = saved_auth;
             }
 
+            // 启动即主动保鲜一次 YouTube 会话, 让长期空闲的登录在首次使用前完成 cookie 轮换
+            {
+                let handle_yt = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = handle_yt.state::<AppState>();
+                    auth_cmd::maybe_refresh_youtube_session(&handle_yt, state.inner(), true).await;
+                });
+            }
+
             // 启动时迁移同步 Token 和 WebDAV 密码到当前构建的凭据存储
             sync_cmd::initialize_secure_storage(&handle);
 
-            // ── 初始化系统媒体会话 (SMTC / MPRIS) ──
+            // 初始化系统媒体会话 (SMTC / MPRIS)
             let (media_action_tx, media_action_rx) = mpsc::channel::<MediaAction>();
 
             // 获取 HWND（Windows 必需）
@@ -97,7 +106,7 @@ fn main() {
 
                     let state = handle_ticker.state::<AppState>();
 
-                    // ── 处理媒体键事件 ──
+                    // 处理媒体键事件
                     while let Ok(action) = media_action_rx.try_recv() {
                         match action {
                             MediaAction::Play => {
@@ -124,7 +133,7 @@ fn main() {
                         }
                     }
 
-                    // ── Phase 1: 快速快照（锁持有 <1μs） ──
+                    // 快速快照（锁持有 <1μs）
                     let snapshot = {
                         let player = state.player.lock();
                         if player.current_path.is_none() {
@@ -145,12 +154,12 @@ fn main() {
                             player.loaded_generation().unwrap_or(0),
                             player.shared_audio_level.clone(),
                         )
-                    }; // ← 锁在此释放
+                    }; // <- 锁在此释放
 
                     let (snap_playing, snap_pos, snap_dur, snap_generation, shared_level) =
                         snapshot;
 
-                    // ── Phase 2: 发射事件（无锁） ──
+                    // 发射事件（无锁）
                     if snap_playing || snap_pos > 0 {
                         let _ = handle_ticker.emit(
                             "player:position",
@@ -175,7 +184,7 @@ fn main() {
                         }
                     }
 
-                    // ── Phase 2.5: 媒体会话同步（每 1s = 每 5 个 tick） ──
+                    // 媒体会话同步（每 1s = 每 5 个 tick）
                     if let Some(ref ms) = media_session {
                         media_update_counter += 1;
 
@@ -204,11 +213,19 @@ fn main() {
                         }
                     }
 
-                    // ── Phase 3: 慢检测 — 重新获取锁（is_finished 内部有 200ms recv） ──
+                    // 慢检测：重新获取锁（is_finished 内部有 200ms recv）
+                    // 中段解码饿死/虚拟 body 落点失败不能当「播完」——只在接近曲尾才 emit track-ended
                     {
                         let mut player = state.player.lock();
-                        let finished =
-                            player.is_finished() && player.is_playing && player.position_ms() > 500;
+                        let position_ms = player.position_ms();
+                        let duration_ms = player.duration_ms;
+                        let near_end = duration_ms > 0
+                            && (position_ms.saturating_add(5_000) >= duration_ms
+                                || position_ms.saturating_mul(100) / duration_ms.max(1) >= 98);
+                        let finished = player.is_finished()
+                            && player.is_playing
+                            && position_ms > 500
+                            && near_end;
                         if finished && !last_ended {
                             last_ended = true;
                             let ended_generation = player.loaded_generation().unwrap_or(0);
@@ -271,6 +288,7 @@ fn main() {
             library_cmd::remove_from_playlist,
             library_cmd::remove_tracks_from_playlist,
             library_cmd::reorder_playlist_tracks,
+            library_cmd::update_playlist_track,
             library_cmd::list_favorite_playlists,
             search_cmd::search,
             image_cmd::fetch_bilibili_cover,

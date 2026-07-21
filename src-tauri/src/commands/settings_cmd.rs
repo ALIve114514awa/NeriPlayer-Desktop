@@ -1,7 +1,6 @@
 use crate::api::bilibili::client::{BiliAudioStream, BiliClient};
 use crate::api::netease::client::{NeteaseClient, NeteasePlaybackUnavailableReason};
 use crate::api::qq::client::QqMusicClient;
-use crate::api::youtube::client::YouTubeClient;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::settings::store::{self, AppSettings, SettingsLoadResult};
@@ -240,10 +239,32 @@ pub struct YtAudioResult {
 #[tauri::command]
 pub async fn get_youtube_audio_url(
     video_id: String,
+    request_generation: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<YtAudioResult>> {
-    let client = YouTubeClient::new(&state.http());
-    let streams = client.get_streams(&video_id).await?;
+    // 快速切歌时丢弃过期解析, 与网易云/QQ/B站一致
+    if let Some(gen) = request_generation {
+        if state.playback_generation.load(std::sync::atomic::Ordering::Acquire) > gen {
+            return Err(AppError::Audio("Playback request superseded".into()));
+        }
+    }
+    // player 请求在已登录时附带 Cookie (不附 SAPISID*HASH; mobile+hash 会 400);
+    // 客户端仍用 IOS/ANDROID/ANDROID_MUSIC/TVHTML5 (非 WEB_REMIX 完整浏览器), 降低互踢
+    // googlevideo CDN 拉流不附带登录 Cookie (对齐 Android stream headers)
+    let yt_auth = {
+        let auth = state.auth.lock();
+        auth.youtube.clone()
+    };
+    let streams = crate::api::youtube::playback::resolve_audio_streams(
+        &video_id,
+        yt_auth.as_ref().filter(|a| a.has_login()),
+    )
+    .await?;
+    if let Some(gen) = request_generation {
+        if state.playback_generation.load(std::sync::atomic::Ordering::Acquire) > gen {
+            return Err(AppError::Audio("Playback request superseded".into()));
+        }
+    }
     Ok(streams
         .into_iter()
         .map(|s| YtAudioResult {
@@ -271,14 +292,19 @@ pub async fn set_bypass_proxy(bypass: bool, state: State<'_, AppState>) -> AppRe
 /// 获取构建信息
 #[derive(Serialize)]
 pub struct BuildInfo {
+    /// package.json / Cargo.toml 语义版本，如 1.0.0
+    pub app_version: String,
+    /// 构建指纹 UUID，可用于对齐 CI 产物
     pub build_uuid: String,
     pub build_timestamp: String,
+    /// 构建版本：短 git sha + 时区时间戳，如 361c08f.07140636
     pub version: String,
 }
 
 #[tauri::command]
 pub async fn get_build_info() -> AppResult<BuildInfo> {
     Ok(BuildInfo {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         build_uuid: env!("BUILD_UUID").to_string(),
         build_timestamp: env!("BUILD_TIMESTAMP").to_string(),
         version: env!("BUILD_VERSION").to_string(),

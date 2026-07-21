@@ -174,8 +174,9 @@ async fn write_download_sidecars(
     let base_path = file_path.with_extension("");
     let mut written_files: Vec<PathBuf> = Vec::new();
 
-    // 1) 歌词 sidecar
+    // 歌词 sidecar
     let lyrics_manager = LyricsManager::new(client);
+    let youtube_video_id = track_id.strip_prefix("youtube:").filter(|id| !id.is_empty());
     let lyrics = lyrics_manager
         .fetch_lyrics(
             title,
@@ -184,6 +185,7 @@ async fn write_download_sidecars(
             None,
             extract_netease_id(track_id),
             extract_qq_song_mid(track_id),
+            youtube_video_id,
         )
         .await
         .unwrap_or_default();
@@ -200,7 +202,7 @@ async fn write_download_sidecars(
         written_files.push(tlrc_path);
     }
 
-    // 2) 封面 sidecar
+    // 封面 sidecar
     if let Some(raw_cover_url) = cover_url {
         let normalized_cover_url = if raw_cover_url.starts_with("//") {
             format!("https:{}", raw_cover_url)
@@ -470,10 +472,18 @@ async fn perform_download(
         "https://music.163.com"
     };
 
+    // YouTube googlevideo CDN 校验拉流 UA 与直链 `c=` 客户端一致, 不一致 403;
+    // 故 googlevideo 直链按客户端选匹配 UA, 其它平台用桌面 Chrome UA (对齐 player_cmd)
+    let user_agent = if url.contains("googlevideo.com") || url.contains("youtube.com") {
+        crate::api::youtube::playback::stream_user_agent_for_url(&url)
+    } else {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    };
+
     let resp = client
         .get(&url)
         .header("Referer", referer)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .header("User-Agent", user_agent)
         .send()
         .await?;
 

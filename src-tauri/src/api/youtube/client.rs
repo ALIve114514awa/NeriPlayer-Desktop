@@ -95,47 +95,11 @@ impl YouTubeClient {
         self.innertube_post("search", &body).await
     }
 
-    /// 获取音频流
+    /// 获取音频流 (兼容入口: 委托 playback; 无 auth 时仅 guest 路径)
+    /// 正式播放请走 commands 注入 YouTubeAuth, 以便 Premium 生效
     pub async fn get_streams(&self, video_id: &str) -> AppResult<Vec<YtAudioStream>> {
-        let body = json!({
-            "context": self.build_context(),
-            "videoId": video_id,
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        });
-
-        let resp = self.innertube_post("player", &body).await?;
-
-        let status = resp["playabilityStatus"]["status"].as_str().unwrap_or("");
-        if status != "OK" {
-            return Err(AppError::Api(format!("YouTube playback error: {}", status)));
-        }
-
-        let formats = resp["streamingData"]["adaptiveFormats"].as_array()
-            .ok_or_else(|| AppError::Api("No adaptive formats".into()))?;
-
-        let mut streams: Vec<YtAudioStream> = formats.iter()
-            .filter(|f| {
-                f["mimeType"].as_str()
-                    .map(|m| m.starts_with("audio/"))
-                    .unwrap_or(false)
-            })
-            .filter_map(|f| {
-                let url = f["url"].as_str()?;
-                Some(YtAudioStream {
-                    url: url.to_string(),
-                    bitrate: f["bitrate"].as_u64().unwrap_or(0),
-                    mime_type: f["mimeType"].as_str().unwrap_or("").to_string(),
-                    content_length: f["contentLength"].as_str()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0),
-                })
-            })
-            .collect();
-
-        // 按码率降序
-        streams.sort_by(|a, b| b.bitrate.cmp(&a.bitrate));
-        Ok(streams)
+        let _ = self;
+        super::playback::resolve_audio_streams(video_id, None).await
     }
 
     /// 获取歌词（通过 next endpoint）
@@ -176,47 +140,49 @@ impl YouTubeClient {
         Ok(None)
     }
 
-    // ===== 需要登录的 API =====
-
-    /// 认证版 InnerTube POST — 附加 SAPISIDHASH + Cookie 头
+    // 需要登录的 API
+    /// 认证版 InnerTube POST: 使用完整 SAPISID*HASH (对齐 Android buildYouTubeInnertubeRequestHeaders)
     async fn innertube_post_auth(
         &self,
         endpoint: &str,
         body: &Value,
-        sapisid: &str,
-        cookie_header: &str,
+        auth: &crate::auth::state::YouTubeAuth,
     ) -> AppResult<Value> {
-        let api_key = self.api_key.lock().clone();
-        let url = format!("{}/{}?prettyPrint=false&key={}", INNERTUBE_URL, endpoint, api_key);
-
-        let auth_header = crate::auth::youtube_hash::compute_sapisidhash(
-            sapisid, "https://music.youtube.com",
-        );
-
-        let resp = self.http
-            .post(&url)
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", "application/json")
-            .header("Origin", "https://music.youtube.com")
-            .header("X-Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/")
-            .header("X-YouTube-Client-Name", "67")
-            .header("Authorization", auth_header)
-            .header("X-Goog-AuthUser", "0")
-            .header("Cookie", cookie_header)
-            .json(body)
-            .send().await?;
-
-        let data: Value = resp.json().await?;
+        let (data, _) = self.innertube_post_auth_with_session(endpoint, body, auth).await?;
         Ok(data)
     }
 
     /// 构建 Cookie 头字符串
     fn build_cookie_header(cookies: &[crate::auth::state::CookieEntry]) -> String {
-        cookies.iter()
+        cookies
+            .iter()
+            .filter(|c| !c.name.is_empty() && !c.value.is_empty())
             .map(|c| format!("{}={}", c.name, c.value))
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    fn cookie_map(auth: &crate::auth::state::YouTubeAuth) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        for cookie in &auth.cookies {
+            if cookie.name.is_empty() || cookie.value.is_empty() {
+                continue;
+            }
+            map.insert(cookie.name.clone(), cookie.value.clone());
+        }
+        map
+    }
+
+    fn authorization_header(auth: &crate::auth::state::YouTubeAuth) -> AppResult<String> {
+        let cookies = Self::cookie_map(auth);
+        crate::auth::youtube_hash::build_youtube_authorization(
+            cookies.get("SAPISID").map(String::as_str),
+            cookies.get("__Secure-1PAPISID").map(String::as_str),
+            cookies.get("__Secure-3PAPISID").map(String::as_str),
+            "https://music.youtube.com",
+            "",
+        )
+        .ok_or_else(|| AppError::Api("No SAPISID for YouTube auth".into()))
     }
 
     /// 获取当前 YouTube Music 账号资料
@@ -232,16 +198,11 @@ impl YouTubeClient {
         &self,
         auth: &crate::auth::state::YouTubeAuth,
     ) -> AppResult<Value> {
-        let sapisid = auth.get_sapisid()
-            .ok_or_else(|| AppError::Api("No SAPISID for YouTube auth".into()))?;
-        let cookie_header = Self::build_cookie_header(&auth.cookies);
-
         let body = json!({
             "context": self.build_context(),
             "browseId": "FEmusic_home"
         });
-
-        self.innertube_post_auth("browse", &body, sapisid, &cookie_header).await
+        self.innertube_post_auth("browse", &body, auth).await
     }
 
     /// YouTube Music 用户音乐库歌单（需登录）
@@ -249,16 +210,11 @@ impl YouTubeClient {
         &self,
         auth: &crate::auth::state::YouTubeAuth,
     ) -> AppResult<Value> {
-        let sapisid = auth.get_sapisid()
-            .ok_or_else(|| AppError::Api("No SAPISID for YouTube auth".into()))?;
-        let cookie_header = Self::build_cookie_header(&auth.cookies);
-
         let body = json!({
             "context": self.build_context(),
             "browseId": "FEmusic_liked_playlists"
         });
-
-        self.innertube_post_auth("browse", &body, sapisid, &cookie_header).await
+        self.innertube_post_auth("browse", &body, auth).await
     }
 
     /// YouTube Music 歌单详情（需登录）
@@ -267,15 +223,95 @@ impl YouTubeClient {
         browse_id: &str,
         auth: &crate::auth::state::YouTubeAuth,
     ) -> AppResult<Value> {
-        let sapisid = auth.get_sapisid()
-            .ok_or_else(|| AppError::Api("No SAPISID for YouTube auth".into()))?;
-        let cookie_header = Self::build_cookie_header(&auth.cookies);
-
         let body = json!({
             "context": self.build_context(),
             "browseId": browse_id
         });
+        self.innertube_post_auth("browse", &body, auth).await
+    }
 
-        self.innertube_post_auth("browse", &body, sapisid, &cookie_header).await
+    /// 认证版 InnerTube POST, 并回收 Set-Cookie 用于会话保鲜
+    /// 采用轻量 InnerTube + Cookie 方案, 不模拟完整浏览器环境, 避免与移动端会话互相挤掉登录
+    async fn innertube_post_auth_with_session(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        auth: &crate::auth::state::YouTubeAuth,
+    ) -> AppResult<(Value, Option<crate::auth::state::YouTubeAuth>)> {
+        if !auth.has_login() {
+            return Err(AppError::Api("YouTube not logged in".into()));
+        }
+        let cookie_header = Self::build_cookie_header(&auth.cookies);
+        let api_key = self.api_key.lock().clone();
+        let url = format!("{}/{}?prettyPrint=false&key={}", INNERTUBE_URL, endpoint, api_key);
+        let auth_header = Self::authorization_header(auth)?;
+
+        let resp = self.http
+            .post(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", "application/json")
+            .header("Origin", "https://music.youtube.com")
+            .header("X-Origin", "https://music.youtube.com")
+            .header("Referer", "https://music.youtube.com/")
+            .header("X-YouTube-Client-Name", "67")
+            .header("Authorization", auth_header)
+            .header("X-Goog-AuthUser", "0")
+            .header("Cookie", cookie_header)
+            .json(body)
+            .send().await?;
+
+        let set_cookie: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_string))
+            .collect();
+
+        let data: Value = resp.json().await?;
+
+        // 若响应携带新的身份 cookie, 合并回会话(保留旧身份, 避免被短暂响应冲掉)
+        let updated = if set_cookie.is_empty() {
+            None
+        } else {
+            let observed = super::session::parse_set_cookie_headers(&set_cookie);
+            if observed.is_empty() {
+                None
+            } else {
+                let merged = super::session::merge_youtube_auth_cookies(auth, &observed);
+                if super::session::youtube_auth_changed(auth, &merged) {
+                    Some(merged)
+                } else {
+                    None
+                }
+            }
+        };
+
+        Ok((data, updated))
+    }
+
+    /// 歌单详情(携带会话刷新)
+    pub async fn get_playlist_detail_with_session(
+        &self,
+        browse_id: &str,
+        auth: &crate::auth::state::YouTubeAuth,
+    ) -> AppResult<(Value, Option<crate::auth::state::YouTubeAuth>)> {
+        let body = json!({
+            "context": self.build_context(),
+            "browseId": browse_id
+        });
+        self.innertube_post_auth_with_session("browse", &body, auth).await
+    }
+
+    /// 歌单分页 continuation(携带会话刷新)
+    pub async fn continue_playlist_with_session(
+        &self,
+        continuation: &str,
+        auth: &crate::auth::state::YouTubeAuth,
+    ) -> AppResult<(Value, Option<crate::auth::state::YouTubeAuth>)> {
+        let body = json!({
+            "context": self.build_context(),
+            "continuation": continuation
+        });
+        self.innertube_post_auth_with_session("browse", &body, auth).await
     }
 }

@@ -25,7 +25,7 @@ pub struct AppState {
     pub playback_generation: Arc<AtomicU64>,
     pub queue: Mutex<PlayQueue>,
     pub http: parking_lot::RwLock<reqwest::Client>,
-    /// 共享 Cookie Jar — 允许外部注入持久化登录 Cookie
+    /// 共享 Cookie Jar：允许外部注入持久化登录 Cookie
     pub cookie_jar: Arc<reqwest::cookie::Jar>,
     /// 三平台登录状态
     pub auth: Mutex<AuthState>,
@@ -33,6 +33,8 @@ pub struct AppState {
     pub lt_session: Mutex<LtSession>,
     /// 后台下载任务
     pub download_tasks: Mutex<HashMap<String, DownloadTaskControl>>,
+    /// YouTube 会话保鲜闸门(冷却 + 熔断), 对齐 Android 自动刷新
+    pub youtube_refresh: Mutex<crate::api::youtube::refresh::YouTubeRefreshGate>,
 }
 
 impl AppState {
@@ -57,6 +59,7 @@ impl AppState {
             auth: Mutex::new(AuthState::default()),
             lt_session: Mutex::new(LtSession::new()),
             download_tasks: Mutex::new(HashMap::new()),
+            youtube_refresh: Mutex::new(crate::api::youtube::refresh::YouTubeRefreshGate::default()),
         }
     }
 

@@ -118,7 +118,9 @@ pub async fn get_user_account(
 
 /// 获取 YouTube Music 首页信息流（需登录）
 #[tauri::command]
-pub async fn get_home_feed(state: State<'_, AppState>) -> AppResult<Value> {
+pub async fn get_home_feed(app: tauri::AppHandle, state: State<'_, AppState>) -> AppResult<Value> {
+    // 加载前机会式保鲜 YouTube 会话(冷却/熔断内会自动跳过)
+    crate::commands::auth_cmd::maybe_refresh_youtube_session(&app, state.inner(), false).await;
     let yt_auth = {
         let auth = state.auth.lock();
         auth.youtube.as_ref()
@@ -273,20 +275,46 @@ pub async fn get_netease_playlist_detail(
     Ok(detail)
 }
 
-/// 获取 YouTube Music 歌单详情
+/// 单次歌单详情最多展开的 continuation 页数
+const YOUTUBE_PLAYLIST_MAX_PAGES: usize = 20;
+
+/// 获取 YouTube Music 歌单详情(自动展开 continuation 分页 + 会话刷新)
 #[tauri::command]
 pub async fn get_youtube_playlist_detail(
+    app: tauri::AppHandle,
     browse_id: String,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
+    // 加载前机会式保鲜 YouTube 会话(冷却/熔断内会自动跳过)
+    crate::commands::auth_cmd::maybe_refresh_youtube_session(&app, state.inner(), false).await;
     let yt_auth = {
         let auth = state.auth.lock();
         auth.youtube.as_ref()
             .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
             .clone()
     };
+    let browse_id = crate::api::youtube::playlist::ensure_browse_id(&browse_id)?;
     let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
-    client.get_playlist_detail(&browse_id, &yt_auth).await
+    let (detail, refreshed_auth) = crate::api::youtube::playlist::fetch_playlist_detail_pages(
+        &client,
+        &browse_id,
+        &yt_auth,
+        YOUTUBE_PLAYLIST_MAX_PAGES,
+    )
+    .await?;
+
+    // 会话保鲜: 落盘 + 注入共享 jar, 与 maybe_refresh_youtube_session 一致
+    if let Some(updated) = refreshed_auth {
+        let mut auth_state = state.auth.lock();
+        if let Some(saved) = auth_state.youtube.as_mut() {
+            *saved = updated;
+            let refreshed_cookies = saved.cookies.clone();
+            crate::auth::cookies::save_auth(&app, &auth_state);
+            crate::auth::cookies::inject_cookies(&state.cookie_jar, &refreshed_cookies);
+        }
+    }
+
+    Ok(detail)
 }
 
 /// 验证平台登录状态是否仍有效

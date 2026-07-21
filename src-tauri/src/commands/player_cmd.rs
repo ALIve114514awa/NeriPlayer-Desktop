@@ -16,7 +16,7 @@ use tauri::{AppHandle, Manager, State};
 use tokio::io::AsyncWriteExt;
 
 const STREAM_START_BUFFER_BYTES: usize = 64 * 1024;
-const STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_START_TIMEOUT: Duration = Duration::from_secs(12);
 const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(80);
 const MAX_CACHE_LOOKUP_CANDIDATES: usize = 16;
 const PLAYBACK_SUPERSEDED_ERROR: &str = "Playback request superseded";
@@ -101,7 +101,7 @@ async fn lookup_ready_playback_cache(
     Ok(path)
 }
 
-/// 两阶段播放：短锁发命令 → 锁外等待 → 短锁更新状态。不阻塞其他命令。
+/// 两阶段播放：短锁发命令 -> 锁外等待 -> 短锁更新状态。不阻塞其他命令。
 async fn run_player_play(
     player: Arc<Mutex<PlayerEngine>>,
     action: impl FnOnce(&mut PlayerEngine) -> AppResult<PlayRequest> + Send + 'static,
@@ -593,7 +593,7 @@ pub async fn play_url(
     let start = std::time::Instant::now();
     let resp = state.http().get(&url)
         .header("Referer", referer)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .header("User-Agent", playback_user_agent(&url))
         .send().await
         .map_err(|e| {
             log::error!(
@@ -1334,6 +1334,21 @@ fn playback_referer(url: &str) -> &'static str {
     }
 }
 
+// 通用桌面 Chrome UA (非 YouTube 直链使用)
+const DEFAULT_PLAYBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// 按 URL 选择拉流 User-Agent.
+/// YouTube googlevideo CDN 会校验拉流 UA 与直链 `c=` 客户端一致, 不一致直接 403;
+/// 因此 googlevideo 直链必须按铸造它的客户端 (IOS/ANDROID/...) 选择匹配 UA (对齐 Android).
+/// 其它平台仍用桌面 Chrome UA.
+fn playback_user_agent(url: &str) -> &'static str {
+    if url.contains("googlevideo.com") || url.contains("youtube.com") {
+        crate::api::youtube::playback::stream_user_agent_for_url(url)
+    } else {
+        DEFAULT_PLAYBACK_USER_AGENT
+    }
+}
+
 async fn open_remote_audio_source(
     url: &str,
     duration_hint_ms: u64,
@@ -1400,7 +1415,7 @@ async fn download_url_bytes(
     let download = async {
         let resp = state.http().get(url)
             .header("Referer", playback_referer(url))
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .header("User-Agent", playback_user_agent(url))
             .send().await
             .map_err(AppError::Network)?;
 
@@ -1497,7 +1512,7 @@ async fn start_streaming_download(
     );
     let request = state.http().get(url)
         .header("Referer", playback_referer(url))
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .header("User-Agent", playback_user_agent(url))
         .send();
     tokio::pin!(request);
     let resp = tokio::select! {

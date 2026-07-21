@@ -18,9 +18,9 @@ use crate::state::AppState;
 const BILIBILI_LOGIN_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 // 登录检测机制：
-// 1. 打开 WebviewWindow 加载平台登录页
-// 2. 每 800ms 调用 Tauri 内置 cookies_for_url() 读取 Cookie（含 HttpOnly）
-// 3. 检测到 sentinel cookie 后关闭窗口，保存 cookie
+// 打开 WebviewWindow 加载平台登录页
+// 每 800ms 调用 Tauri 内置 cookies_for_url() 读取 Cookie（含 HttpOnly）
+// 检测到 sentinel cookie 后关闭窗口，保存 cookie
 
 fn track_login_window_close<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -390,7 +390,7 @@ pub async fn login_bilibili(app: AppHandle, state: State<'_, AppState>) -> AppRe
         &app, label, "SESSDATA", None, cookie_urls, 300, &close_requested,
     ).await?;
 
-    // B站核心 cookie 必须关联到 .bilibili.com 域，确保 api.bilibili.com 子域名也能发送
+    // B 站登录 cookie 必须关联到 .bilibili.com 域，确保 api.bilibili.com 子域名也能发送
     let bili_core_cookies = ["SESSDATA", "DedeUserID", "DedeUserID__ckMd5", "bili_jct", "sid"];
     for entry in &mut entries {
         if bili_core_cookies.contains(&entry.name.as_str()) && !entry.domain.starts_with('.') {
@@ -633,6 +633,64 @@ pub async fn refresh_youtube_profile(
     }
 
     Ok(youtube_auth_info(&updated_auth))
+}
+
+/// 机会式/强制保鲜 YouTube 登录会话(受冷却 + 熔断闸门约束)
+/// 成功回收轮换 cookie 后持久化并注入共享 Jar; 失败仅计数熔断, 绝不清除本地登录
+pub async fn maybe_refresh_youtube_session(app: &AppHandle, state: &AppState, force: bool) {
+    use crate::api::youtube::refresh;
+
+    let now = refresh::now_ms();
+    let current = {
+        let mut gate = state.youtube_refresh.lock();
+        let auth = state.auth.lock();
+        let has_login = auth
+            .youtube
+            .as_ref()
+            .map(YouTubeAuth::has_login)
+            .unwrap_or(false);
+        if !gate.should_attempt(now, force, has_login) {
+            return;
+        }
+        gate.record_attempt(now);
+        match auth.youtube.clone() {
+            Some(a) => a,
+            None => return,
+        }
+    };
+
+    let http = state.http();
+    match refresh::refresh_youtube_session(&http, &current).await {
+        Ok(updated) => {
+            state.youtube_refresh.lock().record_success(refresh::now_ms());
+            if let Some(new_auth) = updated {
+                let mut auth_state = state.auth.lock();
+                if let Some(saved) = auth_state.youtube.as_mut() {
+                    // 仅当仍是同一账号且未登出时才落盘, 避免刷新期间账号切换被旧 cookie 覆盖
+                    let same_account = saved.get_sapisid() == current.get_sapisid();
+                    if saved.has_login() && same_account {
+                        let mut merged = new_auth;
+                        if merged.nickname.is_none() {
+                            merged.nickname = saved.nickname.clone();
+                        }
+                        if merged.avatar_url.is_none() {
+                            merged.avatar_url = saved.avatar_url.clone();
+                        }
+                        *saved = merged;
+                        // 先克隆再落盘, 避免 saved 的可变借用跨越 save_auth 的不可变借用
+                        let refreshed_cookies = saved.cookies.clone();
+                        cookies::save_auth(app, &auth_state);
+                        crate::auth::cookies::inject_cookies(&state.cookie_jar, &refreshed_cookies);
+                        log::info!(target: "youtube-refresh", "session cookies refreshed");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            state.youtube_refresh.lock().record_failure(refresh::now_ms());
+            log::warn!(target: "youtube-refresh", "refresh failed: {e}");
+        }
+    }
 }
 
 /// 查询所有平台登录状态
