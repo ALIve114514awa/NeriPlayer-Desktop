@@ -46,16 +46,16 @@ impl SharedAudioLevel {
     }
 }
 
-/// PCM 音频分析器 — 精确对齐 Android `AudioReactive.kt`
+/// PCM 音频分析器：精确对齐 Android `AudioReactive.kt`
 ///
 /// 算法流程：
-/// 1. 计算 RMS（线性幅值，0..1）
-/// 2. 双 EMA 包络：emaFast(α=0.5) 和 emaSlow(α=0.05) 跟踪 RMS
-/// 3. 正向能量增量：delta = max(0, emaFast - emaSlow)
-/// 4. 自适应噪声底限：noiseEma(α=0.02) 跟踪 delta
-/// 5. Beat 检测：delta > 3 * (noiseEma + EPS)，最小间隔 120ms
-/// 6. Beat 帧直接置 1.0，非 beat 帧衰减 *= 0.90
-/// 7. 感知响度：sqrt(rms)，beat 时加 0.08 boost
+/// 计算 RMS（线性幅值，0..1）
+/// 双 EMA 包络：emaFast(α=0.5) 和 emaSlow(α=0.05) 跟踪 RMS
+/// 正向能量增量：delta = max(0, emaFast - emaSlow)
+/// 自适应噪声底限：noiseEma(α=0.02) 跟踪 delta
+/// Beat 检测：delta > 3 * (noiseEma + EPS)，最小间隔 120ms
+/// Beat 帧直接置 1.0，非 beat 帧衰减 *= 0.90
+/// 感知响度：sqrt(rms)，beat 时加 0.08 boost
 pub struct AudioAnalyzer {
     /// 快速 EMA（α=0.5，跟踪 RMS 攻速）
     ema_fast: f64,
@@ -128,28 +128,28 @@ impl AudioAnalyzer {
             };
         }
 
-        // 1. 计算 RMS（线性幅值，0..1）
+        // 计算 RMS（线性幅值，0..1）
         let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let rms = (sum_sq / samples.len() as f64).sqrt(); // 0..1 线性
 
-        // 2. 双 EMA 包络 — 对齐 Android emaFast/emaSlow
+        // 双 EMA 包络：对齐 Android emaFast/emaSlow
         self.ema_fast = EMA_FAST_ALPHA * rms + (1.0 - EMA_FAST_ALPHA) * self.ema_fast;
         self.ema_slow = EMA_SLOW_ALPHA * rms + (1.0 - EMA_SLOW_ALPHA) * self.ema_slow;
 
-        // 3. 正向能量增量 — 对齐 Android delta = max(0, emaFast - emaSlow)
+        // 正向能量增量：对齐 Android delta = max(0, emaFast - emaSlow)
         let delta = (self.ema_fast - self.ema_slow).max(0.0);
 
-        // 4. 自适应噪声底限 — 对齐 Android noiseEma
+        // 自适应噪声底限：对齐 Android noiseEma
         self.noise_ema = NOISE_EMA_ALPHA * delta + (1.0 - NOISE_EMA_ALPHA) * self.noise_ema;
         let threshold = BEAT_THRESHOLD_MULT * (self.noise_ema + EPS);
 
-        // 5. Beat 检测 — 对齐 Android: delta > threshold && 间隔 > 120ms
+        // Beat 检测：对齐 Android: delta > threshold && 间隔 > 120ms
         let frames_since_beat = self.frame_count - self.last_beat_frame;
         let ns_since_beat = frames_since_beat as f64 * self.ns_per_frame;
 
         let new_beat = delta > threshold && ns_since_beat > MIN_BEAT_GAP_NS;
 
-        // 6. Beat 脉冲更新 — 对齐 Android: beat 帧置 1.0，否则衰减
+        // Beat 脉冲更新：对齐 Android: beat 帧置 1.0，否则衰减
         if new_beat {
             self.last_beat_frame = self.frame_count;
             self.beat_impulse = 1.0;
@@ -157,7 +157,7 @@ impl AudioAnalyzer {
             self.beat_impulse *= DECAY_PER_CALL;
         }
 
-        // 7. 感知响度 — 对齐 Android: sqrt(clamp(rms, 0, 1))
+        // 感知响度：对齐 Android: sqrt(clamp(rms, 0, 1))
         let perceptual = rms.clamp(0.0, 1.0).sqrt() as f32;
         let level = if new_beat {
             // 对齐 Android: max(perceptual, min(1, perceptual + 0.08))

@@ -4,7 +4,7 @@
 //   - 取色算法复用 paletteExtractor.extractPalette（与 HyperBackground/NowPlaying 同源）
 //   - 令牌应用复用 themeColor.applyThemeVars（含深色 surface 微混）
 //   - 封面代理/缓存复用 bilibiliCover 的 resolve/peek
-// 本模块只负责：把封面解析成像素 → 取主色种子 → 生成 M3 令牌 → 应用/还原
+// 本模块只负责：把封面解析成像素 -> 取主色种子 -> 生成 M3 令牌 -> 应用/还原
 
 import { createLogger } from '@/utils/logger'
 import { extractPalette } from '@/utils/paletteExtractor'
@@ -24,8 +24,7 @@ type RGB = [number, number, number]
 // 采样尺寸对齐 Android CoverArtColorCache（96x96）
 const SAMPLE_SIZE = 96
 
-// --- 色彩空间工具（h 取 0..1，仅本模块令牌生成使用） ---
-
+// 色彩空间工具（h 取 0..1，仅本模块令牌生成使用）
 function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
   const nr = r / 255, ng = g / 255, nb = b / 255
   const max = Math.max(nr, ng, nb)

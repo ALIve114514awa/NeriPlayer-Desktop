@@ -280,7 +280,7 @@ onUnmounted(() => {
   pointer-events: auto;
 }
 
-/* 左右槽固定宽度，切换内容绝对叠层 → 整栏不左右跳 */
+/* 左右槽固定宽度，切换内容绝对叠层 -> 整栏不左右跳 */
 .tb-left-slot {
   display: flex;
   align-items: center;
@@ -323,7 +323,7 @@ onUnmounted(() => {
   transform: translateY(-50%);
 }
 
-/* ========== 普通模式 ========== */
+/* 普通模式 */
 .tb-brand {
   display: flex;
   align-items: center;
@@ -352,7 +352,7 @@ onUnmounted(() => {
   opacity: 0.85;
 }
 
-/* ========== 播放器模式 ========== */
+/* 播放器模式 */
 .tb-np-left {
   display: flex;
   align-items: center;
@@ -470,7 +470,7 @@ onUnmounted(() => {
   padding-right: 0;
 }
 
-/* ========== 公共 ========== */
+/* 公共 */
 .tb-drag {
   flex: 1;
   -webkit-app-region: drag;

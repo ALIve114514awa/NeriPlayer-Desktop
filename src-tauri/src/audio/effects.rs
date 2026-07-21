@@ -1,4 +1,4 @@
-// 音效 DSP 模块 — 响度增益 + 5频段参数均衡器
+// 音效 DSP 模块：响度增益 + 5频段参数均衡器
 // 通过 Arc<Mutex<AudioEffectsParams>> 与前端实时同步参数
 
 use std::sync::{Arc, Mutex};
@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use crate::audio::pcm::{PcmSeekError, PcmSource};
 
-// ─── 共享音效参数 ──────────────────────────────────────────────────────────────
-
+// 共享音效参数
 /// 运行时可变的音效参数，通过 Arc<Mutex<>> 共享给音频线程
 pub struct AudioEffectsParams {
     /// 响度增益 (millibels)，范围 0~1500 (0 ~ +15.0 dB)
@@ -49,7 +48,7 @@ impl AudioEffectsParams {
     }
 }
 
-// ─── Biquad 滤波器 ─────────────────────────────────────────────────────────────
+// Biquad 滤波器
 // 参考: Audio EQ Cookbook (Robert Bristow-Johnson)
 // 使用 Peaking EQ 类型，Q = 1.0
 
@@ -140,7 +139,7 @@ impl BiquadFilter {
     }
 }
 
-// ─── EqualizerSource ────────────────────────────────────────────────────────────
+// EqualizerSource
 // 5 频段参数均衡器，串联 5 个 Biquad Peaking EQ
 
 /// 5 频段均衡器中心频率
@@ -295,7 +294,7 @@ where
     }
 }
 
-// ─── LoudnessSource ─────────────────────────────────────────────────────────────
+// LoudnessSource
 // 响度增益：将 millibels 转为线性增益，对每个 sample 乘以增益
 
 pub struct LoudnessSource<S> {
@@ -390,7 +389,7 @@ where
     }
 }
 
-/// millibels → 线性增益: gain = 10^(mb / 2000)
+/// millibels -> 线性增益: gain = 10^(mb / 2000)
 fn mb_to_linear(mb: i32) -> f64 {
     if mb == 0 { 1.0 } else { 10.0_f64.powf(mb as f64 / 2000.0) }
 }

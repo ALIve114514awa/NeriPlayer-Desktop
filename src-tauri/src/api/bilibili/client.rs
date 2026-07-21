@@ -182,8 +182,7 @@ impl BiliClient {
         self.wbi_get("https://api.bilibili.com/x/web-interface/wbi/search/type", params).await
     }
 
-    // ===== 需要登录的 API =====
-
+    // 需要登录的 API
     /// 获取登录用户信息（也用于 Wbi key 刷新）
     pub async fn get_user_info(&self) -> AppResult<Value> {
         let resp = self.http

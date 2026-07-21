@@ -1,4 +1,4 @@
-// 系统媒体会话集成 — Windows SMTC / Linux MPRIS
+// 系统媒体会话集成：Windows SMTC / Linux MPRIS
 // 通过 souvlaki 库实现跨平台媒体键控制和系统通知中心展示
 
 use souvlaki::{

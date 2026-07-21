@@ -1,5 +1,5 @@
 /**
- * 调色板提取器 — 完整移植 Android HyperBackground.kt 的 5 角色取色 + softenPaletteColor
+ * 调色板提取器：完整移植 Android HyperBackground.kt 的 5 角色取色与 softenPaletteColor
  * 确保 shader 获得色彩多样性，避免"看起来像纯色"的问题
  */
 
@@ -27,7 +27,7 @@ export interface PaletteResult {
   darkMuted: RGB
 }
 
-// --- 常量（对齐 Android HyperBackground.kt） ---
+// 常量（对齐 Android HyperBackground.kt）
 const STRONG_HUE_CONFLICT_DEGREES = 105
 const FALLBACK_COLOR: RGB = [128, 128, 128]
 
@@ -39,8 +39,7 @@ enum ColorRole {
   Bridge = 'Bridge',
 }
 
-// --- 色彩空间工具 ---
-
+// 色彩空间工具
 function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
   const nr = r / 255, ng = g / 255, nb = b / 255
   const max = Math.max(nr, ng, nb), min = Math.min(nr, ng, nb)
@@ -102,8 +101,7 @@ function clamp(v: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, v))
 }
 
-// --- Median-Cut ---
-
+// Median-Cut
 function channelRange(pixels: RGB[], ch: 0 | 1 | 2): number {
   let min = 255, max = 0
   for (const p of pixels) {
@@ -158,15 +156,14 @@ function medianCut(pixels: RGB[], maxBuckets: number): ColorBucket[] {
   }))
 }
 
-// --- Android 对齐：角色色选取（buildDynamicBackgroundPalette） ---
-
+// Android 对齐：角色色选取（buildDynamicBackgroundPalette）
 /** 对齐 Android colorfulnessScore */
 function colorfulnessScore(c: RGB): number {
   const [, s, l] = rgbToHsl(c[0], c[1], c[2])
   return s * (0.45 + Math.min(Math.abs(l - 0.5), 0.5))
 }
 
-/** 对齐 Android pickPaletteColor — 取第一个非黑非零色 */
+/** 对齐 Android pickPaletteColor：取第一个非黑非零色 */
 function pickColor(...candidates: (RGB | null)[]): RGB {
   for (const c of candidates) {
     if (c && (c[0] !== 0 || c[1] !== 0 || c[2] !== 0)) return c
@@ -174,7 +171,7 @@ function pickColor(...candidates: (RGB | null)[]): RGB {
   return FALLBACK_COLOR
 }
 
-/** 对齐 Android pickAccentPaletteColor — 选色彩最丰富的 */
+/** 对齐 Android pickAccentPaletteColor：选色彩最丰富的 */
 function pickAccentColor(fallback: RGB, ...candidates: (RGB | null)[]): RGB {
   const validColors = candidates.filter(
     (c): c is RGB => c != null && (c[0] !== 0 || c[1] !== 0 || c[2] !== 0)
@@ -187,7 +184,7 @@ function pickAccentColor(fallback: RGB, ...candidates: (RGB | null)[]): RGB {
   return ensureAccentColor(selected, fallback)
 }
 
-/** 对齐 Android ensureAccentColor — 保证 accent 有最低饱和度 */
+/** 对齐 Android ensureAccentColor：保证 accent 有最低饱和度 */
 function ensureAccentColor(color: RGB, fallback: RGB): RGB {
   const [h, s, l] = rgbToHsl(color[0], color[1], color[2])
   if (s >= 0.24) return color
@@ -202,7 +199,7 @@ function darkenColor(color: RGB, targetLightness: number): RGB {
   return hslToRgb(h, s, Math.min(l, targetLightness))
 }
 
-/** 对齐 Android softenPaletteColor — 核心色彩散布逻辑 */
+/** 对齐 Android softenPaletteColor：色彩散布逻辑 */
 function softenPaletteColor(
   rawColor: RGB,
   anchorColor: RGB,
@@ -286,8 +283,7 @@ function softenPaletteColor(
   return hslToRgb(hsl[0], hsl[1], hsl[2])
 }
 
-// --- 角色色提取（从 Median-Cut buckets 推导，模拟 AndroidX Palette swatch 分类） ---
-
+// 角色色提取（从 Median-Cut buckets 推导，模拟 AndroidX Palette swatch 分类）
 interface SwatchSet {
   dominant: RGB | null
   vibrant: RGB | null
@@ -397,8 +393,7 @@ function colorKey(c: RGB): string {
   return `${c[0]},${c[1]},${c[2]}`
 }
 
-// --- 主入口（对齐 Android buildDynamicBackgroundPalette） ---
-
+// 主入口（对齐 Android buildDynamicBackgroundPalette）
 export function extractPalette(
   imageData: ImageData,
   maxColors = 16,
@@ -444,7 +439,7 @@ export function extractPalette(
   )
   const bridgeColor = blendRgb(blendRgb(accentColor, lightColor, 0.50), baseColor, 0.24)
 
-  // --- softenPaletteColor 对每个角色做色彩散布 ---
+  // softenPaletteColor 对每个角色做色彩散布
   const softenedBase = softenPaletteColor(baseColor, baseColor, isDark, ColorRole.Base)
   const softenedAccent = softenPaletteColor(accentColor, baseColor, isDark, ColorRole.Accent)
   const softenedLight = softenPaletteColor(lightColor, baseColor, isDark, ColorRole.Light)

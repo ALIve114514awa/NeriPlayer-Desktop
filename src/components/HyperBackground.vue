@@ -34,7 +34,7 @@ let animFrame = 0
 let startTime = 0
 let lastFrameMs = 0
 
-// —— 音乐律动第二级非对称平滑（对齐 Android HyperBackground 帧循环）——
+// 音乐律动第二级非对称平滑（对齐 Android HyperBackground 帧循环）
 // Rust analyzer.rs 已做第一级帧率无关衰减，这里补一层 attack/release，
 // 并统一换算为与帧率无关的系数，避免 120Hz(ProMotion)/30fps 上手感不同。
 const REF_FPS = 60            // 参考帧率：Android 每帧系数按 ~60fps 调校
@@ -46,7 +46,7 @@ const BEAT_SCALE = 0.94       // 对齐 Android targetBeat = beat * 0.94
 let smoothLevel = 0
 let smoothBeat = 0
 
-// —— 调色板过渡：基于时间的 520ms smoothStep（对齐 Android，帧率无关）——
+// 调色板过渡：基于时间的 520ms smoothStep（对齐 Android，帧率无关）
 const PALETTE_TRANSITION_MS = 520
 const smoothColors: number[][] = [
   [0.07, 0.27, 0.42, 1],
@@ -82,7 +82,7 @@ function smoothStep01(t: number): number {
   return x * x * (3 - 2 * x)
 }
 
-// 目标调色板是否变化（切歌）→ 启动一次定时过渡
+// 目标调色板是否变化（切歌）-> 启动一次定时过渡
 function colorsChanged(): boolean {
   for (let i = 0; i < 5; i++) {
     for (let j = 0; j < 4; j++) {
@@ -192,7 +192,7 @@ function render() {
   const dt = Math.min((nowMs - lastFrameMs) / 1000, 0.1) // 秒，钳制避免卡顿后跳变
   lastFrameMs = nowMs
 
-  // —— 调色板过渡：检测目标变化 → 启动 520ms 定时 smoothStep 过渡 ——
+  // 调色板过渡：检测目标变化 -> 启动 520ms 定时 smoothStep 过渡
   if (colorsChanged()) {
     for (let i = 0; i < 5; i++) transStartColors[i] = smoothColors[i].slice()
     transStartLight = smoothLightOffset
@@ -222,7 +222,7 @@ function render() {
   gl.uniform2f(uResolution, w, h)
   gl.uniform1f(uTime, time)
 
-  // —— 音乐律动第二级非对称平滑（帧率无关）——
+  // 音乐律动第二级非对称平滑（帧率无关）
   const targetLevel = Math.min(Math.max(props.musicLevel, 0), 1)
   const targetBeat = Math.min(Math.max(props.beatImpulse * BEAT_SCALE, 0), 1)
   const levelRate = frameIndependentRate(

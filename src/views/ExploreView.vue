@@ -19,11 +19,11 @@ const player = usePlayerStore()
 const auth = useAuthStore()
 const recommend = useRecommendStore()
 
-// ===== 搜索 =====
+// 搜索
 const searchQuery = ref('')
 const isFocused = ref(false)
 
-// ===== 平台 Tab =====
+// 平台 Tab
 // 探索页不含 QQ 音乐（QQ 的搜索/播放/账号能力仍保留在其它模块）
 type PlatformTab = 'netease' | 'bilibili' | 'youtube'
 const PLATFORM_KEYS: PlatformTab[] = ['netease', 'bilibili', 'youtube']
@@ -38,7 +38,7 @@ const platformTabs = computed(() => [
   { key: 'youtube' as PlatformTab, label: t('settings.youtube_account'), icon: '/icons/ic_youtube.svg' },
 ])
 
-// ===== 网易云歌单 Tag =====
+// 网易云歌单 Tag
 const TAG_KEYS = [
   'tag_all', 'tag_pop', 'tag_soundtrack', 'tag_chinese', 'tag_nostalgia', 'tag_rock',
   'tag_acg', 'tag_western', 'tag_fresh', 'tag_night', 'tag_children', 'tag_folk',
@@ -142,7 +142,7 @@ async function loadQualityByTag(tagKey: string) {
   }
 }
 
-// ===== 搜索逻辑 =====
+// 搜索逻辑
 const isSearching = computed(() => !!searchQuery.value.trim())
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null
@@ -174,7 +174,7 @@ watch(activeTab, (tab) => {
   }
 })
 
-// ===== 工具函数 =====
+// 工具函数
 function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000)
   return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
@@ -229,7 +229,7 @@ function goToYoutubeShelfItem(item: any) {
   }
 }
 
-// ===== 初始化 =====
+// 初始化
 onMounted(() => {
   // 首次加载网易云精品歌单
   if (qualityPlaylists.value.length === 0) {
@@ -279,12 +279,12 @@ onMounted(() => {
       </button>
     </div>
 
-    <!-- ===== 加载状态 ===== -->
+    <!-- 加载状态 -->
     <div v-if="searchStore.isSearching" class="loading-state">
       <span class="material-symbols-rounded spinning">progress_activity</span>
     </div>
 
-    <!-- ===== 搜索结果 ===== -->
+    <!-- 搜索结果 -->
     <div v-else-if="isSearching && searchStore.results.length > 0" class="search-results">
       <div
         v-for="r in searchStore.results"
@@ -313,7 +313,7 @@ onMounted(() => {
       <p class="empty-desc" style="margin-top: 8px">{{ t('explore.empty_desc') }}</p>
     </div>
 
-    <!-- ===== 默认内容（按平台） ===== -->
+    <!-- 默认内容（按平台） -->
     <template v-else>
 
       <!-- 网易云 Tab：Tag 选择 + 精品歌单 -->

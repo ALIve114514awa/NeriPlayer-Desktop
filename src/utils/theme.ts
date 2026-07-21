@@ -41,7 +41,7 @@ export function applyTheme(mode: ThemeMode, persist = true) {
 
 /**
  * 带圆形扩散动画的主题切换
- * 核心优化：transition 回调内只做纯视觉 DOM 操作，
+ * transition 回调内只做纯视觉 DOM 操作，
  * localStorage 写入移到 microtask 异步执行
  */
 export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: number, persist = true) {

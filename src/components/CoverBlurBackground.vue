@@ -19,7 +19,7 @@ const frontUrl = ref(props.coverUrl)
 const backUrl = ref('')
 const showBack = ref(false)
 
-// 外扩至少 2× 模糊核，避免滤镜在窗角采到透明像素露出方框
+// 外扩至少 2x 模糊核，避免滤镜在窗角采到透明像素露出方框
 const expandPx = computed(() => Math.max(140, Math.ceil(props.blurAmount * 2.5)))
 const imgGeometryStyle = computed(() => {
   const e = expandPx.value
@@ -63,7 +63,7 @@ watch(() => props.coverUrl, (newUrl) => {
     // 触发淡入 back 层
     requestAnimationFrame(() => {
       showBack.value = true
-      // 过渡结束后交换：back→front，重置 back
+      // 过渡结束后交换：back->front，重置 back
       swapTimer = setTimeout(() => {
         swapTimer = null
         frontUrl.value = newUrl

@@ -1,4 +1,4 @@
-// 主题色管理 — 点击色块实时切换全局 CSS 变量
+// 主题色管理：点击色块实时切换全局 CSS 变量
 // 色值参考 Material Theme Builder (material-foundation/material-color-utilities) 生成
 
 export interface ThemeColorScheme {
@@ -8,7 +8,7 @@ export interface ThemeColorScheme {
   light: Record<string, string>
 }
 
-// 预设主题色 — light palette 使用 M3 标准淡色调
+// 预设主题色：light palette 使用 M3 标准淡色调
 export const THEME_COLORS: ThemeColorScheme[] = [
   {
     key: 'purple',
@@ -291,7 +291,7 @@ export function applyThemeColor(key: string, isDark?: boolean, persist = true) {
 
 /**
  * 带圆形扩散动画的主题色切换
- * 参考 Android 端 pending state 模式：先切换视觉 → 异步持久化
+ * 参考 Android 端 pending state 模式：先切换视觉 -> 异步持久化
  */
 export async function switchThemeColorWithRipple(key: string, x: number, y: number, persist = true) {
   if (!(document as any).startViewTransition) {

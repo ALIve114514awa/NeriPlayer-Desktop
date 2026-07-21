@@ -1,5 +1,5 @@
 /**
- * Spring — 移植自 AMLL (applemusic-like-lyrics) core 的解析式弹簧求解器
+ * Spring：移植自 AMLL (applemusic-like-lyrics) core 的解析式弹簧求解器
  * Ref: applemusic-like-lyrics/packages/core/src/utils/spring.ts
  *
  * 与常见的欧拉数值积分不同，这里用弹簧微分方程的「闭式解」：

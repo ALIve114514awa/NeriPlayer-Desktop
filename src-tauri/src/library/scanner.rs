@@ -120,12 +120,12 @@ fn find_nearby_cover(audio_path: &Path) -> Option<PathBuf> {
     let dir = audio_path.parent()?;
     let stem = audio_path.file_stem()?.to_str()?.to_lowercase();
 
-    // 1. 同目录下与音频同名的图片（大小写无关）
+    // 同目录下与音频同名的图片（大小写无关）
     if let Some(cover) = find_image_in_dir(dir, |name| name == stem) {
         return Some(cover);
     }
 
-    // 2. 大小写无关的封面子目录下与音频同名的图片
+    // 大小写无关的封面子目录下与音频同名的图片
     if let Some(sub) = find_cover_subdir(dir) {
         if let Some(cover) = find_image_in_dir(&sub, |name| name == stem) {
             return Some(cover);
@@ -138,7 +138,7 @@ fn find_nearby_cover(audio_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    // 3. 同目录下常见封面文件名（cover/folder/front/albumart...，大小写无关）
+    // 同目录下常见封面文件名（cover/folder/front/albumart...，大小写无关）
     if let Some(cover) = find_image_in_dir(dir, |name| COVER_NAMES.contains(&name)) {
         return Some(cover);
     }

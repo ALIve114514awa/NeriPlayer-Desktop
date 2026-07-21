@@ -347,7 +347,7 @@ defineExpose({
   transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease, backdrop-filter 320ms ease;
 }
 
-/* ── 顶部进度条（通栏） ── */
+/* 顶部进度条（通栏） */
 .progress-track {
   height: 5px;
   background: var(--md-surface-container-highest);
@@ -422,7 +422,7 @@ defineExpose({
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
-/* ── 三栏主体 ── */
+/* 三栏主体 */
 .mp-body {
   display: flex;
   align-items: center;
@@ -432,7 +432,7 @@ defineExpose({
   transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
 }
 
-/* ── 左：封面 + 信息 ── */
+/* 左：封面 + 信息 */
 .mp-left {
   display: flex;
   align-items: center;
@@ -515,7 +515,7 @@ defineExpose({
   min-height: 1.45em;
 }
 
-/* ── 中：播放控制 ── */
+/* 中：播放控制 */
 .mp-center {
   display: flex;
   align-items: center;
@@ -576,7 +576,7 @@ defineExpose({
   justify-content: center;
 }
 
-/* ── 右：工具按钮 ── */
+/* 右：工具按钮 */
 .mp-right {
   flex: 1;
   display: flex;

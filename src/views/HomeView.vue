@@ -360,7 +360,7 @@ function formatNotifTime(ts: number): string {
       </div>
     </section>
 
-    <!-- 热力飙升 — 三列网格 + 分页箭头 -->
+    <!-- 热力飙升：三列网格 + 分页箭头 -->
     <section v-if="auth.netease.loggedIn && (hotSongs.length > 0 || hotSection.loading || hotSection.error)" class="section">
       <div class="section-header">
         <h2 class="section-title">
@@ -403,7 +403,7 @@ function formatNotifTime(ts: number): string {
       </div>
     </section>
 
-    <!-- 私人雷达 — 三列网格 + 分页箭头 -->
+    <!-- 私人雷达：三列网格 + 分页箭头 -->
     <section v-if="auth.netease.loggedIn && (radarSongs.length > 0 || radarSection.loading || radarSection.error)" class="section">
       <div class="section-header">
         <h2 class="section-title">
@@ -753,7 +753,7 @@ function formatNotifTime(ts: number): string {
   overflow: hidden;
   transition: transform var(--duration-short) var(--ease-standard);
 
-  // M3 state layer — 叠加半透明层而非 brightness 滤镜
+  // M3 state layer：叠加半透明层而非 brightness 滤镜
   &::after {
     content: '';
     position: absolute;
@@ -1176,7 +1176,7 @@ function formatNotifTime(ts: number): string {
   margin-top: 3px;
 }
 
-// --- 骨架屏 ---
+// 骨架屏
 .skeleton-title {
   width: 120px;
   height: 22px;

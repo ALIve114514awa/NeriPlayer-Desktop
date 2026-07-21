@@ -1,4 +1,4 @@
-// Cookie 持久化 — Release 使用系统钥匙串，Debug 使用随机路径明文文件
+// Cookie 持久化：Release 使用系统钥匙串，Debug 使用随机路径明文文件
 // tauri-plugin-store 仅负责旧数据迁移
 use std::sync::Arc;
 use reqwest::cookie::Jar;
