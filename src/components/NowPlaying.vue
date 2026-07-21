@@ -1162,10 +1162,12 @@ async function confirmApplySearchResult() {
   if (Object.keys(patch).length > 0) player.updateCurrentTrackInfo(patch)
   if (applyInfoFields.value.lyrics) {
     try {
-      const directLyrics = await parseLyricsFromSearchResult(result)
-      if (directLyrics && directLyrics.length > 0) {
-        fetchedLyrics.value = directLyrics
-        cacheLyricsForTrack(player.currentTrack, directLyrics)
+      const direct = await parseLyricsFromSearchResult(result)
+      if (direct && direct.lines.length > 0) {
+        fetchedLyrics.value = direct.lines
+        cacheLyricsForTrack(player.currentTrack, direct.lines)
+        const source = String(result?.platform || 'LOCAL_EDIT').toUpperCase()
+        await commitLyricsToTrack(direct.rawLyric, direct.rawTranslated, source)
       } else {
         const idText = String(result.id || '')
         const neteaseId = idText.startsWith('netease:') ? parseInt(idText.replace('netease:', '')) : null
@@ -1177,8 +1179,8 @@ async function confirmApplySearchResult() {
           audioPath: null,
           neteaseId,
           qqSongMid,
-                youtubeVideoId: null,
-      })
+          youtubeVideoId: null,
+        })
         if (lyrics.length) {
           const nextLyrics = mapBackendLyrics(lyrics)
           fetchedLyrics.value = nextLyrics
