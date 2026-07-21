@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import ts from 'typescript'
 
-const sourceUrl = new URL('../src/utils/lyricsRequest.ts', import.meta.url)
+const sourceUrl = new URL('../src/modules/lyrics/lyricsRequest.ts', import.meta.url)
 const source = await readFile(sourceUrl, 'utf8')
 const compiled = ts.transpileModule(source, {
   compilerOptions: {

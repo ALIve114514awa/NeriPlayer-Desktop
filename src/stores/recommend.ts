@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { createLogger } from '@/utils/logger'
+import { parseYouTubeLibraryPlaylists as parseYouTubeLibraryPlaylistsShared } from '@/modules/youtube/youtubePlaylistParse'
 
 const log = createLogger('recommend')
 
@@ -78,7 +79,7 @@ export const useRecommendStore = defineStore('recommend', () => {
   const isLoading = ref(false)
   const error = ref<string | null>(null)
 
-  // --- stale-while-revalidate 缓存 ---
+  // stale-while-revalidate 缓存
   const CACHE_KEY = 'neri:recommend:cache'
   const CACHE_MAX_AGE_MS = 30 * 60 * 1000 // 30 分钟
 
@@ -243,7 +244,7 @@ export const useRecommendStore = defineStore('recommend', () => {
         }
       } else if (platform === 'youtube') {
         // YouTube browse 响应需要解析 sectionListRenderer
-        playlists = parseYouTubeLibraryPlaylists(data)
+        playlists = parseYouTubeLibraryPlaylistsShared(data)
       }
 
       userPlaylists.value[platform] = playlists
@@ -421,29 +422,4 @@ function parseYouTubeHomeFeed(data: any): HomeFeedShelf[] {
     // 解析失败返回空
   }
   return shelves
-}
-
-function parseYouTubeLibraryPlaylists(data: any): PlaylistInfo[] {
-  const playlists: PlaylistInfo[] = []
-  try {
-    const tabs = data?.contents?.singleColumnBrowseResultsRenderer?.tabs || []
-    const contents = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || []
-    for (const section of contents) {
-      const items = section?.gridRenderer?.items || section?.musicShelfRenderer?.contents || []
-      for (const item of items) {
-        const renderer = item?.musicTwoRowItemRenderer
-        if (!renderer) continue
-        playlists.push({
-          id: renderer?.navigationEndpoint?.browseEndpoint?.browseId || '',
-          name: renderer?.title?.runs?.[0]?.text || '',
-          coverUrl: renderer?.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url || '',
-          trackCount: 0,
-          description: renderer?.subtitle?.runs?.map((r: any) => r.text).join('') || '',
-        })
-      }
-    }
-  } catch {
-    // 解析失败返回空
-  }
-  return playlists
 }

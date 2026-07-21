@@ -6,7 +6,7 @@ const mockModule = Buffer.from(`
   export const invoke = (command, args) => globalThis.__playbackInvoke(command, args)
 `).toString('base64')
 const mockModuleUrl = `data:text/javascript;base64,${mockModule}`
-const sourceUrl = new URL('../src/utils/playbackSource.ts', import.meta.url)
+const sourceUrl = new URL('../src/modules/playback/playbackSource.ts', import.meta.url)
 const source = (await readFile(sourceUrl, 'utf8')).replace(
   "from '@tauri-apps/api/core'",
   `from '${mockModuleUrl}'`,
@@ -270,6 +270,42 @@ await run('accepts Android YouTube channel aliases and media URI fallback', asyn
   assert.deepEqual(receivedVideoIds, ['channel-video-id', 'media-uri-video-id'])
   assert.equal(canonicalizePlaybackTrack(channelTrack).id, 'youtube:channel-video-id')
   assert.equal(canonicalizePlaybackTrack(mediaUriTrack).id, 'youtube:media-uri-video-id')
+})
+
+await run('prefers youtube m4a/aac over higher-bitrate webm/opus', async () => {
+  // 桌面 symphonia 未启 opus; 即使 opus 码率更高也必须优先 mp4/AAC
+  globalThis.__playbackInvoke = async (command) => {
+    assert.equal(command, 'get_youtube_audio_url')
+    return [
+      {
+        url: 'https://audio.example/youtube-opus',
+        bitrate: 160_000,
+        mime_type: 'audio/webm; codecs="opus"',
+        content_length: 2_000_000,
+      },
+      {
+        url: 'https://audio.example/youtube-aac',
+        bitrate: 128_000,
+        mime_type: 'audio/mp4; codecs="mp4a.40.2"',
+        content_length: 1_800_000,
+      },
+    ]
+  }
+
+  const resolved = await resolvePlaybackSource({
+    id: 'youtube:prefer-m4a',
+    title: 'prefer-m4a',
+    artist: 'tester',
+    album: '',
+    durationMs: 180_000,
+    coverUrl: '',
+    source: 'youtube',
+    syncPayload: { mediaUri: 'ytmusic://video/prefer-m4a' },
+  }, settings)
+
+  assert.ok(resolved)
+  assert.equal(resolved.url, 'https://audio.example/youtube-aac')
+  assert.equal(resolved.candidateUrls?.[0], 'https://audio.example/youtube-opus')
 })
 
 await run('surfaces the Android-aligned login requirement', async () => {

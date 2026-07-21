@@ -21,7 +21,7 @@ import { applyTheme } from '@/utils/theme'
 import { applyThemeColor } from '@/utils/themeColor'
 import { getTrackCoverUrl } from '@/utils/trackCover'
 import { applyDynamicColorFromCover, clearDynamicColor } from '@/utils/colorExtractor'
-import { hasVisiblePlaybackSession } from '@/utils/playbackRequest'
+import { hasVisiblePlaybackSession } from '@/modules/playback/playbackRequest'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }

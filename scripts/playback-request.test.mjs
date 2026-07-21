@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
 
-const sourceUrl = new URL('../src/utils/playbackRequest.ts', import.meta.url)
+const sourceUrl = new URL('../src/modules/playback/playbackRequest.ts', import.meta.url)
 const source = await readFile(sourceUrl, 'utf8')
 const transpiled = ts.transpileModule(source, {
   compilerOptions: {

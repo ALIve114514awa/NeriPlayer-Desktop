@@ -19,7 +19,7 @@ import {
   playlistDetailCacheKey,
   readPlaylistDetailCache,
   writePlaylistDetailCache,
-} from '@/utils/playlistDetailCache'
+} from '@/modules/library/playlistDetailCache'
 
 const props = defineProps<{ isAlbum?: boolean }>()
 const route = useRoute()
