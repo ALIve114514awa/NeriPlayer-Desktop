@@ -232,7 +232,7 @@ async fn search_youtube(_query: &str, state: &State<'_, AppState>) -> AppResult<
                             .as_array()
                             .and_then(|arr| arr.last())
                             .and_then(|t| t["url"].as_str())
-                            .map(String::from);
+                            .map(upgrade_youtube_thumbnail_url);
 
                         results.push(SearchResult {
                             id: format!("youtube:{}", vid),
@@ -274,4 +274,106 @@ async fn search_lrclib(query: &str, state: &State<'_, AppState>) -> AppResult<Ve
             translated_lyrics: None,
         })
         .collect())
+}
+
+/// 将 YouTube Music 缩略图 URL 升级为高清尺寸（对齐 Android upgradeYouTubeThumbnailUrl）
+fn upgrade_youtube_thumbnail_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    // =w60-h60-l90-rj / =w226-h226 等尺寸参数
+    static SIZE_PARAM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let size_param = SIZE_PARAM.get_or_init(|| {
+        regex::Regex::new(r"=w\d+(-h\d+)?(-[a-zA-Z0-9-]+)*$").expect("youtube size param regex")
+    });
+    if size_param.is_match(trimmed) {
+        return size_param.replace(trimmed, "=w1200-h1200").into_owned();
+    }
+
+    // =s88 / =s120 等头像尺寸参数（仅 Google 图片域名）
+    if is_google_image_host(trimmed) {
+        static S_PARAM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let s_param = S_PARAM.get_or_init(|| {
+            regex::Regex::new(r"=s\d+(-[a-zA-Z0-9-]+)*$").expect("youtube s-param regex")
+        });
+        if s_param.is_match(trimmed) {
+            return s_param.replace(trimmed, "=w1200-h1200").into_owned();
+        }
+        if !trimmed.contains('=') {
+            return format!("{trimmed}=w1200-h1200");
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn is_google_image_host(url: &str) -> bool {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+    match host.as_deref() {
+        Some(h) => {
+            h == "lh3.googleusercontent.com"
+                || h.ends_with(".googleusercontent.com")
+                || h == "yt3.ggpht.com"
+                || h.ends_with(".ggpht.com")
+        }
+        None => {
+            url.contains("lh3.googleusercontent.com")
+                || url.contains("googleusercontent.com")
+                || url.contains("yt3.ggpht.com")
+                || url.contains("ggpht.com")
+        }
+    }
+}
+
+#[cfg(test)]
+mod youtube_cover_tests {
+    use super::upgrade_youtube_thumbnail_url;
+
+    #[test]
+    fn upgrades_w_h_size_params() {
+        assert_eq!(
+            upgrade_youtube_thumbnail_url(
+                "https://lh3.googleusercontent.com/abc123=w226-h226-l90-rj"
+            ),
+            "https://lh3.googleusercontent.com/abc123=w1200-h1200"
+        );
+        assert_eq!(
+            upgrade_youtube_thumbnail_url(
+                "https://lh3.googleusercontent.com/abc123=w60-h60-l90-rj"
+            ),
+            "https://lh3.googleusercontent.com/abc123=w1200-h1200"
+        );
+    }
+
+    #[test]
+    fn appends_size_when_missing() {
+        assert_eq!(
+            upgrade_youtube_thumbnail_url("https://lh3.googleusercontent.com/abc123"),
+            "https://lh3.googleusercontent.com/abc123=w1200-h1200"
+        );
+    }
+
+    #[test]
+    fn upgrades_ggpht_hosts() {
+        assert_eq!(
+            upgrade_youtube_thumbnail_url("https://yt3.ggpht.com/abc123=w120-h120"),
+            "https://yt3.ggpht.com/abc123=w1200-h1200"
+        );
+    }
+
+    #[test]
+    fn preserves_non_google_urls() {
+        let url = "https://i.ytimg.com/vi/abc123/maxresdefault.jpg";
+        assert_eq!(upgrade_youtube_thumbnail_url(url), url);
+    }
+
+    #[test]
+    fn handles_blank() {
+        assert_eq!(upgrade_youtube_thumbnail_url(""), "");
+        assert_eq!(upgrade_youtube_thumbnail_url("  "), "");
+    }
 }

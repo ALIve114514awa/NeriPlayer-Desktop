@@ -326,6 +326,68 @@ fn next_track_added_at(tracks: &[TrackInfo], count: usize) -> i64 {
     now.max(existing_max.saturating_add(count as i64)).max(1)
 }
 
+/// 按 track id / playlist_key 更新本地歌单中的曲目元数据(含 sync_payload)
+/// 用于歌词编辑、偏移写入等需要回写 Android 对齐字段的场景
+#[tauri::command]
+pub async fn update_playlist_track(
+    app: AppHandle,
+    playlist_id: Option<i64>,
+    track: TrackInfo,
+) -> AppResult<usize> {
+    let path = playlists_path();
+    let mut store = PlaylistStore::load(&path);
+    let target_key = playlist_track_key(&track);
+    let target_id = track.id.clone();
+    let mut updated = 0usize;
+    let now = chrono::Utc::now().timestamp_millis().max(1) as u64;
+
+    for pl in store.playlists.iter_mut() {
+        if let Some(pid) = playlist_id {
+            if pl.id != pid {
+                continue;
+            }
+        }
+        let mut touched = false;
+        for existing in pl.tracks.iter_mut() {
+            let same = playlist_track_key(existing) == target_key
+                || (!target_id.is_empty() && existing.id == target_id);
+            if !same {
+                continue;
+            }
+            // 保留歌单内加入时间与 playlist_key, 只覆盖展示字段与 sync_payload
+            let added_at = existing.added_at;
+            let playlist_key = existing.playlist_key.clone();
+            *existing = track.clone();
+            existing.added_at = added_at;
+            if existing.playlist_key.is_none() {
+                existing.playlist_key = playlist_key.or_else(|| Some(playlist_track_key(existing)));
+            }
+            // 确保上传载荷使用 CURRENT metadata version (对齐 Android fromSongItem)
+            // 注意: 此处不能调用 normalized_for_sync, 它会把有意清空的 "" 歌词剥成 None,
+            // 本地会丢失 CLEARED 语义并在下次播放时重新在线拉取
+            if let Some(payload) = existing.sync_payload.as_mut() {
+                if payload.sync_metadata_version
+                    < crate::sync::models::CURRENT_SYNC_METADATA_VERSION
+                {
+                    payload.sync_metadata_version =
+                        crate::sync::models::CURRENT_SYNC_METADATA_VERSION;
+                }
+            }
+            touched = true;
+            updated += 1;
+        }
+        if touched {
+            pl.modified_at = now;
+        }
+    }
+
+    if updated > 0 {
+        store.save(&path)?;
+        let _ = app.emit("playlists-changed", ());
+    }
+    Ok(updated)
+}
+
 #[tauri::command]
 pub async fn remove_from_playlist(app: AppHandle, playlist_id: i64, track_id: String) -> AppResult<()> {
     let path = playlists_path();
