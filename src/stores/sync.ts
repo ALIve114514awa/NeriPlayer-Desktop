@@ -190,7 +190,7 @@ export const useSyncStore = defineStore('sync', () => {
     },
   )
 
-  /** Phase 1: 验证 GitHub token */
+  /** 验证 GitHub token */
   async function validateGitHubToken(token: string): Promise<string | null> {
     dialogError.value = null
     try {
@@ -202,7 +202,7 @@ export const useSyncStore = defineStore('sync', () => {
     }
   }
 
-  /** Phase 2a: 创建新仓库 */
+  /** 创建新仓库 */
   async function createGitHubRepo(repoName: string): Promise<boolean> {
     dialogError.value = null
     try {
@@ -219,7 +219,7 @@ export const useSyncStore = defineStore('sync', () => {
     }
   }
 
-  /** Phase 2b: 使用已有仓库 */
+  /** 使用已有仓库 */
   async function useExistingGitHubRepo(owner: string, repo: string): Promise<boolean> {
     dialogError.value = null
     try {

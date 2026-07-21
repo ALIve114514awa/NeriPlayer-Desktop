@@ -1,4 +1,4 @@
-// ProtoBuf 消息定义 — 与 Android 端 SyncDataModels.kt 的 @ProtoNumber 对齐
+// ProtoBuf 消息定义：与 Android 端 SyncDataModels.kt 的 @ProtoNumber 对齐
 // 用于省流模式 (backup.bin: ProtoBuf + GZIP + Base64)
 
 /// SyncData 根容器
@@ -182,9 +182,8 @@ pub struct ProtoSyncLogEntry {
     pub details: Option<String>,
 }
 
-// === 以下为 Android 对齐新增的结构体 ===
-
-/// 因果一致性令牌 — 用于 CRDT 风格的歌曲成员关系追踪
+// 以下为 Android 对齐新增的结构体
+/// 因果一致性令牌：用于 CRDT 风格的歌曲成员关系追踪
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ProtoSyncCausalToken {
     #[prost(string, tag = "1")]
@@ -230,7 +229,7 @@ pub struct ProtoSyncTrackStat {
     pub counter_shards: Vec<ProtoSyncPlaybackCounterShard>,
 }
 
-/// 播放计数分片 — 每设备独立计数，避免并发冲突
+/// 播放计数分片：每设备独立计数，避免并发冲突
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ProtoSyncPlaybackCounterShard {
     #[prost(string, tag = "1")]
@@ -286,7 +285,7 @@ pub struct ProtoSyncPlaybackStatBucket {
     pub counter_shards: Vec<ProtoSyncPlaybackCounterShard>,
 }
 
-/// 歌单内歌曲删除记录 — 区别于 RecentPlayDeletion（最近播放的删除）
+/// 歌单内歌曲删除记录：区别于 RecentPlayDeletion（最近播放的删除）
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ProtoSyncPlaylistSongDeletion {
     #[prost(int64, tag = "1")]

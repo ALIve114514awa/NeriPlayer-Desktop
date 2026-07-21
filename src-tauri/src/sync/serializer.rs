@@ -1,4 +1,4 @@
-// 省流模式序列化/反序列化 — 与 Android SyncDataSerializer.kt 对齐
+// 省流模式序列化/反序列化：与 Android SyncDataSerializer.kt 对齐
 // backup.bin: Base64(GZIP(ProtoBuf))
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -90,8 +90,7 @@ pub fn deserialize(content: &str, is_binary: bool) -> AppResult<SyncData> {
     }
 }
 
-// ---- Proto <-> SyncData 转换 ----
-
+// Proto <-> SyncData 转换
 fn sync_data_to_proto(data: &SyncData) -> ProtoSyncData {
     ProtoSyncData {
         version: data.version.clone(),
@@ -377,6 +376,18 @@ fn legacy_proto_to_log_entry(p: &LegacyProtoSyncLogEntry) -> SyncLogEntry {
     }
 }
 
+/// 空白 optional 文本编码为 None, 对齐 Android null/omit 语义, 避免 Some("") 上云
+fn option_text_to_proto(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn required_text_to_proto(value: &str) -> Option<String> {
+    option_text_to_proto(Some(value))
+}
+
 fn sync_song_to_proto(s: &SyncSong) -> ProtoSyncSong {
     ProtoSyncSong {
         id: sync_i64_from_string(&s.id),
@@ -385,26 +396,26 @@ fn sync_song_to_proto(s: &SyncSong) -> ProtoSyncSong {
         album: s.album.clone(),
         album_id: sync_i64_from_string(&s.album_id),
         duration_ms: s.duration_ms,
-        cover_url: if s.cover_url.is_empty() { None } else { Some(s.cover_url.clone()) },
-        media_uri: if s.media_uri.is_empty() { None } else { Some(s.media_uri.clone()) },
+        cover_url: required_text_to_proto(&s.cover_url),
+        media_uri: required_text_to_proto(&s.media_uri),
         added_at: s.added_at,
-        matched_lyric: s.matched_lyric.clone(),
-        matched_translated_lyric: s.matched_translated_lyric.clone(),
-        matched_lyric_source: s.matched_lyric_source.clone(),
-        matched_song_id: s.matched_song_id.clone(),
+        matched_lyric: option_text_to_proto(s.matched_lyric.as_deref()),
+        matched_translated_lyric: option_text_to_proto(s.matched_translated_lyric.as_deref()),
+        matched_lyric_source: option_text_to_proto(s.matched_lyric_source.as_deref()),
+        matched_song_id: option_text_to_proto(s.matched_song_id.as_deref()),
         user_lyric_offset_ms: s.user_lyric_offset_ms,
-        custom_cover_url: s.custom_cover_url.clone(),
-        custom_name: s.custom_name.clone(),
-        custom_artist: s.custom_artist.clone(),
-        original_name: s.original_name.clone(),
-        original_artist: s.original_artist.clone(),
-        original_cover_url: s.original_cover_url.clone(),
-        original_lyric: s.original_lyric.clone(),
-        original_translated_lyric: s.original_translated_lyric.clone(),
-        channel_id: s.channel_id.clone(),
-        audio_id: s.audio_id.clone(),
-        sub_audio_id: s.sub_audio_id.clone(),
-        playlist_context_id: s.playlist_context_id.clone(),
+        custom_cover_url: option_text_to_proto(s.custom_cover_url.as_deref()),
+        custom_name: option_text_to_proto(s.custom_name.as_deref()),
+        custom_artist: option_text_to_proto(s.custom_artist.as_deref()),
+        original_name: option_text_to_proto(s.original_name.as_deref()),
+        original_artist: option_text_to_proto(s.original_artist.as_deref()),
+        original_cover_url: option_text_to_proto(s.original_cover_url.as_deref()),
+        original_lyric: option_text_to_proto(s.original_lyric.as_deref()),
+        original_translated_lyric: option_text_to_proto(s.original_translated_lyric.as_deref()),
+        channel_id: option_text_to_proto(s.channel_id.as_deref()),
+        audio_id: option_text_to_proto(s.audio_id.as_deref()),
+        sub_audio_id: option_text_to_proto(s.sub_audio_id.as_deref()),
+        playlist_context_id: option_text_to_proto(s.playlist_context_id.as_deref()),
         sync_membership_tokens: s.sync_membership_tokens.iter().map(causal_token_to_proto).collect(),
         sync_metadata_version: s.sync_metadata_version,
     }
@@ -471,7 +482,7 @@ fn fav_playlist_to_proto(f: &SyncFavoritePlaylist) -> ProtoSyncFavoritePlaylist 
     ProtoSyncFavoritePlaylist {
         id: sync_i64_from_string(&f.id),
         name: f.name.clone(),
-        cover_url: if f.cover_url.is_empty() { None } else { Some(f.cover_url.clone()) },
+        cover_url: required_text_to_proto(&f.cover_url),
         track_count: f.track_count,
         source: f.source.clone(),
         songs: f.songs.iter().map(sync_song_to_proto).collect(),
@@ -479,9 +490,9 @@ fn fav_playlist_to_proto(f: &SyncFavoritePlaylist) -> ProtoSyncFavoritePlaylist 
         modified_at: f.modified_at,
         is_deleted: f.is_deleted,
         sort_order: f.sort_order,
-        browse_id: f.browse_id.clone(),
-        playlist_id: f.playlist_id.clone(),
-        subtitle: f.subtitle.clone(),
+        browse_id: option_text_to_proto(f.browse_id.as_deref()),
+        playlist_id: option_text_to_proto(f.playlist_id.as_deref()),
+        subtitle: option_text_to_proto(f.subtitle.as_deref()),
     }
 }
 
@@ -550,7 +561,7 @@ fn deletion_to_proto(d: &SyncRecentPlayDeletion) -> ProtoSyncRecentPlayDeletion 
     ProtoSyncRecentPlayDeletion {
         song_id: sync_i64_from_string(&d.song_id),
         album: d.album.clone(),
-        media_uri: if d.media_uri.is_empty() { None } else { Some(d.media_uri.clone()) },
+        media_uri: required_text_to_proto(&d.media_uri),
         deleted_at: d.deleted_at,
         device_id: d.device_id.clone(),
     }
@@ -566,8 +577,7 @@ fn proto_to_deletion(p: &ProtoSyncRecentPlayDeletion) -> SyncRecentPlayDeletion 
     }
 }
 
-// ---- 新增：Android 对齐的转换函数 ----
-
+// 新增：Android 对齐的转换函数
 fn causal_token_to_proto(t: &SyncCausalToken) -> ProtoSyncCausalToken {
     ProtoSyncCausalToken {
         device_id: t.device_id.clone(),
@@ -614,9 +624,9 @@ fn track_stat_to_proto(s: &SyncTrackStat) -> ProtoSyncTrackStat {
         play_count: s.play_count,
         last_played_at: s.last_played_at,
         first_played_at: s.first_played_at,
-        cover_url: s.cover_url.clone(),
+        cover_url: option_text_to_proto(s.cover_url.as_deref()),
         duration_ms: s.duration_ms,
-        media_uri: s.media_uri.clone(),
+        media_uri: option_text_to_proto(s.media_uri.as_deref()),
         id: sync_i64_from_string(&s.id),
         album_id: sync_i64_from_string(&s.album_id),
         counter_base_listen_ms: s.counter_base_listen_ms,
@@ -657,9 +667,9 @@ fn stat_bucket_to_proto(b: &SyncPlaybackStatBucket) -> ProtoSyncPlaybackStatBuck
         play_count: b.play_count,
         last_played_at: b.last_played_at,
         first_played_at: b.first_played_at,
-        cover_url: b.cover_url.clone(),
+        cover_url: option_text_to_proto(b.cover_url.as_deref()),
         duration_ms: b.duration_ms,
-        media_uri: b.media_uri.clone(),
+        media_uri: option_text_to_proto(b.media_uri.as_deref()),
         id: sync_i64_from_string(&b.id),
         album_id: sync_i64_from_string(&b.album_id),
         counter_base_listen_ms: b.counter_base_listen_ms,
@@ -695,7 +705,7 @@ fn playlist_song_deletion_to_proto(d: &SyncPlaylistSongDeletion) -> ProtoSyncPla
         playlist_id: sync_i64_from_string(&d.playlist_id),
         song_id: sync_i64_from_string(&d.song_id),
         album: d.album.clone(),
-        media_uri: d.media_uri.clone(),
+        media_uri: option_text_to_proto(d.media_uri.as_deref()),
         deleted_at: d.deleted_at,
         device_id: d.device_id.clone(),
         removed_membership_tokens: d.removed_membership_tokens.iter().map(causal_token_to_proto).collect(),
@@ -775,6 +785,67 @@ mod compressed_contract_tests {
             CURRENT_SYNC_METADATA_VERSION
         );
         assert_eq!(decoded.sync_log[0].action, "REMOVE_SONG");
+    }
+
+    #[test]
+    fn compressed_encode_omits_blank_optional_song_fields() {
+        let song = SyncSong {
+            id: "42".into(),
+            name: "Song".into(),
+            cover_url: "   ".into(),
+            media_uri: "".into(),
+            matched_lyric: Some("   ".into()),
+            matched_translated_lyric: Some("".into()),
+            custom_name: Some("\t".into()),
+            channel_id: Some(" netease ".into()),
+            audio_id: Some("42".into()),
+            sync_metadata_version: CURRENT_SYNC_METADATA_VERSION,
+            ..Default::default()
+        };
+        let data = SyncData {
+            version: "2.0".into(),
+            device_id: "desktop".into(),
+            device_name: "Desktop".into(),
+            playlists: vec![SyncPlaylist {
+                id: "1".into(),
+                name: "Playlist".into(),
+                songs: vec![song],
+                created_at: 10,
+                modified_at: 20,
+                is_deleted: false,
+                song_order_version: 1,
+            }],
+            playback_stats: vec![SyncTrackStat {
+                identity_key: "k".into(),
+                cover_url: Some("".into()),
+                media_uri: Some("   ".into()),
+                ..Default::default()
+            }],
+            playlist_song_deletions: vec![SyncPlaylistSongDeletion {
+                playlist_id: "1".into(),
+                song_id: "42".into(),
+                media_uri: Some("".into()),
+                deleted_at: 1,
+                device_id: "desktop".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let encoded = serialize_compressed(&data).unwrap();
+        let decoded = deserialize_compressed(&encoded).unwrap();
+        let decoded_song = &decoded.playlists[0].songs[0];
+
+        assert_eq!(decoded_song.cover_url, "");
+        assert_eq!(decoded_song.media_uri, "");
+        assert!(decoded_song.matched_lyric.is_none());
+        assert!(decoded_song.matched_translated_lyric.is_none());
+        assert!(decoded_song.custom_name.is_none());
+        assert_eq!(decoded_song.channel_id.as_deref(), Some("netease"));
+        assert_eq!(decoded_song.audio_id.as_deref(), Some("42"));
+        assert!(decoded.playback_stats[0].cover_url.is_none());
+        assert!(decoded.playback_stats[0].media_uri.is_none());
+        assert!(decoded.playlist_song_deletions[0].media_uri.is_none());
     }
 
     #[test]

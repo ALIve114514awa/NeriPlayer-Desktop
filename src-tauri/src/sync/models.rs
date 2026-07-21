@@ -1,4 +1,4 @@
-// 同步数据模型 — 与 Android 端 SyncDataModels.kt 保持 JSON 字段兼容
+// 同步数据模型：与 Android 端 SyncDataModels.kt 保持 JSON 字段兼容
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -606,8 +606,37 @@ impl SyncSong {
     pub fn normalized_for_sync(&self) -> Self {
         let mut normalized = self.clone();
         normalized.sync_membership_tokens = normalize_sync_causal_tokens(&self.sync_membership_tokens);
+        // 空字符串歌词/元数据视为缺失, 避免上传 Some("") 洗掉云端或制造伪 diff
+        normalized.matched_lyric = normalize_optional_text(self.matched_lyric.as_deref());
+        normalized.matched_translated_lyric =
+            normalize_optional_text(self.matched_translated_lyric.as_deref());
+        normalized.matched_lyric_source =
+            normalize_optional_text(self.matched_lyric_source.as_deref());
+        normalized.matched_song_id = normalize_optional_text(self.matched_song_id.as_deref());
+        normalized.custom_cover_url = normalize_optional_text(self.custom_cover_url.as_deref());
+        normalized.custom_name = normalize_optional_text(self.custom_name.as_deref());
+        normalized.custom_artist = normalize_optional_text(self.custom_artist.as_deref());
+        normalized.original_name = normalize_optional_text(self.original_name.as_deref());
+        normalized.original_artist = normalize_optional_text(self.original_artist.as_deref());
+        normalized.original_cover_url = normalize_optional_text(self.original_cover_url.as_deref());
+        normalized.original_lyric = normalize_optional_text(self.original_lyric.as_deref());
+        normalized.original_translated_lyric =
+            normalize_optional_text(self.original_translated_lyric.as_deref());
+        normalized.channel_id = normalize_optional_text(self.channel_id.as_deref());
+        normalized.audio_id = normalize_optional_text(self.audio_id.as_deref());
+        normalized.sub_audio_id = normalize_optional_text(self.sub_audio_id.as_deref());
+        normalized.playlist_context_id =
+            normalize_optional_text(self.playlist_context_id.as_deref());
         normalized
     }
+}
+
+/// 空白 optional 文本 -> None (与 Android nonBlank 语义对齐)
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 /// 歌曲身份标识，用于去重
@@ -1177,5 +1206,27 @@ mod legacy_json_tests {
         assert_eq!(normalize_history_update_mode("EVERY_30_MINUTES"), "every_30_minutes");
         assert_eq!(normalize_history_update_mode("BATCHED"), "every_10_minutes");
         assert_eq!(normalize_history_update_mode("unknown"), "immediate");
+    }
+
+    #[test]
+    fn normalized_for_sync_clears_blank_lyric_fields() {
+        let song = SyncSong {
+            id: "1".into(),
+            matched_lyric: Some("   ".into()),
+            matched_translated_lyric: Some("".into()),
+            original_lyric: Some(" keep ".into()),
+            matched_lyric_source: Some("\t".into()),
+            custom_name: Some("".into()),
+            channel_id: Some(" netease ".into()),
+            ..Default::default()
+        };
+
+        let normalized = song.normalized_for_sync();
+        assert!(normalized.matched_lyric.is_none());
+        assert!(normalized.matched_translated_lyric.is_none());
+        assert_eq!(normalized.original_lyric.as_deref(), Some("keep"));
+        assert!(normalized.matched_lyric_source.is_none());
+        assert!(normalized.custom_name.is_none());
+        assert_eq!(normalized.channel_id.as_deref(), Some("netease"));
     }
 }

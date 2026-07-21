@@ -1,4 +1,4 @@
-// 三方合并算法 — 对齐 Android GitHubSyncManager.performThreeWayMerge
+// 三方合并算法：对齐 Android GitHubSyncManager.performThreeWayMerge
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::models::*;
@@ -1351,10 +1351,10 @@ pub fn has_data_changed(remote: &SyncData, merged: &SyncData) -> bool {
 }
 
 fn same_playlist(left: &SyncPlaylist, right: &SyncPlaylist) -> bool {
+    // 对齐 Android SyncDataChangeDetector: 仅比较内容, 不比较 created_at/modified_at
+    // 时间戳单调增长, 若纳入比较会把"仅时间戳变化"误判为改动, 导致同步回流/回声上传
     left.id == right.id
         && left.name == right.name
-        && left.created_at == right.created_at
-        && left.modified_at == right.modified_at
         && left.is_deleted == right.is_deleted
         && left.song_order_version == right.song_order_version
         && left.songs.len() == right.songs.len()
@@ -1362,18 +1362,15 @@ fn same_playlist(left: &SyncPlaylist, right: &SyncPlaylist) -> bool {
 }
 
 fn same_favorite(left: &SyncFavoritePlaylist, right: &SyncFavoritePlaylist) -> bool {
+    // 对齐 Android SyncDataChangeDetector.favorite:
+    // 比较 isDeleted/modifiedAt/sortOrder/trackCount/song identity+metadata
+    // 不比较 name/cover/source 展示字段与 addedTime, 避免仅展示刷新触发回声上传
     left.id == right.id
-        && left.name == right.name
-        && left.cover_url == right.cover_url
-        && left.track_count == right.track_count
         && left.source == right.source
-        && left.added_time == right.added_time
         && left.modified_at == right.modified_at
         && left.is_deleted == right.is_deleted
         && left.sort_order == right.sort_order
-        && left.browse_id == right.browse_id
-        && left.playlist_id == right.playlist_id
-        && left.subtitle == right.subtitle
+        && left.track_count == right.track_count
         && left.songs.len() == right.songs.len()
         && left.songs.iter().zip(&right.songs).all(|(a, b)| same_song(a, b))
 }
@@ -1820,6 +1817,49 @@ mod tests {
         let remote = sync_data(vec![playlist(vec![song("42", 10_000)])]);
         let mut merged = remote.clone();
         merged.playlists[0].songs[0].name = "Changed".into();
+        assert!(has_data_changed(&remote, &merged));
+    }
+
+    #[test]
+    fn playlist_timestamp_only_change_is_not_data_change() {
+        let remote = sync_data(vec![playlist(vec![song("42", 10_000)])]);
+        let mut merged = remote.clone();
+        merged.playlists[0].created_at = 999;
+        merged.playlists[0].modified_at = 1_000_000;
+        assert!(!has_data_changed(&remote, &merged));
+    }
+
+    #[test]
+    fn favorite_display_only_fields_are_not_data_change() {
+        let remote = SyncData {
+            favorite_playlists: vec![SyncFavoritePlaylist {
+                id: "7".into(),
+                name: "Fav".into(),
+                cover_url: "https://a".into(),
+                track_count: 1,
+                source: "netease".into(),
+                songs: vec![song("42", 10)],
+                added_time: 1,
+                modified_at: 2,
+                is_deleted: false,
+                sort_order: 3,
+                browse_id: Some("B".into()),
+                playlist_id: Some("P".into()),
+                subtitle: Some("old".into()),
+            }],
+            ..Default::default()
+        };
+        let mut merged = remote.clone();
+        // 仅展示字段变化不应触发回声上传
+        merged.favorite_playlists[0].name = "Fav Renamed".into();
+        merged.favorite_playlists[0].cover_url = "https://b".into();
+        merged.favorite_playlists[0].added_time = 99;
+        merged.favorite_playlists[0].browse_id = Some("B2".into());
+        merged.favorite_playlists[0].subtitle = Some("new".into());
+        assert!(!has_data_changed(&remote, &merged));
+
+        // 内容字段变化仍应检测
+        merged.favorite_playlists[0].sort_order = 4;
         assert!(has_data_changed(&remote, &merged));
     }
 

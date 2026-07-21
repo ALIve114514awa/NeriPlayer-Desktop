@@ -391,7 +391,7 @@ pub async fn update_sync_preferences(
     Ok(())
 }
 
-/// Phase 1: 验证 GitHub token，返回用户名
+/// 验证 GitHub token，返回用户名
 #[tauri::command]
 pub async fn validate_github_token(
     app: AppHandle,
@@ -413,7 +413,7 @@ pub async fn validate_github_token(
     }))
 }
 
-/// Phase 2: 创建新仓库
+/// 创建新仓库
 #[tauri::command]
 pub async fn create_github_repo(
     app: AppHandle,
@@ -445,7 +445,7 @@ pub async fn create_github_repo(
     }))
 }
 
-/// Phase 2 (alternative): 使用已有仓库
+/// 使用已有仓库
 #[tauri::command]
 pub async fn use_existing_github_repo(
     app: AppHandle,
@@ -663,14 +663,14 @@ pub async fn clear_app_cache(app: AppHandle) -> AppResult<Value> {
     let mut cleared: u64 = 0;
     let mut failed: u64 = 0;
 
-    // 1. 清理 app_cache_dir
+    // 清理 app_cache_dir
     if let Ok(cache_dir) = app.path().app_cache_dir() {
         let (c, f) = clear_directory_contents(&cache_dir);
         cleared += c;
         failed += f;
     }
 
-    // 2. 清理 app_data_dir 下的缓存子目录（covers, temp 等）
+    // 清理 app_data_dir 下的缓存子目录（covers, temp 等）
     if let Ok(data_dir) = app.path().app_data_dir() {
         for sub in &["covers", "temp", "cache", "thumbnails"] {
             let sub_dir = data_dir.join(sub);

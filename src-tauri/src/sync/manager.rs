@@ -1,4 +1,4 @@
-// 同步管理器 — 协调 GitHub/WebDAV 同步流程
+// 同步管理器：协调 GitHub/WebDAV 同步流程
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
@@ -280,10 +280,10 @@ pub async fn sync_webdav(
     let _sync_guard = acquire_sync_lock().await;
     let api = WebDavApiClient::new(http, &config.server_url, &config.username, &config.password, &config.base_path);
 
-    // 1. 验证连接
+    // 验证连接
     api.validate_connection().await?;
 
-    // 2. 拉取远程文件
+    // 拉取远程文件
     let (remote_content, remote_fingerprint) = match api.get_file_content().await? {
         Some((content, fp)) if !content.trim().is_empty() => (content, fp),
         _ => {
@@ -301,7 +301,7 @@ pub async fn sync_webdav(
         }
     };
 
-    // 3. 解析远程数据（WebDAV 始终 JSON）
+    // 解析远程数据（WebDAV 始终 JSON）
     let remote_data: SyncData = serde_json::from_str(&remote_content)
         .map_err(|e| AppError::Other(format!("Failed to parse remote sync data: {}", e)))?;
 
@@ -604,6 +604,10 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
     if let Some(payload) = &track.sync_payload {
         let mut preserved = payload.normalized_for_sync();
         preserved.added_at = track.added_at.max(0);
+        // 有完整载荷时标记为 CURRENT, 对齐 Android SyncSong.fromSongItem
+        if preserved.sync_metadata_version < CURRENT_SYNC_METADATA_VERSION {
+            preserved.sync_metadata_version = CURRENT_SYNC_METADATA_VERSION;
+        }
         return preserved;
     }
 
@@ -637,6 +641,7 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
         sub_audio_id: platform.sub_audio_id,
         playlist_context_id: None,
         sync_membership_tokens: Vec::new(),
+        // 无历史载荷时仍用 LEGACY, 让 merge fill-missing 可补齐云端歌词
         sync_metadata_version: LEGACY_SYNC_METADATA_VERSION,
     }
 }
@@ -1017,8 +1022,7 @@ fn load_local_playlist_song_deletions() -> Vec<SyncPlaylistSongDeletion> {
         .collect()
 }
 
-// ===== Base Snapshot — 用于三方歌曲合并的删除检测 =====
-
+// Base Snapshot：用于三方歌曲合并的删除检测
 /// snapshot 文件路径
 fn base_snapshot_path(scope: &str) -> std::path::PathBuf {
     let mut path = dirs_next::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
