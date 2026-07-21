@@ -62,8 +62,12 @@ type RichPlayerLyricWord = PlayerLyricWord & {
 }
 
 const offsetMs = computed(() => {
-  if (typeof props.lyricOffsetMs === 'number') return props.lyricOffsetMs
-  return settings.cloudMusicOffset || 0
+  // 必须由上层传入有效偏移; 不再回退到网易云全局默认,
+  // 否则 YouTube/B站/本地在漏传时会被错误套上 +1000ms
+  if (typeof props.lyricOffsetMs === 'number' && Number.isFinite(props.lyricOffsetMs)) {
+    return props.lyricOffsetMs
+  }
+  return 0
 })
 
 const effectiveTimeMs = computed(() => {
@@ -263,7 +267,10 @@ function buildAmllLines(): AmllLyricLine[] {
 function syncCurrentTime(forceSeek = false): void {
   if (!lyricPlayer) return
   const time = Math.max(0, Math.round(amllTimeMs.value))
-  if (!forceSeek && Math.abs(time - lastSyncedTime) < 1) return
+  const drift = Math.abs(time - lastSyncedTime)
+  // 插值时钟与 AMLL 内部时间漂移超过 80ms 时强制 seek, 避免卡在错误行
+  if (!forceSeek && drift < 1) return
+  if (!forceSeek && drift >= 80) forceSeek = true
 
   lyricPlayer.setCurrentTime(time, forceSeek)
   lastSyncedTime = time

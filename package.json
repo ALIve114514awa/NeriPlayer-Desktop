@@ -14,6 +14,10 @@
     "test:playback-source": "node scripts/test-playback-source.mjs",
     "test:player-state": "node scripts/test-player-state.mjs",
     "test:track-cover": "node scripts/test-track-cover.mjs",
+    "test:lyric-offset": "node scripts/test-lyric-offset.mjs",
+    "test:lyrics-format": "node scripts/test-lyrics-format.mjs",
+    "test:listen-together-mapper": "node scripts/test-listen-together-mapper.mjs",
+    "test:youtube-playlist-parse": "node scripts/test-youtube-playlist-parse.mjs",
     "tauri": "node scripts/run-tauri.mjs"
   },
   "dependencies": {

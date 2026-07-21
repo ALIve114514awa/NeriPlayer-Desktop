@@ -27,7 +27,7 @@ export interface StorageCacheClearOptions {
 
 const BROWSER_CACHE_KEYS = {
   platformList: ['neri:playlist-detail-cache:v1', 'neri:recommend:cache'],
-  other: ['neri:lyrics-cache:v1'],
+  other: ['neri:lyrics-cache:v3', 'neri:lyrics-cache:v2', 'neri:lyrics-cache:v1'],
 } as const
 
 export function mergeBrowserCacheUsage(summary: StorageUsageSummary): StorageUsageSummary {

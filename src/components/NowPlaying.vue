@@ -16,8 +16,20 @@ import {
   peekCoverImage,
   resolveCoverImage,
 } from '@/utils/bilibiliCover'
-import { clearCachedLyrics, getCachedLyrics, saveCachedLyrics } from '@/utils/lyricsCache'
-import { hasLyricsRequestInFlight, loadLyricsSingleFlight } from '@/utils/lyricsRequest'
+import { clearCachedLyrics, getCachedLyrics, saveCachedLyrics } from '@/modules/lyrics/lyricsCache'
+import { hasLyricsRequestInFlight, loadLyricsSingleFlight } from '@/modules/lyrics/lyricsRequest'
+import {
+  toEditableLyricsText,
+  toEditableTranslationText,
+  resolveStoredLyricStateFromPayload,
+  resolveStoredTranslatedLyricStateFromPayload,
+  withUpdatedLyricsPayload,
+  mapBackendLyrics as mapBackendLyricsShared,
+  mergeParsedLyricsWithTranslations,
+} from '@/modules/lyrics/lyricsFormat'
+import { offsetBucketForSource } from '@/modules/lyrics/lyricOffset'
+import { persistTrackSyncPayload } from '@/modules/lyrics/syncTrackPayload'
+import { useLyricOffsetStore } from '@/stores/lyricOffset'
 import HyperBackground from './HyperBackground.vue'
 import CoverBlurBackground from './CoverBlurBackground.vue'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
@@ -30,7 +42,7 @@ import CustomSelect from './ui/CustomSelect.vue'
 import EditableRangeValue from './ui/EditableRangeValue.vue'
 import ContextMenu from './ui/ContextMenu.vue'
 import type { ContextMenuActionItem } from '@/utils/contextMenu'
-import { playbackSessionTrackKey } from '@/utils/playbackRequest'
+import { playbackSessionTrackKey } from '@/modules/playback/playbackRequest'
 import { createLogger } from '@/utils/logger'
 import { getTrackCoverUrl } from '@/utils/trackCover'
 import { summarizeLogError } from '@/utils/logSanitizer'
@@ -47,6 +59,7 @@ const likedSongs = useLikedSongsStore()
 const settings = useSettingsStore()
 const toast = useToastStore()
 const downloadStore = useDownloadStore()
+const lyricOffsetStore = useLyricOffsetStore()
 const router = useRouter()
 const { t } = useI18n()
 const playViewMode = ref<'cover' | 'lyrics'>('cover')
@@ -82,7 +95,7 @@ function hideMoreSheet() {
   showMoreSheet.value = false
 }
 
-// ─── 均衡器辅助 ───
+// 均衡器辅助
 import { EQ_PRESETS } from '@/stores/player'
 const eqPresetIds = Object.keys(EQ_PRESETS)
 const eqFreqLabels = ['60', '230', '910', '3.6k', '14k']
@@ -95,7 +108,7 @@ function onEqBandChange(index: number, value: number) {
   settings.equalizerPresetId = 'custom'
 }
 
-// --- 来源徽章（对齐 Android PlaybackSourceBadge） ---
+// 来源徽章（对齐 Android PlaybackSourceBadge）
 const playbackSourceLabel = computed(() => {
   const id = player.currentTrack?.id || ''
   if (id.startsWith('netease:')) return t('player.source_netease')
@@ -129,21 +142,42 @@ function platformLabel(source?: string) {
 }
 
 function mapBackendLyrics(lyrics: any[]): LyricLine[] {
-  return lyrics.map(l => ({
-    startMs: l.start_ms ?? l.startMs ?? 0,
-    durationMs: l.duration_ms ?? l.durationMs ?? 0,
-    words: (l.words || []).map((w: any) => ({
-      startMs: w.start_ms ?? w.startMs ?? 0,
-      durationMs: w.duration_ms ?? w.durationMs ?? 0,
-      text: w.text || '',
-    })),
-    text: l.text || '',
-    translation: l.translation || undefined,
-  }))
+  return mapBackendLyricsShared(lyrics)
 }
 
 function readCachedLyrics(track: TrackInfo) {
   return getCachedLyrics(track)
+}
+
+// 同步歌词落地: 将云同步下来的 matched/original 歌词解析为本地歌词行
+// 仅读取 syncPayload, 不在读取路径回写云端
+// 返回 null 表示无本地覆盖 (可在线拉取); [] 表示有意清空或解析失败
+async function materializeSyncedLyrics(track: TrackInfo): Promise<LyricLine[] | null> {
+  const payload = track.syncPayload
+  const lyricState = resolveStoredLyricStateFromPayload(payload)
+  if (lyricState.kind === 'absent') return null
+  if (lyricState.kind === 'cleared') return []
+  try {
+    const parsed = await invoke<any[]>('parse_lrc_content', { content: lyricState.text })
+    const translationState = resolveStoredTranslatedLyricStateFromPayload(payload)
+    let parsedTranslations: any[] = []
+    if (translationState.kind === 'present' && translationState.text.trim()) {
+      try {
+        parsedTranslations = await invoke<any[]>('parse_lrc_content', {
+          content: translationState.text,
+        })
+      } catch (e) {
+        log.warn('Parse synced translation failed:', e)
+      }
+    }
+    return mergeParsedLyricsWithTranslations(
+      mapBackendLyrics(parsed),
+      mapBackendLyrics(parsedTranslations),
+    )
+  } catch (e) {
+    log.warn('Materialize synced lyrics failed:', e)
+    return []
+  }
 }
 
 function cacheLyricsForTrack(track: TrackInfo | null | undefined, lines: LyricLine[]) {
@@ -156,30 +190,54 @@ function removeCachedLyricsForCurrentTrack() {
   clearCachedLyrics(player.currentTrack)
 }
 
-// --- 歌词编辑器 ---
+/** 编辑后的歌词写回 syncPayload + 本地歌单, 供同步上传 (对齐 Android) */
+async function commitLyricsToTrack(
+  nextLyric: string | null,
+  nextTranslated: string | null,
+  source?: string | null,
+) {
+  const track = player.currentTrack
+  if (!track) return
+  const nextPayload = withUpdatedLyricsPayload(
+    track.syncPayload,
+    nextLyric,
+    nextTranslated,
+    source ?? 'LOCAL_EDIT',
+  )
+  // CURRENT version: 有意清空也会上传 None, 与 Android v1 一致
+  nextPayload.syncMetadataVersion = 1
+  delete nextPayload.sync_metadata_version
+  player.patchCurrentTrackSyncPayload(nextPayload)
+  const updatedTrack = player.currentTrack
+  if (updatedTrack) {
+    await persistTrackSyncPayload(updatedTrack)
+  }
+}
+
+// 歌词编辑器
 const lyricsEditorText = ref('')
 const lyricsTranslationEditorText = ref('')
 const lyricsEditorTab = ref<'original' | 'translation'>('original')
 
-function lyricLineToLrc(line: any, text: string) {
-  const min = Math.floor(line.startMs / 60000)
-  const sec = Math.floor((line.startMs % 60000) / 1000)
-  const ms = Math.floor((line.startMs % 1000) / 10)
-  return `[${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${String(ms).padStart(2, '0')}]${text || ''}`
-}
-
 function openLyricsEditor() {
-  // 将当前歌词还原为 LRC 文本
+  // 优先使用 syncPayload 原文(保持用户编辑/YRC 源文本), 否则从当前展示行导出
+  const payload = player.currentTrack?.syncPayload
+  const stored = resolveStoredLyricStateFromPayload(payload)
+  const storedTranslation = resolveStoredTranslatedLyricStateFromPayload(payload)
   const lines = displayLyrics.value
   lyricsEditorTab.value = 'original'
-  if (lines.length > 0) {
-    lyricsEditorText.value = lines.map(l => lyricLineToLrc(l, l.text)).join('\n')
-    lyricsTranslationEditorText.value = lines
-      .filter(l => l.translation)
-      .map(l => lyricLineToLrc(l, l.translation || ''))
-      .join('\n')
+  if (stored.kind === 'present') {
+    lyricsEditorText.value = stored.text
+  } else if (lines.length > 0) {
+    lyricsEditorText.value = toEditableLyricsText(lines)
   } else {
     lyricsEditorText.value = ''
+  }
+  if (storedTranslation.kind === 'present') {
+    lyricsTranslationEditorText.value = storedTranslation.text
+  } else if (lines.length > 0) {
+    lyricsTranslationEditorText.value = toEditableTranslationText(lines)
+  } else {
     lyricsTranslationEditorText.value = ''
   }
   goToSubView('lyrics-editor')
@@ -189,14 +247,16 @@ async function applyLyricsFromEditor() {
   const text = lyricsEditorText.value.trim()
   const translationText = lyricsTranslationEditorText.value.trim()
   if (!text) {
-    // 清除歌词
+    // 清除歌词: 本地 cache + syncPayload matched* 置空 (CURRENT 版本会同步清空)
     fetchedLyrics.value = []
     removeCachedLyricsForCurrentTrack()
+    await commitLyricsToTrack(null, null, 'LOCAL_EDIT')
     toast.success(t('player.lyrics_cleared'))
     goBackToMain()
     return
   }
   try {
+    // parse_lrc_content 已走 parse_auto, 支持 YRC 逐字往返
     const parsed = await invoke<any[]>('parse_lrc_content', { content: text })
     let parsedTranslations: any[] = []
     if (translationText) {
@@ -206,72 +266,67 @@ async function applyLyricsFromEditor() {
         log.warn('Parse translation LRC failed, applying original only:', e)
       }
     }
-    const translationByTime = new Map(
-      parsedTranslations.map(l => [Math.round(Number(l.start_ms || 0)), l.text || '']),
+    const nextLyrics = mergeParsedLyricsWithTranslations(
+      mapBackendLyrics(parsed),
+      mapBackendLyrics(parsedTranslations),
     )
-    const nextLyrics = parsed.map((l, index) => ({
-      startMs: l.start_ms,
-      durationMs: l.duration_ms,
-      words: (l.words || []).map((w: any) => ({
-        startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-      })),
-      text: l.text,
-      translation: translationByTime.get(Math.round(Number(l.start_ms || 0)))
-        || parsedTranslations[index]?.text
-        || l.translation
-        || undefined,
-    }))
     fetchedLyrics.value = nextLyrics
     cacheLyricsForTrack(player.currentTrack, nextLyrics)
+    // 原文保留编辑器文本(YRC/LRC), 与 Android toEditableLyricsText 往返一致
+    await commitLyricsToTrack(text, translationText || null, 'LOCAL_EDIT')
     toast.success(t('player.lyrics_applied'))
   } catch (e) {
-    log.error('Parse LRC failed:', e)
+    log.error('Parse lyrics failed:', e)
     toast.error(String(e))
   }
   goBackToMain()
 }
 
-// --- 歌词填充（搜索 + 应用歌词） ---
+// 歌词填充（搜索 + 应用歌词）
 const lyricFillQuery = ref('')
 const lyricFillResults = ref<any[]>([])
 const isLyricFilling = ref(false)
 const lyricFillPlatform = ref<'netease' | 'lrclib' | 'qq'>('netease')
 
-async function parseLyricsFromSearchResult(result: any): Promise<LyricLine[] | null> {
+async function parseLyricsFromSearchResult(result: any): Promise<{
+  lines: LyricLine[]
+  rawLyric: string
+  rawTranslated: string | null
+} | null> {
   if (result?.synced_lyrics) {
-    const parsed = await invoke<any[]>('parse_lrc_content', { content: String(result.synced_lyrics) })
+    const rawLyric = String(result.synced_lyrics)
+    const rawTranslated = result?.translated_lyrics ? String(result.translated_lyrics) : null
+    const parsed = await invoke<any[]>('parse_lrc_content', { content: rawLyric })
     let parsedTranslations: any[] = []
-    if (result?.translated_lyrics) {
+    if (rawTranslated) {
       try {
-        parsedTranslations = await invoke<any[]>('parse_lrc_content', { content: String(result.translated_lyrics) })
+        parsedTranslations = await invoke<any[]>('parse_lrc_content', { content: rawTranslated })
       } catch {}
     }
-    const translationByTime = new Map(
-      parsedTranslations.map(l => [Math.round(Number(l.start_ms || 0)), l.text || '']),
-    )
-    return parsed.map(l => ({
-      startMs: l.start_ms,
-      durationMs: l.duration_ms,
-      words: (l.words || []).map((w: any) => ({
-        startMs: w.start_ms, durationMs: w.duration_ms, text: w.text,
-      })),
-      text: l.text,
-      translation: translationByTime.get(Math.round(Number(l.start_ms || 0))) || l.translation || undefined,
-    }))
+    return {
+      lines: mergeParsedLyricsWithTranslations(
+        mapBackendLyrics(parsed),
+        mapBackendLyrics(parsedTranslations),
+      ),
+      rawLyric,
+      rawTranslated,
+    }
   }
 
   if (result?.plain_lyrics) {
-    return String(result.plain_lyrics)
+    const rawLyric = String(result.plain_lyrics)
+    const lines = rawLyric
       .split(/\r?\n/)
       .map((line: string) => line.trim())
       .filter(Boolean)
       .map((line: string, index: number) => ({
         startMs: index * 3000,
         durationMs: 3000,
-        words: [],
+        words: [] as LyricLine['words'],
         text: line,
-        translation: undefined,
+        translation: undefined as string | undefined,
       }))
+    return { lines, rawLyric, rawTranslated: null }
   }
 
   return null
@@ -298,10 +353,13 @@ async function doLyricFillSearch() {
 
 async function applyLyricFill(result: any) {
   try {
-    const directLyrics = await parseLyricsFromSearchResult(result)
-    if (directLyrics && directLyrics.length > 0) {
-      fetchedLyrics.value = directLyrics
-      cacheLyricsForTrack(player.currentTrack, directLyrics)
+    const source = String(result?.platform || lyricFillPlatform.value || 'LOCAL_EDIT').toUpperCase()
+    const direct = await parseLyricsFromSearchResult(result)
+    if (direct && direct.lines.length > 0) {
+      fetchedLyrics.value = direct.lines
+      cacheLyricsForTrack(player.currentTrack, direct.lines)
+      // 搜索填充也写回本地 syncPayload, 不直接覆写云端; 下次同步上传
+      await commitLyricsToTrack(direct.rawLyric, direct.rawTranslated, source)
       toast.success(t('player.lyrics_fill_applied'))
       goBackToMain()
       return
@@ -316,10 +374,18 @@ async function applyLyricFill(result: any) {
       audioPath: null,
       neteaseId: neteaseId,
       qqSongMid,
-    })
+            youtubeVideoId: null,
+      })
     const nextLyrics = mapBackendLyrics(lyrics)
     fetchedLyrics.value = nextLyrics
     cacheLyricsForTrack(player.currentTrack, nextLyrics)
+    if (nextLyrics.length > 0) {
+      await commitLyricsToTrack(
+        toEditableLyricsText(nextLyrics),
+        toEditableTranslationText(nextLyrics) || null,
+        source,
+      )
+    }
     toast.success(t('player.lyrics_fill_applied'))
     goBackToMain()
   } catch (e) {
@@ -787,11 +853,42 @@ watch(nowPlayingTrackKey, async (trackKey) => {
     reusedRequest,
   })
   try {
+    // 本地 cache 优先; 有缓存则不再触网/回写云端
+    if (cachedLyrics?.length) {
+      log.info('lyrics from local cache:', {
+        requestId,
+        trackId: track.id,
+        lines: cachedLyrics.length,
+      })
+      return
+    }
+
+    // 同步歌词优先落地为本地歌词(不触网, 不回写云端)
+    // present -> 使用; cleared -> 空词并阻止在线回填; absent -> 继续在线
+    const syncedLyrics = await materializeSyncedLyrics(track)
+    if (requestId !== lyricFetchRequestId) return
+    if (syncedLyrics !== null) {
+      fetchedLyrics.value = syncedLyrics
+      if (syncedLyrics.length > 0) {
+        cacheLyricsForTrack(track, syncedLyrics)
+      }
+      log.info('lyrics from sync payload:', {
+        requestId,
+        trackId: track.id,
+        lines: syncedLyrics.length,
+        cleared: syncedLyrics.length === 0,
+      })
+      return
+    }
+
     const neteaseId = track.id.startsWith('netease:')
       ? parseInt(track.id.replace('netease:', ''))
       : undefined
     const qqSongMid = track.id.startsWith('qq:')
       ? track.id.replace('qq:', '')
+      : undefined
+    const youtubeVideoId = track.id.startsWith('youtube:')
+      ? track.id.replace('youtube:', '')
       : undefined
 
     const nextLyrics = await loadLyricsSingleFlight(track, async () => {
@@ -800,10 +897,11 @@ watch(nowPlayingTrackKey, async (trackKey) => {
       const lyrics = await invoke<any[]>('fetch_lyrics', {
         title: track.title,
         artist: track.artist,
-        durationSecs: Math.floor(track.durationMs / 1000),
+        durationSecs: Math.floor((track.durationMs || player.durationMs || 0) / 1000),
         audioPath: track.audioUrl || null,
         neteaseId: neteaseId || null,
         qqSongMid: qqSongMid || null,
+        youtubeVideoId: youtubeVideoId || null,
       })
       const mapped = mapBackendLyrics(lyrics)
       if (mapped.length > 0) cacheLyricsForTrack(track, mapped)
@@ -825,11 +923,7 @@ watch(nowPlayingTrackKey, async (trackKey) => {
       })
       return
     }
-    if (nextLyrics.length > 0) {
-      fetchedLyrics.value = nextLyrics
-    } else if (!cachedLyrics?.length) {
-      fetchedLyrics.value = []
-    }
+    fetchedLyrics.value = nextLyrics.length > 0 ? nextLyrics : []
     log.info('lyrics load committed:', {
       requestId,
       trackId: track.id,
@@ -863,7 +957,7 @@ watch(nowPlayingTrackKey, async (trackKey) => {
   }
 }, { immediate: true })
 
-// --- 唱片旋转（JS 驱动，停止时保持角度 + 缓动） ---
+// 唱片旋转（JS 驱动，停止时保持角度 + 缓动）
 const discRef = ref<HTMLDivElement>()
 let discAngle = 0            // 当前累计角度（度）
 let discAnimFrame = 0
@@ -903,7 +997,7 @@ defineExpose({
   getCoverSnapshot,
 })
 
-// --- 右键菜单（歌曲名/歌手复制 + 封面保存） ---
+// 右键菜单（歌曲名/歌手复制 + 封面保存）
 const contextMenu = ref({ show: false, x: 0, y: 0, type: '' as 'title' | 'artist' | 'cover' })
 
 watch(() => player.hasPlaybackSession, (hasSession) => {
@@ -1007,7 +1101,7 @@ function goBackToMain() {
 // 关闭更多选项面板时重置子视图
 watch(showMoreSheet, (v) => { if (!v) setTimeout(() => { moreSheetView.value = 'main' }, 220) })
 
-// --- 获取歌曲信息（搜索） ---
+// 获取歌曲信息（搜索）
 const searchQuery = ref('')
 const searchResults = ref<any[]>([])
 const isSearching = ref(false)
@@ -1083,7 +1177,8 @@ async function confirmApplySearchResult() {
           audioPath: null,
           neteaseId,
           qqSongMid,
-        })
+                youtubeVideoId: null,
+      })
         if (lyrics.length) {
           const nextLyrics = mapBackendLyrics(lyrics)
           fetchedLyrics.value = nextLyrics
@@ -1099,7 +1194,7 @@ async function confirmApplySearchResult() {
   goBackToMain()
 }
 
-// --- 编辑歌曲信息 ---
+// 编辑歌曲信息
 const editTitle = ref('')
 const editArtist = ref('')
 const editCoverUrl = ref('')
@@ -1127,7 +1222,7 @@ function restoreInfo() {
   goBackToMain()
 }
 
-// --- 音质切换 ---
+// 音质切换
 const currentSource = computed(() => {
   const id = player.currentTrack?.id || ''
   if (id.startsWith('netease:')) return 'netease'
@@ -1137,12 +1232,35 @@ const currentSource = computed(() => {
   return 'local'
 })
 
-const currentLyricOffsetMs = computed<number>({
-  get: () => currentSource.value === 'qq' ? settings.qqMusicOffset : settings.cloudMusicOffset,
-  set: (value: number) => {
-    if (currentSource.value === 'qq') settings.qqMusicOffset = value
-    else settings.cloudMusicOffset = value
-  },
+// 偏移分桶: netease→cloud, qq→qq, youtube/bili/local→none(默认 0)
+const currentOffsetBucket = computed(() => offsetBucketForSource(currentSource.value))
+
+// 逐曲用户偏移(delta, 默认 0) -- 偏移面板编辑的就是它, 不再混入系统默认
+const currentLyricUserOffsetMs = computed<number>({
+  get: () => lyricOffsetStore.getUserOffsetMs(player.currentTrack),
+  set: (value: number) => lyricOffsetStore.setUserOffsetMs(player.currentTrack, value),
+})
+
+// 系统全局默认(基线), 只读展示; youtube 等 none 桶恒为 0
+const currentLyricDefaultOffsetMs = computed(() =>
+  lyricOffsetStore.defaultOffsetMs(currentOffsetBucket.value),
+)
+
+// 有效偏移 = 基线 + delta, 喂给歌词渲染
+const currentLyricTotalOffsetMs = computed(
+  () => currentLyricDefaultOffsetMs.value + currentLyricUserOffsetMs.value,
+)
+
+// 偏移面板副标题: 标明当前生效的系统默认来源
+const currentLyricOffsetSourceLabel = computed(() => {
+  switch (currentOffsetBucket.value) {
+    case 'qq':
+      return t('player.source_qq')
+    case 'cloud':
+      return t('player.source_netease')
+    default:
+      return t(`player.source_${currentSource.value}` as 'player.source_youtube')
+  }
 })
 
 const currentTrackId = computed(() => player.currentTrack?.id || '')
@@ -1179,6 +1297,42 @@ function formatFileSize(bytes?: number) {
     unitIndex += 1
   }
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
+}
+
+// 歌曲详情专用: 码率/编解码/采样 等完整音频参数 (含 kbps, 与进度条纸面规格分离)
+const trackDetailAudioParams = computed(() => {
+  const info = player.audioInfo
+  if (!info) return ''
+  const parts: string[] = []
+  const quality = currentAudioQualityLabel()
+  if (quality) parts.push(quality)
+  if (info.codec) {
+    const codec = normalizeAudioDisplayToken(info.codec)
+    if (codec && !parts.includes(codec)) parts.push(codec)
+  }
+  if (info.format) {
+    const format = normalizeAudioDisplayToken(info.format)
+    if (format && !parts.includes(format) && format.toLowerCase() !== (info.codec || '').toLowerCase()) {
+      parts.push(format)
+    }
+  }
+  if (info.bitrate && info.bitrate > 0) parts.push(`${Math.round(info.bitrate)} kbps`)
+  for (const token of paperSpecFromAudioInfo(info)) {
+    if (!parts.includes(token)) parts.push(token)
+  }
+  return parts.join(' · ')
+})
+
+// 播放缓存 / 下载 / 在线流 三态
+const trackDetailCacheStatus = computed(() => {
+  if (player.isPlayingFromDownload) return t('player.cache_status_download')
+  if (player.isPlayingFromCache) return t('player.cache_status_playback_cache')
+  if (isRemotePlaybackSource(currentSource.value)) return t('player.cache_status_stream')
+  return t('player.cache_status_local')
+})
+
+function isRemotePlaybackSource(source: string) {
+  return source === 'netease' || source === 'qq' || source === 'bilibili' || source === 'youtube'
 }
 
 function downloadTaskStatusText(status?: string) {
@@ -1402,26 +1556,57 @@ const albumName = computed(() => {
 const canViewNeteaseAlbum = computed(() => currentSource.value === 'netease' && !!albumName.value && !!currentNeteaseSongNumericId.value)
 
 // 进度条下方音质信息（不展示 Local / download 占位）
+// 纸面规格: 最高/极高/杜比… + 可选编解码; 不展示 kbps 数字
 const audioInfoParts = computed(() => {
   const info = player.audioInfo
   if (!info) return []
   const parts: Array<{ text: string; accent?: boolean }> = []
   if (settings.showQualitySwitch) addAudioInfoPart(parts, currentAudioQualityLabel(), true)
   if (settings.showAudioCodec) addAudioInfoPart(parts, normalizeAudioDisplayToken(info.codec))
-  if (settings.showAudioSpec && info.bitrate) addAudioInfoPart(parts, `${info.bitrate} kbps`)
-  if (settings.showAudioSpec) addAudioInfoPart(parts, normalizeAudioDisplayToken(info.format))
-  // 本地下载占位词过滤：Local / download / file 等
+  // showAudioSpec: 只补 sampleRate/bitDepth 类纸面规格, 不写 kbps
+  if (settings.showAudioSpec) {
+    for (const token of paperSpecFromAudioInfo(info)) addAudioInfoPart(parts, token)
+  }
   return parts.filter(part => !isHiddenAudioInfoToken(part.text))
 })
 
 const audioInfoDisplay = computed(() => {
-  return audioInfoParts.value.map(part => part.text).join(' \u00B7 ')
+  return audioInfoParts.value.map(part => part.text).join(' · ')
 })
 
 function currentAudioQualityLabel() {
   const info = player.audioInfo
   const source = info?.source && info.source !== 'local' ? info.source : currentSource.value
+  // 优先已本地化的 qualityLabel; 否则用 qualityKey 映射到 标准/极高/最高…
+  const labeled = info?.qualityLabel?.trim()
+  if (labeled && !/kbps/i.test(labeled) && labeled !== info?.qualityKey) {
+    return labeled
+  }
   return qualityLabelFor(source, info?.qualityKey || currentQualityKey(source))
+}
+
+/** 从 audioInfo 抽出非码率的纸面规格 (如 48 kHz / 16 bit) */
+function paperSpecFromAudioInfo(info: {
+  sampleRateHz?: number
+  bitDepth?: number
+  specLabel?: string
+}): string[] {
+  const tokens: string[] = []
+  if (info.sampleRateHz && info.sampleRateHz > 0) {
+    const khz = info.sampleRateHz / 1000
+    tokens.push(info.sampleRateHz % 1000 === 0
+      ? `${khz.toFixed(0)} kHz`
+      : `${khz.toFixed(1)} kHz`)
+  }
+  if (info.bitDepth && info.bitDepth > 0) tokens.push(`${info.bitDepth} bit`)
+  // specLabel 里可能混有 kbps, 过滤掉
+  if (info.specLabel) {
+    for (const part of info.specLabel.split('|').map(s => s.trim())) {
+      if (!part || /kbps/i.test(part)) continue
+      if (!tokens.includes(part)) tokens.push(part)
+    }
+  }
+  return tokens
 }
 
 function addAudioInfoPart(
@@ -1504,7 +1689,7 @@ const dynamicColorVars = computed(() => {
   if (!p) return {}
   const lv = p.lightVibrant
 
-  // RGB → HSL 转换
+  // RGB -> HSL 转换
   const r = lv[0] / 255, g = lv[1] / 255, b = lv[2] / 255
   const max = Math.max(r, g, b), min = Math.min(r, g, b)
   let h = 0, s = 0
@@ -1517,7 +1702,7 @@ const dynamicColorVars = computed(() => {
     else h = ((r - g) / d + 4) / 6
   }
 
-  // HSL → RGB
+  // HSL -> RGB
   const hsl2rgb = (h: number, s: number, l: number): [number, number, number] => {
     if (s === 0) return [Math.round(l * 255), Math.round(l * 255), Math.round(l * 255)]
     const hue2rgb = (p: number, q: number, t: number) => {
@@ -1792,7 +1977,7 @@ const sliderActiveColor = computed(() => {
           </button>
         </div>
 
-        <!-- 工具栏（对齐 Android 底部：Favorite → Queue → Sleep → Volume → Speed → Add） -->
+        <!-- 工具栏（对齐 Android 底部：Favorite -> Queue -> Sleep -> Volume -> Speed -> Add） -->
         <div
           class="np-toolbar"
           @click.stop
@@ -2018,7 +2203,7 @@ const sliderActiveColor = computed(() => {
           :current-time-ms="player.interpolatedPositionMs"
           :preview-time-ms="previewPositionMs"
           :is-playing="player.isPlaying"
-          :lyric-offset-ms="currentLyricOffsetMs"
+          :lyric-offset-ms="currentLyricTotalOffsetMs"
           :seek-seq="player.lastSeekCommand.seq"
           @seek="onLyricSeek"
         />
@@ -2094,7 +2279,7 @@ const sliderActiveColor = computed(() => {
               <span class="material-symbols-rounded">music_note</span>
               <div class="np-more-list-info">
                 <span class="np-more-list-headline">{{ t('player.quality_switch') }}</span>
-                <span class="np-more-list-desc">{{ player.audioInfo?.codec }} · {{ player.audioInfo?.bitrate }}kbps</span>
+                <span class="np-more-list-desc">{{ currentAudioQualityLabel() || '—' }}</span>
               </div>
               <span class="material-symbols-rounded np-more-chevron">chevron_right</span>
             </button>
@@ -2114,7 +2299,7 @@ const sliderActiveColor = computed(() => {
               <span class="material-symbols-rounded">timer</span>
               <div class="np-more-list-info">
                 <span class="np-more-list-headline">{{ t('player.lyric_offset') }}</span>
-                <span class="np-more-list-desc">{{ currentLyricOffsetMs > 0 ? '+' : '' }}{{ currentLyricOffsetMs }}ms · {{ currentSource === 'qq' ? t('player.source_qq') : t('player.source_netease') }}</span>
+                <span class="np-more-list-desc">{{ currentLyricUserOffsetMs > 0 ? '+' : '' }}{{ currentLyricUserOffsetMs }}ms · {{ currentLyricOffsetSourceLabel }}</span>
               </div>
               <span class="material-symbols-rounded np-more-chevron">chevron_right</span>
             </button>
@@ -2190,21 +2375,22 @@ const sliderActiveColor = computed(() => {
               <h4 class="np-more-title">{{ t('player.lyric_offset') }}</h4>
             </div>
             <div class="np-more-item">
-              <div class="np-more-label">{{ currentSource === 'qq' ? t('settings.qq_offset') : t('settings.netease_offset') }}</div>
+              <div class="np-more-label">{{ t('player.lyric_offset_song') }}</div>
+              <div class="np-more-hint">{{ t('player.lyric_offset_base', { value: `${currentLyricDefaultOffsetMs >= 0 ? '+' : ''}${currentLyricDefaultOffsetMs}ms` }) }} · {{ currentLyricOffsetSourceLabel }}</div>
               <div class="np-more-row">
                 <input type="range" min="-2000" max="2000" step="50"
-                  :value="currentLyricOffsetMs"
+                  :value="currentLyricUserOffsetMs"
                   class="np-more-slider"
-                  @input="currentLyricOffsetMs = parseInt(($event.target as HTMLInputElement).value)"
+                  @input="currentLyricUserOffsetMs = parseInt(($event.target as HTMLInputElement).value)"
                 />
                 <EditableRangeValue
-                  v-model="currentLyricOffsetMs"
+                  v-model="currentLyricUserOffsetMs"
                   class="np-offset-value"
-                  :class="{ positive: currentLyricOffsetMs > 0, negative: currentLyricOffsetMs < 0 }"
+                  :class="{ positive: currentLyricUserOffsetMs > 0, negative: currentLyricUserOffsetMs < 0 }"
                   :min="-2000"
                   :max="2000"
                   :step="50"
-                  :display-value="`${currentLyricOffsetMs > 0 ? '+' : ''}${currentLyricOffsetMs}ms`"
+                  :display-value="`${currentLyricUserOffsetMs > 0 ? '+' : ''}${currentLyricUserOffsetMs}ms`"
                   input-suffix="ms"
                   :aria-label="t('player.lyric_offset')"
                 />
@@ -2472,30 +2658,44 @@ const sliderActiveColor = computed(() => {
                 <strong>{{ playbackSourceLabel || currentSource }}</strong>
               </div>
               <div class="np-track-detail-row">
-                <span>时长</span>
+                <span>{{ t('player.track_detail_duration') }}</span>
                 <strong>{{ formatDurationMs(player.currentTrack?.durationMs || player.durationMs) }}</strong>
               </div>
               <div class="np-track-detail-row">
-                <span>音频参数</span>
-                <strong>{{ audioInfoDisplay || '-' }}</strong>
+                <span>{{ t('player.track_detail_audio_params') }}</span>
+                <strong>{{ trackDetailAudioParams || audioInfoDisplay || '-' }}</strong>
               </div>
               <div class="np-track-detail-row">
-                <span>本地下载播放</span>
-                <strong>{{ player.isPlayingFromDownload ? '是' : '否' }}</strong>
-              </div>
-              <div class="np-track-detail-row">
-                <span>下载状态</span>
+                <span>{{ t('player.track_detail_bitrate') }}</span>
                 <strong>
-                  {{ currentDownloadTask ? downloadTaskStatusText(currentDownloadTask.status) : (isCurrentDownloaded ? '已下载' : '未下载') }}
+                  {{ player.audioInfo?.bitrate && player.audioInfo.bitrate > 0
+                    ? `${Math.round(player.audioInfo.bitrate)} kbps`
+                    : '-' }}
+                </strong>
+              </div>
+              <div class="np-track-detail-row">
+                <span>{{ t('player.track_detail_cache_status') }}</span>
+                <strong>{{ trackDetailCacheStatus }}</strong>
+              </div>
+              <div class="np-track-detail-row">
+                <span>{{ t('player.track_detail_local_download_play') }}</span>
+                <strong>{{ player.isPlayingFromDownload ? t('player.yes') : t('player.no') }}</strong>
+              </div>
+              <div class="np-track-detail-row">
+                <span>{{ t('player.track_detail_download_status') }}</span>
+                <strong>
+                  {{ currentDownloadTask
+                    ? downloadTaskStatusText(currentDownloadTask.status)
+                    : (isCurrentDownloaded ? t('download.downloaded') : t('download.not_downloaded')) }}
                 </strong>
               </div>
               <div v-if="currentDownloadedTrack" class="np-track-detail-row">
-                <span>文件大小</span>
+                <span>{{ t('player.track_detail_file_size') }}</span>
                 <strong>{{ formatFileSize(currentDownloadedTrack.fileSize) }}</strong>
               </div>
               <button class="np-more-form-btn primary np-track-detail-share" @click="shareSong">
                 <span class="material-symbols-rounded">share</span>
-                复制分享信息
+                {{ t('player.copy_share_info') }}
               </button>
             </div>
           </template>
@@ -2714,7 +2914,7 @@ const sliderActiveColor = computed(() => {
   animation: np-beat-shell-bloom 320ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-// 纯色底层 — 由 accentBgStyle 动态控制颜色
+// 纯色底层：由 accentBgStyle 动态控制颜色
 .np-bg-solid {
   position: absolute;
   inset: 0;
@@ -2832,7 +3032,7 @@ const sliderActiveColor = computed(() => {
   .material-symbols-rounded { font-size: 28px; }
 }
 
-/* 双栏主体 — 五五分 */
+/* 双栏主体：五五分 */
 .np-body {
   position: relative;
   z-index: 2;
@@ -4283,7 +4483,7 @@ const sliderActiveColor = computed(() => {
 </style>
 
 <style lang="scss">
-/* 更多选项面板 — Overlay + Sheet 过渡 */
+/* 更多选项面板：Overlay + Sheet 过渡 */
 .more-sheet-enter-active {
   transition: opacity 280ms cubic-bezier(0.2, 0, 0, 1);
   .np-more-sheet {
@@ -4488,6 +4688,13 @@ const sliderActiveColor = computed(() => {
   font-weight: 500;
   color: rgba(255,255,255,0.7);
   margin-bottom: 10px;
+}
+
+.np-more-hint {
+  font-size: 12px;
+  color: rgba(255,255,255,0.5);
+  margin-top: -4px;
+  margin-bottom: 12px;
 }
 
 .np-more-row {

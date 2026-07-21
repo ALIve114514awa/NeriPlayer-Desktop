@@ -26,13 +26,13 @@ import {
   type PlaybackSourceSettings,
   type PlaybackResolution,
   type ResolvedPlaybackSource,
-} from '@/utils/playbackSource'
-import { PlaybackPrefetchManager } from '@/utils/playbackPrefetch'
+} from '@/modules/playback/playbackSource'
+import { PlaybackPrefetchManager } from '@/modules/playback/playbackPrefetch'
 import {
   PlaybackStartupWatchdog,
   resolvePlaybackFailureAdvanceAction,
-} from '@/utils/playbackPolicy'
-import { resolvePlaybackQueueStartIndex } from '@/utils/playbackQueue'
+} from '@/modules/playback/playbackPolicy'
+import { resolvePlaybackQueueStartIndex } from '@/modules/playback/playbackQueue'
 import {
   isPlaybackSeekCompletionCurrent,
   resolvePlaybackLoadStart,
@@ -40,13 +40,13 @@ import {
   initialPlaybackPrefetchWindow,
   shouldResolvePlaybackSourceInParallel,
   type DeferredPlaybackSeek,
-} from '@/utils/playbackRequest'
+} from '@/modules/playback/playbackRequest'
 import { createLogger } from '@/utils/logger'
 import { getTrackCoverUrl } from '@/utils/trackCover'
 import {
   buildPersistedPlaybackQueue,
   restorePersistedPlaybackQueue,
-} from '@/utils/playerState'
+} from '@/modules/playback/playerState'
 import { summarizeLogError } from '@/utils/logSanitizer'
 
 const log = createLogger('player')
@@ -165,13 +165,69 @@ export interface AudioInfo {
   specLabel?: string
 }
 
+
+// 纸面音质名: 与 NowPlaying 音质列表 / 设置页一致, 供缓存命中与 UI 共用
+const NETEASE_QUALITY_I18N: Record<string, string> = {
+  standard: '标准',
+  higher: '较高',
+  exhigh: '极高',
+  lossless: '无损',
+  hires: 'Hi-Res',
+  jyeffect: '高清环绕声',
+  sky: '沉浸环绕声',
+  jymaster: '超清母带',
+}
+const QQ_QUALITY_I18N: Record<string, string> = {
+  standard: '标准',
+  high: '高',
+  lossless: '无损',
+}
+const YOUTUBE_QUALITY_I18N: Record<string, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  very_high: '最高',
+}
+const BILI_QUALITY_I18N: Record<string, string> = {
+  low: '流畅',
+  medium: '标准',
+  high: '较好',
+  lossless: '无损',
+  hires: 'Hi-Res',
+  dolby: '杜比全景声',
+}
+
+function qualityLabelFromKey(source?: string | null, key?: string | null): string | undefined {
+  if (!key) return undefined
+  const k = key.trim().toLowerCase()
+  if (!k) return undefined
+  const map =
+    source === 'netease' ? NETEASE_QUALITY_I18N
+    : source === 'qq' ? QQ_QUALITY_I18N
+    : source === 'youtube' ? YOUTUBE_QUALITY_I18N
+    : source === 'bilibili' ? BILI_QUALITY_I18N
+    : null
+  return map?.[k] ?? key
+}
+
+function qualityOptionsFromSource(source?: string | null): Array<{ key: string; label: string }> | undefined {
+  const map =
+    source === 'netease' ? NETEASE_QUALITY_I18N
+    : source === 'qq' ? QQ_QUALITY_I18N
+    : source === 'youtube' ? YOUTUBE_QUALITY_I18N
+    : source === 'bilibili' ? BILI_QUALITY_I18N
+    : null
+  if (!map) return undefined
+  return Object.entries(map).map(([key, label]) => ({ key, label }))
+}
+
 interface PendingSeekState {
   targetMs: number
   issuedAt: number
   expiresAt: number
 }
 
-// ─── 均衡器预设（5频段: 60Hz, 230Hz, 910Hz, 3.6kHz, 14kHz，单位 mB） ───
+// 均衡器预设（5频段: 60Hz, 230Hz, 910Hz, 3.6kHz, 14kHz，单位 mB）
 export const EQ_PRESETS: Record<string, number[]> = {
   flat:           [0, 0, 0, 0, 0],
   acoustic:       [300, 200, 0, 100, 200],
@@ -198,7 +254,7 @@ export const EQ_PRESETS: Record<string, number[]> = {
   custom:         [0, 0, 0, 0, 0],
 }
 
-// ─── 播放位置插值状态（模块级，rAF 驱动） ───
+// 播放位置插值状态（模块级，rAF 驱动）
 let _interpAnchorMs = 0         // 上次后端报告的位置
 let _interpAnchorTime = 0       // 对应的 performance.now() 锚点
 let _interpRenderedMs = 0       // 上次渲染的插值位置
@@ -214,28 +270,28 @@ const POSITION_BACKWARD_TOLERANCE_MS = 250
 const PAUSE_EVENT_GUARD_MS = 2500
 const PAUSE_BACKWARD_TOLERANCE_MS = 250
 
-// ─── 批次 1.2: 连续失败熔断 ───
+// 连续失败熔断
 let consecutivePlayFailures = 0
 const MAX_CONSECUTIVE_FAILURES = 10
 let _isAutoSkipping = false
 
-// ─── 批次 2.1: Shuffle 三栈模型 ───
+// Shuffle 三栈模型
 let shuffleBag: number[] = []       // 未播放索引池
 let shuffleHistory: number[] = []   // 已播放栈 (previous 回溯)
 let shuffleFuture: number[] = []    // 预排队栈 (next 或 previous 回退)
 
-// ─── 批次 2.2: playbackRequestToken 防竞态 ───
+// playbackRequestToken 防竞态
 let playbackRequestToken = Date.now() * 1000
 
-// ─── 批次 2.3: URL 过期检测 (10min) ───
+// URL 过期检测 (10min)
 let lastUrlResolveTime = 0
 const URL_EXPIRY_MS = 10 * 60 * 1000
 
-// ─── 批次 2.4: Track End 去重 ───
+// Track End 去重
 let lastTrackEndedId: string | null = null
 let lastTrackEndedTime = 0
 
-// ─── 播放抽象层：解析缓存、预热仲裁、启动看门狗 ───
+// 播放抽象层：解析缓存、预热仲裁、启动看门狗
 const playbackPrefetchManager = new PlaybackPrefetchManager()
 const playbackStartupWatchdog = new PlaybackStartupWatchdog()
 let startupRecoveryAttempts = 0
@@ -243,7 +299,7 @@ const MAX_STARTUP_RECOVERY_ATTEMPTS = 2
 const STARTUP_WATCHDOG_REMOTE_MS = 8_000
 const STARTUP_WATCHDOG_YOUTUBE_MS = 12_000
 
-// ─── 批次 1.1: 状态持久化 ───
+// 状态持久化
 const PLAYER_STATE_KEY = 'neri:player-state'
 let _persistDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let _progressPersistTime = 0
@@ -277,6 +333,8 @@ export const usePlayerStore = defineStore('player', () => {
   // 当前音频质量信息
   const audioInfo = ref<AudioInfo | null>(null)
   const isPlayingFromDownload = ref(false)
+  // 当前会话是否命中播放缓存 (非下载文件)
+  const isPlayingFromCache = ref(false)
 
   // 睡眠定时器
   const sleepTimerEndMs = ref(0) // 0 = 未启用
@@ -342,7 +400,7 @@ export const usePlayerStore = defineStore('player', () => {
   const progress = computed(() =>
     durationMs.value > 0 ? positionMs.value / durationMs.value : 0
   )
-  const currentTimeFormatted = computed(() => formatTime(positionMs.value))
+  const currentTimeFormatted = computed(() => formatTime(interpolatedPositionMs.value))
   const durationFormatted = computed(() => formatTime(durationMs.value))
 
   // 是否已初始化事件监听
@@ -376,8 +434,7 @@ export const usePlayerStore = defineStore('player', () => {
     return Date.now() < _remoteSyncGuardUntil
   }
 
-  // ─── 状态持久化函数 ───
-
+  // 状态持久化函数
   function persistedPlayerState(compact = false): Record<string, any> {
     const settings = useSettingsStore()
     const persistedQueue = buildPersistedPlaybackQueue(
@@ -506,8 +563,7 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  // ─── Shuffle 三栈辅助函数 ───
-
+  // Shuffle 三栈辅助函数
   /** Fisher-Yates 洗牌重建 shuffleBag，排除当前索引 */
   function rebuildShuffleBag() {
     shuffleBag = []
@@ -535,8 +591,7 @@ export const usePlayerStore = defineStore('player', () => {
     shuffleFuture = shuffleFuture.filter(i => i !== removeIdx).map(i => i > removeIdx ? i - 1 : i)
   }
 
-  // ─── URL 预热 ───
-
+  // URL 预热
   function playbackSourceSettings(): PlaybackSourceSettings {
     return {
       neteaseQuality: settings.neteaseQuality,
@@ -820,6 +875,15 @@ export const usePlayerStore = defineStore('player', () => {
     function tick() {
       requestAnimationFrame(tick)
 
+      // seek 等待后端确认期间冻结进度条，避免「seek 完成仍空转」
+      if (pendingSeek) {
+        interpolatedPositionMs.value = Math.round(pendingSeek.targetMs)
+        _interpRenderedMs = pendingSeek.targetMs
+        _interpAnchorMs = pendingSeek.targetMs
+        _interpAnchorTime = performance.now()
+        return
+      }
+
       if (!_interpIsPlaying) {
         interpolatedPositionMs.value = Math.round(_interpRenderedMs)
         return
@@ -878,7 +942,7 @@ export const usePlayerStore = defineStore('player', () => {
       handleTrackEnded()
     })
 
-    // ─── 系统媒体键事件（SMTC / MPRIS，来自 Rust 后端） ───
+    // 系统媒体键事件（SMTC / MPRIS，来自 Rust 后端）
     listen('media:play', () => {
       void resume()
     })
@@ -1047,6 +1111,7 @@ export const usePlayerStore = defineStore('player', () => {
       playError.value = null
       audioInfo.value = null
       isPlayingFromDownload.value = false
+      isPlayingFromCache.value = false
 
       const downloaded = useDownloadStore().getDownloadedTrack(track.id)
       if (downloaded?.filePath && isRemotePlaybackTrack(track)) {
@@ -1095,6 +1160,8 @@ export const usePlayerStore = defineStore('player', () => {
       } else if (isRemotePlaybackTrack(track)) {
         _currentLoadedFromDownloadPath = null
         isPlayingFromDownload.value = false
+        // 进入在线解析前默认非缓存; 命中缓存时会再置 true
+        isPlayingFromCache.value = false
         let prefetchedResolution = takePrefetchedPlaybackUrl(track)
         const resolveInParallel = shouldResolvePlaybackSourceInParallel(
           hadPlaybackSessionBeforeRequest,
@@ -1137,10 +1204,13 @@ export const usePlayerStore = defineStore('player', () => {
             markLoadStartApplied(startPlan)
             dur = cached.durationMs
             playedFromPlaybackCache = true
+            isPlayingFromCache.value = true
             audioInfo.value = {
               source: cached.source,
               qualityKey: cached.qualityKey,
-              qualityLabel: cached.qualityKey,
+              // 缓存命中也要展示纸面音质名 (最高/极高…), 不能只塞 raw key
+              qualityLabel: qualityLabelFromKey(cached.source, cached.qualityKey),
+              qualityOptions: qualityOptionsFromSource(cached.source),
             }
             tracePlaybackUi(
               'cache_lookup_hit',
@@ -1267,25 +1337,40 @@ export const usePlayerStore = defineStore('player', () => {
             dur = await playResolvedSource(result)
           }
           if (token !== playbackRequestToken) return
-          audioInfo.value = {
-            bitrate: result.audioInfo?.bitrateKbps
-              ?? normalizeBitrateKbps(result.bitrate),
-            codec: result.audioInfo?.codecLabel ?? result.codec,
-            format: result.format || result.audioInfo?.mimeType,
-            source: result.source,
-            qualityKey: result.audioInfo?.qualityKey ?? result.qualityKey,
-            qualityLabel: result.audioInfo?.qualityLabel,
-            qualityOptions: result.audioInfo?.qualityOptions,
-            mimeType: result.audioInfo?.mimeType,
-            sampleRateHz: result.audioInfo?.sampleRateHz,
-            bitDepth: result.audioInfo?.bitDepth,
-            channelCount: result.audioInfo?.channelCount,
-            specLabel: result.audioInfo?.specLabel,
+          {
+            const qKey = result.audioInfo?.qualityKey ?? result.qualityKey
+            const rawLabel = result.audioInfo?.qualityLabel
+            const paperLabel =
+              (rawLabel && rawLabel !== qKey && !/kbps/i.test(rawLabel))
+                ? rawLabel
+                : qualityLabelFromKey(result.source, qKey)
+            audioInfo.value = {
+              bitrate: result.audioInfo?.bitrateKbps
+                ?? normalizeBitrateKbps(result.bitrate),
+              codec: result.audioInfo?.codecLabel ?? result.codec,
+              format: result.format || result.audioInfo?.mimeType,
+              source: result.source,
+              qualityKey: qKey,
+              qualityLabel: paperLabel,
+              qualityOptions: result.audioInfo?.qualityOptions
+                ?? qualityOptionsFromSource(result.source),
+              mimeType: result.audioInfo?.mimeType,
+              sampleRateHz: result.audioInfo?.sampleRateHz,
+              bitDepth: result.audioInfo?.bitDepth,
+              channelCount: result.audioInfo?.channelCount,
+              // 过滤 kbps, 只保留纸面规格
+              specLabel: result.audioInfo?.specLabel
+                ?.split('|')
+                .map(s => s.trim())
+                .filter(s => s && !/kbps/i.test(s))
+                .join(' | ') || undefined,
+            }
           }
         }
       } else {
         _currentLoadedFromDownloadPath = null
         isPlayingFromDownload.value = false
+        isPlayingFromCache.value = false
         // 本地文件
         const startPlan = currentLoadStartPlan()
         tracePlaybackUi(
@@ -1431,6 +1516,7 @@ export const usePlayerStore = defineStore('player', () => {
       )
       playError.value = summarizeLogError(msg)
       isPlayingFromDownload.value = false
+      isPlayingFromCache.value = false
       hasPlaybackSession.value = false
       const shouldRestorePreviousPlaybackState = useOverlapCrossfade && wasPlayingBeforeSwitch && !trackCommitted
       if (shouldRestorePreviousPlaybackState) {
@@ -1639,7 +1725,8 @@ export const usePlayerStore = defineStore('player', () => {
         seekSeq,
         lastSeekCommand.value.seq,
       )) return
-      positionMs.value = safePosMs
+      // 后端确认后才钉死目标位置；失败时 catch 会回滚
+      setRenderedPosition(safePosMs)
       seekGuardUntil = Math.max(seekGuardUntil, Date.now() + SEEK_EVENT_GUARD_MS)
     }).catch((e) => {
       if (!isPlaybackSeekCompletionCurrent(
@@ -1650,6 +1737,27 @@ export const usePlayerStore = defineStore('player', () => {
       )) return
       pendingSeek = null
       seekGuardUntil = 0
+      // seek 失败：停止乐观插值，回到后端真实位置，避免「进度条在走但无声」
+      _interpIsPlaying = isPlaying.value
+      void invoke<{
+        is_playing?: boolean
+        position_ms?: number
+        duration_ms?: number
+      }>('get_player_state').then((state) => {
+        if (!isPlaybackSeekCompletionCurrent(
+          requestGeneration,
+          playbackRequestToken,
+          seekSeq,
+          lastSeekCommand.value.seq,
+        )) return
+        if (typeof state?.position_ms === 'number') {
+          setRenderedPosition(state.position_ms, state.duration_ms)
+        }
+        if (typeof state?.is_playing === 'boolean') {
+          isPlaying.value = state.is_playing
+          _interpIsPlaying = state.is_playing
+        }
+      }).catch(() => {})
       log.error('Seek failed:', e)
     })
   }
@@ -1719,7 +1827,7 @@ export const usePlayerStore = defineStore('player', () => {
 
     let nextIdx: number
     if (shuffleEnabled.value) {
-      // ─── Shuffle 三栈模型 ───
+      // Shuffle 三栈模型
       if (shuffleFuture.length > 0) {
         // 优先从 future 栈弹出（previous 回退过的）
         shuffleHistory.push(queueIndex.value)
@@ -1876,6 +1984,42 @@ export const usePlayerStore = defineStore('player', () => {
     savePlayerState()
   }
 
+  /**
+   * 一起听远端模式应用 (对齐 Android applyListenTogetherPlaybackMode)
+   * 仅本地落状态, 不反向上报, 由调用方负责 suppress watch
+   */
+  function applyListenTogetherPlaybackMode(options: {
+    repeatMode?: number | null
+    shuffleEnabled?: boolean | null
+  }) {
+    let changed = false
+    if (options.repeatMode !== null && options.repeatMode !== undefined) {
+      const mapped =
+        options.repeatMode === 1 ? 'one'
+          : options.repeatMode === 2 ? 'all'
+            : options.repeatMode === 0 ? 'off'
+              : null
+      if (mapped && repeatMode.value !== mapped) {
+        repeatMode.value = mapped
+        changed = true
+      }
+    }
+    if (typeof options.shuffleEnabled === 'boolean' && shuffleEnabled.value !== options.shuffleEnabled) {
+      shuffleEnabled.value = options.shuffleEnabled
+      if (shuffleEnabled.value) {
+        rebuildShuffleBag()
+        shuffleHistory = []
+        shuffleFuture = []
+      } else {
+        shuffleBag = []
+        shuffleHistory = []
+        shuffleFuture = []
+      }
+      changed = true
+    }
+    if (changed) savePlayerState()
+  }
+
   async function setVolume(vol: number) {
     volume.value = Math.max(0, Math.min(1, vol))
     settings.volume = volume.value
@@ -1909,7 +2053,7 @@ export const usePlayerStore = defineStore('player', () => {
     try { await invoke('set_speed', { speed: next }) } catch {}
   }
 
-  // ─── 音效参数（响度增益 + 均衡器） ───
+  // 音效参数（响度增益 + 均衡器）
   const loudnessGainMb = ref(settings.loudnessGainMb)
   const equalizerEnabled = ref(settings.equalizerEnabled)
   const equalizerPresetId = ref(settings.equalizerPresetId)
@@ -2090,7 +2234,7 @@ export const usePlayerStore = defineStore('player', () => {
     savePlayerState()
   }
 
-  // 编辑当前曲目信息（仅前端状态，不持久化）
+  // 编辑当前曲目信息
   let originalTrackInfo: TrackInfo | null = null
 
   function updateCurrentTrackInfo(patch: Partial<TrackInfo>) {
@@ -2099,6 +2243,20 @@ export const usePlayerStore = defineStore('player', () => {
       originalTrackInfo = { ...currentTrack.value }
     }
     currentTrack.value = { ...currentTrack.value, ...patch }
+  }
+
+  /** 更新当前曲目 syncPayload (合并字段), 并同步到队列中同 id 曲目 */
+  function patchCurrentTrackSyncPayload(
+    nextPayload: Record<string, unknown> | null | undefined,
+  ) {
+    if (!currentTrack.value) return
+    const payload = nextPayload ? { ...nextPayload } : undefined
+    updateCurrentTrackInfo({ syncPayload: payload })
+    const trackId = currentTrack.value.id
+    if (!trackId) return
+    queue.value = queue.value.map((item) =>
+      item.id === trackId ? { ...item, syncPayload: payload } : item,
+    )
   }
 
   function restoreOriginalTrackInfo() {
@@ -2144,7 +2302,7 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  // ─── 初始化：恢复持久化状态 ───
+  // 初始化：恢复持久化状态
   loadPlayerState()
   void applyPersistedSettings()
 
@@ -2152,7 +2310,7 @@ export const usePlayerStore = defineStore('player', () => {
     isPlaying, currentTrack, positionMs, durationMs, queue, queueIndex,
     repeatMode, shuffleEnabled, volume, lyrics, playError, isLoadingAudio,
     hasPlaybackSession,
-    audioLevel, beatImpulse, audioInfo, isPlayingFromDownload,
+    audioLevel, beatImpulse, audioInfo, isPlayingFromDownload, isPlayingFromCache,
     lastCommandSource, lastSeekCommand, isRemoteSyncGuardActive,
     playbackSpeed, sleepTimerMode, sleepRemainingSeconds,
     loudnessGainMb, equalizerEnabled, equalizerPresetId, equalizerBands, hasActiveEffects,
@@ -2160,13 +2318,13 @@ export const usePlayerStore = defineStore('player', () => {
     currentTimeFormatted, durationFormatted,
     play, togglePlayPause, pause, resume, seekTo, next, previous,
     flushPlayerState,
-    toggleRepeatMode, toggleShuffle, cyclePlayMode, playMode, setVolume, setSpeed,
+    toggleRepeatMode, toggleShuffle, cyclePlayMode, applyListenTogetherPlaybackMode, playMode, setVolume, setSpeed,
     setLoudnessGain, setEqualizer, setEqualizerPreset, resetAudioEffects,
     applyPersistedSettings,
     startSleepTimer, startSleepTimerEndOfTrack, startSleepTimerEndOfQueue, cancelSleepTimer,
     playAll, shufflePlay, addToQueueNext, addToQueueEnd, removeFromQueue, clearQueue,
     prefetchPlaybackTracks,
-    updateCurrentTrackInfo, restoreOriginalTrackInfo, hasOriginalTrackInfo,
+    updateCurrentTrackInfo, patchCurrentTrackSyncPayload, restoreOriginalTrackInfo, hasOriginalTrackInfo,
     handleDownloadedFileRemoved, replayWithQuality,
   }
 })
