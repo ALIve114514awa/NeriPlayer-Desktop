@@ -22,20 +22,39 @@ use crate::error::{AppError, AppResult};
 use crate::audio::pcm::{PcmSeekError, PcmSource};
 
 const REMOTE_INITIAL_BLOCK_BYTES: u64 = 128 * 1024;
+/// 超长媒体首包加大，尽量一次拿齐 moov + 起始音频
+const REMOTE_LONG_INITIAL_BLOCK_BYTES: u64 = 512 * 1024;
 const REMOTE_FETCH_BLOCK_BYTES: u64 = 256 * 1024;
 const REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 const REMOTE_DECODER_BUFFER_BYTES: usize = 128 * 1024;
+/// virtual-body 远程 demuxer 缓冲：需覆盖单段 moof+mdat 回跳
+const REMOTE_VIRTUAL_DECODER_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+/// 拼接 demux 首段 body：必须 < REMOTE_REQUEST_TIMEOUT 能下完，否则 prepare 被取消
+/// 2MB ≈ 几十秒 AAC，足够出声；后续可按需再拼
+const REMOTE_VIRTUAL_SPLICE_BODY_BYTES: u64 = 2 * 1024 * 1024;
+/// 拼接 demux 单次 Range 上限（避免 16MB 一次拉超时）
+const REMOTE_VIRTUAL_SPLICE_FETCH_CHUNK: u64 = 512 * 1024;
 const REMOTE_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+// 超长媒体按 bitrate 估算时 low/target 会落到 min；抬高下限保证首帧 moov+音频够解码
 const REMOTE_PREFETCH_LOW_WATER_MS: u64 = 5_000;
 const REMOTE_PREFETCH_TARGET_MS: u64 = 15_000;
-const REMOTE_PREFETCH_MIN_LOW_WATER_BYTES: u64 = 128 * 1024;
+const REMOTE_PREFETCH_MIN_LOW_WATER_BYTES: u64 = 256 * 1024;
 const REMOTE_PREFETCH_MAX_LOW_WATER_BYTES: u64 = 8 * 1024 * 1024;
-const REMOTE_PREFETCH_MIN_TARGET_BYTES: u64 = 512 * 1024;
+const REMOTE_PREFETCH_MIN_TARGET_BYTES: u64 = 1024 * 1024;
 const REMOTE_PREFETCH_MAX_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES: u64 = 1024 * 1024;
 const REMOTE_PREFETCH_FALLBACK_TARGET_BYTES: u64 = 4 * 1024 * 1024;
+/// ≥45 分钟按「长内容」处理：初始不向 demuxer 暴露 seekable，避免扫文件尾找 moov
+const REMOTE_LONG_FORM_DURATION_MS: u64 = 45 * 60 * 1000;
+/// 长内容额外预取尾部（moov 常在文件尾），seek 时 demuxer 才能秒开索引
+const REMOTE_LONG_FORM_TAIL_BYTES: u64 = 1024 * 1024;
 const MAX_DECODE_RETRIES: usize = 3;
-const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// virtual-body 中段打开后跳过坏包直到关键帧的上限
+const MAX_VIRTUAL_BODY_SKIP_PACKETS: usize = 256;
+/// virtual-body 拼接 demux：最多吞掉的 moov 假样本数（stco 指向文件头 mdat）
+const MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES: usize = 4096;
+// 超长 YouTube 首包探测 2s 容易假失败，放宽到 6s
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CACHE_MARKER_VERSION: &str = "v2";
 const CACHE_MIN_DURATION_GAP_MS: u64 = 5_000;
@@ -43,6 +62,17 @@ const CACHE_MIN_DURATION_RATIO_PERCENT: u64 = 85;
 const STALE_CACHE_PART_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_VALIDATED_CACHE_STAMPS: usize = 4_096;
 const PLAYBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// 按 URL 选择拉流 User-Agent.
+/// YouTube googlevideo CDN 校验拉流 UA 与直链 `c=` 客户端一致, 不一致直接 403;
+/// 因此 googlevideo 直链按铸造它的客户端选择匹配 UA (对齐 Android), 其它平台用桌面 Chrome UA.
+fn playback_user_agent(url: &str) -> &'static str {
+    if url.contains("googlevideo.com") || url.contains("youtube.com") {
+        crate::api::youtube::playback::stream_user_agent_for_url(url)
+    } else {
+        PLAYBACK_USER_AGENT
+    }
+}
 
 fn summarize_remote_error(error: &dyn std::fmt::Display) -> String {
     let mut message = error.to_string();
@@ -98,6 +128,8 @@ pub struct RemoteAudioSource {
 pub struct RemoteReadCancellation {
     session_cancelled: Arc<AtomicBool>,
     operation_generation: Option<(Arc<AtomicU64>, u64)>,
+    /// 外部 prepare 超时取消（不改 generation，仅打断当前 prepare）
+    external_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl RemoteReadCancellation {
@@ -108,11 +140,21 @@ impl RemoteReadCancellation {
         Self {
             session_cancelled,
             operation_generation,
+            external_cancel: None,
         }
+    }
+
+    pub fn with_external_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.external_cancel = Some(flag);
+        self
     }
 
     fn is_cancelled(&self) -> bool {
         self.session_cancelled.load(Ordering::Acquire)
+            || self
+                .external_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
             || self
                 .operation_generation
                 .as_ref()
@@ -125,21 +167,25 @@ impl RemoteReadCancellation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteAccessMode {
     StandardSeekable,
+    /// 长内容首播：顺序读，不向 demuxer 暴露长度/可 seek，避免扫尾部 moov
+    LongFormProgressive,
     FragmentedProgressive,
     FragmentedSeekable,
 }
 
 impl RemoteAccessMode {
-    fn for_url(url: &str) -> Self {
+    fn for_url(url: &str, duration_hint_ms: u64) -> Self {
         if is_fragmented_mp4_url(url) {
             Self::FragmentedProgressive
+        } else if duration_hint_ms >= REMOTE_LONG_FORM_DURATION_MS {
+            Self::LongFormProgressive
         } else {
             Self::StandardSeekable
         }
     }
 
     fn is_seekable(self) -> bool {
-        !matches!(self, Self::FragmentedProgressive)
+        matches!(self, Self::StandardSeekable | Self::FragmentedSeekable)
     }
 
     fn demand_fetch_block_bytes(self) -> u64 {
@@ -156,16 +202,100 @@ struct RemoteAudioInner {
     url: String,
     referer: String,
     total_len: u64,
+    /// 首个 mdat/moof 起点；长内容虚拟 seek 时逻辑头长度
+    header_end: AtomicU64,
     prefetch_window: PrefetchWindow,
     cache: Mutex<Vec<CachedSegment>>,
     disk_ranges: Mutex<Vec<CachedRange>>,
     in_flight: Mutex<HashSet<u64>>,
     range_available: Condvar,
     last_read_pos: Mutex<u64>,
+    /// 保护尾部 moov/sidx：seek 重开 demuxer 时不可被 trim 掉
+    protected_ranges: Mutex<Vec<CachedRange>>,
     disk_cache: Option<RemoteAudioCache>,
     cache_finalize_started: AtomicBool,
+    /// 预取世代：seek 时 +1，旧预取任务看到后立刻停
+    prefetch_epoch: AtomicU64,
+    /// demuxer 打开阶段：对 isomp4 隐藏 seekable，避免扫完整 mdat
+    demuxer_open_sequential: AtomicBool,
+    /// 虚拟 body：逻辑 header_end 对应的远端 moof 起点；0 表示关闭
+    virtual_body_origin: AtomicU64,
+    /// 粗粒度时间→字节映射（来自 sidx 或线性估算），长内容 seek 用
+    seek_index: Mutex<Option<RemoteSeekIndex>>,
     playback_generation: Arc<AtomicU64>,
     expected_generation: u64,
+}
+
+/// 粗粒度 seek 索引：用 sidx 或线性比例估算目标字节
+#[derive(Clone, Debug)]
+struct RemoteSeekIndex {
+    duration_ms: u64,
+    entries: Vec<SeekIndexEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SeekIndexEntry {
+    time_ms: u64,
+    byte_offset: u64,
+}
+
+impl RemoteSeekIndex {
+    /// 返回 <= target_ms 的最近 segment 起点（moof 边界），供 virtual-body 跳转
+    #[cfg(test)]
+    fn estimate_segment_start(&self, target_ms: u64) -> u64 {
+        self.estimate_segment(target_ms).0
+    }
+
+    /// (start, end_exclusive_hint)：用下一条 sidx 推段长，便于一次预满 moof+mdat
+    fn estimate_segment(&self, target_ms: u64) -> (u64, Option<u64>) {
+        if self.entries.is_empty() {
+            return (0, None);
+        }
+        let mut best_idx = 0usize;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.time_ms <= target_ms {
+                best_idx = idx;
+            } else {
+                break;
+            }
+        }
+        let start = self.entries[best_idx].byte_offset;
+        let end = self.entries.get(best_idx + 1).map(|e| e.byte_offset);
+        (start, end)
+    }
+
+    #[allow(dead_code)]
+    fn estimate_byte(&self, target_ms: u64) -> u64 {
+
+        if self.entries.is_empty() {
+            return 0;
+        }
+        if target_ms == 0 {
+            return self.entries[0].byte_offset;
+        }
+        // 找最后一个 time <= target 的 entry，再线性插值到下一个
+        let mut lo = 0usize;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.time_ms <= target_ms {
+                lo = idx;
+            } else {
+                break;
+            }
+        }
+        let left = self.entries[lo];
+        if lo + 1 >= self.entries.len() {
+            return left.byte_offset;
+        }
+        let right = self.entries[lo + 1];
+        if right.time_ms <= left.time_ms {
+            return left.byte_offset;
+        }
+        let span = right.time_ms - left.time_ms;
+        let progress = target_ms.saturating_sub(left.time_ms).min(span);
+        let byte_span = right.byte_offset.saturating_sub(left.byte_offset);
+        left.byte_offset
+            + (u128::from(byte_span) * u128::from(progress) / u128::from(span)) as u64
+    }
 }
 
 impl RemoteAudioInner {
@@ -258,7 +388,7 @@ impl RemoteAudioSource {
             .ok()
             .and_then(|value| value.host_str().map(str::to_owned))
             .unwrap_or_else(|| "unknown".into());
-        let access_mode = RemoteAccessMode::for_url(&url);
+        let access_mode = RemoteAccessMode::for_url(&url, duration_hint_ms);
         log::info!(
             target: "remote-audio",
             "open begin host={}, mode={:?}, generation={}, duration_hint_ms={}",
@@ -270,9 +400,14 @@ impl RemoteAudioSource {
         if playback_generation.load(Ordering::Acquire) != expected_generation {
             return Err(AppError::Audio("Playback request superseded".into()));
         }
+        let initial_block = if duration_hint_ms >= REMOTE_LONG_FORM_DURATION_MS {
+            REMOTE_LONG_INITIAL_BLOCK_BYTES
+        } else {
+            REMOTE_INITIAL_BLOCK_BYTES
+        };
         let probe_started = Instant::now();
         let range_result = {
-            let range_probe = probe_range_len(&client, &url, &referer);
+            let range_probe = probe_range_len(&client, &url, &referer, initial_block);
             tokio::pin!(range_probe);
             tokio::select! {
                 result = &mut range_probe => result,
@@ -348,27 +483,107 @@ impl RemoteAudioSource {
             .map(|segment| (segment.start, segment.data.clone()));
         let cache = initial_segment.into_iter().collect();
         let prefetch_window = prefetch_window(total_len, duration_hint_ms);
+        let mut protected_ranges = Vec::new();
+        if let Some((start, data)) = &initial_disk_segment {
+            if !data.is_empty() {
+                protected_ranges.push(CachedRange {
+                    start: *start,
+                    end: start.saturating_add(data.len() as u64),
+                });
+            }
+        }
+        let header_end = detect_mp4_header_end(
+            initial_disk_segment
+                .as_ref()
+                .map(|(_, data)| data.as_slice())
+                .unwrap_or(&[]),
+        )
+        .unwrap_or(0);
         let inner = Arc::new(RemoteAudioInner {
             client,
             url,
             referer,
             total_len,
+            header_end: AtomicU64::new(header_end),
             prefetch_window,
             cache: Mutex::new(cache),
             disk_ranges: Mutex::new(Vec::new()),
             in_flight: Mutex::new(HashSet::new()),
             range_available: Condvar::new(),
             last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(protected_ranges),
             disk_cache,
             cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
             playback_generation,
             expected_generation,
         });
+        if header_end > 0 {
+            log::info!(
+                target: "remote-audio",
+                "mp4 header_end detected host={}, header_end={}",
+                host,
+                header_end,
+            );
+        }
         inner
             .ensure_playback_current()
             .map_err(|err| AppError::Audio(err.to_string()))?;
         if let Some((start, data)) = initial_disk_segment {
             write_disk_range(&inner, start, &data);
+        }
+        // 长内容：尾部 moov/sidx 预取进缓存，seek 升级为 seekable 后 demuxer 能直接跳转
+        if matches!(access_mode, RemoteAccessMode::LongFormProgressive) && total_len > 0 {
+            let tail_len = REMOTE_LONG_FORM_TAIL_BYTES.min(total_len);
+            let tail_start = total_len.saturating_sub(tail_len);
+            // 与首包重叠时跳过（极短文件）
+            if tail_start > 0 {
+                let tail_end = total_len.saturating_sub(1);
+                match fetch_range_block_async(
+                    &inner,
+                    tail_start,
+                    tail_end,
+                    None,
+                )
+                .await
+                {
+                    Ok(data) if !data.is_empty() => {
+                        log::info!(
+                            target: "remote-audio",
+                            "long-form tail cached host={}, start={}, bytes={}",
+                            host,
+                            tail_start,
+                            data.len(),
+                        );
+                        protect_cached_range(&inner, tail_start, data.len() as u64);
+                        if let Ok(mut cache) = inner.cache.lock() {
+                            if !cache_contains_position(&cache, tail_start) {
+                                cache.push(CachedSegment {
+                                    start: tail_start,
+                                    data: data.clone(),
+                                });
+                                cache.sort_by_key(|segment| segment.start);
+                                trim_cache(&inner, &mut cache, cache_center(&inner, 0));
+                            }
+                        }
+                        write_disk_range(&inner, tail_start, &data);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!(
+                            target: "remote-audio",
+                            "long-form tail prefetch failed host={}, error={}",
+                            host,
+                            summarize_remote_error(&err),
+                        );
+                    }
+                }
+            }
+            // 构建粗粒度时间→字节索引（sidx 优先，否则线性估算）
+            build_seek_index_for_long_form(&inner, duration_hint_ms);
         }
         replenish_prefetch_window(&inner, 0);
 
@@ -395,10 +610,26 @@ impl RemoteAudioSource {
     }
 
     pub fn seekable_clone(&self) -> Self {
-        let access_mode = match self.access_mode {
-            RemoteAccessMode::FragmentedProgressive => RemoteAccessMode::FragmentedSeekable,
-            mode => mode,
+        // 分片 m4s → FragmentedSeekable（大块按需）；
+        // 长内容渐进 m4a → StandardSeekable（用 moov 表跳转，绝不能走分片 8MB 逻辑）
+        let (access_mode, sequential_demuxer_open) = match self.access_mode {
+            RemoteAccessMode::FragmentedProgressive => {
+                (RemoteAccessMode::FragmentedSeekable, true)
+            }
+            RemoteAccessMode::LongFormProgressive => {
+                (RemoteAccessMode::StandardSeekable, true)
+            }
+            mode => (mode, false),
         };
+        // 作废旧位置的预取，避免 seek 重建 demuxer 时和旧 in_flight 撞车
+        invalidate_prefetch_epoch(&self.inner);
+        // 长内容/分片升级：demuxer 打开必须假装不可 seek，否则会扫完整 mdat
+        // 短内容本身就是 StandardSeekable，moov 可能在尾部，不能强制顺序打开
+        if sequential_demuxer_open {
+            self.inner
+                .demuxer_open_sequential
+                .store(true, Ordering::Release);
+        }
         Self {
             inner: Arc::clone(&self.inner),
             pos: 0,
@@ -410,6 +641,235 @@ impl RemoteAudioSource {
     pub fn with_read_cancellation(mut self, cancellation: RemoteReadCancellation) -> Self {
         self.read_cancellation = Some(cancellation);
         self
+    }
+
+    /// demuxer 打开完成：允许真实时间 seek 的字节跳转
+    pub fn finish_demuxer_open(&self) {
+        self.inner
+            .demuxer_open_sequential
+            .store(false, Ordering::Release);
+    }
+
+    fn is_demuxer_open_sequential(&self) -> bool {
+        self.inner.demuxer_open_sequential.load(Ordering::Acquire)
+    }
+
+    /// 长内容 seek：用「虚拟 body」打开 demuxer，而不是 format.seek 扫全文件
+    ///
+    /// LongFormProgressive 也算：seek 时会先 seekable_clone 升级，再走虚拟 body。
+    /// 判断必须在 clone 前后都能成立，否则会误走 format.seek 扫整文件 mdat。
+    pub fn prefers_virtual_body_seek(&self) -> bool {
+        let header_end = self.inner.header_end.load(Ordering::Acquire);
+        if header_end == 0 {
+            return false;
+        }
+        let mode_ok = matches!(
+            self.access_mode,
+            RemoteAccessMode::LongFormProgressive
+                | RemoteAccessMode::StandardSeekable
+                | RemoteAccessMode::FragmentedSeekable
+        );
+        if !mode_ok {
+            return false;
+        }
+        self.inner
+            .seek_index
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|index| !index.entries.is_empty()))
+            .unwrap_or(false)
+    }
+
+    /// 取出文件头缓存（ftyp/moov/sidx），供 virtual-body 拼接 demux 使用
+    pub fn header_bytes(&self) -> Option<Vec<u8>> {
+        let header_end = self.inner.header_end.load(Ordering::Acquire);
+        if header_end == 0 {
+            return None;
+        }
+        let need = header_end as usize;
+        let mut out = vec![0u8; need];
+        // 优先内存缓存 start=0
+        if let Ok(cache) = self.inner.cache.lock() {
+            if let Some(seg) = cache.iter().find(|s| s.start == 0) {
+                let n = seg.data.len().min(need);
+                out[..n].copy_from_slice(&seg.data[..n]);
+                if n == need {
+                    return Some(out);
+                }
+            }
+        }
+        // 磁盘缓存兜底
+        if let Some(disk) = &self.inner.disk_cache {
+            if disk.read_cached(0, &mut out).unwrap_or(0) == need {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// 配置虚拟 body：逻辑 [0, header_end) = 文件头；逻辑 header_end.. = 目标 moof 起
+    pub fn configure_virtual_body_for_time(&self, position_ms: u64) -> io::Result<u64> {
+        self.ensure_read_current()?;
+        let header_end = self.inner.header_end.load(Ordering::Acquire);
+        if header_end == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mp4 header_end unknown",
+            ));
+        }
+        let index = self
+            .inner
+            .seek_index
+            .lock()
+            .map_err(|_| io::Error::other("seek index lock poisoned"))?
+            .clone();
+        let Some(index) = index else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "seek index missing",
+            ));
+        };
+        // 只算 sidx 落点；真正 body 拉取交给 splice 分块（避免这里一次拉过大超时）
+        let (seg_start, _seg_end_hint) = index.estimate_segment(position_ms);
+        let mut target = seg_start.max(header_end).min(self.inner.total_len.saturating_sub(1));
+
+        // 轻量探测：最多拉 256KB 校验 moof 并对齐；失败也不致命，splice 会再 snap
+        let probe_end = target
+            .saturating_add(REMOTE_FETCH_BLOCK_BYTES)
+            .saturating_sub(1)
+            .min(self.inner.total_len.saturating_sub(1));
+        let probe = if position_is_cached_range(&self.inner, target, probe_end) {
+            None
+        } else {
+            match fetch_range_block(
+                &self.inner,
+                target,
+                probe_end,
+                self.read_cancellation.as_ref(),
+            ) {
+                Ok(data) if !data.is_empty() => Some(data),
+                Ok(_) => None,
+                Err(err) => {
+                    log::warn!(
+                        target: "remote-audio",
+                        "virtual-body probe fetch failed at {}: {}",
+                        target,
+                        err,
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(data) = probe {
+            if let Some(rel) = find_moof_offset_near(&data, 0, 64 * 1024) {
+                if rel > 0 {
+                    log::warn!(
+                        target: "remote-audio",
+                        "virtual-body sidx miss-aligned by {} bytes, snapping to moof",
+                        rel,
+                    );
+                    target = target
+                        .saturating_add(rel)
+                        .min(self.inner.total_len.saturating_sub(1));
+                }
+                let store = data[rel as usize..].to_vec();
+                if !store.is_empty() {
+                    if let Ok(mut cache) = self.inner.cache.lock() {
+                        if !cache_contains_position(&cache, target) {
+                            cache.push(CachedSegment {
+                                start: target,
+                                data: store.clone(),
+                            });
+                            cache.sort_by_key(|segment| segment.start);
+                            trim_cache(&self.inner, &mut cache, target);
+                        }
+                    }
+                    write_disk_range(&self.inner, target, &store);
+                    protect_cached_range(&self.inner, target, store.len() as u64);
+                }
+            } else {
+                log::warn!(
+                    target: "remote-audio",
+                    "virtual-body probe {:#x} has no moof in first 64KiB (head={:02x?})",
+                    target,
+                    &data[..data.len().min(16)],
+                );
+            }
+        }
+
+        self.inner
+            .virtual_body_origin
+            .store(target, Ordering::Release);
+        self.inner
+            .demuxer_open_sequential
+            .store(true, Ordering::Release);
+        invalidate_prefetch_epoch(&self.inner);
+        let logical_len = header_end.saturating_add(self.inner.total_len.saturating_sub(target));
+        log::info!(
+            target: "remote-audio",
+            "virtual-body configured target_ms={}, header_end={}, body_origin={}, total_len={}, logical_len={}",
+            position_ms,
+            header_end,
+            target,
+            self.inner.total_len,
+            logical_len,
+        );
+        Ok(target)
+    }
+
+    pub fn clear_virtual_body(&self) {
+        self.inner.virtual_body_origin.store(0, Ordering::Release);
+    }
+
+    /// virtual-body **纯逻辑连续**坐标（AtomIterator / moof_base_pos 共用）：
+    /// - [0, header_end) → 物理 header
+    /// - [header_end + k) → 物理 body_origin + k
+    ///
+    /// 绝对 base_data_offset 的 sample Seek 在 `seek()` 里先折算成逻辑坐标，
+    /// 禁止在 map 里对 pos≥origin 做恒等：否则 MSS pos 跳到物理 55MB，
+    /// AtomIterator 仍在逻辑 ~header_end，下一 atom 直接 overread / EOF。
+    fn map_logical_to_physical(&self, pos: u64) -> u64 {
+        let origin = self.inner.virtual_body_origin.load(Ordering::Acquire);
+        if origin == 0 {
+            return pos.min(self.inner.total_len);
+        }
+        let header_end = self.inner.header_end.load(Ordering::Acquire);
+        if pos < header_end {
+            pos.min(self.inner.total_len)
+        } else {
+            origin
+                .saturating_add(pos - header_end)
+                .min(self.inner.total_len)
+        }
+    }
+
+    fn logical_len(&self) -> u64 {
+        let origin = self.inner.virtual_body_origin.load(Ordering::Acquire);
+        if origin == 0 {
+            return self.inner.total_len;
+        }
+        let header_end = self.inner.header_end.load(Ordering::Acquire);
+        // 纯连续逻辑长度；绝对 sample 偏移在 seek 时折算，不靠拉长 logical_len
+        header_end.saturating_add(self.inner.total_len.saturating_sub(origin))
+    }
+
+    /// 将 demuxer 的 Seek 目标折成逻辑坐标。
+    /// - 相对 moof：目标已在 [0, logical_len)
+    /// - 绝对 base_data_offset：目标 ≥ body_origin，折成 header_end + (phys - origin)
+    fn normalize_seek_offset(&self, offset: u64) -> u64 {
+        let origin = self.inner.virtual_body_origin.load(Ordering::Acquire);
+        if origin == 0 {
+            return offset.min(self.inner.total_len);
+        }
+        let header_end = self.inner.header_end.load(Ordering::Acquire);
+        let logical_len = self.logical_len();
+        if offset >= origin {
+            // 绝对文件偏移 → 逻辑 body
+            let logical = header_end.saturating_add(offset - origin);
+            logical.min(logical_len)
+        } else {
+            offset.min(logical_len)
+        }
     }
 
     fn read_cancelled(&self) -> bool {
@@ -431,7 +891,8 @@ impl RemoteAudioSource {
         }
     }
 
-    fn read_cached(&self, out: &mut [u8]) -> usize {
+    /// 按物理偏移读内存缓存
+    fn read_cached_at(&self, physical: u64, out: &mut [u8]) -> usize {
         let cache = match self.inner.cache.lock() {
             Ok(cache) => cache,
             Err(_) => return 0,
@@ -439,11 +900,11 @@ impl RemoteAudioSource {
 
         for segment in cache.iter() {
             let segment_end = segment.start + segment.data.len() as u64;
-            if self.pos < segment.start || self.pos >= segment_end {
+            if physical < segment.start || physical >= segment_end {
                 continue;
             }
 
-            let offset = (self.pos - segment.start) as usize;
+            let offset = (physical - segment.start) as usize;
             let available = segment.data.len().saturating_sub(offset);
             let len = available.min(out.len());
             out[..len].copy_from_slice(&segment.data[offset..offset + len]);
@@ -453,17 +914,17 @@ impl RemoteAudioSource {
         0
     }
 
-    fn read_disk_cached(&self, out: &mut [u8]) -> usize {
+    fn read_disk_cached_at(&self, physical: u64, out: &mut [u8]) -> usize {
         let Some(cache) = &self.inner.disk_cache else {
             return 0;
         };
-        let Some(len) = disk_cached_len(&self.inner, self.pos, out.len()) else {
+        let Some(len) = disk_cached_len(&self.inner, physical, out.len()) else {
             return 0;
         };
-        cache.read_cached(self.pos, &mut out[..len]).unwrap_or(0)
+        cache.read_cached(physical, &mut out[..len]).unwrap_or(0)
     }
 
-    fn has_cached_position(&self) -> bool {
+    fn has_cached_physical(&self, physical: u64) -> bool {
         let cache = match self.inner.cache.lock() {
             Ok(cache) => cache,
             Err(_) => return false,
@@ -471,41 +932,56 @@ impl RemoteAudioSource {
 
         cache.iter().any(|segment| {
             let segment_end = segment.start + segment.data.len() as u64;
-            self.pos >= segment.start && self.pos < segment_end
+            physical >= segment.start && physical < segment_end
         })
     }
 
-    fn fetch_from_current_position(&self, wanted_len: usize) -> io::Result<()> {
+    /// 按物理偏移拉取；全程不改 self.pos（self.pos 只存逻辑坐标）
+    fn fetch_physical_range(&self, physical: u64, wanted_len: usize) -> io::Result<()> {
         self.ensure_read_current()?;
-        let start = self.pos;
-        if start >= self.inner.total_len {
+        if physical >= self.inner.total_len {
             return Ok(());
         }
-        if self.wait_for_prefetch(start) {
+        if self.has_cached_physical(physical)
+            || disk_cached_len(&self.inner, physical, 1).is_some()
+        {
             return Ok(());
         }
-        if !claim_prefetch_start(&self.inner, start) {
-            if self.wait_for_prefetch(start) || self.has_cached_position() {
+        if self.wait_for_prefetch(physical) {
+            return Ok(());
+        }
+
+        // 同 offset 被别人占着时优先等；超时仍无数据则抢占，避免 seek 死等旧预取
+        let mut claimed = claim_prefetch_start(&self.inner, physical);
+        if !claimed {
+            if self.wait_for_prefetch(physical) || self.has_cached_physical(physical) {
                 return Ok(());
             }
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "remote range is already being fetched",
-            ));
+            force_release_prefetch_start(&self.inner, physical);
+            claimed = claim_prefetch_start(&self.inner, physical);
+            if !claimed {
+                if self.wait_for_prefetch(physical) || self.has_cached_physical(physical) {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote range is already being fetched",
+                ));
+            }
         }
 
         let wanted = wanted_len.max(self.access_mode.demand_fetch_block_bytes() as usize) as u64;
-        let end = start
+        let end = physical
             .saturating_add(wanted)
             .saturating_sub(1)
             .min(self.inner.total_len.saturating_sub(1));
         let fetched = fetch_range_block(
             &self.inner,
-            start,
+            physical,
             end,
             self.read_cancellation.as_ref(),
         );
-        release_prefetch_start(&self.inner, start);
+        release_prefetch_start(&self.inner, physical);
         let data = fetched?;
 
         if data.is_empty() {
@@ -517,68 +993,99 @@ impl RemoteAudioSource {
             .cache
             .lock()
             .map_err(|_| io::Error::other("remote cache lock poisoned"))?;
-        cache.push(CachedSegment { start, data });
-        cache.sort_by_key(|segment| segment.start);
-        trim_cache(&mut cache, cache_center(&self.inner, self.pos));
+        if !cache_contains_position(&cache, physical) {
+            cache.push(CachedSegment {
+                start: physical,
+                data,
+            });
+            cache.sort_by_key(|segment| segment.start);
+            trim_cache(
+                &self.inner,
+                &mut cache,
+                cache_center(&self.inner, physical),
+            );
+        }
         drop(cache);
-        replenish_prefetch_window(&self.inner, self.pos);
+        replenish_prefetch_window(&self.inner, physical);
         Ok(())
     }
 
     fn wait_for_prefetch(&self, start: u64) -> bool {
         let started = Instant::now();
+        // seek 后需求读不应被 15s 旧预取拖死；短等即可
+        let wait_budget = Duration::from_millis(800);
         let Ok(mut in_flight) = self.inner.in_flight.lock() else {
             return false;
         };
-        while in_flight.contains(&start) && started.elapsed() < REMOTE_REQUEST_TIMEOUT {
+        while in_flight.contains(&start) && started.elapsed() < wait_budget {
             if self.read_cancelled() {
                 return false;
             }
             in_flight = match self
                 .inner
                 .range_available
-                .wait_timeout(in_flight, Duration::from_millis(50))
+                .wait_timeout(in_flight, Duration::from_millis(40))
             {
                 Ok((guard, _)) => guard,
                 Err(error) => error.into_inner().0,
             };
+            drop(in_flight);
+            if self.has_cached_physical(start) || disk_cached_len(&self.inner, start, 1).is_some() {
+                return true;
+            }
+            in_flight = match self.inner.in_flight.lock() {
+                Ok(guard) => guard,
+                Err(_) => return false,
+            };
         }
         drop(in_flight);
 
-        self.has_cached_position()
-            || disk_cached_len(&self.inner, start, 1).is_some()
+        self.has_cached_physical(start) || disk_cached_len(&self.inner, start, 1).is_some()
     }
 }
 
 impl Read for RemoteAudioSource {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.ensure_read_current()?;
-        if out.is_empty() || self.pos >= self.inner.total_len {
+        let logical_len = self.logical_len();
+        if out.is_empty() || self.pos >= logical_len {
             return Ok(0);
         }
 
         let mut total_read = 0usize;
-        while total_read < out.len() && self.pos < self.inner.total_len {
+        while total_read < out.len() && self.pos < logical_len {
             self.ensure_read_current()?;
-            let read = self.read_cached(&mut out[total_read..]);
-            if read > 0 {
-                self.pos += read as u64;
-                total_read += read;
-                remember_read_pos(&self.inner, self.pos);
-                replenish_prefetch_window(&self.inner, self.pos);
-                continue;
+            let logical_pos = self.pos;
+            let physical = self.map_logical_to_physical(logical_pos);
+
+            // 全程不改 self.pos 为物理坐标：缓存按 physical 显式寻址
+            let mut read = self.read_cached_at(physical, &mut out[total_read..]);
+            if read == 0 {
+                read = self.read_disk_cached_at(physical, &mut out[total_read..]);
             }
-            let read = self.read_disk_cached(&mut out[total_read..]);
-            if read > 0 {
-                self.pos += read as u64;
-                total_read += read;
-                remember_read_pos(&self.inner, self.pos);
-                replenish_prefetch_window(&self.inner, self.pos);
-                continue;
+            if read == 0 {
+                match self.fetch_physical_range(physical, out.len() - total_read) {
+                    Ok(()) => {
+                        read = self.read_cached_at(physical, &mut out[total_read..]);
+                        if read == 0 {
+                            read = self.read_disk_cached_at(physical, &mut out[total_read..]);
+                        }
+                    }
+                    Err(_err) if total_read > 0 => return Ok(total_read),
+                    Err(err) => return Err(err),
+                }
             }
-            self.fetch_from_current_position(out.len() - total_read)?;
-            if !self.has_cached_position() {
+            if read == 0 {
                 break;
+            }
+            self.pos = logical_pos.saturating_add(read as u64);
+            total_read += read;
+            remember_read_pos(&self.inner, physical.saturating_add(read as u64));
+            if !self.is_demuxer_open_sequential() {
+                replenish_prefetch_window(
+                    &self.inner,
+                    physical.saturating_add(read as u64),
+                );
             }
         }
 
@@ -589,21 +1096,47 @@ impl Read for RemoteAudioSource {
 impl Seek for RemoteAudioSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.ensure_read_current()?;
-        let next = match pos {
+        let logical_len = self.logical_len();
+        let raw_next = match pos {
             SeekFrom::Start(offset) => offset as i128,
             SeekFrom::Current(offset) => self.pos as i128 + offset as i128,
-            SeekFrom::End(offset) => self.inner.total_len as i128 + offset as i128,
+            SeekFrom::End(offset) => logical_len as i128 + offset as i128,
         };
 
-        if next < 0 {
+        if raw_next < 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid seek before start",
             ));
         }
 
-        self.pos = (next as u64).min(self.inner.total_len);
-        replenish_prefetch_window(&self.inner, self.pos);
+        let previous = self.pos;
+        // Start 可能带绝对 base_data_offset；先折成逻辑坐标再 clamp
+        let next = match pos {
+            SeekFrom::Start(offset) => self.normalize_seek_offset(offset),
+            _ => (raw_next as u64).min(logical_len),
+        };
+        self.pos = next;
+        if self.pos.abs_diff(previous) > REMOTE_FETCH_BLOCK_BYTES {
+            invalidate_prefetch_epoch(&self.inner);
+        }
+        let physical = self.map_logical_to_physical(self.pos);
+        if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0
+            && self.pos.abs_diff(previous) > 64
+        {
+            log::debug!(
+                target: "remote-audio",
+                "virtual-body seek logical={} physical={} header_end={} body_origin={} prev={} raw={}",
+                self.pos,
+                physical,
+                self.inner.header_end.load(Ordering::Acquire),
+                self.inner.virtual_body_origin.load(Ordering::Acquire),
+                previous,
+                raw_next,
+            );
+        }
+        remember_read_pos(&self.inner, physical);
+        // 返回逻辑 pos（MSS / AtomIterator 只认连续逻辑坐标）
         Ok(self.pos)
     }
 }
@@ -1075,8 +1608,8 @@ fn validate_published_cache_file(
     )
     .is_none()
     {
-        // File name embeds SHA-256 and content length matches the marker — integrity
-        // is already guaranteed by the download pipeline. Skip the expensive symphonia
+        // 文件名已包含 SHA-256，长度也与 marker 一致
+        // 完整性已由下载流程保证，跳过昂贵的 symphonia
         // probe that reopens and parses the entire container (very slow for large
         // ISO-MP4 files in debug builds).
     }
@@ -1295,10 +1828,24 @@ fn cache_file_digest(path: &Path) -> Option<&str> {
 
 impl MediaSource for RemoteAudioSource {
     fn is_seekable(&self) -> bool {
+        // 仅 try_new 扫描顶层 atom 时隐藏 seekable，避免扫完整 mdat
+        if self.is_demuxer_open_sequential() {
+            return false;
+        }
+        // virtual-body：打开后必须可 seek，样本要从 mdat 回跳
+        if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0 {
+            return true;
+        }
         self.access_mode.is_seekable()
     }
 
     fn byte_len(&self) -> Option<u64> {
+        if self.is_demuxer_open_sequential() {
+            return None;
+        }
+        if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0 {
+            return Some(self.logical_len());
+        }
         self.access_mode
             .is_seekable()
             .then_some(self.inner.total_len)
@@ -1334,6 +1881,187 @@ impl SymphoniaAudioDecoder {
         };
         let mss = MediaSourceStream::new(source, options);
         Self::init(mss, extension).map_err(|err| format!("Decode error: {}", err))
+    }
+
+    /// 远程源：若处于 demuxer_open_sequential，打开时对 isomp4 隐藏 seekable
+    pub fn new_remote(source: RemoteAudioSource) -> Result<Self, String> {
+        Self::new_remote_virtual(source, false)
+    }
+
+    /// 远程源：virtual_body 模式用于长内容 seek（header + 目标 moof）
+    pub fn new_remote_virtual(
+        mut source: RemoteAudioSource,
+        keep_virtual_body: bool,
+    ) -> Result<Self, String> {
+        let finish_handle = RemoteAudioSource {
+            inner: Arc::clone(&source.inner),
+            pos: 0,
+            access_mode: source.access_mode,
+            read_cancellation: source.read_cancellation.clone(),
+        };
+        source.pos = 0;
+        if keep_virtual_body {
+            source
+                .inner
+                .demuxer_open_sequential
+                .store(true, Ordering::Release);
+
+            // 关键修复：把 header + 目标 moof/mdat 拼成连续内存 demux。
+            // 旧路径让 isomp4 在 virtual-body 上自己 next_packet：
+            // - MoovSegment stco 样本会被映射到中段字节 → 假 AAC
+            // - Unsupported("coupling channel element") 会直接杀 worker
+            // - 段边界假 EOF 会让 worker frames≈1k 就 exhausted
+            // 拼接后 demuxer 看到的是真实连续字节，坐标无歧义。
+            return Self::new_remote_virtual_spliced(source, finish_handle);
+        }
+        let buffer_len = REMOTE_DECODER_BUFFER_BYTES;
+        let options = MediaSourceStreamOptions { buffer_len };
+        let mss = MediaSourceStream::new(Box::new(source), options);
+        let decoder = Self::init_remote(mss, None)
+            .map_err(|err| format!("Decode error: {}", err))?;
+        finish_handle.finish_demuxer_open();
+        finish_handle.clear_virtual_body();
+        log::info!(
+            target: "remote-audio",
+            "demuxer open finished sequential_cleared=true virtual_body=false",
+        );
+        Ok(decoder)
+    }
+
+    /// virtual-body：header ∥ 目标 moof/mdat 连续拼接后本地 demux
+    fn new_remote_virtual_spliced(
+        source: RemoteAudioSource,
+        finish_handle: RemoteAudioSource,
+    ) -> Result<Self, String> {
+        let header_end = source.inner.header_end.load(Ordering::Acquire);
+        let origin = source.inner.virtual_body_origin.load(Ordering::Acquire);
+        if header_end == 0 || origin == 0 {
+            return Err("virtual-body splice requires header_end and body_origin".into());
+        }
+        let header = source
+            .header_bytes()
+            .ok_or_else(|| "virtual-body header cache missing".to_string())?;
+        if header.len() < header_end as usize {
+            return Err(format!(
+                "virtual-body header incomplete: got {} need {}",
+                header.len(),
+                header_end
+            ));
+        }
+        let header = header[..header_end as usize].to_vec();
+
+        // 从缓存取 body；分块拉满 want_body（默认 2MB），避免单次 16MB Range 超时被 prepare 取消
+        let mut body = Vec::new();
+        if let Ok(cache) = source.inner.cache.lock() {
+            // 合并所有覆盖 [origin, origin+want) 的段
+            let mut cursor = origin;
+            let want = REMOTE_VIRTUAL_SPLICE_BODY_BYTES;
+            let limit = origin.saturating_add(want).min(source.inner.total_len);
+            while cursor < limit {
+                let Some(seg) = cache.iter().find(|s| {
+                    s.start <= cursor && cursor < s.start + s.data.len() as u64
+                }) else {
+                    break;
+                };
+                let off = (cursor - seg.start) as usize;
+                let take = (limit - cursor).min(seg.data.len() as u64 - off as u64) as usize;
+                body.extend_from_slice(&seg.data[off..off + take]);
+                cursor += take as u64;
+            }
+        }
+        let want_body = REMOTE_VIRTUAL_SPLICE_BODY_BYTES
+            .min(source.inner.total_len.saturating_sub(origin))
+            .max(REMOTE_FETCH_BLOCK_BYTES);
+        if (body.len() as u64) < want_body {
+            let mut cursor = origin.saturating_add(body.len() as u64);
+            let end_target = origin
+                .saturating_add(want_body)
+                .min(source.inner.total_len);
+            while cursor < end_target {
+                source.ensure_read_current().map_err(|err| err.to_string())?;
+                let chunk_end = cursor
+                    .saturating_add(REMOTE_VIRTUAL_SPLICE_FETCH_CHUNK)
+                    .saturating_sub(1)
+                    .min(end_target.saturating_sub(1));
+                log::info!(
+                    target: "remote-audio",
+                    "virtual-body splice fetch chunk {}..{} ({}/{})",
+                    cursor,
+                    chunk_end,
+                    body.len(),
+                    want_body,
+                );
+                let data = fetch_range_block(
+                    &source.inner,
+                    cursor,
+                    chunk_end,
+                    source.read_cancellation.as_ref(),
+                )
+                .map_err(|err| format!("virtual-body body fetch: {err}"))?;
+                if data.is_empty() {
+                    break;
+                }
+                body.extend_from_slice(&data);
+                cursor = cursor.saturating_add(data.len() as u64);
+                write_disk_range(
+                    &source.inner,
+                    cursor.saturating_sub(data.len() as u64),
+                    &data,
+                );
+            }
+            if !body.is_empty() {
+                if let Ok(mut cache) = source.inner.cache.lock() {
+                    if !cache_contains_position(&cache, origin) {
+                        cache.push(CachedSegment {
+                            start: origin,
+                            data: body.clone(),
+                        });
+                        cache.sort_by_key(|segment| segment.start);
+                        trim_cache(&source.inner, &mut cache, origin);
+                    }
+                }
+                protect_cached_range(&source.inner, origin, body.len() as u64);
+            }
+        }
+        if body.len() < 16 || body.get(4..8) != Some(&b"moof"[..]) {
+            // 再 snap 一次
+            if let Some(rel) = find_moof_offset_near(&body, 0, 64 * 1024) {
+                body = body[rel as usize..].to_vec();
+            }
+        }
+        if body.get(4..8) != Some(&b"moof"[..]) {
+            return Err(format!(
+                "virtual-body body does not start with moof (head={:02x?})",
+                &body[..body.len().min(16)]
+            ));
+        }
+
+        let mut spliced = Vec::with_capacity(header.len() + body.len());
+        spliced.extend_from_slice(&header);
+        spliced.extend_from_slice(&body);
+        log::info!(
+            target: "remote-audio",
+            "virtual-body spliced header={} body={} total={} origin={}",
+            header.len(),
+            body.len(),
+            spliced.len(),
+            origin,
+        );
+
+        let cursor = std::io::Cursor::new(spliced);
+        let options = MediaSourceStreamOptions {
+            buffer_len: REMOTE_VIRTUAL_DECODER_BUFFER_BYTES,
+        };
+        let mss = MediaSourceStream::new(Box::new(cursor), options);
+        // 本地 Cursor 全程 seekable；init 内已跳过 moov 假样本
+        finish_handle.finish_demuxer_open();
+        let decoder = Self::init_remote_spliced(mss)
+            .map_err(|err| format!("Decode error: {}", err))?;
+        log::info!(
+            target: "remote-audio",
+            "demuxer open finished sequential_cleared=true virtual_body=true splice=true",
+        );
+        Ok(decoder)
     }
 
     pub fn new_file(path: &Path) -> Result<Self, String> {
@@ -1411,6 +2139,256 @@ impl SymphoniaAudioDecoder {
         })
     }
 
+    /// 远程打开：try_new 期间可保持 sequential；探测完成后立刻恢复 seekable 再读首包
+    fn init_remote(
+        mss: MediaSourceStream,
+        enable_seek_after_probe: Option<RemoteAudioSource>,
+    ) -> symphonia::core::errors::Result<Self> {
+        let hint = Hint::new();
+        let format_opts = FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
+        let metadata_opts: MetadataOptions = Default::default();
+        let mut probed = get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
+
+        // try_new 已结束：允许样本级 Seek（virtual-body 必需）
+        if let Some(handle) = enable_seek_after_probe.as_ref() {
+            handle.finish_demuxer_open();
+        }
+
+        let track_id = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+            .ok_or(SymphoniaError::Unsupported("No track with supported codec"))?
+            .id;
+
+        let track = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or(SymphoniaError::Unsupported("Selected track disappeared"))?;
+
+        let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+        let total_duration = track_duration(
+            track.codec_params.time_base,
+            track.codec_params.n_frames,
+        );
+
+        // 中段 moof 首帧可能非 RAP，多跳过一些 DecodeError。
+        // 注意：fragmented 流里 moov 常无样本，首个 moof 的 first_ts 也可能是 0，
+        // 绝不能按 ts==0 丢弃，否则会把目标段整段扔掉。
+        let max_errors = if enable_seek_after_probe.is_some() {
+            MAX_VIRTUAL_BODY_SKIP_PACKETS
+        } else {
+            MAX_DECODE_RETRIES
+        };
+        let mut decode_errors = 0usize;
+        let mut packet_idx = 0usize;
+        let decoded = loop {
+            let packet = probed.format.next_packet()?;
+            if packet.track_id() != track_id {
+                continue;
+            }
+            packet_idx += 1;
+            match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    if enable_seek_after_probe.is_some() {
+                        log::info!(
+                            target: "remote-audio",
+                            "virtual-body first good packet idx={} ts={} dur={} bytes={} after_errors={}",
+                            packet_idx,
+                            packet.ts(),
+                            packet.dur(),
+                            packet.buf().len(),
+                            decode_errors,
+                        );
+                    }
+                    break decoded;
+                }
+                Err(SymphoniaError::DecodeError(msg)) if decode_errors < max_errors => {
+                    decode_errors += 1;
+                    if enable_seek_after_probe.is_some() && decode_errors <= 4 {
+                        log::warn!(
+                            target: "remote-audio",
+                            "virtual-body decode error idx={} ts={} bytes={} err={}",
+                            packet_idx,
+                            packet.ts(),
+                            packet.buf().len(),
+                            msg,
+                        );
+                    }
+                    decoder.reset();
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let spec = decoded.spec().to_owned();
+        let buffer = Self::copy_buffer(decoded, &spec);
+
+        Ok(Self {
+            decoder,
+            current_frame_offset: 0,
+            format: probed.format,
+            track_id,
+            total_duration,
+            buffer,
+            spec,
+        })
+    }
+
+    /// 拼接 demux：本地 Cursor 全程 seekable；首包必须来自 moof（跳过 moov stco 假样本）
+    fn init_remote_spliced(
+        mss: MediaSourceStream,
+    ) -> symphonia::core::errors::Result<Self> {
+        let hint = Hint::new();
+        let format_opts = FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
+        let metadata_opts: MetadataOptions = Default::default();
+        let mut probed = get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
+
+        let track_id = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+            .ok_or(SymphoniaError::Unsupported("No track with supported codec"))?
+            .id;
+
+        let track = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or(SymphoniaError::Unsupported("Selected track disappeared"))?;
+
+        let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+        let total_duration = track_duration(
+            track.codec_params.time_base,
+            track.codec_params.n_frames,
+        );
+
+        // 先吞掉 moov 段样本（stco 指向文件头 mdat，在拼接缓冲里是错误数据）
+        // 策略：连续 DecodeError / Unsupported 都跳；一旦解出好包就停
+        let mut skipped = 0usize;
+        let mut decode_errors = 0usize;
+        let decoded = loop {
+            let packet = match probed.format.next_packet() {
+                Ok(p) => p,
+                Err(err) if skipped < MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES => {
+                    // 可能还在假样本区；再试
+                    skipped += 1;
+                    if skipped <= 4 {
+                        log::warn!(
+                            target: "remote-audio",
+                            "splice next_packet err while skipping moov: {}",
+                            err,
+                        );
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            skipped += 1;
+            match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    log::info!(
+                        target: "remote-audio",
+                        "splice first good packet after_skip={} ts={} dur={} bytes={}",
+                        skipped,
+                        packet.ts(),
+                        packet.dur(),
+                        packet.buf().len(),
+                    );
+                    break decoded;
+                }
+                Err(SymphoniaError::DecodeError(_))
+                | Err(SymphoniaError::Unsupported(_))
+                    if decode_errors < MAX_VIRTUAL_BODY_SKIP_PACKETS =>
+                {
+                    decode_errors += 1;
+                    decoder.reset();
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    decoder.reset();
+                }
+                Err(err) if skipped < MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES => {
+                    // 其它瞬时错误也跳
+                    if skipped <= 4 {
+                        log::warn!(
+                            target: "remote-audio",
+                            "splice skip decode err: {}",
+                            err,
+                        );
+                    }
+                    decoder.reset();
+                }
+                Err(err) => return Err(err),
+            }
+            if skipped >= MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES {
+                return Err(SymphoniaError::DecodeError(
+                    "virtual-body splice: could not find decodable moof sample",
+                ));
+            }
+        };
+
+        let spec = decoded.spec().to_owned();
+        let buffer = Self::copy_buffer(decoded, &spec);
+        Ok(Self {
+            decoder,
+            current_frame_offset: 0,
+            format: probed.format,
+            track_id,
+            total_duration,
+            buffer,
+            spec,
+        })
+    }
+
+    /// 已有好包后继续跳过坏包（当前未使用；拼接路径在 init 内已处理）
+    #[allow(dead_code)]
+    fn skip_to_fragment_samples(&mut self, max_packets: usize) -> usize {
+        let mut skipped = 0usize;
+        while skipped < max_packets {
+            // 已有 buffer 里是好包就直接返回
+            if self.buffer.len() > 0 && self.current_frame_offset < self.buffer.len() {
+                break;
+            }
+            let packet = match self.format.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    decoded.spec().clone_into(&mut self.spec);
+                    self.buffer = Self::copy_buffer(decoded, &self.spec);
+                    self.current_frame_offset = 0;
+                    break;
+                }
+                Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::Unsupported(_)) => {
+                    skipped += 1;
+                    self.decoder.reset();
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    self.decoder.reset();
+                }
+                Err(_) => break,
+            }
+        }
+        skipped
+    }
+
     fn copy_buffer(decoded: AudioBufferRef<'_>, spec: &SignalSpec) -> SampleBuffer<f32> {
         let duration = units::Duration::from(decoded.capacity() as u64);
         let mut buffer = SampleBuffer::<f32>::new(duration, *spec);
@@ -1451,24 +2429,87 @@ impl SymphoniaAudioDecoder {
     }
 }
 
+// skip_decode_errors 已移除：init_remote 内已处理坏包；外部再跳会让 buffer 与 format 失步
+
 impl Iterator for SymphoniaAudioDecoder {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
         if self.current_frame_offset >= self.buffer.len() {
+            // 中段流允许跳过更多坏包；真 EOF 才返回 None
             let mut decode_errors = 0usize;
+            let mut consecutive_io = 0usize;
             let decoded = loop {
-                let packet = self.format.next_packet().ok()?;
+                let packet = match self.format.next_packet() {
+                    Ok(packet) => {
+                        consecutive_io = 0;
+                        packet
+                    }
+                    Err(SymphoniaError::ResetRequired) => {
+                        self.decoder.reset();
+                        continue;
+                    }
+                    Err(SymphoniaError::IoError(err))
+                        if consecutive_io < MAX_VIRTUAL_BODY_SKIP_PACKETS
+                            && (err.kind() == std::io::ErrorKind::UnexpectedEof
+                                || err.kind() == std::io::ErrorKind::Interrupted
+                                || err.kind() == std::io::ErrorKind::WouldBlock) =>
+                    {
+                        // 预取窗口边缘瞬时 EOF / 被抢占：稍等再试，避免整段饿死
+                        consecutive_io += 1;
+                        if consecutive_io <= 3 {
+                            log::warn!(
+                                target: "remote-audio",
+                                "virtual-body next_packet io retry={} kind={} msg={}",
+                                consecutive_io,
+                                err.kind(),
+                                err,
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            target: "remote-audio",
+                            "virtual-body next_packet fatal: {}",
+                            err,
+                        );
+                        return None;
+                    }
+                };
                 if packet.track_id() != self.track_id {
                     continue;
                 }
 
                 match self.decoder.decode(&packet) {
                     Ok(decoded) => break decoded,
-                    Err(SymphoniaError::DecodeError(_)) if decode_errors < MAX_DECODE_RETRIES => {
+                    // DecodeError + Unsupported（如 aac coupling）都可跳，不能当 fatal 杀 worker
+                    Err(SymphoniaError::DecodeError(_))
+                    | Err(SymphoniaError::Unsupported(_))
+                        if decode_errors < MAX_VIRTUAL_BODY_SKIP_PACKETS =>
+                    {
                         decode_errors += 1;
+                        if decode_errors <= 4 || decode_errors % 16 == 0 {
+                            log::warn!(
+                                target: "remote-audio",
+                                "virtual-body stream decode skip count={}",
+                                decode_errors,
+                            );
+                        }
+                        self.decoder.reset();
                     }
-                    Err(_) => return None,
+                    Err(SymphoniaError::ResetRequired) => {
+                        self.decoder.reset();
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            target: "remote-audio",
+                            "virtual-body stream decode fatal: {}",
+                            err,
+                        );
+                        return None;
+                    }
                 }
             };
             decoded.spec().clone_into(&mut self.spec);
@@ -1520,12 +2561,13 @@ async fn probe_range_len(
     client: &reqwest::Client,
     url: &str,
     referer: &str,
+    initial_block_bytes: u64,
 ) -> AppResult<(u64, Vec<u8>)> {
-    let range_end = REMOTE_INITIAL_BLOCK_BYTES.saturating_sub(1);
+    let range_end = initial_block_bytes.max(REMOTE_INITIAL_BLOCK_BYTES).saturating_sub(1);
     let response = client
         .get(url)
         .header(REFERER, referer)
-        .header(USER_AGENT, PLAYBACK_USER_AGENT)
+        .header(USER_AGENT, playback_user_agent(url))
         .header(RANGE, format!("bytes=0-{}", range_end))
         .timeout(REMOTE_PROBE_TIMEOUT)
         .send()
@@ -1590,7 +2632,7 @@ async fn fetch_range_block_async(
             .client
             .get(&inner.url)
             .header(REFERER, inner.referer.as_str())
-            .header(USER_AGENT, PLAYBACK_USER_AGENT)
+            .header(USER_AGENT, playback_user_agent(&inner.url))
             .header(RANGE, format!("bytes={}-{}", start, end))
             .timeout(REMOTE_REQUEST_TIMEOUT)
             .send()
@@ -1802,10 +2844,13 @@ fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
     let Some(first_start) = claim_prefetch_sequence_start(&inner, plan) else {
         return;
     };
+    let epoch = inner.prefetch_epoch.load(Ordering::Acquire);
     tauri::async_runtime::spawn(async move {
         let mut next_start = first_start;
         while next_start < inner.total_len && next_start < plan.target_end {
-            if inner.playback_cancelled() {
+            if inner.playback_cancelled()
+                || inner.prefetch_epoch.load(Ordering::Acquire) != epoch
+            {
                 release_prefetch_start(&inner, next_start);
                 break;
             }
@@ -1821,19 +2866,28 @@ fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
             let should_stop = match result {
                 Ok(data) if data.is_empty() => true,
                 Ok(data) => {
-                    let fetched_end = fetch_start.saturating_add(data.len() as u64);
-                    if let Ok(mut cache) = inner.cache.lock() {
-                        if !cache_contains_position(&cache, fetch_start) {
-                            cache.push(CachedSegment {
-                                start: fetch_start,
-                                data,
-                            });
-                            cache.sort_by_key(|segment| segment.start);
-                            trim_cache(&mut cache, cache_center(&inner, fetch_start));
+                    // epoch 变了：丢弃本块，避免旧位置继续污染缓存中心
+                    if inner.prefetch_epoch.load(Ordering::Acquire) != epoch {
+                        true
+                    } else {
+                        let fetched_end = fetch_start.saturating_add(data.len() as u64);
+                        if let Ok(mut cache) = inner.cache.lock() {
+                            if !cache_contains_position(&cache, fetch_start) {
+                                cache.push(CachedSegment {
+                                    start: fetch_start,
+                                    data,
+                                });
+                                cache.sort_by_key(|segment| segment.start);
+                                trim_cache(
+                                    &inner,
+                                    &mut cache,
+                                    cache_center(&inner, fetch_start),
+                                );
+                            }
                         }
+                        next_start = fetched_end.max(fetch_start.saturating_add(1));
+                        false
                     }
-                    next_start = fetched_end.max(fetch_start.saturating_add(1));
-                    false
                 }
                 Err(err) => {
                     log::warn!(
@@ -2015,6 +3069,304 @@ fn cache_contains_position(cache: &[CachedSegment], pos: u64) -> bool {
     })
 }
 
+fn position_is_cached_range(inner: &RemoteAudioInner, start: u64, end: u64) -> bool {
+    if end < start {
+        return false;
+    }
+    // 只要 start 已缓存就认为窗口可用（按需读会补齐）
+    if let Ok(cache) = inner.cache.lock() {
+        if cache_contains_position(&cache, start) {
+            return true;
+        }
+    }
+    disk_cached_len(inner, start, 1).is_some()
+}
+
+fn build_seek_index_for_long_form(inner: &RemoteAudioInner, duration_hint_ms: u64) {
+    let duration_ms = duration_hint_ms.max(1);
+    let mut index = parse_sidx_seek_index(inner, duration_ms)
+        .or_else(|| parse_sidx_seek_index_from_tail(inner, duration_ms));
+    if index.is_none() {
+        // 线性估算兜底：足够让字节跳转落到大致区域
+        let total = inner.total_len.max(1);
+        let steps = 32u64;
+        let mut entries = Vec::with_capacity(steps as usize + 1);
+        for i in 0..=steps {
+            let time_ms = duration_ms.saturating_mul(i) / steps;
+            let byte_offset = total.saturating_mul(i) / steps;
+            entries.push(SeekIndexEntry {
+                time_ms,
+                byte_offset,
+            });
+        }
+        index = Some(RemoteSeekIndex {
+            duration_ms,
+            entries,
+        });
+        log::info!(
+            target: "remote-audio",
+            "seek index fallback linear duration_ms={}, entries={}",
+            duration_ms,
+            steps + 1
+        );
+    } else if let Some(ref built) = index {
+        log::info!(
+            target: "remote-audio",
+            "seek index from sidx duration_ms={}, entries={}",
+            built.duration_ms,
+            built.entries.len()
+        );
+    }
+    if let Ok(mut slot) = inner.seek_index.lock() {
+        *slot = index;
+    }
+}
+
+fn parse_sidx_seek_index(inner: &RemoteAudioInner, duration_ms: u64) -> Option<RemoteSeekIndex> {
+    // 从头缓存里找 sidx
+    let head = {
+        let cache = inner.cache.lock().ok()?;
+        cache
+            .iter()
+            .find(|segment| segment.start == 0)
+            .map(|segment| segment.data.clone())
+    }?;
+    parse_sidx_from_bytes(&head, 0, duration_ms, inner.total_len)
+}
+
+fn parse_sidx_seek_index_from_tail(
+    inner: &RemoteAudioInner,
+    duration_ms: u64,
+) -> Option<RemoteSeekIndex> {
+    let cache = inner.cache.lock().ok()?;
+    let tail = cache
+        .iter()
+        .filter(|segment| segment.start > 0)
+        .max_by_key(|segment| segment.start)?;
+    parse_sidx_from_bytes(&tail.data, tail.start, duration_ms, inner.total_len)
+}
+
+
+fn detect_mp4_header_end(data: &[u8]) -> Option<u64> {
+    let mut offset = 0usize;
+    while offset + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        let kind = &data[offset + 4..offset + 8];
+        let header_len = if size == 1 { 16 } else { 8 };
+        let atom_size = if size == 1 {
+            if offset + 16 > data.len() {
+                break;
+            }
+            u64::from_be_bytes(data[offset + 8..offset + 16].try_into().ok()?) as usize
+        } else if size == 0 {
+            // 到文件尾：对 header 探测无意义
+            break;
+        } else {
+            size
+        };
+        if atom_size < header_len {
+            break;
+        }
+        // 首个 mdat/moof 即媒体起点
+        if kind == b"mdat" || kind == b"moof" {
+            return Some(offset as u64);
+        }
+        if offset + atom_size > data.len() {
+            // 不完整 atom：若不是 mdat/moof，停止
+            break;
+        }
+        offset += atom_size;
+    }
+    None
+}
+
+/// 在 [start, start+window) 内找第一个 moof atom 相对偏移；用于 sidx 落点校正
+fn find_moof_offset_near(data: &[u8], start: usize, window: u64) -> Option<u64> {
+    if start >= data.len() {
+        return None;
+    }
+    let end = (start + window as usize).min(data.len());
+    let mut offset = start;
+    while offset + 8 <= end {
+        let size = u32::from_be_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        let kind = &data[offset + 4..offset + 8];
+        if kind == b"moof" {
+            return Some((offset - start) as u64);
+        }
+        let atom_size = if size == 1 {
+            if offset + 16 > data.len() {
+                break;
+            }
+            u64::from_be_bytes(data[offset + 8..offset + 16].try_into().ok()?) as usize
+        } else if size == 0 {
+            break;
+        } else {
+            size
+        };
+        if atom_size < 8 {
+            // 坏 size：逐字节扫描找 "moof" fourcc
+            offset += 1;
+            continue;
+        }
+        if offset + atom_size > data.len() {
+            // 不完整：在剩余窗口里暴力找 moof fourcc
+            let search = &data[offset..end];
+            if let Some(pos) = search
+                .windows(4)
+                .position(|w| w == b"moof")
+            {
+                // fourcc 在 size 之后 4 字节，atom 起点 = pos - 4
+                if pos >= 4 {
+                    return Some((offset + pos - 4 - start) as u64);
+                }
+            }
+            break;
+        }
+        offset += atom_size;
+    }
+    // 兜底：窗口内暴力找 moof fourcc
+    let search = &data[start..end];
+    if let Some(pos) = search.windows(4).position(|w| w == b"moof") {
+        if pos >= 4 {
+            return Some((pos - 4) as u64);
+        }
+    }
+    None
+}
+
+fn parse_sidx_from_bytes(
+    data: &[u8],
+    base_offset: u64,
+    duration_ms: u64,
+    total_len: u64,
+) -> Option<RemoteSeekIndex> {
+    // 在缓冲里扫描 sidx box
+    let mut offset = 0usize;
+    while offset + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        let kind = &data[offset + 4..offset + 8];
+        let atom_size = if size == 1 {
+            if offset + 16 > data.len() {
+                break;
+            }
+            u64::from_be_bytes(data[offset + 8..offset + 16].try_into().ok()?) as usize
+        } else if size == 0 {
+            data.len().saturating_sub(offset)
+        } else {
+            size
+        };
+        if atom_size < 8 || offset + atom_size > data.len() {
+            break;
+        }
+        if kind == b"sidx" {
+            let header_len = if size == 1 { 16 } else { 8 };
+            let body = &data[offset + header_len..offset + atom_size];
+            if let Some(index) =
+                parse_sidx_body(body, base_offset + offset as u64 + atom_size as u64, duration_ms, total_len)
+            {
+                return Some(index);
+            }
+        }
+        if atom_size == 0 {
+            break;
+        }
+        offset += atom_size;
+    }
+    None
+}
+
+fn parse_sidx_body(
+    body: &[u8],
+    first_offset_anchor: u64,
+    duration_ms: u64,
+    total_len: u64,
+) -> Option<RemoteSeekIndex> {
+    if body.len() < 20 {
+        return None;
+    }
+    let version = body[0];
+    let mut o = 4usize; // skip version+flags
+    o += 4; // reference_id
+    if o + 4 > body.len() {
+        return None;
+    }
+    let timescale = u32::from_be_bytes(body[o..o + 4].try_into().ok()?) as u64;
+    o += 4;
+    if timescale == 0 {
+        return None;
+    }
+    let (earliest_pts, first_offset) = if version == 0 {
+        if o + 8 > body.len() {
+            return None;
+        }
+        let pts = u32::from_be_bytes(body[o..o + 4].try_into().ok()?) as u64;
+        o += 4;
+        let off = u32::from_be_bytes(body[o..o + 4].try_into().ok()?) as u64;
+        o += 4;
+        (pts, first_offset_anchor + off)
+    } else {
+        if o + 16 > body.len() {
+            return None;
+        }
+        let pts = u64::from_be_bytes(body[o..o + 8].try_into().ok()?);
+        o += 8;
+        let off = u64::from_be_bytes(body[o..o + 8].try_into().ok()?);
+        o += 8;
+        (pts, first_offset_anchor + off)
+    };
+    if o + 4 > body.len() {
+        return None;
+    }
+    o += 2; // reserved
+    let reference_count = u16::from_be_bytes(body[o..o + 2].try_into().ok()?) as usize;
+    o += 2;
+
+    let mut entries = Vec::with_capacity(reference_count.saturating_add(1));
+    let mut time_ticks = earliest_pts;
+    let mut byte_pos = first_offset.min(total_len);
+    entries.push(SeekIndexEntry {
+        time_ms: time_ticks.saturating_mul(1000) / timescale,
+        byte_offset: byte_pos,
+    });
+    for _ in 0..reference_count {
+        if o + 12 > body.len() {
+            break;
+        }
+        let reference = u32::from_be_bytes(body[o..o + 4].try_into().ok()?);
+        o += 4;
+        let subsegment_duration = u32::from_be_bytes(body[o..o + 4].try_into().ok()?) as u64;
+        o += 4;
+        o += 4; // SAP
+        let reference_type = (reference & 0x8000_0000) != 0;
+        let reference_size = (reference & 0x7fff_ffff) as u64;
+        if reference_type {
+            // 嵌套 sidx，跳过大小但仍推进偏移
+            byte_pos = byte_pos.saturating_add(reference_size).min(total_len);
+            continue;
+        }
+        byte_pos = byte_pos.saturating_add(reference_size).min(total_len);
+        time_ticks = time_ticks.saturating_add(subsegment_duration);
+        entries.push(SeekIndexEntry {
+            time_ms: time_ticks.saturating_mul(1000) / timescale,
+            byte_offset: byte_pos,
+        });
+    }
+    if entries.len() < 2 {
+        return None;
+    }
+    // 夹到声明时长
+    for entry in &mut entries {
+        if duration_ms > 0 {
+            entry.time_ms = entry.time_ms.min(duration_ms);
+        }
+        entry.byte_offset = entry.byte_offset.min(total_len);
+    }
+    Some(RemoteSeekIndex {
+        duration_ms: duration_ms.max(entries.last().map(|e| e.time_ms).unwrap_or(0)),
+        entries,
+    })
+}
+
 fn claim_prefetch_start(inner: &RemoteAudioInner, start: u64) -> bool {
     if contiguous_cached_end(inner, start) > start {
         return false;
@@ -2031,6 +3383,68 @@ fn release_prefetch_start(inner: &RemoteAudioInner, start: u64) {
         drop(in_flight);
         inner.range_available.notify_all();
     }
+}
+
+/// seek 时作废旧预取：抬 epoch + 清空 in_flight，让需求读立刻能 claim
+fn invalidate_prefetch_epoch(inner: &RemoteAudioInner) {
+    inner.prefetch_epoch.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut in_flight) = inner.in_flight.lock() {
+        in_flight.clear();
+        drop(in_flight);
+        inner.range_available.notify_all();
+    }
+}
+
+fn force_release_prefetch_start(inner: &RemoteAudioInner, start: u64) {
+    if let Ok(mut in_flight) = inner.in_flight.lock() {
+        if in_flight.remove(&start) {
+            drop(in_flight);
+            inner.range_available.notify_all();
+        }
+    }
+}
+
+fn protect_cached_range(inner: &RemoteAudioInner, start: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let next = CachedRange {
+        start,
+        end: start.saturating_add(len).min(inner.total_len),
+    };
+    let Ok(mut ranges) = inner.protected_ranges.lock() else {
+        return;
+    };
+    ranges.push(next);
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<CachedRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.iter().copied() {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+}
+
+fn range_overlaps(a: CachedRange, b: CachedRange) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+fn segment_is_protected(inner: &RemoteAudioInner, segment: &CachedSegment) -> bool {
+    let segment_range = CachedRange {
+        start: segment.start,
+        end: segment.start.saturating_add(segment.data.len() as u64),
+    };
+    let Ok(ranges) = inner.protected_ranges.lock() else {
+        return false;
+    };
+    ranges
+        .iter()
+        .any(|range| range_overlaps(*range, segment_range))
 }
 
 fn parse_content_range(value: &reqwest::header::HeaderValue) -> Option<HttpByteRange> {
@@ -2082,17 +3496,26 @@ fn validate_http_range_data(
     Ok(())
 }
 
-fn trim_cache(cache: &mut Vec<CachedSegment>, current_pos: u64) {
+fn trim_cache(inner: &RemoteAudioInner, cache: &mut Vec<CachedSegment>, current_pos: u64) {
     let mut total: usize = cache.iter().map(|segment| segment.data.len()).sum();
     if total <= REMOTE_MAX_CACHE_BYTES {
         return;
     }
 
-    cache.sort_by_key(|segment| segment_distance(segment, current_pos));
+    // 先丢离读头最远且未受保护（非头/尾 moov）的块
+    cache.sort_by_key(|segment| {
+        let protected = segment_is_protected(inner, segment);
+        (protected, segment_distance(segment, current_pos))
+    });
     while total > REMOTE_MAX_CACHE_BYTES {
         let Some(segment) = cache.pop() else {
             break;
         };
+        // 只剩保护块时停止，避免把 moov 裁掉导致 seek 重开 demuxer 扫全文件
+        if segment_is_protected(inner, &segment) {
+            cache.push(segment);
+            break;
+        }
         total = total.saturating_sub(segment.data.len());
     }
     cache.sort_by_key(|segment| segment.start);
@@ -2222,10 +3645,15 @@ mod tests {
 
     #[test]
     fn prefetch_window_uses_duration_hint_for_time_based_buffering() {
+        // 9MB / 180s ≈ 50KB/s → 5s=250KB、15s=750KB，均被抬到 min
         let window = prefetch_window(9_000_000, 180_000);
+        assert_eq!(window.low_water_bytes, 256 * 1024);
+        assert_eq!(window.target_bytes, 1024 * 1024);
 
-        assert_eq!(window.low_water_bytes, 250_000);
-        assert_eq!(window.target_bytes, 750_000);
+        // 更高码率时按时间窗口缩放
+        let hi = prefetch_window(36_000_000, 180_000);
+        assert_eq!(hi.low_water_bytes, 1_000_000);
+        assert_eq!(hi.target_bytes, 3_000_000);
     }
 
     #[test]
@@ -2281,6 +3709,7 @@ mod tests {
             url: "http://127.0.0.1:9/should-not-be-requested".into(),
             referer: "https://example.com".into(),
             total_len: 4,
+            header_end: AtomicU64::new(0),
             prefetch_window: PrefetchWindow {
                 low_water_bytes: 1,
                 target_bytes: 4,
@@ -2290,8 +3719,13 @@ mod tests {
             in_flight: Mutex::new(HashSet::new()),
             range_available: Condvar::new(),
             last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         };
@@ -2317,6 +3751,7 @@ mod tests {
             url: "http://127.0.0.1:9/should-not-be-requested".into(),
             referer: "https://example.com".into(),
             total_len: 4,
+            header_end: AtomicU64::new(0),
             prefetch_window: PrefetchWindow {
                 low_water_bytes: 1,
                 target_bytes: 1,
@@ -2326,8 +3761,13 @@ mod tests {
             in_flight: Mutex::new(HashSet::from([0])),
             range_available: Condvar::new(),
             last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
             playback_generation,
             expected_generation: 1,
         });
@@ -2366,6 +3806,7 @@ mod tests {
             url: "http://127.0.0.1:9/should-not-be-requested".into(),
             referer: "https://example.com".into(),
             total_len: 4,
+            header_end: AtomicU64::new(0),
             prefetch_window: PrefetchWindow {
                 low_water_bytes: 1,
                 target_bytes: 1,
@@ -2375,8 +3816,13 @@ mod tests {
             in_flight: Mutex::new(HashSet::new()),
             range_available: Condvar::new(),
             last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
             playback_generation: Arc::clone(&playback_generation),
             expected_generation: 1,
         });
@@ -2403,6 +3849,7 @@ mod tests {
             url: "http://127.0.0.1:9/should-not-be-requested".into(),
             referer: "https://example.com".into(),
             total_len: 4,
+            header_end: AtomicU64::new(0),
             prefetch_window: PrefetchWindow {
                 low_water_bytes: 1,
                 target_bytes: 1,
@@ -2412,8 +3859,13 @@ mod tests {
             in_flight: Mutex::new(HashSet::new()),
             range_available: Condvar::new(),
             last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
             playback_generation,
             expected_generation: 1,
         });
@@ -2450,6 +3902,7 @@ mod tests {
                 url: "https://cdn.example/audio/track.m4s".into(),
                 referer: "https://example.com".into(),
                 total_len: 4,
+                header_end: AtomicU64::new(0),
                 prefetch_window: PrefetchWindow {
                     low_water_bytes: 1,
                     target_bytes: 1,
@@ -2459,8 +3912,13 @@ mod tests {
                 in_flight: Mutex::new(HashSet::new()),
                 range_available: Condvar::new(),
                 last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(0),
+                seek_index: Mutex::new(None),
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -2472,10 +3930,507 @@ mod tests {
         assert!(!symphonia::core::io::MediaSource::is_seekable(&source));
         assert!(symphonia::core::io::MediaSource::byte_len(&source).is_none());
         let seekable = source.seekable_clone();
+        // demuxer open 阶段隐藏 seekable，避免扫 mdat
+        assert!(!symphonia::core::io::MediaSource::is_seekable(&seekable));
+        assert!(source.inner.demuxer_open_sequential.load(std::sync::atomic::Ordering::Acquire));
+        seekable.finish_demuxer_open();
         assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
         assert_eq!(
             seekable.access_mode.demand_fetch_block_bytes(),
             super::REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES
+        );
+    }
+
+    #[test]
+    fn long_form_progressive_promotes_to_standard_seekable() {
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/long.m4a".into(),
+                referer: "https://example.com".into(),
+                total_len: 135_000_000,
+                header_end: AtomicU64::new(0),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 256 * 1024,
+                    target_bytes: 1024 * 1024,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(0),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::LongFormProgressive,
+            read_cancellation: None,
+        };
+
+        assert!(!symphonia::core::io::MediaSource::is_seekable(&source));
+        assert!(symphonia::core::io::MediaSource::byte_len(&source).is_none());
+
+        let seekable = source.seekable_clone();
+        assert_eq!(seekable.access_mode, RemoteAccessMode::StandardSeekable);
+        // demuxer open 阶段隐藏 seekable，finish 后才对 demuxer 暴露
+        assert!(!symphonia::core::io::MediaSource::is_seekable(&seekable));
+        assert!(source.inner.demuxer_open_sequential.load(std::sync::atomic::Ordering::Acquire));
+        seekable.finish_demuxer_open();
+        assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
+        // 绝不能走分片 8MB 按需块，否则 seek 会卡死
+        assert_eq!(
+            seekable.access_mode.demand_fetch_block_bytes(),
+            super::REMOTE_FETCH_BLOCK_BYTES
+        );
+        // seekable_clone 必须作废旧预取 epoch，否则 seek 会撞 in_flight
+        assert_eq!(
+            source.inner.prefetch_epoch.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(source.inner.in_flight.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn long_form_prefers_virtual_body_before_and_after_promote() {
+        let index = super::RemoteSeekIndex {
+            duration_ms: 100_000,
+            entries: vec![
+                super::SeekIndexEntry {
+                    time_ms: 0,
+                    byte_offset: 1_000,
+                },
+                super::SeekIndexEntry {
+                    time_ms: 50_000,
+                    byte_offset: 50_000_000,
+                },
+                super::SeekIndexEntry {
+                    time_ms: 100_000,
+                    byte_offset: 100_000_000,
+                },
+            ],
+        };
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/long.m4a".into(),
+                referer: "https://example.com".into(),
+                total_len: 135_000_000,
+                header_end: AtomicU64::new(10_799),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 256 * 1024,
+                    target_bytes: 1024 * 1024,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(0),
+                seek_index: Mutex::new(Some(index)),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::LongFormProgressive,
+            read_cancellation: None,
+        };
+
+        // 关键：clone 前 LongForm 也必须 prefers，否则 seek 会先选 format.seek
+        assert!(source.prefers_virtual_body_seek());
+        let seekable = source.seekable_clone();
+        assert!(seekable.prefers_virtual_body_seek());
+        assert_eq!(seekable.access_mode, RemoteAccessMode::StandardSeekable);
+    }
+
+    #[test]
+    fn virtual_body_media_source_seekable_after_open_only() {
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/long.m4a".into(),
+                referer: "https://example.com".into(),
+                total_len: 10_000,
+                header_end: AtomicU64::new(100),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 1,
+                    target_bytes: 1,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(true),
+                virtual_body_origin: AtomicU64::new(5_000),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        assert!(!symphonia::core::io::MediaSource::is_seekable(&source));
+        assert!(symphonia::core::io::MediaSource::byte_len(&source).is_none());
+
+        source.finish_demuxer_open();
+        assert!(symphonia::core::io::MediaSource::is_seekable(&source));
+        assert_eq!(
+            symphonia::core::io::MediaSource::byte_len(&source),
+            Some(source.logical_len())
+        );
+        // 纯逻辑连续：header + (total - origin)
+        assert_eq!(source.logical_len(), 100 + (10_000 - 5_000));
+    }
+
+
+
+    #[test]
+    fn detect_mp4_header_end_finds_mdat() {
+        // ftyp(16) + free(8) + mdat(size=100)
+        let mut data = Vec::new();
+        data.extend_from_slice(&16u32.to_be_bytes());
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(&[0u8; 8]);
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(b"free");
+        data.extend_from_slice(&100u32.to_be_bytes());
+        data.extend_from_slice(b"mdat");
+        data.extend_from_slice(&[0u8; 20]);
+        assert_eq!(super::detect_mp4_header_end(&data), Some(24));
+    }
+
+    #[test]
+    fn find_moof_offset_near_snaps_past_garbage_prefix() {
+        // 12 字节垃圾 + moof(size=32)
+        let mut data = vec![0u8; 12];
+        data.extend_from_slice(&32u32.to_be_bytes());
+        data.extend_from_slice(b"moof");
+        data.extend_from_slice(&[0u8; 24]);
+        assert_eq!(super::find_moof_offset_near(&data, 0, 64), Some(12));
+        // 已对齐
+        assert_eq!(super::find_moof_offset_near(&data[12..], 0, 64), Some(0));
+    }
+
+    #[test]
+    fn virtual_body_maps_logical_header_and_body() {
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/long.m4a".into(),
+                referer: "https://example.com".into(),
+                total_len: 10_000,
+                header_end: AtomicU64::new(100),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 1,
+                    target_bytes: 1,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(5_000),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        assert_eq!(source.map_logical_to_physical(0), 0);
+        assert_eq!(source.map_logical_to_physical(99), 99);
+        // 相对 moof：逻辑 body 映射到 physical origin+
+        assert_eq!(source.map_logical_to_physical(100), 5_000);
+        assert_eq!(source.map_logical_to_physical(150), 5_050);
+        // 纯逻辑：pos 绝不能用物理恒等，否则 MSS/AtomIterator 失步
+        // 5_000 在逻辑里是 body 中点：physical = 5000 + (5000-100) = 9900
+        assert_eq!(source.map_logical_to_physical(5_000), 9_900);
+        assert_eq!(source.logical_len(), 100 + (10_000 - 5_000));
+    }
+
+    #[test]
+    fn virtual_body_normalizes_absolute_sample_seeks() {
+        use std::io::{Seek, SeekFrom};
+        // 对齐真实长视频：header=10799, body_origin≈55MB, total≈135MB
+        let mut source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/long.m4a".into(),
+                referer: "https://example.com".into(),
+                total_len: 135_169_876,
+                header_end: AtomicU64::new(10_799),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 1,
+                    target_bytes: 1,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(54_947_352),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        // 相对样本：逻辑 header_end → 物理 origin
+        assert_eq!(source.map_logical_to_physical(10_799), 54_947_352);
+        assert_eq!(source.map_logical_to_physical(11_299), 54_947_852);
+        // 绝对 base_data_offset：Seek(物理) 必须折成逻辑并返回逻辑 pos
+        let logical = source.seek(SeekFrom::Start(54_947_852)).unwrap();
+        assert_eq!(logical, 10_799 + 500);
+        assert_eq!(source.pos, 10_799 + 500);
+        assert_eq!(source.map_logical_to_physical(source.pos), 54_947_852);
+        // logical_len = header + (total - origin)，不能被拉成 total
+        assert_eq!(
+            source.logical_len(),
+            10_799 + (135_169_876 - 54_947_352)
+        );
+    }
+
+    #[test]
+    fn estimate_segment_start_snaps_to_entry_boundary() {
+        let index = super::RemoteSeekIndex {
+            duration_ms: 100_000,
+            entries: vec![
+                super::SeekIndexEntry {
+                    time_ms: 0,
+                    byte_offset: 1_000,
+                },
+                super::SeekIndexEntry {
+                    time_ms: 50_000,
+                    byte_offset: 50_000,
+                },
+                super::SeekIndexEntry {
+                    time_ms: 100_000,
+                    byte_offset: 100_000,
+                },
+            ],
+        };
+        assert_eq!(index.estimate_segment_start(0), 1_000);
+        assert_eq!(index.estimate_segment_start(49_999), 1_000);
+        assert_eq!(index.estimate_segment_start(50_000), 50_000);
+        assert_eq!(index.estimate_segment_start(90_000), 50_000);
+        assert_eq!(index.estimate_segment_start(100_000), 100_000);
+    }
+
+    #[test]
+    fn virtual_body_seek_uses_logical_sample_offsets() {
+        use std::io::{Seek, SeekFrom};
+        let mut source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://cdn.example/audio/long.m4a".into(),
+                referer: "https://example.com".into(),
+                total_len: 10_000,
+                header_end: AtomicU64::new(100),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 1,
+                    target_bytes: 1,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(5_000),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        // sample Seek 用逻辑坐标；映射到物理 body
+        assert_eq!(source.seek(SeekFrom::Start(100)).unwrap(), 100);
+        assert_eq!(source.map_logical_to_physical(source.pos), 5_000);
+        assert_eq!(source.seek(SeekFrom::Start(150)).unwrap(), 150);
+        assert_eq!(source.map_logical_to_physical(source.pos), 5_050);
+        assert_eq!(source.seek(SeekFrom::Start(50)).unwrap(), 50);
+        assert_eq!(source.map_logical_to_physical(source.pos), 50);
+    }
+
+    #[test]
+    fn linear_seek_index_estimates_midpoint_bytes() {
+        let index = super::RemoteSeekIndex {
+            duration_ms: 100_000,
+            entries: vec![
+                super::SeekIndexEntry {
+                    time_ms: 0,
+                    byte_offset: 0,
+                },
+                super::SeekIndexEntry {
+                    time_ms: 50_000,
+                    byte_offset: 500,
+                },
+                super::SeekIndexEntry {
+                    time_ms: 100_000,
+                    byte_offset: 1_000,
+                },
+            ],
+        };
+        assert_eq!(index.estimate_byte(0), 0);
+        assert_eq!(index.estimate_byte(25_000), 250);
+        assert_eq!(index.estimate_byte(75_000), 750);
+        assert_eq!(index.estimate_byte(100_000), 1_000);
+    }
+
+    #[test]
+    fn parse_sidx_body_builds_time_byte_entries() {
+        // version0 sidx: timescale=1000, earliest=0, first_offset=0, 2 refs size=100 dur=1000
+        let mut body = Vec::new();
+        body.push(0); // version
+        body.extend_from_slice(&[0, 0, 0]); // flags
+        body.extend_from_slice(&1u32.to_be_bytes()); // reference_id
+        body.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        body.extend_from_slice(&0u32.to_be_bytes()); // earliest_pts
+        body.extend_from_slice(&0u32.to_be_bytes()); // first_offset
+        body.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        body.extend_from_slice(&2u16.to_be_bytes()); // reference_count
+        for _ in 0..2 {
+            body.extend_from_slice(&100u32.to_be_bytes()); // size, type=media
+            body.extend_from_slice(&1000u32.to_be_bytes()); // duration ticks
+            body.extend_from_slice(&0u32.to_be_bytes()); // sap
+        }
+        let index = super::parse_sidx_body(&body, 0, 10_000, 10_000).expect("sidx");
+        assert!(index.entries.len() >= 3);
+        assert_eq!(index.entries[0].byte_offset, 0);
+        assert_eq!(index.entries[1].byte_offset, 100);
+        assert_eq!(index.entries[1].time_ms, 1000);
+    }
+
+    #[test]
+    fn invalidate_prefetch_epoch_clears_in_flight_and_allows_reclaim() {
+        let inner = Arc::new(RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "https://cdn.example/audio/long.m4a".into(),
+            referer: "https://example.com".into(),
+            total_len: 1024,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashSet::from([0, 256])),
+            range_available: Condvar::new(),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        });
+        assert!(!super::claim_prefetch_start(&inner, 0));
+        super::invalidate_prefetch_epoch(&inner);
+        assert_eq!(
+            inner.prefetch_epoch.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(inner.in_flight.lock().expect("lock").is_empty());
+        assert!(super::claim_prefetch_start(&inner, 0));
+        super::release_prefetch_start(&inner, 0);
+    }
+
+    #[test]
+    fn trim_cache_keeps_protected_tail_segments() {
+        let protected = CachedSegment {
+            start: 900,
+            data: vec![9; 100],
+        };
+        let near = CachedSegment {
+            start: 0,
+            data: vec![1; super::REMOTE_MAX_CACHE_BYTES],
+        };
+        let inner = RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "https://cdn.example/audio/long.m4a".into(),
+            referer: "https://example.com".into(),
+            total_len: 1000,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(vec![near, protected]),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashSet::new()),
+            range_available: Condvar::new(),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(vec![CachedRange {
+                start: 900,
+                end: 1000,
+            }]),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        };
+        let mut cache = {
+            let guard = inner.cache.lock().expect("cache");
+            guard
+                .iter()
+                .map(|segment| CachedSegment {
+                    start: segment.start,
+                    data: segment.data.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        super::trim_cache(&inner, &mut cache, 0);
+        assert!(
+            cache.iter().any(|segment| segment.start == 900),
+            "protected tail must survive trim"
         );
     }
 

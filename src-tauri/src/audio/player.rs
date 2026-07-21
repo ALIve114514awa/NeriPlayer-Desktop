@@ -19,6 +19,10 @@ use crate::audio::remote::{
 use crate::error::{AppError, AppResult};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// 远程/超长媒体首帧准备超时：超时必须取消读，否则音频线程卡死会堵住后续 fallback
+const REMOTE_PREPARE_TIMEOUT: Duration = Duration::from_secs(12);
+// 超长远程 seek 重建 demuxer 可能需要拉尾部 moov，单独放宽
+const REMOTE_SEEK_TIMEOUT: Duration = Duration::from_secs(45);
 const LOCAL_PREBUFFER: Duration = Duration::from_millis(80);
 const GROWING_PREBUFFER: Duration = Duration::from_millis(800);
 const REMOTE_PREBUFFER: Duration = Duration::from_millis(400);
@@ -103,6 +107,10 @@ impl AudioSource {
             _ => self.clone(),
         }
     }
+
+    fn prefers_remote_virtual_body_seek(&self) -> bool {
+        matches!(self, Self::Remote(reader, _) if reader.prefers_virtual_body_seek())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +126,8 @@ enum AudioCmd {
         transition: PlayTransition,
         playback_generation: u64,
         transition_generation: u64,
+        /// 外部等待超时后置位，打断 remote make_decoder / prebuffer
+        prepare_cancel: Arc<AtomicBool>,
         reply: mpsc::Sender<Result<PlaybackStarted, String>>,
     },
     Pause,
@@ -169,6 +179,11 @@ impl PlaybackClock {
 
     fn position_ms(&self) -> u64 {
         self.position_us.load(Ordering::Acquire) / 1_000
+    }
+
+    fn store_ms(&self, position_ms: u64) {
+        self.position_us
+            .store(position_ms.saturating_mul(1_000), Ordering::Release);
     }
 }
 
@@ -455,6 +470,9 @@ pub struct PlayRequest {
     pub expected_generation: u64,
     pub current_path: String,
     fade_ms: u32,
+    /// 与音频线程 prepare 共享；等待超时后置位以释放音频线程
+    prepare_cancel: Arc<AtomicBool>,
+    is_remote: bool,
 }
 
 pub struct PlayerEngine {
@@ -554,6 +572,8 @@ impl PlayerEngine {
         self.ensure_request_current(expected_generation)?;
         let transition_generation =
             self.transition_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let prepare_cancel = Arc::new(AtomicBool::new(false));
+        let is_remote = matches!(source, AudioSource::Remote(_, _) | AudioSource::Growing(_, _));
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
             .send(AudioCmd::Play {
@@ -562,6 +582,7 @@ impl PlayerEngine {
                 transition,
                 playback_generation: expected_generation,
                 transition_generation,
+                prepare_cancel: Arc::clone(&prepare_cancel),
                 reply: reply_tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
@@ -578,6 +599,8 @@ impl PlayerEngine {
             expected_generation,
             current_path,
             fade_ms,
+            prepare_cancel,
+            is_remote,
         })
     }
 
@@ -960,8 +983,7 @@ impl PlayerEngine {
         )
     }
 
-    // ─── request_* 变体：只发命令不等待，供 cmd 层锁外等待 ───
-
+    // request_* 变体：只发命令不等待，供 cmd 层锁外等待
     pub fn request_play_file_at_with_hint(
         &mut self,
         path: &str,
@@ -1180,6 +1202,7 @@ fn audio_control_loop(
                 transition,
                 playback_generation: expected,
                 transition_generation: expected_transition,
+                prepare_cancel,
                 reply,
             } => {
                 let source_label = source.label();
@@ -1197,6 +1220,9 @@ fn audio_control_loop(
                     transition_label,
                 );
                 let prepared = (|| {
+                    if prepare_cancel.load(Ordering::Acquire) {
+                        return Err("Timed out waiting for decoded audio".into());
+                    }
                     let output = ensure_output_profile(&mut output_profile)?;
                     prepare_session(
                         source,
@@ -1210,6 +1236,7 @@ fn audio_control_loop(
                         None,
                         None,
                         output,
+                        Arc::clone(&prepare_cancel),
                     )
                 })();
                 if prepared
@@ -1360,16 +1387,38 @@ fn audio_control_loop(
                     &receiver,
                     &mut deferred,
                 );
-                let Some(session) = current.as_ref() else {
-                    let _ = latest_reply.send(Err("Nothing is playing".into()));
-                    continue;
+                let (
+                    source,
+                    paused,
+                    rollback_position_ms,
+                    clock,
+                ) = {
+                    let Some(session) = current.as_ref() else {
+                        let _ = latest_reply.send(Err("Nothing is playing".into()));
+                        continue;
+                    };
+                    if session.playback_generation != latest_generation
+                        || ensure_generation(&playback_generation, latest_generation).is_err()
+                    {
+                        let _ = latest_reply.send(Err(PLAYBACK_SUPERSEDED.into()));
+                        continue;
+                    }
+                    let seek_token = GenerationToken {
+                        generation: Arc::clone(&seek_generation),
+                        expected: latest_seek_generation,
+                    };
+                    if !seek_token.is_current() {
+                        let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
+                        continue;
+                    }
+                    (
+                        session.source.clone(),
+                        session.shared.paused.load(Ordering::Acquire),
+                        session.shared.clock.position_ms(),
+                        Arc::clone(&session.shared.clock),
+                    )
                 };
-                if session.playback_generation != latest_generation
-                    || ensure_generation(&playback_generation, latest_generation).is_err()
-                {
-                    let _ = latest_reply.send(Err(PLAYBACK_SUPERSEDED.into()));
-                    continue;
-                }
+                // seek_token 需要在块外，重新构造一次
                 let seek_token = GenerationToken {
                     generation: Arc::clone(&seek_generation),
                     expected: latest_seek_generation,
@@ -1378,10 +1427,15 @@ fn audio_control_loop(
                     let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
                     continue;
                 }
-                let source = session.source.clone();
-                let paused = session.shared.paused.load(Ordering::Acquire);
-                let clock = Arc::clone(&session.shared.clock);
-                let _ = session.stream.pause();
+                // 先停旧会话：取消旧 decode worker 的 remote 读，避免和 seekable 重建抢 in_flight
+                let mut previous = match current.take() {
+                    Some(session) => session,
+                    None => {
+                        let _ = latest_reply.send(Err("Nothing is playing".into()));
+                        continue;
+                    }
+                };
+                previous.stop();
                 let prepared = (|| {
                     let output = ensure_output_profile(&mut output_profile)?;
                     prepare_session(
@@ -1394,8 +1448,9 @@ fn audio_control_loop(
                         Arc::clone(&playback_generation),
                         latest_generation,
                         Some(seek_token.clone()),
-                        Some(clock),
+                        Some(Arc::clone(&clock)),
                         output,
+                        Arc::new(AtomicBool::new(false)),
                     )
                 })();
                 if prepared
@@ -1408,25 +1463,41 @@ fn audio_control_loop(
                     Ok(next) => {
                         if ensure_generation(&playback_generation, latest_generation).is_err()
                             || !seek_token.is_current()
-                            || current.as_ref().is_none_or(|session| {
-                                session.playback_generation != latest_generation
-                            })
                         {
+                            drop(previous);
                             let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
                             continue;
                         }
                         if !paused {
                             if let Err(error) = next.play() {
-                                if let Some(session) = current.as_ref() {
-                                    let _ = session.stream.play();
+                                log::warn!(target: "cpal-output", "seek play failed: {error}");
+                                clock.store_ms(rollback_position_ms);
+                                if let Ok(output) = ensure_output_profile(&mut output_profile) {
+                                    if let Ok(restored) = prepare_session(
+                                        previous.source.clone(),
+                                        rollback_position_ms,
+                                        volume,
+                                        speed,
+                                        Arc::clone(&shared_level),
+                                        Arc::clone(&effects_params),
+                                        Arc::clone(&playback_generation),
+                                        latest_generation,
+                                        None,
+                                        Some(Arc::clone(&clock)),
+                                        output,
+                                        Arc::new(AtomicBool::new(false)),
+                                    ) {
+                                        let _ = restored.play();
+                                        current = Some(restored);
+                                    }
                                 }
+                                drop(previous);
+                                drop(next);
                                 let _ = latest_reply.send(Err(error));
                                 continue;
                             }
                         }
-                        if let Some(mut previous) = current.take() {
-                            previous.stop();
-                        }
+                        drop(previous);
                         current = Some(next);
                         let _ = latest_reply.send(Ok(()));
                     }
@@ -1437,17 +1508,51 @@ fn audio_control_loop(
                         )
                         .is_err()
                             || !seek_token.is_current();
-                        if !paused && !superseded {
-                            if let Some(session) = current.as_ref() {
-                                let _ = session.stream.play();
+                        log::warn!(target: "cpal-output", "seek failed: {error}");
+                        if superseded {
+                            drop(previous);
+                            let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
+                            continue;
+                        }
+                        // 回滚时钟并重建旧位置
+                        clock.store_ms(rollback_position_ms);
+                        match (|| {
+                            let output = ensure_output_profile(&mut output_profile)?;
+                            prepare_session(
+                                previous.source.clone(),
+                                rollback_position_ms,
+                                volume,
+                                speed,
+                                Arc::clone(&shared_level),
+                                Arc::clone(&effects_params),
+                                Arc::clone(&playback_generation),
+                                latest_generation,
+                                None,
+                                Some(Arc::clone(&clock)),
+                                output,
+                                Arc::new(AtomicBool::new(false)),
+                            )
+                        })() {
+                            Ok(restored) => {
+                                if !paused {
+                                    if let Err(play_error) = restored.play() {
+                                        log::warn!(
+                                            target: "cpal-output",
+                                            "seek rollback play failed: {play_error}"
+                                        );
+                                    }
+                                }
+                                current = Some(restored);
+                            }
+                            Err(restore_error) => {
+                                log::warn!(
+                                    target: "cpal-output",
+                                    "seek rollback failed: {restore_error}"
+                                );
                             }
                         }
-                        log::warn!(target: "cpal-output", "seek failed: {error}");
-                        let _ = latest_reply.send(Err(if superseded {
-                            SEEK_SUPERSEDED.into()
-                        } else {
-                            error
-                        }));
+                        drop(previous);
+                        let _ = latest_reply.send(Err(error));
                     }
                 }
             }
@@ -1538,6 +1643,7 @@ fn prepare_session(
     operation_generation: Option<GenerationToken>,
     clock: Option<Arc<PlaybackClock>>,
     output: &OutputDeviceProfile,
+    prepare_cancel: Arc<AtomicBool>,
 ) -> Result<PlaybackSession, String> {
     let prepare_started = Instant::now();
     ensure_preparation_current(
@@ -1545,14 +1651,19 @@ fn prepare_session(
         expected_generation,
         operation_generation.as_ref(),
     )?;
+    if prepare_cancel.load(Ordering::Acquire) {
+        return Err("Timed out waiting for decoded audio".into());
+    }
     let decoder_started = Instant::now();
     let session_cancelled = Arc::new(AtomicBool::new(false));
+    // 外部 prepare_cancel 挂到读取消链：等待超时后 remote read 可立刻打断
     let read_cancellation = RemoteReadCancellation::new(
         Arc::clone(&session_cancelled),
         operation_generation.as_ref().map(|token| {
             (Arc::clone(&token.generation), token.expected)
         }),
-    );
+    )
+    .with_external_cancel(Arc::clone(&prepare_cancel));
     log::info!(
         target: "cpal-output",
         "decoder begin source={}, generation={}, start_ms={}",
@@ -1560,15 +1671,35 @@ fn prepare_session(
         expected_generation,
         start_position_ms,
     );
+    // 必须先 clone/升级 access_mode，再判断 virtual-body：
+    // LongFormProgressive 源在 clone 前也要能选中该路径（prefers 已兼容），
+    // 但最终以 decoder_source 上的状态为准，避免误走 format.seek。
     let decoder_source =
         source.decoder_source_for_position(start_position_ms, read_cancellation);
-    let mut decoder = match make_decoder(&decoder_source) {
+    let use_byte_seek =
+        start_position_ms > 0 && decoder_source.prefers_remote_virtual_body_seek();
+    if start_position_ms > 0 {
+        log::info!(
+            target: "cpal-output",
+            "decoder path generation={}, start_ms={}, use_byte_seek={}, prefers_virtual={}",
+            expected_generation,
+            start_position_ms,
+            use_byte_seek,
+            decoder_source.prefers_remote_virtual_body_seek(),
+        );
+    }
+    let mut decoder = match make_decoder_for_position(&decoder_source, start_position_ms, use_byte_seek)
+    {
         Ok(decoder) => decoder,
         Err(error) => {
             session_cancelled.store(true, Ordering::Release);
             return Err(error);
         }
     };
+    if prepare_cancel.load(Ordering::Acquire) {
+        session_cancelled.store(true, Ordering::Release);
+        return Err("Timed out waiting for decoded audio".into());
+    }
     let decoder_ms = decoder_started.elapsed().as_millis();
     let duration_ms = decoder
         .total_duration()
@@ -1576,10 +1707,18 @@ fn prepare_session(
         .filter(|duration| *duration > 0)
         .unwrap_or_else(|| source.duration_hint_ms());
     let start_position_ms = clamp_position(start_position_ms, duration_ms);
-    if start_position_ms > 0 {
+    // 字节跳转路径已经在目标附近顺序打开，不再走 format.seek（它会扫全文件）
+    if start_position_ms > 0 && !use_byte_seek {
         decoder
             .try_seek(Duration::from_millis(start_position_ms))
             .map_err(|error| format!("Could not seek decoder: {error}"))?;
+    } else if start_position_ms > 0 && use_byte_seek {
+        log::info!(
+            target: "cpal-output",
+            "virtual-body open ready generation={}, start_ms={}, skip_format_seek=true virtual_body=true",
+            expected_generation,
+            start_position_ms,
+        );
     }
 
     let config = &output.config;
@@ -1643,6 +1782,7 @@ fn prepare_session(
         &playback_generation,
         expected_generation,
         operation_generation.as_ref(),
+        &prepare_cancel,
     ) {
         shared.cancelled.store(true, Ordering::Release);
         shared.wake.notify_all();
@@ -1674,7 +1814,11 @@ fn prepare_session(
     })
 }
 
-fn make_decoder(source: &AudioSource) -> Result<Box<dyn PcmSource>, String> {
+fn make_decoder_for_position(
+    source: &AudioSource,
+    start_position_ms: u64,
+    use_byte_seek: bool,
+) -> Result<Box<dyn PcmSource>, String> {
     match source {
         AudioSource::Bytes(data, _) => SymphoniaAudioDecoder::new(
             Box::new(Cursor::new(Arc::clone(data))),
@@ -1688,8 +1832,18 @@ fn make_decoder(source: &AudioSource) -> Result<Box<dyn PcmSource>, String> {
                 .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>)
         }
         AudioSource::Remote(reader, _) => {
-            SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)
-                .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>)
+            if use_byte_seek && start_position_ms > 0 {
+                reader
+                    .configure_virtual_body_for_time(start_position_ms)
+                    .map_err(|error| format!("Could not prepare remote virtual body: {error}"))?;
+                let decoder = SymphoniaAudioDecoder::new_remote_virtual(reader.clone(), true)?;
+                Ok(Box::new(decoder) as Box<dyn PcmSource>)
+            } else {
+                // 普通远程：demuxer open 可隐藏 seekable；无虚拟 body
+                reader.clear_virtual_body();
+                let decoder = SymphoniaAudioDecoder::new_remote(reader.clone())?;
+                Ok(Box::new(decoder) as Box<dyn PcmSource>)
+            }
         }
     }
 }
@@ -1711,6 +1865,8 @@ fn spawn_decode_worker(
             analyzer.configure(shared.sample_rate, ANALYSIS_FRAME_SIZE);
             let mut analysis = Vec::with_capacity(ANALYSIS_FRAME_SIZE);
 
+            let mut frames_pushed = 0u64;
+            let mut exit_reason = "source_eof";
             while !shared.cancelled.load(Ordering::Acquire)
                 && playback_generation.load(Ordering::Acquire) == expected_generation
                 && operation_generation
@@ -1722,12 +1878,14 @@ fn spawn_decode_worker(
                     continue;
                 }
                 if !converter.next_frame(shared.sample_rate, shared.speed.load(), &mut frame) {
+                    exit_reason = "decoder_exhausted";
                     break;
                 }
                 if !shared.ring.try_push_frame(&frame) {
                     thread::yield_now();
                     continue;
                 }
+                frames_pushed = frames_pushed.saturating_add(1);
 
                 analysis.push(frame[0]);
                 if analysis.len() >= ANALYSIS_FRAME_SIZE {
@@ -1741,6 +1899,23 @@ fn spawn_decode_worker(
                 }
                 shared.update_buffering_state();
             }
+            if shared.cancelled.load(Ordering::Acquire) {
+                exit_reason = "cancelled";
+            } else if playback_generation.load(Ordering::Acquire) != expected_generation {
+                exit_reason = "generation_changed";
+            } else if operation_generation
+                .as_ref()
+                .is_some_and(|token| !token.is_current())
+            {
+                exit_reason = "operation_superseded";
+            }
+            log::info!(
+                target: "cpal-output",
+                "decode worker exit reason={}, frames={}, generation={}",
+                exit_reason,
+                frames_pushed,
+                expected_generation,
+            );
             shared.finished.store(true, Ordering::Release);
             shared.update_buffering_state();
             shared.wake.notify_all();
@@ -1753,6 +1928,7 @@ fn wait_until_ready(
     playback_generation: &AtomicU64,
     expected_generation: u64,
     operation_generation: Option<&GenerationToken>,
+    prepare_cancel: &AtomicBool,
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut guard = shared
@@ -1765,8 +1941,14 @@ fn wait_until_ready(
             expected_generation,
             operation_generation,
         )?;
-        if shared.cancelled.load(Ordering::Acquire) {
-            return Err(PLAYBACK_SUPERSEDED.into());
+        if shared.cancelled.load(Ordering::Acquire)
+            || prepare_cancel.load(Ordering::Acquire)
+        {
+            return Err(if prepare_cancel.load(Ordering::Acquire) {
+                "Timed out waiting for decoded audio".into()
+            } else {
+                PLAYBACK_SUPERSEDED.into()
+            });
         }
         if started.elapsed() >= COMMAND_TIMEOUT {
             return Err("Timed out waiting for decoded audio".into());
@@ -1782,6 +1964,9 @@ fn wait_until_ready(
         expected_generation,
         operation_generation,
     )?;
+    if prepare_cancel.load(Ordering::Acquire) {
+        return Err("Timed out waiting for decoded audio".into());
+    }
     Ok(())
 }
 
@@ -1975,19 +2160,33 @@ fn ensure_preparation_current(
 pub fn wait_for_seek_result(
     receiver: mpsc::Receiver<Result<(), String>>,
 ) -> AppResult<()> {
+    // 超长媒体 seek 可能要等 tail moov + 目标位置数据
     receiver
-        .recv_timeout(COMMAND_TIMEOUT)
+        .recv_timeout(REMOTE_SEEK_TIMEOUT)
         .map_err(|error| AppError::Audio(format!("Seek command timeout: {error}")))?
         .map_err(AppError::Audio)
 }
 
 /// 在锁外等待播放命令的结果
 pub fn wait_for_play_result(request: &PlayRequest) -> AppResult<PlaybackStarted> {
-    let timeout = COMMAND_TIMEOUT + Duration::from_millis(u64::from(request.fade_ms) + 1_000);
-    request.reply_rx
-        .recv_timeout(timeout)
-        .map_err(|error| AppError::Audio(format!("Audio thread timeout: {error}")))?
-        .map_err(AppError::Audio)
+    // 远程源用更短超时；超时必须 cancel prepare，否则音频线程卡在 make_decoder 会堵死后续 fallback
+    let base = if request.is_remote {
+        REMOTE_PREPARE_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    };
+    let timeout = base + Duration::from_millis(u64::from(request.fade_ms) + 1_000);
+    match request.reply_rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(AppError::Audio),
+        Err(_) => {
+            request.prepare_cancel.store(true, Ordering::Release);
+            // 给音频线程一点时间感知 cancel 并回包，避免泄漏阻塞
+            match request.reply_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(result) => result.map_err(AppError::Audio),
+                Err(error) => Err(AppError::Audio(format!("Audio thread timeout: {error}"))),
+            }
+        }
+    }
 }
 
 fn take_latest_seek(
