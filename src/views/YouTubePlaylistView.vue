@@ -19,7 +19,8 @@ import {
   playlistDetailCacheKey,
   readPlaylistDetailCache,
   writePlaylistDetailCache,
-} from '@/utils/playlistDetailCache'
+} from '@/modules/library/playlistDetailCache'
+import { parseYouTubePlaylistTracks, parseYouTubePlaylistMeta } from '@/modules/youtube/youtubePlaylistParse'
 
 const route = useRoute()
 const router = useRouter()
@@ -85,91 +86,20 @@ function formatDuration(ms: number): string {
   return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
 }
 
-// 解析 InnerTube browse 响应中的歌曲列表
+// 解析 InnerTube browse 响应, 复用共享解析器统一多端布局
 function parsePlaylistTracks(data: any): TrackInfo[] {
-  const result: TrackInfo[] = []
-  try {
-    const tabs = data?.contents?.singleColumnBrowseResultsRenderer?.tabs ||
-                 data?.contents?.twoColumnBrowseResultsRenderer?.tabs || []
-
-    for (const tab of tabs) {
-      const contents = tab?.tabRenderer?.content?.sectionListRenderer?.contents || []
-      for (const section of contents) {
-        const items = section?.musicShelfRenderer?.contents ||
-                      section?.musicPlaylistShelfRenderer?.contents || []
-        for (const item of items) {
-          const renderer = item?.musicResponsiveListItemRenderer
-          if (!renderer) continue
-
-          // 提取 videoId
-          const overlay = renderer?.overlay?.musicItemThumbnailOverlayRenderer
-          const videoId = overlay?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId
-          if (!videoId) continue
-
-          // 提取标题
-          const titleRuns = renderer?.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []
-          const title = titleRuns.map((r: any) => r.text).join('')
-
-          // 提取艺术家
-          const artistRuns = renderer?.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []
-          const artist = artistRuns.map((r: any) => r.text).join('')
-
-          // 提取封面
-          const thumbnails = renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []
-          const cover = thumbnails[thumbnails.length - 1]?.url || ''
-
-          // 提取时长
-          const durationText = renderer?.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || ''
-          const durationMs = parseDuration(durationText)
-
-          result.push({
-            id: `youtube:${videoId}`,
-            title,
-            artist,
-            album: '',
-            durationMs,
-            coverUrl: cover,
-            audioUrl: '',
-          })
-        }
-      }
-    }
-  } catch {
-    // 解析失败返回空
-  }
-
-  // 也尝试解析 header 信息
-  try {
-    const header = data?.header?.musicImmersiveHeaderRenderer ||
-                   data?.header?.musicDetailHeaderRenderer ||
-                   data?.header?.musicEditablePlaylistDetailHeaderRenderer?.header?.musicDetailHeaderRenderer
-    if (header) {
-      playlistName.value = header?.title?.runs?.[0]?.text || playlistName.value
-      subtitle.value = header?.subtitle?.runs?.map((r: any) => r.text).join('') || ''
-      const thumbs = header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
-                     header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
-      if (thumbs.length > 0) coverUrl.value = thumbs[thumbs.length - 1]?.url || coverUrl.value
-    }
-  } catch {
-    // 忽略
-  }
-
-  return result
-}
-
-function parseDuration(text: string): number {
-  if (!text) return 0
-  const parts = text.split(':').map(Number)
-  if (parts.length === 2) return (parts[0] * 60 + parts[1]) * 1000
-  if (parts.length === 3) return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000
-  return 0
+  const meta = parseYouTubePlaylistMeta(data)
+  if (meta.playlistName) playlistName.value = meta.playlistName
+  if (meta.subtitle) subtitle.value = meta.subtitle
+  if (meta.coverUrl) coverUrl.value = meta.coverUrl
+  return parseYouTubePlaylistTracks(data)
 }
 
 async function loadDetail() {
   const browseId = route.params.browseId as string
   if (!browseId) return
 
-  const cacheKey = playlistDetailCacheKey('youtube-playlist', browseId)
+  const cacheKey = playlistDetailCacheKey('youtube-playlist-v2', browseId)
   const cached = readPlaylistDetailCache<YouTubeDetailCache>(cacheKey)
   if (cached) {
     applyDetailCache(cached)
@@ -182,6 +112,11 @@ async function loadDetail() {
   try {
     const data = await invoke<any>('get_youtube_playlist_detail', { browseId })
     tracks.value = parsePlaylistTracks(data)
+    // header 封面偶发缺失时用首曲封面兜底, 避免大图占位空白
+    if (!coverUrl.value) {
+      const firstCover = tracks.value.find(t => !!t.coverUrl)?.coverUrl || ''
+      if (firstCover) coverUrl.value = firstCover
+    }
     saveDetailCache(cacheKey)
   } catch (e: any) {
     if (!cached) {
