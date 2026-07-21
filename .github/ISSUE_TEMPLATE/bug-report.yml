@@ -80,11 +80,11 @@ body:
     attributes:
       label: 应用版本与构建信息 / App version and build information
       description: >-
-        可在设置页查看版本、构建版本、Build UUID 和构建时间 /
-        Find the version, build version, Build UUID, and build time in Settings
+        在设置页「关于」中点击右侧复制图标即可复制版本号。只需填写构建版本，无需 Build UUID /
+        Open Settings → About and click the copy icon on the right. Only the build version is needed; Build UUID is not required
       placeholder: >-
-        例如 1.0.0，构建 361c08f.07140636，Build UUID fc27ed9b-5007-4d56-8bc8-40a921de6c41 /
-        For example 1.0.0, build 361c08f.07140636, Build UUID fc27ed9b-5007-4d56-8bc8-40a921de6c41
+        例如 38547d9.07210803 /
+        For example 38547d9.07210803
     validations:
       required: true
 
@@ -139,7 +139,7 @@ body:
       options:
         - DMG
         - MSI
-        - NSIS EXE
+        - EXE
         - AppImage
         - DEB
         - RPM

@@ -30,10 +30,86 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare-build-metadata:
+    name: Prepare build metadata
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      build_epoch: ${{ steps.build_metadata.outputs.build_epoch }}
+      build_git_sha: ${{ steps.build_metadata.outputs.build_git_sha }}
+      build_uuid: ${{ steps.build_metadata.outputs.build_uuid }}
+      build_version: ${{ steps.build_metadata.outputs.build_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          submodules: recursive
+
+      - name: Generate shared build metadata
+        id: build_metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_epoch="$(date +%s)"
+          build_git_sha="$(git rev-parse HEAD)"
+          build_timestamp="$(TZ=Asia/Taipei date --date="@$build_epoch" +%m%d%H%M)"
+          build_version="${build_git_sha:0:7}.${build_timestamp}"
+          build_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          [[ "$build_version" =~ ^[0-9a-f]{7}\.[0-9]{8}$ ]]
+          [[ "$build_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+
+          {
+            echo "build_epoch=$build_epoch"
+            echo "build_git_sha=$build_git_sha"
+            echo "build_uuid=$build_uuid"
+            echo "build_version=$build_version"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Build version: $build_version"
+          echo "Build UUID: $build_uuid"
+
+      - name: Upload build metadata summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "build_uuid=${{ steps.build_metadata.outputs.build_uuid }}"
+            echo "build_version=${{ steps.build_metadata.outputs.build_version }}"
+            echo "build_git_sha=${{ steps.build_metadata.outputs.build_git_sha }}"
+            echo "build_epoch=${{ steps.build_metadata.outputs.build_epoch }}"
+            echo "github_sha=${{ github.sha }}"
+            echo "github_ref=${{ github.ref }}"
+            echo "github_run_id=${{ github.run_id }}"
+            echo "github_run_number=${{ github.run_number }}"
+          } > artifacts/build-metadata.txt
+          {
+            echo "### Build metadata"
+            echo ""
+            echo "- Build UUID: \`${{ steps.build_metadata.outputs.build_uuid }}\`"
+            echo "- Build version: \`${{ steps.build_metadata.outputs.build_version }}\`"
+            echo "- Git SHA: \`${{ steps.build_metadata.outputs.build_git_sha }}\`"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build metadata artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: NeriPlayer-build-metadata
+          path: artifacts/build-metadata.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
   build-artifacts:
     name: Build (${{ matrix.artifact_name }})
+    needs: prepare-build-metadata
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
+    env:
+      NERI_BUILD_EPOCH: ${{ needs.prepare-build-metadata.outputs.build_epoch }}
+      NERI_BUILD_GIT_SHA: ${{ needs.prepare-build-metadata.outputs.build_git_sha }}
+      NERI_BUILD_UUID: ${{ needs.prepare-build-metadata.outputs.build_uuid }}
     strategy:
       fail-fast: false
       matrix:
@@ -94,10 +170,28 @@ jobs:
           workspaces: src-tauri -> target
           shared-key: build-${{ matrix.target }}
 
+      - name: Record build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Build UUID: ${NERI_BUILD_UUID}"
+          echo "Build git SHA: ${NERI_BUILD_GIT_SHA}"
+          echo "Build epoch: ${NERI_BUILD_EPOCH}"
+          {
+            echo "### Build metadata (${{ matrix.artifact_name }})"
+            echo ""
+            echo "- Build UUID: \`${NERI_BUILD_UUID}\`"
+            echo "- Build version seed: \`${NERI_BUILD_GIT_SHA:0:7}\`"
+            echo "- Shared epoch: \`${NERI_BUILD_EPOCH}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NERI_BUILD_EPOCH: ${{ env.NERI_BUILD_EPOCH }}
+          NERI_BUILD_GIT_SHA: ${{ env.NERI_BUILD_GIT_SHA }}
+          NERI_BUILD_UUID: ${{ env.NERI_BUILD_UUID }}
         with:
           args: --target ${{ matrix.target }}
 
@@ -105,6 +199,15 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
+          {
+            echo "build_uuid=${NERI_BUILD_UUID}"
+            echo "build_git_sha=${NERI_BUILD_GIT_SHA}"
+            echo "build_epoch=${NERI_BUILD_EPOCH}"
+            echo "artifact_name=${{ matrix.artifact_name }}"
+            echo "target=${{ matrix.target }}"
+            echo "github_sha=${{ github.sha }}"
+            echo "github_run_id=${{ github.run_id }}"
+          } > artifacts/build-metadata.txt
           case "${{ matrix.artifact_name }}" in
             macOS-*)
               cp src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg artifacts/ 2>/dev/null || true

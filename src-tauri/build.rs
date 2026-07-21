@@ -5,11 +5,13 @@ use std::time::{Duration, SystemTime};
 
 const BUILD_EPOCH_ENV: &str = "NERI_BUILD_EPOCH";
 const BUILD_GIT_SHA_ENV: &str = "NERI_BUILD_GIT_SHA";
+const BUILD_UUID_ENV: &str = "NERI_BUILD_UUID";
 const VERSION_TIMEZONE_OFFSET_SECONDS: u64 = 8 * 60 * 60;
 
 fn main() {
     println!("cargo:rerun-if-env-changed={BUILD_EPOCH_ENV}");
     println!("cargo:rerun-if-env-changed={BUILD_GIT_SHA_ENV}");
+    println!("cargo:rerun-if-env-changed={BUILD_UUID_ENV}");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-changed=src");
@@ -21,12 +23,14 @@ fn main() {
     let build_time = resolve_build_time();
     let git_revision = resolve_git_revision();
     let build_version = format!("{}.{}", git_revision, format_version_timestamp(&build_time));
-    let uuid = uuid_v4();
+    let uuid = resolve_build_uuid();
     let timestamp = format_build_timestamp(&build_time);
 
     println!("cargo:rustc-env=BUILD_UUID={}", uuid);
     println!("cargo:rustc-env=BUILD_TIMESTAMP={}", timestamp);
     println!("cargo:rustc-env=BUILD_VERSION={}", build_version);
+    // 方便 CI 从编译日志回收本次构建 UUID
+    println!("cargo:warning=NeriPlayer build metadata: uuid={uuid} version={build_version}");
 
     tauri_build::build()
 }
@@ -64,6 +68,33 @@ fn resolve_git_revision() -> String {
     git_output(&["rev-parse", "--short=7", "HEAD"])
         .and_then(|value| normalize_git_revision(&value))
         .unwrap_or_else(|| "no_commit".to_string())
+}
+
+fn resolve_build_uuid() -> String {
+    if let Ok(value) = env::var(BUILD_UUID_ENV) {
+        if let Some(uuid) = normalize_build_uuid(&value) {
+            return uuid;
+        }
+        println!("cargo:warning=Ignoring invalid {BUILD_UUID_ENV} value: {value}");
+    }
+
+    uuid_v4()
+}
+
+fn normalize_build_uuid(value: &str) -> Option<String> {
+    let uuid = value.trim().to_ascii_lowercase();
+    let mut parts = uuid.split('-');
+    let expected_lengths = [8usize, 4, 4, 4, 12];
+    for expected in expected_lengths {
+        let part = parts.next()?;
+        if part.len() != expected || !part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(uuid)
 }
 
 fn normalize_git_revision(value: &str) -> Option<String> {

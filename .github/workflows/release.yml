@@ -20,6 +20,8 @@ jobs:
     outputs:
       build_epoch: ${{ steps.build_metadata.outputs.build_epoch }}
       build_git_sha: ${{ steps.build_metadata.outputs.build_git_sha }}
+      build_uuid: ${{ steps.build_metadata.outputs.build_uuid }}
+      build_version: ${{ steps.build_metadata.outputs.build_version }}
 
     steps:
       - name: Checkout
@@ -34,11 +36,51 @@ jobs:
           build_git_sha="$(git rev-parse HEAD)"
           build_timestamp="$(TZ=Asia/Taipei date --date="@$build_epoch" +%m%d%H%M)"
           build_version="${build_git_sha:0:7}.${build_timestamp}"
+          build_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
           [[ "$build_version" =~ ^[0-9a-f]{7}\.[0-9]{8}$ ]]
+          [[ "$build_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
 
-          echo "build_epoch=$build_epoch" >> "$GITHUB_OUTPUT"
-          echo "build_git_sha=$build_git_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "build_epoch=$build_epoch"
+            echo "build_git_sha=$build_git_sha"
+            echo "build_uuid=$build_uuid"
+            echo "build_version=$build_version"
+          } >> "$GITHUB_OUTPUT"
+
           echo "Build version: $build_version"
+          echo "Build UUID: $build_uuid"
+          {
+            echo "### Build metadata"
+            echo ""
+            echo "- Build UUID: \`$build_uuid\`"
+            echo "- Build version: \`$build_version\`"
+            echo "- Git SHA: \`$build_git_sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build metadata artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "build_uuid=${{ steps.build_metadata.outputs.build_uuid }}"
+            echo "build_version=${{ steps.build_metadata.outputs.build_version }}"
+            echo "build_git_sha=${{ steps.build_metadata.outputs.build_git_sha }}"
+            echo "build_epoch=${{ steps.build_metadata.outputs.build_epoch }}"
+            echo "github_sha=${{ github.sha }}"
+            echo "github_ref=${{ github.ref }}"
+            echo "github_run_id=${{ github.run_id }}"
+            echo "github_run_number=${{ github.run_number }}"
+          } > artifacts/build-metadata.txt
+
+      - name: Persist build metadata artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: NeriPlayer-build-metadata-${{ github.ref_name }}
+          path: artifacts/build-metadata.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -90,6 +132,7 @@ jobs:
     env:
       NERI_BUILD_EPOCH: ${{ needs.validate.outputs.build_epoch }}
       NERI_BUILD_GIT_SHA: ${{ needs.validate.outputs.build_git_sha }}
+      NERI_BUILD_UUID: ${{ needs.validate.outputs.build_uuid }}
     strategy:
       fail-fast: false
       matrix:
