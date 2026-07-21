@@ -183,7 +183,8 @@
     "in_use_hint": "This track is using the local downloaded file. Switch tracks or pause before editing it",
     "empty_title": "No downloads yet",
     "empty_desc": "Save tracks locally from the more menu on the playback page",
-    "delete_confirm_msg": "Delete \"{name}\"? This cannot be undone."
+    "delete_confirm_msg": "Delete \"{name}\"? This cannot be undone.",
+    "not_downloaded": "Not downloaded"
   },
   "player": {
     "not_playing": "Not Playing",
@@ -228,6 +229,8 @@
     "cover_save_failed": "Failed to save cover",
     "more_options": "More Options",
     "lyric_offset": "Lyrics Offset",
+    "lyric_offset_song": "This Song",
+    "lyric_offset_base": "System default {value}",
     "font_scale": "Lyrics Font Size",
     "font_preview": "Sample lyrics text",
     "audio_effects": "Audio Effects",
@@ -298,7 +301,20 @@
     "eq_treble_boost": "Treble Boost",
     "eq_treble_reduce": "Treble Reduce",
     "eq_vocal_boost": "Vocal Boost",
-    "eq_custom": "Custom"
+    "track_detail_duration": "Duration",
+    "track_detail_audio_params": "Audio Specs",
+    "track_detail_bitrate": "Bitrate",
+    "track_detail_cache_status": "Cache Status",
+    "track_detail_local_download_play": "Playing Local Download",
+    "track_detail_download_status": "Download Status",
+    "track_detail_file_size": "File Size",
+    "cache_status_download": "Local download file",
+    "cache_status_playback_cache": "Playback cache hit",
+    "cache_status_stream": "Online stream (uncached)",
+    "cache_status_local": "Local file",
+    "copy_share_info": "Copy Share Info",
+    "yes": "Yes",
+    "no": "No"
   },
   "recent": {
     "title": "Recent",
@@ -348,7 +364,6 @@
     "color_green": "Green",
     "dynamic_color": "Dynamic Color",
     "dynamic_color_desc": "Automatically tint the interface with the cover's theme color",
-
     "personalization": "Personalization",
     "nav_personalization_desc": "Adjust visuals and player layout",
     "motion": "Motion Settings",
@@ -367,7 +382,6 @@
     "audio_spec": "Audio Specs",
     "audio_spec_desc": "Show sample rate / bit depth",
     "lyric_font_size": "Lyrics Font Size",
-
     "playback": "Playback Settings",
     "nav_playback_desc": "Expand to configure playback behavior",
     "crossfade": "Gapless Playback",
@@ -386,7 +400,6 @@
     "keep_progress_desc": "Resume last position on restart",
     "keep_mode": "Remember Play Mode",
     "keep_mode_desc": "Keep repeat/shuffle mode",
-
     "lyrics": "Lyrics",
     "nav_lyrics_desc": "Adjust lyrics display and synchronization",
     "show_translation": "Show Translation",
@@ -396,7 +409,6 @@
     "blur_strength": "Blur Strength",
     "netease_offset": "Netease Lyrics Offset",
     "qq_offset": "QQ Music Lyrics Offset",
-
     "effects": "Effects & Visuals",
     "advanced_lyrics": "Advanced Lyrics",
     "advanced_lyrics_desc": "Word-by-word reveal with transitions",
@@ -408,7 +420,6 @@
     "cover_blur_desc": "Use blurred cover as player background",
     "blur_amount": "Blur Amount",
     "bg_darken": "Background Darken",
-
     "audio_quality": "Audio Quality Settings",
     "audio_quality_desc": "Expand to configure audio quality",
     "quality": "Audio Quality",
@@ -430,7 +441,6 @@
     "q_smooth": "Fluent",
     "q_good": "High Quality",
     "q_dolby": "Dolby Atmos",
-
     "storage": "Storage & Cache",
     "nav_storage_desc": "Manage downloads and cache",
     "cache_limit": "Cache Size Limit",
@@ -506,7 +516,6 @@
     "storage_desc_custom_background": "User-selected background images",
     "storage_desc_playlist_data": "Local playlists and usage data",
     "storage_desc_app_data": "Settings and other app data",
-
     "backup": "Backup & Sync",
     "nav_backup_desc": "Manage config and playlist backups",
     "nav_listen_together_desc": "Configure server and identity",
@@ -575,29 +584,24 @@
     "export_config_warning_sync": "GitHub / WebDAV sync keys",
     "export_config_warning_private": "The file can be used to migrate your account",
     "export_config_warning_confirm": "I understand, continue",
-
     "about": "About",
     "about_desc": "Version, project home, and developer mode",
     "version_info": "Version {version} · Tauri 2 + Vue 3",
     "github": "GitHub Repository",
     "github_desc": "View source code",
-
     "network": "Network",
     "nav_network_desc": "Configure network connections",
     "bypass_proxy": "Bypass Proxy",
     "bypass_proxy_desc": "Bypass system proxy for direct connection, useful when proxy causes issues",
-
     "download_manage": "Download Management",
     "download_progress": "{completed}/{total} completed",
     "cancel_all_downloads": "Cancel All",
     "go_to_downloads": "View Downloads",
     "no_active_downloads": "No active downloads",
-
     "internationalization": "YouTube Internationalization",
     "internationalization_desc": "Enable YouTube Music international mode to access global content",
     "intl_checking": "Checking connectivity...",
     "intl_check_failed": "Connectivity check failed, reverted",
-
     "cover_style": "Cover Style",
     "cover_style_disc": "Disc",
     "cover_style_card": "Card",
@@ -607,12 +611,19 @@
     "clear_image": "Clear",
     "bg_blur": "Background Blur",
     "bg_opacity": "Background Opacity",
-
     "dev_mode": "Debug Mode",
     "dev_mode_toast": "Debug mode enabled",
     "dev_mode_tap_hint": "Tap {count} more times to enable debug mode",
     "build_uuid": "Build UUID",
     "build_time": "Build Time",
+    "app_version": "App Version",
+    "build_version_label": "Version",
+    "copy_app_version": "Click to copy version",
+    "copy_build_version": "Click to copy version",
+    "copy_build_uuid": "Click to copy Build UUID",
+    "copy_build_time": "Click to copy build time",
+    "build_info_copied": "Build info copied",
+    "build_info_copy_failed": "Failed to copy build info",
     "debug": "Debug",
     "debug_title": "Debug Panel",
     "api_probe": "API Probe",
@@ -647,10 +658,8 @@
     "debug_cookie_clear_confirm_desc": "This deletes the randomized file, clears in-memory and WebView cookies, and signs out every platform account. This cannot be undone.",
     "debug_cookie_clear_success": "Debug cookies deleted",
     "debug_cookie_clear_failed": "Failed to delete debug cookies",
-
     "language": "Language",
     "language_desc": "Choose display language",
-
     "github_sync_success": "GitHub sync complete",
     "github_disconnected": "GitHub sync disconnected",
     "webdav_sync_success": "WebDAV sync complete",

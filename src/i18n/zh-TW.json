@@ -183,7 +183,8 @@
     "in_use_hint": "目前歌曲正在使用本地下載檔案，切歌或暫停後再操作",
     "empty_title": "暫無下載",
     "empty_desc": "在播放頁的更多選單裡將歌曲儲存到本地",
-    "delete_confirm_msg": "確定要刪除「{name}」嗎？此操作無法復原。"
+    "delete_confirm_msg": "確定要刪除「{name}」嗎？此操作無法復原。",
+    "not_downloaded": "未下載"
   },
   "player": {
     "not_playing": "未在播放",
@@ -228,6 +229,8 @@
     "cover_save_failed": "儲存封面失敗",
     "more_options": "更多選項",
     "lyric_offset": "歌詞偏移",
+    "lyric_offset_song": "此歌曲偏移",
+    "lyric_offset_base": "系統預設 {value}",
     "font_scale": "歌詞字型大小",
     "font_preview": "歌詞預覽文字",
     "audio_effects": "音訊效果",
@@ -298,7 +301,20 @@
     "eq_treble_boost": "高音增強",
     "eq_treble_reduce": "高音減弱",
     "eq_vocal_boost": "人聲增強",
-    "eq_custom": "自訂"
+    "track_detail_duration": "時長",
+    "track_detail_audio_params": "音訊參數",
+    "track_detail_bitrate": "碼率",
+    "track_detail_cache_status": "快取狀態",
+    "track_detail_local_download_play": "本地下載播放",
+    "track_detail_download_status": "下載狀態",
+    "track_detail_file_size": "檔案大小",
+    "cache_status_download": "本地下載檔案",
+    "cache_status_playback_cache": "播放快取命中",
+    "cache_status_stream": "線上流 (未快取)",
+    "cache_status_local": "本地檔案",
+    "copy_share_info": "複製分享資訊",
+    "yes": "是",
+    "no": "否"
   },
   "recent": {
     "title": "最近播放",
@@ -348,7 +364,6 @@
     "color_green": "綠色",
     "dynamic_color": "動態取色",
     "dynamic_color_desc": "跟隨封面主題色自動調整介面色彩",
-
     "personalization": "個人化",
     "nav_personalization_desc": "調整外觀和播放介面",
     "motion": "動效設定",
@@ -367,7 +382,6 @@
     "audio_spec": "顯示音訊參數",
     "audio_spec_desc": "在進度條旁顯示取樣率/位元深度",
     "lyric_font_size": "歌詞字型大小",
-
     "playback": "播放設定",
     "nav_playback_desc": "展開以設定播放行為",
     "crossfade": "無縫切換",
@@ -386,7 +400,6 @@
     "keep_progress_desc": "下次開啟時恢復上次播放位置",
     "keep_mode": "記住播放模式",
     "keep_mode_desc": "保持循環/隨機等播放模式",
-
     "lyrics": "歌詞",
     "nav_lyrics_desc": "調整歌詞顯示和同步",
     "show_translation": "顯示翻譯",
@@ -396,7 +409,6 @@
     "blur_strength": "模糊強度",
     "netease_offset": "網易雲歌詞偏移",
     "qq_offset": "QQ 音樂歌詞偏移",
-
     "effects": "動效 & 視覺",
     "advanced_lyrics": "進階歌詞動畫",
     "advanced_lyrics_desc": "逐字顯示、縮放過渡效果",
@@ -408,7 +420,6 @@
     "cover_blur_desc": "使用封面模糊圖作為播放頁背景",
     "blur_amount": "模糊程度",
     "bg_darken": "背景暗度",
-
     "audio_quality": "音質設定",
     "audio_quality_desc": "展開以設定音質選項",
     "quality": "音質",
@@ -430,7 +441,6 @@
     "q_smooth": "流暢",
     "q_good": "高品質",
     "q_dolby": "杜比全景聲",
-
     "storage": "儲存 & 快取",
     "nav_storage_desc": "管理下載和快取",
     "cache_limit": "快取大小上限",
@@ -506,7 +516,6 @@
     "storage_desc_custom_background": "使用者選擇的背景圖片",
     "storage_desc_playlist_data": "本地播放清單和使用資料",
     "storage_desc_app_data": "設定和其他應用程式資料",
-
     "backup": "備份 & 同步",
     "nav_backup_desc": "管理設定和歌單備份",
     "nav_listen_together_desc": "配置伺服器和個人身份",
@@ -575,29 +584,24 @@
     "export_config_warning_sync": "包含 GitHub / WebDAV 同步金鑰",
     "export_config_warning_private": "檔案等同於帳號搬移憑證",
     "export_config_warning_confirm": "我已了解，繼續匯出",
-
     "about": "關於",
     "about_desc": "版本資訊、專案首頁和開發者模式",
     "version_info": "版本 {version} · Tauri 2 + Vue 3",
     "github": "GitHub 儲存庫",
     "github_desc": "檢視原始碼",
-
     "network": "網路",
     "nav_network_desc": "配置網路連線",
     "bypass_proxy": "繞過代理",
     "bypass_proxy_desc": "繞過系統代理直接連線，適用於代理導致的連線問題",
-
     "download_manage": "下載管理",
     "download_progress": "已完成 {completed}/{total}",
     "cancel_all_downloads": "取消全部",
     "go_to_downloads": "查看已下載",
     "no_active_downloads": "暫無活躍下載",
-
     "internationalization": "YouTube 國際化",
     "internationalization_desc": "啟用 YouTube Music 國際化模式以存取海外內容",
     "intl_checking": "檢測連通性...",
     "intl_check_failed": "連通性檢測失敗，已回退",
-
     "cover_style": "封面樣式",
     "cover_style_disc": "唱片",
     "cover_style_card": "卡片",
@@ -607,12 +611,19 @@
     "clear_image": "清除",
     "bg_blur": "背景模糊",
     "bg_opacity": "背景透明度",
-
     "dev_mode": "開發者模式",
     "dev_mode_toast": "已啟用開發者模式",
     "dev_mode_tap_hint": "再點擊 {count} 次啟用開發者模式",
     "build_uuid": "構建 UUID",
     "build_time": "構建時間",
+    "app_version": "應用版本",
+    "build_version_label": "版本號",
+    "copy_app_version": "點擊複製版本號",
+    "copy_build_version": "點擊複製版本號",
+    "copy_build_uuid": "點擊複製 Build UUID",
+    "copy_build_time": "點擊複製構建時間",
+    "build_info_copied": "已複製構建資訊",
+    "build_info_copy_failed": "複製構建資訊失敗",
     "debug": "偵錯",
     "debug_title": "偵錯面板",
     "api_probe": "API 探針",
@@ -647,10 +658,8 @@
     "debug_cookie_clear_confirm_desc": "這會刪除隨機檔案、清除記憶體與 WebView Cookie，並登出所有平台帳號。此操作無法復原。",
     "debug_cookie_clear_success": "偵錯 Cookie 已刪除",
     "debug_cookie_clear_failed": "刪除偵錯 Cookie 失敗",
-
     "language": "語言",
     "language_desc": "選擇介面顯示語言",
-
     "github_sync_success": "GitHub 同步完成",
     "github_disconnected": "已斷開 GitHub 同步",
     "webdav_sync_success": "WebDAV 同步完成",

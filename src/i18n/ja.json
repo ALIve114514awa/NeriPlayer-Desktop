@@ -183,7 +183,8 @@
     "in_use_hint": "この曲はローカル保存ファイルを使用中です。曲を切り替えるか一時停止してから操作してください",
     "empty_title": "ダウンロードはまだありません",
     "empty_desc": "再生ページのその他メニューから曲をローカルに保存できます",
-    "delete_confirm_msg": "「{name}」を削除しますか？この操作は元に戻せません。"
+    "delete_confirm_msg": "「{name}」を削除しますか？この操作は元に戻せません。",
+    "not_downloaded": "未ダウンロード"
   },
   "player": {
     "not_playing": "再生停止中",
@@ -228,6 +229,8 @@
     "cover_save_failed": "カバーの保存に失敗",
     "more_options": "その他のオプション",
     "lyric_offset": "歌詞オフセット",
+    "lyric_offset_song": "この曲のオフセット",
+    "lyric_offset_base": "システム既定 {value}",
     "font_scale": "歌詞フォントサイズ",
     "font_preview": "歌詞プレビューテキスト",
     "audio_effects": "オーディオエフェクト",
@@ -298,7 +301,20 @@
     "eq_treble_boost": "高音ブースト",
     "eq_treble_reduce": "高音カット",
     "eq_vocal_boost": "ボーカルブースト",
-    "eq_custom": "カスタム"
+    "track_detail_duration": "再生時間",
+    "track_detail_audio_params": "音声パラメータ",
+    "track_detail_bitrate": "ビットレート",
+    "track_detail_cache_status": "キャッシュ状態",
+    "track_detail_local_download_play": "ローカル保存から再生",
+    "track_detail_download_status": "ダウンロード状態",
+    "track_detail_file_size": "ファイルサイズ",
+    "cache_status_download": "ローカル保存ファイル",
+    "cache_status_playback_cache": "再生キャッシュ命中",
+    "cache_status_stream": "オンラインストリーム (未キャッシュ)",
+    "cache_status_local": "ローカルファイル",
+    "copy_share_info": "共有情報をコピー",
+    "yes": "はい",
+    "no": "いいえ"
   },
   "recent": {
     "title": "最近再生",
@@ -348,7 +364,6 @@
     "color_green": "緑",
     "dynamic_color": "ダイナミックカラー",
     "dynamic_color_desc": "カバーのテーマカラーに合わせて配色を自動調整",
-
     "personalization": "カスタマイズ",
     "nav_personalization_desc": "外観と再生画面を調整",
     "motion": "モーション設定",
@@ -367,7 +382,6 @@
     "audio_spec": "音声パラメータ",
     "audio_spec_desc": "サンプルレート/ビット深度を表示",
     "lyric_font_size": "歌詞フォントサイズ",
-
     "playback": "再生設定",
     "nav_playback_desc": "展開して再生動作を設定",
     "crossfade": "ギャップレス再生",
@@ -386,7 +400,6 @@
     "keep_progress_desc": "再起動時に前回の位置を復元",
     "keep_mode": "再生モードを記憶",
     "keep_mode_desc": "リピート/シャッフルモードを保持",
-
     "lyrics": "歌詞",
     "nav_lyrics_desc": "歌詞の表示と同期を調整",
     "show_translation": "翻訳を表示",
@@ -396,7 +409,6 @@
     "blur_strength": "ぼかし強度",
     "netease_offset": "網易雲歌詞オフセット",
     "qq_offset": "QQ音楽歌詞オフセット",
-
     "effects": "エフェクト",
     "advanced_lyrics": "高度な歌詞アニメーション",
     "advanced_lyrics_desc": "単語ごとの表示とトランジション",
@@ -408,7 +420,6 @@
     "cover_blur_desc": "ぼかしたカバーを背景に使用",
     "blur_amount": "ぼかし量",
     "bg_darken": "背景の暗さ",
-
     "audio_quality": "音質設定",
     "audio_quality_desc": "展開して音質を設定",
     "quality": "音質",
@@ -430,7 +441,6 @@
     "q_smooth": "スムーズ",
     "q_good": "高品質",
     "q_dolby": "Dolby Atmos",
-
     "storage": "ストレージ",
     "nav_storage_desc": "ダウンロードとキャッシュを管理",
     "cache_limit": "キャッシュ上限",
@@ -506,7 +516,6 @@
     "storage_desc_custom_background": "ユーザーが選択した背景画像",
     "storage_desc_playlist_data": "ローカルプレイリストと利用データ",
     "storage_desc_app_data": "設定とその他のアプリデータ",
-
     "backup": "バックアップ & 同期",
     "nav_backup_desc": "設定とプレイリストのバックアップを管理",
     "nav_listen_together_desc": "サーバーと個人情報を設定",
@@ -575,29 +584,24 @@
     "export_config_warning_sync": "GitHub / WebDAV 同期キー",
     "export_config_warning_private": "アカウント移行に使える情報",
     "export_config_warning_confirm": "理解しました。続行",
-
     "about": "アプリについて",
     "about_desc": "バージョン、プロジェクト、開発者モード",
     "version_info": "バージョン {version} · Tauri 2 + Vue 3",
     "github": "GitHubリポジトリ",
     "github_desc": "ソースコードを見る",
-
     "network": "ネットワーク",
     "nav_network_desc": "ネットワーク接続を設定",
     "bypass_proxy": "プロキシをバイパス",
     "bypass_proxy_desc": "システムプロキシをバイパスして直接接続（プロキシが原因の問題に有効）",
-
     "download_manage": "ダウンロード管理",
     "download_progress": "{completed}/{total} 完了",
     "cancel_all_downloads": "すべてキャンセル",
     "go_to_downloads": "ダウンロード済みを見る",
     "no_active_downloads": "アクティブなダウンロードなし",
-
     "internationalization": "YouTube 国際化",
     "internationalization_desc": "YouTube Music 国際化モードを有効にしてグローバルコンテンツにアクセス",
     "intl_checking": "接続を確認中...",
     "intl_check_failed": "接続確認に失敗しました、元に戻しました",
-
     "cover_style": "カバースタイル",
     "cover_style_disc": "ディスク",
     "cover_style_card": "カード",
@@ -607,12 +611,19 @@
     "clear_image": "クリア",
     "bg_blur": "背景ぼかし",
     "bg_opacity": "背景の不透明度",
-
     "dev_mode": "開発者モード",
     "dev_mode_toast": "開発者モードが有効になりました",
     "dev_mode_tap_hint": "あと{count}回タップで開発者モードを有効化",
     "build_uuid": "ビルドUUID",
     "build_time": "ビルド時刻",
+    "app_version": "アプリバージョン",
+    "build_version_label": "バージョン",
+    "copy_app_version": "クリックしてバージョンをコピー",
+    "copy_build_version": "クリックしてバージョンをコピー",
+    "copy_build_uuid": "クリックして Build UUID をコピー",
+    "copy_build_time": "クリックしてビルド時刻をコピー",
+    "build_info_copied": "ビルド情報をコピーしました",
+    "build_info_copy_failed": "ビルド情報のコピーに失敗しました",
     "debug": "デバッグ",
     "debug_title": "デバッグパネル",
     "api_probe": "API探針",
@@ -647,10 +658,8 @@
     "debug_cookie_clear_confirm_desc": "ランダムファイル、メモリ、WebView の Cookie を削除し、すべてのプラットフォームからログアウトします。この操作は取り消せません。",
     "debug_cookie_clear_success": "デバッグ Cookie を削除しました",
     "debug_cookie_clear_failed": "デバッグ Cookie を削除できませんでした",
-
     "language": "言語",
     "language_desc": "表示言語を選択",
-
     "github_sync_success": "GitHub同期完了",
     "github_disconnected": "GitHub同期を解除しました",
     "webdav_sync_success": "WebDAV同期完了",

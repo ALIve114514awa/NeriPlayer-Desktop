@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { usePlayerStore } from '@/stores/player'
 import { useSyncStore } from '@/stores/sync'
 import { useSettingsStore } from '@/stores/settings'
@@ -20,7 +21,12 @@ const settingsStore = useSettingsStore()
 const authStore = useAuthStore()
 const toast = useToastStore()
 
-const buildInfo = ref<{ uuid: string; timestamp: string } | null>(null)
+const buildInfo = ref<{
+  app_version?: string
+  version?: string
+  uuid: string
+  timestamp: string
+} | null>(null)
 const appDataDir = ref('')
 const debugCookieStorage = ref<{ available: boolean; stored: boolean } | null>(null)
 const clearingDebugCookies = ref(false)
@@ -136,9 +142,32 @@ async function clearDebugCookies() {
   }
 }
 
+async function copyBuildValue(value: string | undefined | null) {
+  const text = value?.trim()
+  if (!text) return
+  try {
+    await writeText(text)
+    toast.success(t('settings.build_info_copied'))
+  } catch (error) {
+    log.error('Failed to copy build info:', error)
+    toast.error(t('settings.build_info_copy_failed'))
+  }
+}
+
 onMounted(async () => {
   try {
-    buildInfo.value = await invoke('get_build_info')
+    const info = await invoke<{
+      app_version?: string
+      build_uuid: string
+      build_timestamp: string
+      version: string
+    }>('get_build_info')
+    buildInfo.value = {
+      app_version: info.app_version,
+      version: info.version,
+      uuid: info.build_uuid,
+      timestamp: info.build_timestamp,
+    }
   } catch { /* 命令不存在时忽略 */ }
   try {
     appDataDir.value = await invoke('get_app_data_dir')
@@ -164,11 +193,15 @@ onMounted(async () => {
     <div v-if="buildInfo" class="setting-card">
       <div class="setting-info">
         <div class="state-grid">
-          <div class="state-item">
+          <div class="state-item copyable-state-item" @click="copyBuildValue(buildInfo.version)">
+            <span class="state-label">{{ t('settings.build_version_label') }}</span>
+            <span class="state-value mono">{{ buildInfo.version || '—' }}</span>
+          </div>
+          <div class="state-item copyable-state-item" @click="copyBuildValue(buildInfo.uuid)">
             <span class="state-label">{{ t('settings.build_uuid') }}</span>
             <span class="state-value mono">{{ buildInfo.uuid }}</span>
           </div>
-          <div class="state-item">
+          <div class="state-item copyable-state-item" @click="copyBuildValue(buildInfo.timestamp)">
             <span class="state-label">{{ t('settings.build_time') }}</span>
             <span class="state-value">{{ buildInfo.timestamp }}</span>
           </div>
@@ -483,6 +516,18 @@ onMounted(async () => {
 
   &.full-width {
     grid-column: 1 / -1;
+  }
+
+  &.copyable-state-item {
+    cursor: pointer;
+    border-radius: 8px;
+    padding: 4px 6px;
+    margin: -4px -6px;
+    transition: background var(--duration-short, 0.15s);
+
+    &:hover {
+      background: var(--md-surface-container-high, rgba(255, 255, 255, 0.06));
+    }
   }
 }
 

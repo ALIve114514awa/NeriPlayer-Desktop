@@ -7,6 +7,7 @@ import { SUPPORTED_LOCALES, setLocaleWithTransition } from '@/i18n'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import {
   MAX_MEDIA_CACHE_SIZE_MB,
   MIN_MEDIA_CACHE_SIZE_MB,
@@ -494,7 +495,7 @@ onBeforeUnmount(() => {
   persistSettingsUiState()
 })
 
-// ── 网络：绕过代理 ──
+// 网络：绕过代理
 async function handleBypassProxyChange(val: boolean) {
   bypassProxy.value = val
   try {
@@ -504,7 +505,7 @@ async function handleBypassProxyChange(val: boolean) {
   }
 }
 
-// ── 一起听 ──
+// 一起听
 const showResetLtIdentityConfirm = ref(false)
 
 function confirmResetLtIdentity() {
@@ -524,7 +525,7 @@ async function importConfig() {
   await syncStore.importConfig()
 }
 
-// ── 下载管理 ──
+// 下载管理
 const activeDownloadCount = computed(() => downloadStore.downloading.size)
 const completedDownloadCount = computed(() => downloadStore.downloads.length)
 const activeDownloadTasks = computed(() => downloadStore.activeDownloads)
@@ -573,7 +574,7 @@ function activeDownloadProgressText(task: {
   return activeDownloadStatusText(task.status)
 }
 
-// ── 下载目录 ──
+// 下载目录
 const defaultDownloadDir = ref('')
 
 async function loadDefaultDownloadDir() {
@@ -605,7 +606,7 @@ function resetDownloadDir() {
   downloadDir.value = ''
 }
 
-// ── 下载文件名格式 ──
+// 下载文件名格式
 const showDownloadTemplateDialog = ref(false)
 const pendingTemplate = ref('')
 
@@ -704,7 +705,7 @@ async function clearStorageCache(options: StorageCacheClearOptions) {
   }
 }
 
-// ── YouTube 国际化 ──
+// YouTube 国际化
 const intlChecking = ref(false)
 
 async function handleIntlToggle(val: boolean) {
@@ -725,13 +726,13 @@ async function handleIntlToggle(val: boolean) {
   }
 }
 
-// ── 封面样式选项 ──
+// 封面样式选项
 const coverStyleOptions = computed(() => [
   { value: 'disc', label: t('settings.cover_style_disc') },
   { value: 'card', label: t('settings.cover_style_card') },
 ])
 
-// ── 背景图片选择 ──
+// 背景图片选择
 async function selectBackgroundImage() {
   try {
     const result = await dialogOpen({
@@ -750,7 +751,7 @@ function clearBackgroundImage() {
   backgroundImageUri.value = ''
 }
 
-// ── 开发者模式：7-tap 解锁 ──
+// 开发者模式：7-tap 解锁
 const versionTapCount = ref(0)
 let tapTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -771,8 +772,9 @@ function handleVersionTap() {
   }
 }
 
-// ── 构建信息 ──
+// 构建信息
 interface BuildInfo {
+  app_version: string
   build_uuid: string
   build_timestamp: string
   version: string
@@ -788,9 +790,22 @@ async function loadBuildInfo() {
   }
 }
 
-// GitHub 同步两阶段引导（对齐 Android）
+async function copyBuildValue(value: string | undefined | null, event?: Event) {
+  event?.stopPropagation()
+  const text = value?.trim()
+  if (!text) return
+  try {
+    await writeText(text)
+    toast.success(t('settings.build_info_copied'))
+  } catch (e) {
+    log.error('Failed to copy build info:', e)
+    toast.error(t('settings.build_info_copy_failed'))
+  }
+}
+
+// GitHub 同步引导（对齐 Android）
 const showGitHubDialog = ref(false)
-const githubPhase = ref<1 | 2>(1) // Phase 1: token 验证, Phase 2: 仓库选择
+const githubPhase = ref<1 | 2>(1) // 当前步骤：1=token 验证，2=仓库选择
 const githubToken = ref('')
 const githubUsername = ref('')
 const githubIsValidating = ref(false)
@@ -2087,27 +2102,48 @@ function confirmDataSaverChange() {
       </div>
       <div class="setting-info">
         <div class="setting-title">NeriPlayer Desktop{{ devModeEnabled ? ' (dev)' : '' }}</div>
-        <div class="setting-desc">{{ t('settings.version_info', {
-          version: buildInfo?.version || 'dev',
-        }) }}</div>
+        <div class="setting-desc mono-build-value">
+          {{ t('settings.version_info', {
+            version: buildInfo?.version || 'dev',
+          }) }}
+        </div>
       </div>
+      <button
+        type="button"
+        class="about-copy-btn"
+        :title="t('settings.copy_build_version')"
+        :aria-label="t('settings.copy_build_version')"
+        @click="copyBuildValue(buildInfo?.version, $event)"
+      >
+        <span class="material-symbols-rounded">content_copy</span>
+      </button>
       <span class="material-symbols-rounded section-arrow" :class="{ expanded: isExpanded('about') }" style="font-size: 20px; opacity: 0.3">expand_more</span>
     </div>
 
     <Transition @enter="onExpandEnter" @after-enter="onExpandAfterEnter" @leave="onExpandLeave" @after-leave="onExpandAfterLeave"><div v-if="isExpanded('about') && buildInfo">
-      <div class="setting-card sub-card">
+      <div
+        class="setting-card sub-card copyable-setting-card"
+        :title="t('settings.copy_build_uuid')"
+        @click="copyBuildValue(buildInfo.build_uuid, $event)"
+      >
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">fingerprint</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.build_uuid') }}</div>
-          <div class="setting-desc" style="font-family: monospace; font-size: 11px">{{ buildInfo.build_uuid }}</div>
+          <div class="setting-desc mono-build-value">{{ buildInfo.build_uuid }}</div>
         </div>
+        <span class="material-symbols-rounded copy-hint-icon">content_copy</span>
       </div>
-      <div class="setting-card sub-card">
+      <div
+        class="setting-card sub-card copyable-setting-card"
+        :title="t('settings.copy_build_time')"
+        @click="copyBuildValue(buildInfo.build_timestamp, $event)"
+      >
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">schedule</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.build_time') }}</div>
           <div class="setting-desc">{{ buildInfo.build_timestamp }}</div>
         </div>
+        <span class="material-symbols-rounded copy-hint-icon">content_copy</span>
       </div>
     </div></Transition>
 
@@ -2129,7 +2165,7 @@ function confirmDataSaverChange() {
         <div class="dialog-card" style="width: 420px">
           <h3 class="dialog-title">{{ t('settings.github_sync_config') }}</h3>
 
-          <!-- Phase 1: Token 验证 -->
+          <!-- Token 验证 -->
           <div class="phase-section">
             <div class="phase-header">
               <span class="phase-number" :class="{ done: githubPhase === 2 }">{{ githubPhase === 2 ? '✓' : '1' }}</span>
@@ -2153,7 +2189,7 @@ function confirmDataSaverChange() {
             </div>
           </div>
 
-          <!-- Phase 2: 仓库选择 -->
+          <!-- 仓库选择 -->
           <div v-if="githubPhase === 2" class="phase-section">
             <div class="phase-header">
               <span class="phase-number">2</span>
@@ -2572,6 +2608,55 @@ function confirmDataSaverChange() {
 
 .about-card { cursor: pointer; }
 
+.about-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin-left: auto;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--md-on-surface-variant);
+  opacity: 0.45;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity var(--duration-short), background var(--duration-short), color var(--duration-short);
+
+  .material-symbols-rounded {
+    font-size: 18px;
+  }
+
+  &:hover {
+    opacity: 0.9;
+    color: var(--md-primary);
+    background: color-mix(in srgb, var(--md-primary) 10%, transparent);
+  }
+}
+
+.copyable-setting-card {
+  cursor: pointer;
+  user-select: none;
+
+  &:hover .copy-hint-icon {
+    opacity: 0.7;
+  }
+}
+
+.mono-build-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.copy-hint-icon {
+  font-size: 14px;
+  opacity: 0.35;
+  flex-shrink: 0;
+  transition: opacity var(--duration-short);
+}
+
 /* 账号卡片 */
 .platform-icon {
   display: block;
@@ -2750,7 +2835,7 @@ function confirmDataSaverChange() {
   100% { transform: translateX(280%); }
 }
 
-/* 深色模式切换胶囊 — 滑动拇指 */
+/* 深色模式切换胶囊：滑动拇指 */
 .dark-mode-pills {
   position: relative;
   display: grid;
@@ -2817,7 +2902,7 @@ function confirmDataSaverChange() {
   &.selected { border-color: rgba(255,255,255,0.8); }
 }
 
-/* M3 Switch — 严格对齐 M3 规范 */
+/* M3 Switch：严格对齐 M3 规范 */
 .m3-switch {
   position: relative;
   flex-shrink: 0;

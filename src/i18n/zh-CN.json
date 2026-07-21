@@ -183,7 +183,8 @@
     "in_use_hint": "当前歌曲正在使用本地下载文件，切歌或暂停后再操作",
     "empty_title": "暂无下载",
     "empty_desc": "在播放页的更多菜单里保存歌曲到本地",
-    "delete_confirm_msg": "确定要删除「{name}」吗？此操作不可撤销。"
+    "delete_confirm_msg": "确定要删除「{name}」吗？此操作不可撤销。",
+    "not_downloaded": "未下载"
   },
   "player": {
     "not_playing": "未在播放",
@@ -228,6 +229,8 @@
     "cover_save_failed": "保存封面失败",
     "more_options": "更多选项",
     "lyric_offset": "歌词偏移",
+    "lyric_offset_song": "此歌曲偏移",
+    "lyric_offset_base": "系统默认 {value}",
     "font_scale": "歌词字体大小",
     "font_preview": "歌词预览文本",
     "audio_effects": "音频效果",
@@ -298,7 +301,20 @@
     "eq_treble_boost": "高音增强",
     "eq_treble_reduce": "高音减弱",
     "eq_vocal_boost": "人声增强",
-    "eq_custom": "自定义"
+    "track_detail_duration": "时长",
+    "track_detail_audio_params": "音频参数",
+    "track_detail_bitrate": "码率",
+    "track_detail_cache_status": "缓存状态",
+    "track_detail_local_download_play": "本地下载播放",
+    "track_detail_download_status": "下载状态",
+    "track_detail_file_size": "文件大小",
+    "cache_status_download": "本地下载文件",
+    "cache_status_playback_cache": "播放缓存命中",
+    "cache_status_stream": "在线流 (未缓存)",
+    "cache_status_local": "本地文件",
+    "copy_share_info": "复制分享信息",
+    "yes": "是",
+    "no": "否"
   },
   "recent": {
     "title": "最近播放",
@@ -346,10 +362,8 @@
     "color_brown": "棕色",
     "color_orange": "橙色",
     "color_green": "绿色",
-
     "dynamic_color": "动态取色",
     "dynamic_color_desc": "跟随封面主题色自动调整界面色彩",
-
     "personalization": "个性化",
     "nav_personalization_desc": "调整外观和播放界面",
     "motion": "动效设置",
@@ -368,7 +382,6 @@
     "audio_spec": "显示音频参数",
     "audio_spec_desc": "在进度条旁显示采样率/位深",
     "lyric_font_size": "歌词字体大小",
-
     "playback": "播放设置",
     "nav_playback_desc": "展开以配置播放行为",
     "crossfade": "无缝切换",
@@ -387,7 +400,6 @@
     "keep_progress_desc": "下次打开时恢复上次播放位置",
     "keep_mode": "记住播放模式",
     "keep_mode_desc": "保持循环/随机等播放模式",
-
     "lyrics": "歌词",
     "nav_lyrics_desc": "调整歌词显示和同步",
     "show_translation": "显示翻译",
@@ -397,7 +409,6 @@
     "blur_strength": "模糊强度",
     "netease_offset": "网易云歌词偏移",
     "qq_offset": "QQ 音乐歌词偏移",
-
     "effects": "动效 & 视觉",
     "advanced_lyrics": "高级歌词动画",
     "advanced_lyrics_desc": "逐字显示、缩放过渡效果",
@@ -409,7 +420,6 @@
     "cover_blur_desc": "使用封面模糊图作为播放页背景",
     "blur_amount": "模糊程度",
     "bg_darken": "背景暗度",
-
     "audio_quality": "音质设置",
     "audio_quality_desc": "展开以配置音质选项",
     "quality": "音质",
@@ -431,7 +441,6 @@
     "q_smooth": "流畅",
     "q_good": "高品质",
     "q_dolby": "杜比全景声",
-
     "storage": "存储 & 缓存",
     "nav_storage_desc": "管理下载和缓存",
     "cache_limit": "缓存大小上限",
@@ -507,7 +516,6 @@
     "storage_desc_custom_background": "用户选择的背景图片",
     "storage_desc_playlist_data": "本地歌单和使用记录",
     "storage_desc_app_data": "设置和其他应用数据",
-
     "backup": "备份 & 同步",
     "nav_backup_desc": "管理配置和歌单备份",
     "nav_listen_together_desc": "配置服务器和个人身份",
@@ -576,29 +584,24 @@
     "export_config_warning_sync": "包含 GitHub / WebDAV 同步密钥",
     "export_config_warning_private": "文件等同于账号迁移凭证",
     "export_config_warning_confirm": "我已了解，继续导出",
-
     "about": "关于",
     "about_desc": "版本信息、项目主页和开发者模式",
     "version_info": "版本 {version} · Tauri 2 + Vue 3",
     "github": "GitHub 仓库",
     "github_desc": "查看源代码",
-
     "network": "网络",
     "nav_network_desc": "配置网络连接",
     "bypass_proxy": "绕过代理",
     "bypass_proxy_desc": "绕过系统代理直接连接，适用于代理导致的连接问题",
-
     "download_manage": "下载管理",
     "download_progress": "已完成 {completed}/{total}",
     "cancel_all_downloads": "取消全部",
     "go_to_downloads": "查看已下载",
     "no_active_downloads": "暂无活跃下载",
-
     "internationalization": "YouTube 国际化",
     "internationalization_desc": "启用 YouTube Music 国际化模式以访问海外内容",
     "intl_checking": "检测连通性...",
     "intl_check_failed": "连通性检测失败，已回退",
-
     "cover_style": "封面样式",
     "cover_style_disc": "唱片",
     "cover_style_card": "卡片",
@@ -608,12 +611,19 @@
     "clear_image": "清除",
     "bg_blur": "背景模糊",
     "bg_opacity": "背景透明度",
-
     "dev_mode": "调试模式",
     "dev_mode_toast": "已启用调试模式",
     "dev_mode_tap_hint": "再点击 {count} 次启用调试模式",
     "build_uuid": "构建 UUID",
     "build_time": "构建时间",
+    "app_version": "应用版本",
+    "build_version_label": "版本号",
+    "copy_app_version": "点击复制版本号",
+    "copy_build_version": "点击复制版本号",
+    "copy_build_uuid": "点击复制 Build UUID",
+    "copy_build_time": "点击复制构建时间",
+    "build_info_copied": "已复制构建信息",
+    "build_info_copy_failed": "复制构建信息失败",
     "debug": "调试",
     "debug_title": "调试面板",
     "api_probe": "API 探针",
@@ -648,10 +658,8 @@
     "debug_cookie_clear_confirm_desc": "这会删除随机文件、清空内存与 WebView Cookie，并退出所有平台账号。此操作不可撤销。",
     "debug_cookie_clear_success": "调试 Cookie 已删除",
     "debug_cookie_clear_failed": "删除调试 Cookie 失败",
-
     "language": "语言",
     "language_desc": "选择界面显示语言",
-
     "github_sync_success": "GitHub 同步完成",
     "github_disconnected": "已断开 GitHub 同步",
     "webdav_sync_success": "WebDAV 同步完成",
