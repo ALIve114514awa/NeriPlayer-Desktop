@@ -22,7 +22,7 @@ impl LtWsClient {
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
-        // 写通道：前端 → WS
+        // 写通道：前端 -> WS
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         // 关闭信号
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);

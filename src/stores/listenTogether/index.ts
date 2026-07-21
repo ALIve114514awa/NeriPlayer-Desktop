@@ -20,6 +20,7 @@ import type {
   ListenTogetherEvent,
   ListenTogetherInitialSnapshot,
 } from './protocol'
+import { desktopRepeatToWire } from './protocol'
 import { trackInfoToLtTrack, ltTrackToTrackInfo, toShareableQueueSnapshot } from './mapper'
 import { createLogger } from '@/utils/logger'
 
@@ -45,7 +46,7 @@ const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]
 export const useListenTogetherStore = defineStore('listenTogether', () => {
   const settings = useSettingsStore()
 
-  // ─── 状态 ───
+  // 状态
   const connectionState = ref<ConnectionState>('disconnected')
   const roomId = ref<string | null>(null)
   const userUuid = ref(loadOrCreateUuid())
@@ -88,11 +89,13 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
   let _unlistenDisconnected: UnlistenFn | null = null
   let _suppressPlayerWatch = false
   let _lastAppliedRoomVersion = 0
-  // Echo suppression: 避免自己发出的事件触发回环
+  // 回环抑制：避免自己发出的事件触发回环
   const _recentOutboundEventIds = new Set<string>()
   // 记录最后上报的 track id，避免重复上报
   let _lastReportedTrackId: string | null = null
   let _lastReportedIsPlaying: boolean | null = null
+  let _lastReportedRepeatMode: number | null = null
+  let _lastReportedShuffle: boolean | null = null
   let _lastSentControlType: string | null = null
   let _lastSentControlAt = 0
   let _lastSentSeekPosition: number | null = null
@@ -100,13 +103,12 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
   let _pendingSeekReport: { positionMs: number; trackId: string | null } | null = null
   let _pendingSeekTimer: ReturnType<typeof setTimeout> | null = null
 
-  // ─── Computed ───
+  // 计算属性
   const isConnected = computed(() => connectionState.value === 'connected')
   const isController = computed(() => role.value === 'controller')
   const members = computed(() => roomState.value?.members ?? [])
 
-  // ─── 核心方法 ───
-
+  // 房间操作
   /** 创建房间 */
   async function createRoom() {
     const player = usePlayerStore()
@@ -131,6 +133,9 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         settings: roomSettings.value,
         isPlaying: player.isPlaying,
         positionMs: player.positionMs,
+        // Align Android ListenTogetherInitialSnapshot (ExoPlayer ints)
+        repeatMode: desktopRepeatToWire(player.repeatMode),
+        shuffleEnabled: !!player.shuffleEnabled,
       }
 
       const resp = await invoke<any>('lt_create_room', {
@@ -235,12 +240,17 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     _reconnectAttempt = 0
     _lastReportedTrackId = null
     _lastReportedIsPlaying = null
+    _lastReportedRepeatMode = null
+    _lastReportedShuffle = null
+    _lastSentControlType = null
+    _lastSentControlAt = 0
+    _lastSentSeekPosition = null
+    _lastSentSeekAt = 0
     clearPendingSeekReport()
     _recentOutboundEventIds.clear()
   }
 
-  // ─── WebSocket 连接 ───
-
+  // WebSocket 连接
   async function connectWs(wsUrl: string) {
     _wsUrl = wsUrl
     await setupListeners()
@@ -284,8 +294,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     _unlistenDisconnected = null
   }
 
-  // ─── 消息处理 ───
-
+  // 消息处理
   function handleSocketMessage(envelope: ListenTogetherSocketEnvelope) {
     switch (envelope.type) {
       case 'welcome':
@@ -408,6 +417,21 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
             reportSetTrackEvent(envelope.track, envelope.currentIndex ?? 0)
           }
           break
+        case 'REQUEST_PLAYBACK_MODE': {
+          // Align Android: controller commits PLAYBACK_MODE for member request
+          const repeatMode = envelope.repeatMode
+            ?? envelope.state?.playback?.repeatMode
+            ?? undefined
+          const shuffleEnabled = envelope.shuffleEnabled
+            ?? envelope.state?.playback?.shuffleEnabled
+            ?? undefined
+          player.applyListenTogetherPlaybackMode({
+            repeatMode: typeof repeatMode === 'number' ? repeatMode : null,
+            shuffleEnabled: typeof shuffleEnabled === 'boolean' ? shuffleEnabled : null,
+          })
+          reportPlaybackModeEvent()
+          break
+        }
       }
     } finally {
       setTimeout(() => { _suppressPlayerWatch = false }, 350)
@@ -432,8 +456,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     leaveRoom()
   }
 
-  // ─── 播放器同步 ───
-
+  // 播放器同步
   function applyRoomStateToPlayer(
     state: ListenTogetherRoomState,
     causeType: string,
@@ -458,7 +481,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       // 对比当前曲目
       const currentId = player.currentTrack?.id
       if (currentId !== remoteTrack.id) {
-        // 需要切歌 — 同时更新队列
+        // 需要切歌时，同时更新队列
         if (state.queue.length > 0) {
           const newQueue = state.queue.map(ltTrackToTrackInfo)
           player.queue.splice(0, player.queue.length, ...newQueue)
@@ -478,6 +501,16 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         }, 300)
         _lastReportedTrackId = remoteTrack.id
         _lastReportedIsPlaying = remoteIsPlaying
+        player.applyListenTogetherPlaybackMode({
+          repeatMode: state.playback.repeatMode,
+          shuffleEnabled: state.playback.shuffleEnabled,
+        })
+        _lastReportedRepeatMode = typeof state.playback.repeatMode === 'number'
+          ? state.playback.repeatMode
+          : desktopRepeatToWire(player.repeatMode)
+        _lastReportedShuffle = typeof state.playback.shuffleEnabled === 'boolean'
+          ? state.playback.shuffleEnabled
+          : !!player.shuffleEnabled
         return
       }
 
@@ -496,14 +529,25 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       if (diff > DRIFT_SOFT_MS) {
         player.seekTo(expectedPos, 'remote_sync')
       }
+
+      // Align Android applyListenTogetherPlaybackMode
+      player.applyListenTogetherPlaybackMode({
+        repeatMode: state.playback.repeatMode,
+        shuffleEnabled: state.playback.shuffleEnabled,
+      })
+      _lastReportedRepeatMode = typeof state.playback.repeatMode === 'number'
+        ? state.playback.repeatMode
+        : desktopRepeatToWire(player.repeatMode)
+      _lastReportedShuffle = typeof state.playback.shuffleEnabled === 'boolean'
+        ? state.playback.shuffleEnabled
+        : !!player.shuffleEnabled
     } finally {
       // 延迟恢复 watch，避免同步操作触发上报
       setTimeout(() => { _suppressPlayerWatch = false }, 500)
     }
   }
 
-  // ─── 本地变化上报 ───
-
+  // 本地变化上报
   let _playerWatchStop: (() => void) | null = null
   let _seekWatchStop: (() => void) | null = null
 
@@ -515,6 +559,8 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       () => ({
         trackId: player.currentTrack?.id,
         isPlaying: player.isPlaying,
+        repeatMode: player.repeatMode,
+        shuffleEnabled: player.shuffleEnabled,
       }),
       (newVal) => {
         if (_suppressPlayerWatch || player.isRemoteSyncGuardActive() || connectionState.value !== 'connected') return
@@ -543,6 +589,25 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
             else if (!shouldSkipControlEvent('REQUEST_PAUSE')) sendRequestEvent('REQUEST_PAUSE')
           }
         }
+
+        // 循环/随机变化 -> PLAYBACK_MODE (Android-aligned)
+        const wireRepeat = desktopRepeatToWire(newVal.repeatMode)
+        const wireShuffle = !!newVal.shuffleEnabled
+        if (
+          wireRepeat !== _lastReportedRepeatMode
+          || wireShuffle !== _lastReportedShuffle
+        ) {
+          _lastReportedRepeatMode = wireRepeat
+          _lastReportedShuffle = wireShuffle
+          if (isController.value) {
+            reportPlaybackModeEvent()
+          } else if (!shouldSkipControlEvent('REQUEST_PLAYBACK_MODE')) {
+            sendRequestEvent('REQUEST_PLAYBACK_MODE', {
+              repeatMode: wireRepeat,
+              shuffleEnabled: wireShuffle,
+            })
+          }
+        }
       },
       { deep: false },
     )
@@ -568,8 +633,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     clearPendingSeekReport()
   }
 
-  // ─── 事件发送 ───
-
+  // 事件发送
   function generateEventId(): string {
     return `${userUuid.value.slice(0, 8)}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
   }
@@ -644,6 +708,22 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     })
   }
 
+  function reportPlaybackModeEvent() {
+    const player = usePlayerStore()
+    if (shouldSkipControlEvent('PLAYBACK_MODE')) return
+    const repeatMode = desktopRepeatToWire(player.repeatMode)
+    const shuffleEnabled = !!player.shuffleEnabled
+    _lastReportedRepeatMode = repeatMode
+    _lastReportedShuffle = shuffleEnabled
+    sendEvent({
+      type: 'PLAYBACK_MODE',
+      repeatMode,
+      shuffleEnabled,
+      positionMs: player.positionMs,
+      state: player.isPlaying ? 'playing' : 'paused',
+    })
+  }
+
   function scheduleLocalSeekReport(positionMs: number) {
     const player = usePlayerStore()
     _pendingSeekReport = {
@@ -715,8 +795,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     })
   }
 
-  // ─── 心跳 ───
-
+  // 心跳
   function startHeartbeat() {
     stopHeartbeat()
     if (!isController.value) return
@@ -738,6 +817,8 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         queue: ltQueue,
         currentIndex: resolvedIndex,
         track: player.currentTrack ? trackInfoToLtTrack(player.currentTrack) : undefined,
+        repeatMode: desktopRepeatToWire(player.repeatMode),
+        shuffleEnabled: !!player.shuffleEnabled,
       })
     }, HEARTBEAT_INTERVAL_MS)
   }
@@ -749,8 +830,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     }
   }
 
-  // ─── 断线重连 ───
-
+  // 断线重连
   function scheduleReconnect() {
     if (_reconnectTimer) return
 
@@ -781,8 +861,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     }, delay)
   }
 
-  // ─── 房间设置更新 ───
-
+  // 房间设置更新
   async function updateRoomSettings(newSettings: Partial<ListenTogetherRoomSettings>) {
     if (newSettings.allowMemberControl !== undefined) settings.ltAllowMemberControl = newSettings.allowMemberControl
     if (newSettings.autoPauseOnMemberChange !== undefined) settings.ltAutoPauseOnMemberChange = newSettings.autoPauseOnMemberChange
@@ -795,8 +874,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     }
   }
 
-  // ─── 邀请链接 ───
-
+  // 邀请链接
   function getInviteLink(): string {
     return `neriplayer://listen-together/join?roomId=${roomId.value}&baseUrl=${encodeURIComponent(baseUrl.value)}`
   }
@@ -827,8 +905,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     return null
   }
 
-  // ─── 工具函数 ───
-
+  // 工具函数
   function buildWsUrl(base: string, roomId: string, token: string): string {
     const normalized = base.replace(/\/$/, '')
     const httpUrl = `${normalized}/api/rooms/${roomId}/ws?token=${encodeURIComponent(token)}`
@@ -854,7 +931,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     connectionState, roomId, userUuid, nickname, role,
     roomState, sessionError, baseUrl, roomSettings,
     lastSyncEventType, lastSyncAt, lastReconnectAt,
-    // Computed
+    // 计算属性
     isConnected, isController, members,
     // 方法
     createRoom, joinRoom, leaveRoom,

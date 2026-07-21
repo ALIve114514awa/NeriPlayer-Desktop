@@ -73,6 +73,12 @@ pub struct LtPlaybackState {
     pub base_timestamp_ms: i64,
     #[serde(default = "default_rate")]
     pub playback_rate: f64,
+    // Align Android ListenTogetherPlaybackState / ExoPlayer:
+    // REPEAT_MODE_OFF=0, ONE=1, ALL=2
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_mode: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_enabled: Option<bool>,
 }
 
 fn default_paused() -> String {
@@ -89,6 +95,8 @@ impl Default for LtPlaybackState {
             base_position_ms: 0,
             base_timestamp_ms: 0,
             playback_rate: 1.0,
+            repeat_mode: None,
+            shuffle_enabled: None,
         }
     }
 }
@@ -165,6 +173,11 @@ pub struct LtInitialSnapshot {
     pub is_playing: bool,
     #[serde(default)]
     pub position_ms: i64,
+    // Align Android ListenTogetherInitialSnapshot
+    #[serde(default)]
+    pub repeat_mode: i32,
+    #[serde(default)]
+    pub shuffle_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +229,9 @@ pub struct LtStateResponse {
     pub state: Option<LtRoomState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_position_ms: Option<i64>,
+    // Align Android ListenTogetherStateResponse.serverNowMs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_now_ms: Option<i64>,
     #[serde(default)]
     pub auto_pause_on_join: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,10 +246,16 @@ pub struct LtEvent {
     pub event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_time_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_sequence: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_index: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_index: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track: Option<LtTrack>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,8 +266,15 @@ pub struct LtEvent {
     pub should_play: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    // PLAYBACK_MODE / REQUEST_PLAYBACK_MODE payload (Android-aligned)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_mode: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_track_stable_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_track_stable_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +299,9 @@ pub struct LtSocketEnvelope {
     pub expected_position_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub now_ms: Option<i64>,
+    // Android envelope also carries short alias `t`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,8 +326,16 @@ pub struct LtSocketEnvelope {
     pub should_play: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_mode: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_time_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_sequence: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_sequence: Option<i64>,
 }
