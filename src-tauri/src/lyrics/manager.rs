@@ -1,7 +1,10 @@
-// 歌词管理器 — 多源瀑布获取
+// 歌词管理器：多源瀑布获取
+// 跨平台(YouTube/B站/本地)优先 LRCLIB(带时长精确匹配), 再 QQ/网易,
+// 候选必须过时长硬门槛, 避免同名不同版本歌词(如王心凌「爱你」Rap 版)。
 use crate::api::lrclib::LrcLibClient;
 use crate::api::netease::client::NeteaseClient;
 use crate::api::qq::client::QqMusicClient;
+use crate::api::youtube::client::YouTubeClient;
 use crate::error::AppResult;
 use crate::lyrics::parser::{self, LyricLine};
 use std::path::{Path, PathBuf};
@@ -15,7 +18,14 @@ impl LyricsManager {
         Self { http: http.clone() }
     }
 
-    /// 多源获取歌词：本地 sidecar -> 网易云 API -> LRCLIB fallback
+    /// 多源获取歌词
+    /// 顺序:
+    /// 1. 本地 sidecar
+    /// 2. 明确 QQ songmid / 网易 id
+    /// 3. 无平台 id 时: LRCLIB 精确(含时长) → LRCLIB 搜索(时长过滤)
+    /// 4. QQ / 网易 搜索(标题+歌手+时长硬门槛)
+    /// 5. YouTube 原生歌词(若有 video_id)
+    /// 6. LRCLIB 再兜底一次(搜索)
     pub async fn fetch_lyrics(
         &self,
         track_title: &str,
@@ -24,14 +34,19 @@ impl LyricsManager {
         audio_path: Option<&str>,
         netease_id: Option<u64>,
         qq_song_mid: Option<&str>,
+        youtube_video_id: Option<&str>,
     ) -> AppResult<Vec<LyricLine>> {
         log::info!(
             target: "lyrics",
-            "fetch: title={}, artist={}, dur={}s, netease_id={:?}, qq_song_mid={:?}",
-            track_title, track_artist, duration_secs, netease_id, qq_song_mid
+            "fetch: title={}, artist={}, dur={}s, netease_id={:?}, qq_song_mid={:?}, yt={:?}",
+            track_title,
+            track_artist,
+            duration_secs,
+            netease_id,
+            qq_song_mid,
+            youtube_video_id
         );
 
-        // 尝试本地 sidecar 歌词（对齐 Android LocalMediaSupport.findNearbyLyrics）
         if let Some(path) = audio_path {
             if let Some(lines) = load_local_sidecar_lyrics(path) {
                 log::info!(target: "lyrics", "found local sidecar: {} lines", lines.len());
@@ -39,150 +54,354 @@ impl LyricsManager {
             }
         }
 
-        // QQ 音乐：如果调用方提供 songmid，优先直接取 QQ 歌词（含翻译）
+        let target_duration_ms = duration_secs.saturating_mul(1000);
+        let has_platform_id = netease_id.is_some()
+            || qq_song_mid.map(|s| !s.trim().is_empty()).unwrap_or(false);
+
+        // 明确平台 id: 直接取对应源
         if let Some(song_mid) = qq_song_mid.filter(|id| !id.trim().is_empty()) {
             let qq = QqMusicClient::new(&self.http);
             match self.parse_qq_lyrics(&qq, song_mid).await {
-                Ok(Some(lines)) => return Ok(lines),
+                Ok(Some(lines)) => {
+                    if lyrics_duration_acceptable(&lines, target_duration_ms) {
+                        return Ok(lines);
+                    }
+                    log::info!(
+                        target: "lyrics",
+                        "QQ lyrics for song_mid={} rejected by duration gate (target={}ms)",
+                        song_mid,
+                        target_duration_ms
+                    );
+                }
                 Ok(None) => log::info!(target: "lyrics", "QQ lyrics empty for song_mid={}", song_mid),
                 Err(e) => log::warn!(
                     target: "lyrics",
                     "QQ get_lyrics failed for song_mid={}: {}",
-                    song_mid, e
+                    song_mid,
+                    e
                 ),
             }
-        } else if netease_id.is_none() {
-            // 对齐 Android SearchManager：对无明确平台歌词 ID 的歌曲，先尝试 QQ 候选匹配。
-            // 这能改善 Bilibili / YouTube / 本地曲目按歌名补全歌词时的命中率。
+        }
+
+        if let Some(id) = netease_id {
+            let client = NeteaseClient::new(&self.http);
+            if let Some(lines) = self.fetch_netease_lyrics(&client, id, target_duration_ms).await {
+                return Ok(lines);
+            }
+        }
+
+        // 跨平台: 先 LRCLIB (API 自带 duration, 最不容易错版)
+        if !has_platform_id {
+            if let Some(lines) = self
+                .fetch_lrclib_lyrics(track_title, track_artist, duration_secs, target_duration_ms)
+                .await
+            {
+                return Ok(lines);
+            }
+        }
+
+        // QQ 搜索匹配 (标题+歌手, 时长硬门槛)
+        if netease_id.is_none() && qq_song_mid.map(|s| s.trim().is_empty()).unwrap_or(true) {
             let qq = QqMusicClient::new(&self.http);
             match self
-                .search_qq_song_mid(&qq, track_title, track_artist)
+                .search_qq_song_mid(&qq, track_title, track_artist, target_duration_ms)
                 .await
             {
                 Some(song_mid) => match self.parse_qq_lyrics(&qq, &song_mid).await {
-                    Ok(Some(lines)) => return Ok(lines),
-                    Ok(None) => log::info!(target: "lyrics", "matched QQ lyrics empty for song_mid={}", song_mid),
+                    Ok(Some(lines)) => {
+                        if lyrics_duration_acceptable(&lines, target_duration_ms) {
+                            return Ok(lines);
+                        }
+                        log::info!(
+                            target: "lyrics",
+                            "matched QQ lyrics rejected by lyric-span duration gate"
+                        );
+                    }
+                    Ok(None) => log::info!(
+                        target: "lyrics",
+                        "matched QQ lyrics empty for song_mid={}",
+                        song_mid
+                    ),
                     Err(e) => log::warn!(
                         target: "lyrics",
                         "matched QQ get_lyrics failed for song_mid={}: {}",
-                        song_mid, e
+                        song_mid,
+                        e
                     ),
                 },
                 None => log::info!(
                     target: "lyrics",
                     "QQ candidate not found for {} / {}",
-                    track_title, track_artist
+                    track_title,
+                    track_artist
                 ),
             }
         }
 
-        let client = NeteaseClient::new(&self.http);
-
-        // 确定网易云歌曲 ID：直接提供或通过搜索获取
-        let resolved_id = if let Some(id) = netease_id {
-            log::info!(target: "lyrics", "using provided netease_id={}", id);
-            Some(id)
-        } else {
-            // 用 title + artist 搜索网易云，取最匹配的结果
-            let id = self
-                .search_netease_id(&client, track_title, track_artist)
-                .await;
-            log::info!(target: "lyrics", "search_netease_id result: {:?}", id);
-            id
-        };
-
-        // 网易云 API 取歌词（对齐 Android：YRC 优先，LRC 回退）
-        if let Some(id) = resolved_id {
-            match client.get_lyrics(id).await {
-                Ok(lyrics_data) => {
-                    log::info!(
-                        target: "lyrics",
-                        "netease lyrics for id={}: lrc={}, tlyric={}, yrc={}",
-                        id,
-                        lyrics_data.lrc.as_ref().map_or(0, |s| s.len()),
-                        lyrics_data.tlyric.as_ref().map_or(0, |s| s.len()),
-                        lyrics_data.yrc.as_ref().map_or(0, |s| s.len()),
-                    );
-
-                    // 翻译歌词：优先 ytlrc（YRC 翻译），回退 tlyric
-                    let translation = lyrics_data
-                        .ytlrc
-                        .as_deref()
-                        .or(lyrics_data.tlyric.as_deref())
-                        .filter(|s| !s.is_empty());
-
-                    // 优先 YRC（逐字歌词），对齐 Android extractPreferredNeteaseLyricContent
-                    if let Some(ref yrc_str) = lyrics_data.yrc {
-                        if !yrc_str.trim().is_empty() {
-                            let mut lines = parser::parse_yrc(yrc_str);
-                            if !lines.is_empty() {
-                                if let Some(tl) = translation {
-                                    parser::merge_translation(&mut lines, tl);
-                                }
-                                log::info!(
-                                    target: "lyrics",
-                                    "using netease YRC: {} lines, {} with words",
-                                    lines.len(),
-                                    lines.iter().filter(|l| !l.words.is_empty()).count()
-                                );
-                                return Ok(lines);
-                            }
-                        }
-                    }
-
-                    // 回退 LRC
-                    if let Some(ref lrc_str) = lyrics_data.lrc {
-                        let mut lines = parser::parse_auto(lrc_str);
-                        if !lines.is_empty() {
-                            if let Some(tl) = translation {
-                                parser::merge_translation(&mut lines, tl);
-                            }
-                            log::info!(target: "lyrics", "using netease LRC: {} lines", lines.len());
-                            return Ok(lines);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(target: "lyrics", "netease get_lyrics failed for id={}: {}", id, e);
-                }
-            }
-        }
-
-        // LRCLIB fallback — 精确匹配
-        let lrclib = LrcLibClient::new(&self.http);
-        if let Ok(Some(result)) = lrclib
-            .get_lyrics(track_title, track_artist, duration_secs)
-            .await
-        {
-            if let Some(synced) = result.synced_lyrics {
-                let lines = parser::parse_lrc(&synced);
-                if !lines.is_empty() {
-                    log::info!(target: "lyrics", "using LRCLIB exact: {} lines", lines.len());
+        // 网易云搜索匹配
+        if netease_id.is_none() {
+            let client = NeteaseClient::new(&self.http);
+            if let Some(id) = self
+                .search_netease_id(&client, track_title, track_artist, target_duration_ms)
+                .await
+            {
+                if let Some(lines) = self.fetch_netease_lyrics(&client, id, target_duration_ms).await
+                {
                     return Ok(lines);
                 }
             }
         }
 
-        // LRCLIB fallback — 模糊搜索
-        let query = format!("{} {}", track_title, track_artist);
-        if let Ok(results) = lrclib.search(&query).await {
-            for r in results {
-                if let Some(synced) = r.synced_lyrics {
-                    let lines = parser::parse_lrc(&synced);
-                    if !lines.is_empty() {
-                        log::info!(target: "lyrics", "using LRCLIB search: {} lines", lines.len());
-                        return Ok(lines);
-                    }
-                }
+        // YouTube 原生歌词 (plain 居多, 有 timed 则用)
+        if let Some(video_id) = youtube_video_id.filter(|id| !id.trim().is_empty()) {
+            if let Some(lines) = self
+                .fetch_youtube_lyrics(video_id, target_duration_ms)
+                .await
+            {
+                return Ok(lines);
+            }
+        }
+
+        // 最后再试 LRCLIB (平台 id 路径失败时)
+        if has_platform_id {
+            if let Some(lines) = self
+                .fetch_lrclib_lyrics(track_title, track_artist, duration_secs, target_duration_ms)
+                .await
+            {
+                return Ok(lines);
             }
         }
 
         log::info!(
             target: "lyrics",
             "no lyrics found for: {} - {}",
-            track_title, track_artist
+            track_title,
+            track_artist
         );
         Ok(Vec::new())
+    }
+
+    async fn fetch_netease_lyrics(
+        &self,
+        client: &NeteaseClient,
+        id: u64,
+        target_duration_ms: u64,
+    ) -> Option<Vec<LyricLine>> {
+        match client.get_lyrics(id).await {
+            Ok(lyrics_data) => {
+                log::info!(
+                    target: "lyrics",
+                    "netease lyrics for id={}: lrc={}, tlyric={}, yrc={}",
+                    id,
+                    lyrics_data.lrc.as_ref().map_or(0, |s| s.len()),
+                    lyrics_data.tlyric.as_ref().map_or(0, |s| s.len()),
+                    lyrics_data.yrc.as_ref().map_or(0, |s| s.len()),
+                );
+
+                let translation = lyrics_data
+                    .ytlrc
+                    .as_deref()
+                    .or(lyrics_data.tlyric.as_deref())
+                    .filter(|s| !s.is_empty());
+
+                if let Some(ref yrc_str) = lyrics_data.yrc {
+                    if !yrc_str.trim().is_empty() {
+                        let mut lines = parser::parse_yrc(yrc_str);
+                        if !lines.is_empty() {
+                            if let Some(tl) = translation {
+                                parser::merge_translation(&mut lines, tl);
+                            }
+                            if lyrics_duration_acceptable(&lines, target_duration_ms) {
+                                log::info!(
+                                    target: "lyrics",
+                                    "using netease YRC: {} lines",
+                                    lines.len()
+                                );
+                                return Some(lines);
+                            }
+                            log::info!(
+                                target: "lyrics",
+                                "netease YRC rejected by duration gate id={}",
+                                id
+                            );
+                        }
+                    }
+                }
+
+                if let Some(ref lrc_str) = lyrics_data.lrc {
+                    let mut lines = parser::parse_auto(lrc_str);
+                    if !lines.is_empty() {
+                        if let Some(tl) = translation {
+                            parser::merge_translation(&mut lines, tl);
+                        }
+                        if lyrics_duration_acceptable(&lines, target_duration_ms) {
+                            log::info!(target: "lyrics", "using netease LRC: {} lines", lines.len());
+                            return Some(lines);
+                        }
+                        log::info!(
+                            target: "lyrics",
+                            "netease LRC rejected by duration gate id={}",
+                            id
+                        );
+                    }
+                }
+                None
+            }
+            Err(e) => {
+                log::warn!(target: "lyrics", "netease get_lyrics failed for id={}: {}", id, e);
+                None
+            }
+        }
+    }
+
+    async fn fetch_lrclib_lyrics(
+        &self,
+        track_title: &str,
+        track_artist: &str,
+        duration_secs: u64,
+        target_duration_ms: u64,
+    ) -> Option<Vec<LyricLine>> {
+        let lrclib = LrcLibClient::new(&self.http);
+
+        // 精确匹配 (API 按 duration 查)
+        if duration_secs > 0 {
+            if let Ok(Some(result)) = lrclib
+                .get_lyrics(track_title, track_artist, duration_secs)
+                .await
+            {
+                if let Some(synced) = result.synced_lyrics {
+                    let lines = parser::parse_lrc(&synced);
+                    if !lines.is_empty() && lyrics_duration_acceptable(&lines, target_duration_ms) {
+                        log::info!(
+                            target: "lyrics",
+                            "using LRCLIB exact: {} lines, api_dur={}",
+                            lines.len(),
+                            result.duration
+                        );
+                        return Some(lines);
+                    }
+                }
+            }
+            // duration ±2s 再试, LRCLIB 有时按 206/208 入库
+            for delta in [-2i64, -1, 1, 2] {
+                let d = (duration_secs as i64 + delta).max(1) as u64;
+                if d == duration_secs {
+                    continue;
+                }
+                if let Ok(Some(result)) = lrclib.get_lyrics(track_title, track_artist, d).await {
+                    if let Some(synced) = result.synced_lyrics {
+                        let lines = parser::parse_lrc(&synced);
+                        if !lines.is_empty()
+                            && lyrics_duration_acceptable(&lines, target_duration_ms)
+                        {
+                            log::info!(
+                                target: "lyrics",
+                                "using LRCLIB exact(delta={}): {} lines",
+                                delta,
+                                lines.len()
+                            );
+                            return Some(lines);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 模糊搜索 + 时长过滤
+        let query = format!("{} {}", track_title, track_artist);
+        if let Ok(results) = lrclib.search(&query).await {
+            let target_title = normalize_match_text(track_title);
+            let target_artist = normalize_match_text(track_artist);
+            let target_artists = normalize_artists(track_artist);
+
+            let mut ranked: Vec<_> = results
+                .into_iter()
+                .filter(|r| r.synced_lyrics.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+                .map(|r| {
+                    let cand_dur_ms = (r.duration * 1000.0).round().max(0.0) as u64;
+                    let score = score_lyric_candidate(
+                        &r.track_name,
+                        &r.artist_name,
+                        cand_dur_ms,
+                        &target_title,
+                        &target_artist,
+                        &target_artists,
+                        target_duration_ms,
+                    );
+                    (r, score, cand_dur_ms)
+                })
+                .filter(|(_, score, _)| *score >= MINIMUM_MATCH_SCORE)
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+            for (r, score, cand_dur) in ranked {
+                let synced = r.synced_lyrics.as_deref().unwrap_or("");
+                let lines = parser::parse_lrc(synced);
+                if lines.is_empty() {
+                    continue;
+                }
+                if !lyrics_duration_acceptable(&lines, target_duration_ms) {
+                    continue;
+                }
+                // 候选元数据时长也要过硬门槛
+                if target_duration_ms > 0
+                    && cand_dur > 0
+                    && !duration_within_hard_tolerance(cand_dur, target_duration_ms)
+                {
+                    continue;
+                }
+                log::info!(
+                    target: "lyrics",
+                    "using LRCLIB search: score={}, dur={}ms, lines={}",
+                    score,
+                    cand_dur,
+                    lines.len()
+                );
+                return Some(lines);
+            }
+        }
+        None
+    }
+
+    async fn fetch_youtube_lyrics(
+        &self,
+        video_id: &str,
+        target_duration_ms: u64,
+    ) -> Option<Vec<LyricLine>> {
+        let yt = YouTubeClient::new(&self.http);
+        match yt.get_lyrics(video_id).await {
+            Ok(Some(text)) if !text.trim().is_empty() => {
+                // timed LRC / 纯文本
+                let lines = if text.contains('[') && text.contains(':') {
+                    parser::parse_auto(&text)
+                } else {
+                    plain_text_to_lines(&text, target_duration_ms)
+                };
+                if lines.is_empty() {
+                    return None;
+                }
+                log::info!(
+                    target: "lyrics",
+                    "using YouTube native lyrics: {} lines for {}",
+                    lines.len(),
+                    video_id
+                );
+                Some(lines)
+            }
+            Ok(_) => {
+                log::info!(target: "lyrics", "YouTube lyrics empty for {}", video_id);
+                None
+            }
+            Err(e) => {
+                log::warn!(
+                    target: "lyrics",
+                    "YouTube get_lyrics failed for {}: {}",
+                    video_id,
+                    e
+                );
+                None
+            }
+        }
     }
 
     async fn parse_qq_lyrics(
@@ -210,10 +429,23 @@ impl LyricsManager {
         client: &QqMusicClient,
         title: &str,
         artist: &str,
+        target_duration_ms: u64,
     ) -> Option<String> {
-        const MINIMUM_MATCH_SCORE: i32 = 60;
+        // 带上歌手一起搜, 避免「爱你」命中王心凌
+        let query = if artist.trim().is_empty() {
+            title.to_string()
+        } else {
+            format!("{} {}", title, artist)
+        };
+        let mut results = client.search(&query, 1, 15).await.ok().unwrap_or_default();
+        if results.is_empty() && !artist.trim().is_empty() {
+            // 回退仅标题, 但仍走时长硬门槛
+            results = client.search(title, 1, 15).await.ok()?;
+        }
+        if results.is_empty() {
+            return None;
+        }
 
-        let results = client.search(title, 1, 10).await.ok()?;
         let target_title = normalize_match_text(title);
         let target_artist = normalize_match_text(artist);
         let target_artists = normalize_artists(artist);
@@ -221,12 +453,14 @@ impl LyricsManager {
         let best = results
             .into_iter()
             .map(|candidate| {
-                let score = score_qq_candidate(
+                let score = score_lyric_candidate(
                     &candidate.song_name,
                     &candidate.artists.join(" / "),
+                    candidate.duration_ms,
                     &target_title,
                     &target_artist,
                     &target_artists,
+                    target_duration_ms,
                 );
                 (candidate, score)
             })
@@ -235,86 +469,280 @@ impl LyricsManager {
         if best.1 < MINIMUM_MATCH_SCORE {
             log::info!(
                 target: "lyrics",
-                "no confident QQ match for {} / {}, best_score={}",
-                title, artist, best.1
+                "no confident QQ match for {} / {}, best_score={}, target_dur={}ms",
+                title,
+                artist,
+                best.1,
+                target_duration_ms
+            );
+            return None;
+        }
+
+        // 有目标时长时必须过硬门槛
+        if target_duration_ms > 0
+            && best.0.duration_ms > 0
+            && !duration_within_hard_tolerance(best.0.duration_ms, target_duration_ms)
+        {
+            log::info!(
+                target: "lyrics",
+                "best QQ match rejected by hard duration: mid={}, cand={}ms, target={}ms, score={}",
+                best.0.song_mid,
+                best.0.duration_ms,
+                target_duration_ms,
+                best.1
             );
             return None;
         }
 
         log::info!(
             target: "lyrics",
-            "matched QQ song_mid={}, score={}, name={}",
-            best.0.song_mid, best.1, best.0.song_name
+            "matched QQ song_mid={}, score={}, name={}, dur={}ms (target={}ms)",
+            best.0.song_mid,
+            best.1,
+            best.0.song_name,
+            best.0.duration_ms,
+            target_duration_ms
         );
         Some(best.0.song_mid)
     }
 
-    /// 通过搜索网易云获取匹配歌曲 ID
+    /// 通过搜索网易云获取匹配歌曲 ID (标题/歌手/时长综合打分 + 硬门槛)
     async fn search_netease_id(
         &self,
         client: &NeteaseClient,
         title: &str,
         artist: &str,
+        target_duration_ms: u64,
     ) -> Option<u64> {
         let query = format!("{} {}", title, artist);
-        let results = client.search(&query, 5, 0).await.ok()?;
+        let results = client.search(&query, 15, 0).await.ok()?;
         if results.is_empty() {
             return None;
         }
 
-        // 优先精确匹配标题
-        let title_lower = title.to_lowercase();
-        for r in &results {
-            if r.name.to_lowercase() == title_lower {
-                return Some(r.id);
-            }
+        let target_title = normalize_match_text(title);
+        let target_artist = normalize_match_text(artist);
+        let target_artists = normalize_artists(artist);
+
+        let best = results
+            .into_iter()
+            .map(|candidate| {
+                let score = score_lyric_candidate(
+                    &candidate.name,
+                    &candidate.artists.join(" / "),
+                    candidate.duration_ms,
+                    &target_title,
+                    &target_artist,
+                    &target_artists,
+                    target_duration_ms,
+                );
+                (candidate, score)
+            })
+            .max_by_key(|(_, score)| *score)?;
+
+        if best.1 < MINIMUM_MATCH_SCORE {
+            log::info!(
+                target: "lyrics",
+                "no confident netease match for {} / {}, best_score={}, target_dur={}ms",
+                title,
+                artist,
+                best.1,
+                target_duration_ms
+            );
+            return None;
         }
-        // 没有精确匹配，取第一个结果
-        Some(results[0].id)
+
+        if target_duration_ms > 0
+            && best.0.duration_ms > 0
+            && !duration_within_hard_tolerance(best.0.duration_ms, target_duration_ms)
+        {
+            log::info!(
+                target: "lyrics",
+                "best netease match rejected by hard duration: id={}, cand={}ms, target={}ms, score={}",
+                best.0.id,
+                best.0.duration_ms,
+                target_duration_ms,
+                best.1
+            );
+            return None;
+        }
+
+        log::info!(
+            target: "lyrics",
+            "matched netease id={}, score={}, name={}, dur={}ms (target={}ms)",
+            best.0.id,
+            best.1,
+            best.0.name,
+            best.0.duration_ms,
+            target_duration_ms
+        );
+        Some(best.0.id)
     }
 }
 
-fn score_qq_candidate(
+/// 最低置信分: 标题至少部分匹配
+const MINIMUM_MATCH_SCORE: i32 = 60;
+
+/// 歌词候选打分: 标题 + 歌手 + 时长
+/// 有目标时长时: 时长不在硬容差内直接淘汰(返回 0)
+fn score_lyric_candidate(
     candidate_title: &str,
     candidate_artist: &str,
+    candidate_duration_ms: u64,
     target_title: &str,
     target_artist: &str,
     target_artists: &std::collections::HashSet<String>,
+    target_duration_ms: u64,
 ) -> i32 {
     let candidate_title = normalize_match_text(candidate_title);
     let candidate_artist_normalized = normalize_match_text(candidate_artist);
     let candidate_artists = normalize_artists(candidate_artist);
 
+    // 有目标时长 + 候选时长时, 先过硬门槛 (防止王心凌 219s 抢走陈芳语 207s)
+    if target_duration_ms > 0
+        && candidate_duration_ms > 0
+        && !duration_within_hard_tolerance(candidate_duration_ms, target_duration_ms)
+    {
+        return 0;
+    }
+
     let mut score = if candidate_title == target_title {
         100
     } else if !target_title.is_empty()
         && !candidate_title.is_empty()
-        && (candidate_title.contains(target_title) || target_title.contains(&candidate_title))
+        && (candidate_title.contains(&target_title) || target_title.contains(&candidate_title))
     {
         60
     } else {
         0
     };
 
+    // 标题完全对不上时不靠歌手/时长硬凑
+    if score == 0 {
+        return 0;
+    }
+
     if !target_artist.is_empty() || !target_artists.is_empty() {
         score += if candidate_artist_normalized == target_artist {
             40
         } else if !candidate_artists.is_disjoint(target_artists) {
             25
-        } else if candidate_artist_normalized.contains(target_artist)
-            || target_artist.contains(&candidate_artist_normalized)
+        } else if !target_artist.is_empty()
+            && (candidate_artist_normalized.contains(&target_artist)
+                || target_artist.contains(&candidate_artist_normalized))
         {
             15
         } else {
-            0
+            // 歌手对不上: 有目标时长时重罚, 无时长时轻微罚
+            if target_duration_ms > 0 {
+                -35
+            } else {
+                -10
+            }
         };
     }
 
+    score += duration_match_bonus(candidate_duration_ms, target_duration_ms);
     score
 }
 
+/// 硬容差: 对齐 Android isAmllDurationCompatible 偏紧版
+/// 目标 207s 时约允许 ±12~20s, 卡住 219s 王心凌 vs 207s 陈芳语仍靠歌手分区分,
+/// 但 234s 云汐 / 明显不同版本直接淘汰
+fn duration_within_hard_tolerance(candidate_duration_ms: u64, target_duration_ms: u64) -> bool {
+    if candidate_duration_ms == 0 || target_duration_ms == 0 {
+        return true;
+    }
+    let delta = (candidate_duration_ms as i64 - target_duration_ms as i64).unsigned_abs();
+    let tolerance = std::cmp::max(12_000, target_duration_ms / 10).min(25_000);
+    delta <= tolerance
+}
+
+/// 时长匹配加分
+fn duration_match_bonus(candidate_duration_ms: u64, target_duration_ms: u64) -> i32 {
+    if candidate_duration_ms == 0 || target_duration_ms == 0 {
+        return 0;
+    }
+    let delta = (candidate_duration_ms as i64 - target_duration_ms as i64).unsigned_abs();
+    if delta <= 3_000 {
+        30
+    } else if delta <= 6_000 {
+        20
+    } else if delta <= 12_000 {
+        10
+    } else if delta <= 25_000 {
+        0
+    } else {
+        -40
+    }
+}
+
+/// 用歌词时间轴估算总长, 与目标时长比对 (歌词末行常早于音频结束, 允许更宽下限)
+fn lyrics_duration_acceptable(lines: &[LyricLine], target_duration_ms: u64) -> bool {
+    if target_duration_ms == 0 || lines.is_empty() {
+        return true;
+    }
+    let mut end_ms = 0u64;
+    for line in lines {
+        let line_end = line.start_ms.saturating_add(line.duration_ms.max(1));
+        if line_end > end_ms {
+            end_ms = line_end;
+        }
+        for w in &line.words {
+            let we = w.start_ms.saturating_add(w.duration_ms.max(1));
+            if we > end_ms {
+                end_ms = we;
+            }
+        }
+    }
+    if end_ms == 0 {
+        return true;
+    }
+    // 歌词跨度远短于歌曲(如只有前奏/错版) 或 明显超长
+    let short_tol = std::cmp::max(35_000, (target_duration_ms * 20) / 100).min(70_000);
+    let long_tol = std::cmp::max(15_000, target_duration_ms / 8).min(35_000);
+    if end_ms + short_tol < target_duration_ms {
+        // 末行过早: 可能是短版/截断, 仍接受 (片尾空白常见); 但若短超过 50% 则拒
+        if end_ms.saturating_mul(2) < target_duration_ms {
+            return false;
+        }
+        return true;
+    }
+    if end_ms > target_duration_ms.saturating_add(long_tol) {
+        return false;
+    }
+    true
+}
+
+fn plain_text_to_lines(text: &str, target_duration_ms: u64) -> Vec<LyricLine> {
+    let rows: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let total = target_duration_ms.max(rows.len() as u64 * 3000);
+    let step = (total / rows.len() as u64).max(2000);
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, line)| LyricLine {
+            start_ms: i as u64 * step,
+            duration_ms: step,
+            text: line.to_string(),
+            translation: None,
+            words: Vec::new(),
+        })
+        .collect()
+}
+
 fn normalize_match_text(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn normalize_artists(value: &str) -> std::collections::HashSet<String> {
@@ -421,4 +849,113 @@ fn find_nearby_translation(audio_path: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        duration_match_bonus, duration_within_hard_tolerance, lyrics_duration_acceptable,
+        score_lyric_candidate, LyricLine,
+    };
+    use std::collections::HashSet;
+
+    fn artists(value: &str) -> HashSet<String> {
+        super::normalize_artists(value)
+    }
+
+    #[test]
+    fn duration_bonus_prefers_close_lengths() {
+        assert_eq!(duration_match_bonus(207_000, 207_000), 30);
+        assert_eq!(duration_match_bonus(210_000, 207_000), 30);
+        assert_eq!(duration_match_bonus(212_000, 207_000), 20);
+        assert_eq!(duration_match_bonus(218_000, 207_000), 10);
+        assert_eq!(duration_match_bonus(230_000, 207_000), 0);
+        assert_eq!(duration_match_bonus(300_000, 207_000), -40);
+        assert_eq!(duration_match_bonus(0, 207_000), 0);
+        assert_eq!(duration_match_bonus(207_000, 0), 0);
+    }
+
+    #[test]
+    fn hard_tolerance_rejects_far_versions() {
+        // 207s vs 219s = 12s, 边界内
+        assert!(duration_within_hard_tolerance(219_000, 207_000));
+        // 207s vs 234s = 27s, 淘汰
+        assert!(!duration_within_hard_tolerance(234_000, 207_000));
+        // 207s vs 260s 淘汰
+        assert!(!duration_within_hard_tolerance(260_000, 207_000));
+    }
+
+    #[test]
+    fn score_prefers_correct_artist_same_title() {
+        let target_title = "爱你";
+        let target_artist = "陈芳语";
+        let target_artists = artists(target_artist);
+        let target_dur = 207_000;
+
+        let cyndi = score_lyric_candidate(
+            "爱你",
+            "陈芳语",
+            207_000,
+            target_title,
+            target_artist,
+            &target_artists,
+            target_dur,
+        );
+        let wang = score_lyric_candidate(
+            "爱你",
+            "王心凌",
+            219_000,
+            target_title,
+            target_artist,
+            &target_artists,
+            target_dur,
+        );
+        assert!(cyndi > wang, "cyndi={cyndi} wang={wang}");
+        assert!(cyndi >= 60);
+        // 王心凌歌手不对应被扣分, 即使时长擦边
+        assert!(wang < cyndi);
+    }
+
+    #[test]
+    fn score_rejects_far_duration_even_same_title() {
+        let target_artists = artists("陈芳语");
+        let score = score_lyric_candidate(
+            "爱你",
+            "云汐",
+            234_000,
+            "爱你",
+            "陈芳语",
+            &target_artists,
+            207_000,
+        );
+        assert_eq!(score, 0);
+    }
+
+    #[test]
+    fn score_rejects_title_mismatch() {
+        let target_artists = artists("罗言");
+        let score = score_lyric_candidate(
+            "完全不同的歌",
+            "罗言",
+            161_000,
+            "红",
+            "罗言",
+            &target_artists,
+            161_000,
+        );
+        assert_eq!(score, 0);
+    }
+
+    #[test]
+    fn lyrics_span_rejects_half_length() {
+        let lines = vec![LyricLine {
+            start_ms: 0,
+            duration_ms: 5_000,
+            text: "a".into(),
+            translation: None,
+            words: vec![],
+        }];
+        assert!(!lyrics_duration_acceptable(&lines, 207_000));
+    }
 }

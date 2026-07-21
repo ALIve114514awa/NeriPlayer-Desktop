@@ -7,7 +7,8 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn parse_lrc_content(content: String) -> AppResult<Vec<LyricLine>> {
-    Ok(parser::parse_lrc(&content))
+    // 自动识别 LRC / YRC(逐字), 支持逐字歌词编辑往返
+    Ok(parser::parse_auto(&content))
 }
 
 #[tauri::command]
@@ -15,7 +16,8 @@ pub async fn load_lyrics_file(path: String) -> AppResult<Vec<LyricLine>> {
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| crate::error::AppError::Other(format!("Read lyrics: {}", e)))?;
-    Ok(parser::parse_lrc(&content))
+    // 本地歌词文件可能是 LRC 或 YRC, 统一自动解析
+    Ok(parser::parse_auto(&content))
 }
 
 /// 多源歌词获取
@@ -27,14 +29,16 @@ pub async fn fetch_lyrics(
     audio_path: Option<String>,
     netease_id: Option<u64>,
     qq_song_mid: Option<String>,
+    youtube_video_id: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<LyricLine>> {
     let started = Instant::now();
     log::info!(
         target: "lyrics-command",
-        "begin netease_id={:?}, qq_mid={}, duration_secs={}, local_audio={}",
+        "begin netease_id={:?}, qq_mid={}, yt={}, duration_secs={}, local_audio={}",
         netease_id,
         qq_song_mid.is_some(),
+        youtube_video_id.is_some(),
         duration_secs,
         audio_path.is_some(),
     );
@@ -47,6 +51,7 @@ pub async fn fetch_lyrics(
             audio_path.as_deref(),
             netease_id,
             qq_song_mid.as_deref(),
+            youtube_video_id.as_deref(),
         )
         .await;
     log::info!(

@@ -77,6 +77,11 @@ pub fn parse_yrc(content: &str) -> Vec<LyricLine> {
                 words.push(LyricWord { start_ms: ws, duration_ms: wd, text: wt });
             }
 
+            // 无逐字段时保留行文本, 对齐 Android parseNeteaseYrc (混排 YRC 导出走 [start,dur]text)
+            if words.is_empty() {
+                full_text = rest.trim().to_string();
+            }
+
             if full_text.trim().is_empty() { continue; }
 
             if yrc_word_times_are_relative(start_ms, duration_ms, &words) {
@@ -155,7 +160,7 @@ pub fn merge_translation(lines: &mut [LyricLine], translation_lrc: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_yrc;
+    use super::{parse_auto, parse_yrc};
 
     #[test]
     fn parse_yrc_normalizes_relative_word_times() {
@@ -173,5 +178,24 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].words[0].start_ms, 10000);
         assert_eq!(lines[0].words[1].start_ms, 10500);
+    }
+
+    #[test]
+    fn parse_yrc_keeps_text_only_lines_without_word_segments() {
+        let lines = parse_yrc("[12000,3000]世界");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "世界");
+        assert!(lines[0].words.is_empty());
+        assert_eq!(lines[0].start_ms, 12000);
+        assert_eq!(lines[0].duration_ms, 3000);
+    }
+
+    #[test]
+    fn parse_auto_detects_mixed_yrc_block() {
+        let content = "[10000,2000](10000,500,0)你(10500,500,0)好\n[12000,3000]世界";
+        let lines = parse_auto(content);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].words.len(), 2);
+        assert_eq!(lines[1].text, "世界");
     }
 }
