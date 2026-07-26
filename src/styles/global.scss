@@ -272,3 +272,25 @@ html.theme-ripple-active::view-transition-new(root) {
     transition: none !important;
   }
 }
+
+/* 主题切换平滑过渡（非 ripple 路径）
+   CSS 变量本身无法 transition，改为让消费变量的属性过渡：
+   theme.ts / themeColor.ts 在改 --md-* 变量或深浅色类之前给 html 加
+   .theme-switching，350ms 后移除（JS 侧共享计时器防连点叠加）。
+   取舍：!important 会在 350ms 窗口内覆盖元素既有的 transition 声明，
+   属性列表只含颜色类属性、不含 transform/opacity——已在跑的位移/淡入
+   动画（CSS animation、View Transition）不受影响；窗口内新触发的
+   transform/opacity transition 会瞬时完成，主题切换瞬间几乎不会与
+   路由/列表动画并发，可接受。
+   :not(.theme-ripple-active) 保证与 ripple 的 transition:none 互斥，
+   圆形扩散期间圆外区域不会提前变色。 */
+@media (prefers-reduced-motion: no-preference) {
+  html.theme-switching:not(.theme-ripple-active),
+  html.theme-switching:not(.theme-ripple-active) *,
+  html.theme-switching:not(.theme-ripple-active) *::before,
+  html.theme-switching:not(.theme-ripple-active) *::after {
+    transition: background-color .3s ease, color .3s ease,
+                border-color .3s ease, fill .3s ease, stroke .3s ease,
+                box-shadow .3s ease !important;
+  }
+}

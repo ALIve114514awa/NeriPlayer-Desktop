@@ -220,6 +220,35 @@ export const THEME_COLORS: ThemeColorScheme[] = [
   },
 ]
 
+// 非 ripple 路径的平滑过渡计时器：连点时重置，防止过渡类被上一次的定时器提前摘除
+let smoothTransitionTimer: number | undefined
+
+/**
+ * 非 ripple 路径的主题平滑过渡：在改 CSS 变量 / 深浅色类之前调用，
+ * 给根元素加 theme-switching（global.scss 中让颜色类属性过渡 300ms），
+ * 350ms 后移除。ripple（View Transition）期间由 theme-ripple-active
+ * 统一禁用颜色过渡以防圆外提前变色，此处跳过避免冲突
+ */
+export function beginSmoothThemeTransition() {
+  const root = document.documentElement
+  if (root.classList.contains('theme-ripple-active')) return
+  root.classList.add('theme-switching')
+  if (smoothTransitionTimer !== undefined) window.clearTimeout(smoothTransitionTimer)
+  smoothTransitionTimer = window.setTimeout(() => {
+    document.documentElement.classList.remove('theme-switching')
+    smoothTransitionTimer = undefined
+  }, 350)
+}
+
+/** ripple 启动前取消平滑过渡，避免两套过渡机制在同一帧竞争 */
+export function cancelSmoothThemeTransition() {
+  if (smoothTransitionTimer !== undefined) {
+    window.clearTimeout(smoothTransitionTimer)
+    smoothTransitionTimer = undefined
+  }
+  document.documentElement.classList.remove('theme-switching')
+}
+
 /** 获取色块的展示色 */
 export function getSwatchColor(key: string): string {
   const scheme = THEME_COLORS.find(c => c.key === key)
@@ -283,8 +312,9 @@ export function applyThemeColorVisual(key: string, isDark?: boolean) {
   applyThemeVars(vars, scheme.seed, dark)
 }
 
-/** 应用主题色到 CSS 变量（含持久化） */
+/** 应用主题色到 CSS 变量（含持久化）。非 ripple 路径，套 300ms 平滑过渡 */
 export function applyThemeColor(key: string, isDark?: boolean, persist = true) {
+  beginSmoothThemeTransition()
   applyThemeColorVisual(key, isDark)
   if (persist) localStorage.setItem('theme-color', key)
 }
@@ -306,6 +336,8 @@ export async function switchThemeColorWithRipple(key: string, x: number, y: numb
 
   // 预计算当前 dark/light 状态，避免 transition 回调中读 classList
   const isDark = !document.documentElement.classList.contains('light-theme')
+  // ripple 与平滑过渡互斥：清掉可能残留的 theme-switching
+  cancelSmoothThemeTransition()
   document.documentElement.classList.add('theme-ripple-active')
 
   const transition = (document as any).startViewTransition(() => {

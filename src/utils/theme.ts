@@ -1,7 +1,13 @@
 // 深色/浅色模式管理 + 圆形扩散过渡动画
 // 参考 Android 端 pending state 模式：视觉切换与持久化解耦，消除卡顿
 import { reapplyDynamicColorForTheme } from './colorExtractor'
-import { applyThemeColor, applyThemeColorVisual, getSavedThemeColor } from './themeColor'
+import {
+  applyThemeColor,
+  applyThemeColorVisual,
+  beginSmoothThemeTransition,
+  cancelSmoothThemeTransition,
+  getSavedThemeColor,
+} from './themeColor'
 
 export type ThemeMode = 'system' | 'dark' | 'light'
 
@@ -33,8 +39,12 @@ function applyThemeVisual(mode: ThemeMode) {
   }
 }
 
-/** 无动画直接应用（含持久化，用于初始化和 fallback） */
+/**
+ * 非 ripple 路径应用主题（含持久化，用于初始化、系统跟随和 fallback）。
+ * 改类/变量前先套 300ms 平滑过渡，避免整屏瞬间跳变
+ */
 export function applyTheme(mode: ThemeMode, persist = true) {
+  beginSmoothThemeTransition()
   applyThemeVisual(mode)
   if (persist) localStorage.setItem('theme-mode', mode)
 }
@@ -45,8 +55,11 @@ export function applyTheme(mode: ThemeMode, persist = true) {
  * localStorage 写入移到 microtask 异步执行
  */
 export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: number, persist = true) {
-  // 如果浏览器不支持 View Transition，直接切换
+  // 如果浏览器不支持 View Transition，直接切换（走平滑过渡兜底）。
+  // 调用方（SettingsView）可能已预加 theme-ripple-active，而本分支不会走
+  // ripple 的清理流程，先移除以免残留导致全局 transition 被永久禁用
   if (!(document as any).startViewTransition) {
+    document.documentElement.classList.remove('theme-ripple-active')
     applyTheme(mode, persist)
     return
   }
@@ -58,7 +71,9 @@ export async function switchThemeWithRipple(mode: ThemeMode, x: number, y: numbe
   )
 
   // 禁用 CSS color 过渡，避免圆外区域文字提前变色
+  // ripple 与平滑过渡互斥：先清掉可能残留的 theme-switching
   const root = document.documentElement
+  cancelSmoothThemeTransition()
   root.classList.add('theme-ripple-active')
   // 用 CSS 变量驱动 clip-path，兼容 WebView2 对 WAAPI pseudoElement 支持不全的情况
   root.style.setProperty('--theme-ripple-x', `${x}px`)

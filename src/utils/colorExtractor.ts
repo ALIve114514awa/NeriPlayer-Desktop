@@ -14,7 +14,7 @@ import {
   normalizeProxiedCoverUrl,
   normalizeCoverUrlForDisplay,
 } from '@/utils/bilibiliCover'
-import { applyThemeVars, clearDynamicThemeColor } from '@/utils/themeColor'
+import { applyThemeVars, clearDynamicThemeColor, beginSmoothThemeTransition } from '@/utils/themeColor'
 
 const log = createLogger('dynamic-color')
 
@@ -199,6 +199,8 @@ export async function applyDynamicColorFromCover(rawUrl: string, isDark: boolean
   const palette = extractPalette(imageData, 16, isDark)
   const seed = palette.primaryColor
   const vars = buildDynamicVars(seed, isDark)
+  // 换封面驱动的取色变化同样要平滑过渡，不能整屏瞬间跳色
+  beginSmoothThemeTransition()
   applyThemeVars(vars, `${seed[0]}, ${seed[1]}, ${seed[2]}`, isDark)
   lastSeed = seed
   isActive = true
@@ -219,6 +221,8 @@ export function clearDynamicColor(isDark?: boolean): void {
   if (!isActive) return
   isActive = false
   lastSeed = null
+  // 还原预设色也走平滑过渡
+  beginSmoothThemeTransition()
   clearDynamicThemeColor(isDark)
   log.info('动态取色已清除，恢复预设主题')
 }
