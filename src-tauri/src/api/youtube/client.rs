@@ -286,7 +286,31 @@ impl YouTubeClient {
             .filter_map(|value| value.to_str().ok().map(str::to_string))
             .collect();
 
-        let data: Value = resp.json().await?;
+        // 必须先看状态码：401/403 的错误体同样是 JSON，直接 json() 解析会得到
+        // 一个"合法但没有内容"的响应，前端只会渲染成空列表，整条链路不报错
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            let detail = innertube_error_detail(&body);
+            log::warn!(
+                target: "youtube",
+                "innertube {} failed: HTTP {} {}",
+                endpoint,
+                status,
+                detail,
+            );
+            return Err(AppError::Api(format!(
+                "YouTube request failed: HTTP {status}{}",
+                if detail.is_empty() { String::new() } else { format!(" - {detail}") }
+            )));
+        }
+        let data: Value = serde_json::from_str(&body).map_err(|error| {
+            AppError::Api(format!("YouTube response is not valid JSON: {error}"))
+        })?;
+        if let Some(reason) = innertube_rejection_reason(&data) {
+            log::warn!(target: "youtube", "innertube {} rejected: {}", endpoint, reason);
+            return Err(AppError::Api(format!("YouTube request rejected: {reason}")));
+        }
 
         // 若响应携带新的身份 cookie, 合并回会话(保留旧身份, 避免被短暂响应冲掉)
         let updated = if set_cookie.is_empty() {
@@ -333,4 +357,44 @@ impl YouTubeClient {
         });
         self.innertube_post_auth_with_session("browse", &body, auth).await
     }
+}
+
+/// 从 InnerTube 错误体里提取可读原因，截断避免把整页 HTML 灌进日志
+fn innertube_error_detail(body: &str) -> String {
+    const MAX: usize = 200;
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.pointer("/error/status"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| body.split_whitespace().collect::<Vec<_>>().join(" "));
+    if message.chars().count() <= MAX {
+        return message;
+    }
+    message.chars().take(MAX).collect::<String>() + "…"
+}
+
+/// 状态码 200 但内容被拒（登录失效、地区不可用等）时的原因
+///
+/// InnerTube 这类拒绝同样返回 200，不识别就会静默变成空列表。
+fn innertube_rejection_reason(data: &Value) -> Option<String> {
+    if let Some(message) = data
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+    {
+        return Some(message.to_string());
+    }
+    let status = data
+        .pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+        .and_then(Value::as_bool);
+    if status == Some(true) {
+        return Some("YouTube session is signed out".into());
+    }
+    None
 }

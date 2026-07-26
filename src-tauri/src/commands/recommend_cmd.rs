@@ -10,14 +10,14 @@ pub async fn get_recommended_playlists(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_recommended_playlists(limit.unwrap_or(30)).await
 }
 
 /// 获取网易云每日推荐歌曲（需登录）
 #[tauri::command]
 pub async fn get_recommended_songs(state: State<'_, AppState>) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_recommended_songs().await
 }
 
@@ -36,7 +36,7 @@ pub async fn get_user_playlists(
                     .and_then(|a| a.user_id)
                     .ok_or_else(|| AppError::Api("Netease not logged in".into()))?
             };
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+            let client = state.netease();
             client.get_user_playlists(uid, 50, 0).await
         }
         "bilibili" => {
@@ -105,7 +105,7 @@ pub async fn get_user_account(
 ) -> AppResult<Value> {
     match platform.as_str() {
         "netease" => {
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+            let client = state.netease();
             client.get_user_account().await
         }
         "bilibili" => {
@@ -138,7 +138,7 @@ pub async fn get_high_quality_playlists(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_high_quality_playlists(
         cat.as_deref().unwrap_or("全部"),
         limit.unwrap_or(30),
@@ -148,7 +148,7 @@ pub async fn get_high_quality_playlists(
 /// 获取精品歌单分类标签
 #[tauri::command]
 pub async fn get_high_quality_tags(state: State<'_, AppState>) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_high_quality_tags().await
 }
 
@@ -159,7 +159,7 @@ pub async fn like_song(
     like: bool,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.like_song(song_id, like).await
 }
 
@@ -172,7 +172,7 @@ pub async fn get_liked_song_ids(state: State<'_, AppState>) -> AppResult<Value> 
             .and_then(|a| a.user_id)
             .ok_or_else(|| AppError::Api("Netease not logged in".into()))?
     };
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_liked_song_ids(uid).await
 }
 
@@ -182,7 +182,7 @@ pub async fn get_album_detail(
     album_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_album_detail(album_id).await
 }
 
@@ -192,7 +192,7 @@ pub async fn get_netease_song_detail(
     song_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_song_detail(&[song_id]).await
 }
 
@@ -203,7 +203,7 @@ pub async fn get_user_stared_albums(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     client.get_user_stared_albums(offset.unwrap_or(0), limit.unwrap_or(50)).await
 }
 
@@ -234,7 +234,7 @@ pub async fn get_netease_playlist_detail(
     playlist_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     let mut detail = client.get_playlist(playlist_id).await?;
 
     // 若 trackIds 数量 > tracks 数量，分页补全
@@ -325,7 +325,7 @@ pub async fn validate_auth(
 ) -> AppResult<bool> {
     match platform.as_str() {
         "netease" => {
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+            let client = state.netease();
             match client.get_user_account().await {
                 Ok(v) => Ok(v["profile"]["userId"].as_u64().is_some()),
                 Err(_) => Ok(false),

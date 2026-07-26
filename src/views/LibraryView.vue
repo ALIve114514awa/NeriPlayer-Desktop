@@ -25,6 +25,7 @@ import {
 import {
   filterLocalArtists,
   groupLocalArtists,
+  loadArtistSourceTracks,
   sortLocalArtists,
   type LocalArtistSortMode,
   type LocalArtistSummary,
@@ -342,27 +343,8 @@ async function loadLocalArtistTracks(force = false) {
   if (localArtistTracks.value.length > 0 && !force) return
   localArtistsLoading.value = true
   try {
-    // Android 从所有歌单里的本地曲目聚合歌手，只看「本地音乐」会漏掉
-    // 用户手动整理到其它歌单的那些本地文件
-    const lists = playlists.value.length
-      ? playlists.value
-      : await invoke<PlaylistInfo[]>('list_playlists')
-    const collected = await Promise.all(
-      lists.map(async (pl) => {
-        try {
-          const raw = await invoke<any[]>('get_playlist_tracks', { id: pl.id })
-          return (raw || []).map(normalizeTrack)
-        } catch {
-          return [] as TrackInfo[]
-        }
-      }),
-    )
-    // Android 按曲目的 artist 字段聚合，不区分来源：网易云/B站/YouTube 的
-    // 曲目同样要归到对应歌手下，只过滤掉没有 id 的脏数据
-    const seen = new Set<string>()
-    localArtistTracks.value = collected
-      .flat()
-      .filter((track) => !!track.id && !seen.has(track.id) && seen.add(track.id))
+    // 与歌手详情页共用同一个来源，避免两边口径漂移
+    localArtistTracks.value = await loadArtistSourceTracks()
   } catch (e) {
     log.error('Load local artist tracks failed:', e)
     localArtistTracks.value = []

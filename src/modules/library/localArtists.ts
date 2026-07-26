@@ -3,7 +3,8 @@
 // 聚合键与 Android localArtistStableKey 一致（trim + lowercase），
 // 保证两端对同一批本地文件分出来的歌手组完全相同。
 
-import type { TrackInfo } from '@/stores/player'
+import { invoke } from '@tauri-apps/api/core'
+import { normalizeTrack, type TrackInfo } from '@/stores/player'
 
 export type LocalArtistSortMode = 'name' | 'song_count' | 'recent'
 
@@ -92,4 +93,28 @@ export function filterLocalArtists(
           (track.album ?? '').toLowerCase().includes(trimmed),
       ),
   )
+}
+
+
+/// 加载参与歌手聚合的全部曲目
+///
+/// Android 从所有歌单聚合歌手，只看「本地音乐」会漏掉用户手动整理到其它
+/// 歌单的曲目。列表页与详情页必须共用这一个来源，否则两边口径一旦漂移，
+/// 就会出现「列表里有这个歌手、点进去却是空的」。
+export async function loadArtistSourceTracks(): Promise<TrackInfo[]> {
+  const playlists = await invoke<Array<{ id: number }>>('list_playlists')
+  const collected = await Promise.all(
+    (playlists || []).map(async (playlist) => {
+      try {
+        const raw = await invoke<any[]>('get_playlist_tracks', { id: playlist.id })
+        return (raw || []).map(normalizeTrack)
+      } catch {
+        return [] as TrackInfo[]
+      }
+    }),
+  )
+  const seen = new Set<string>()
+  return collected
+    .flat()
+    .filter((track) => !!track.id && !seen.has(track.id) && seen.add(track.id))
 }

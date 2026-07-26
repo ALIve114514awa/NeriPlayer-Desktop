@@ -1,5 +1,5 @@
 use crate::api::bilibili::client::{BiliAudioStream, BiliClient};
-use crate::api::netease::client::{NeteaseClient, NeteasePlaybackUnavailableReason};
+use crate::api::netease::client::NeteasePlaybackUnavailableReason;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::settings::store::{self, AppSettings, SettingsLoadResult};
@@ -66,7 +66,7 @@ pub async fn get_netease_song_url(
             return Err(AppError::Audio("Playback request superseded".into()));
         }
     }
-    let client = NeteaseClient::new(&state.http());
+    let client = state.netease();
     let result = client.get_song_url(song_id, &quality).await?;
     Ok(SongUrlResult {
         url: result.url,

@@ -335,7 +335,7 @@ pub async fn login_netease(app: AppHandle, state: State<'_, AppState>) -> AppRes
     cookies::inject_cookies(&state.cookie_jar, &entries);
 
     // 调用 API 获取用户信息
-    let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+    let client = state.netease();
     let (user_id, nickname, avatar_url) = match client.get_user_account().await {
         Ok(account) => {
             let profile = &account["profile"];
@@ -520,7 +520,7 @@ pub async fn login_with_cookies(
                 return Err(AppError::Other("Missing required cookie: MUSIC_U".into()));
             }
 
-            let client = crate::api::netease::client::NeteaseClient::new(&state.http());
+            let client = state.netease();
             let (user_id, nickname, avatar_url) = match client.get_user_account().await {
                 Ok(account) => {
                     let profile = &account["profile"];

@@ -10,8 +10,17 @@ import type {
   LyricWord as PlayerLyricWord,
 } from '@/stores/player'
 import { useSettingsStore } from '@/stores/settings'
+import { useI18n } from 'vue-i18n'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
+import {
+  createContextMenuItem,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+} from '@/utils/contextMenu'
 
 const settings = useSettingsStore()
+const { t } = useI18n()
 
 const props = withDefaults(defineProps<{
   lyrics: PlayerLyricLine[]
@@ -303,6 +312,70 @@ function reloadLyrics(): void {
   scheduleLayoutSync()
 }
 
+/// 右键菜单：AMLL 自绘 DOM，没有 line-index 属性可读，
+/// 用命中点的纵坐标反查最近的一行——比依赖内部类名稳，AMLL 换皮不会失效
+const lyricMenu = ref<{ show: boolean; x: number; y: number; index: number }>({
+  show: false, x: 0, y: 0, index: -1,
+})
+
+function resolveLineIndexAt(clientY: number): number {
+  if (!lyricPlayer) return -1
+  const container = lyricPlayer.getElement()
+  const children = Array.from(container.querySelectorAll<HTMLElement>('*'))
+    .filter((element) => element.childElementCount === 0 && element.textContent?.trim())
+  if (!children.length) return -1
+
+  let bestIndex = -1
+  let bestDistance = Number.POSITIVE_INFINITY
+  const lines = props.lyrics
+  for (const element of children) {
+    const rect = element.getBoundingClientRect()
+    if (rect.height <= 0) continue
+    const distance = Math.abs(clientY - (rect.top + rect.height / 2))
+    if (distance >= bestDistance) continue
+    const text = element.textContent?.trim() ?? ''
+    const index = lines.findIndex((line) => displayText(line).trim() === text)
+    if (index < 0) continue
+    bestDistance = distance
+    bestIndex = index
+  }
+  return bestIndex
+}
+
+function onLyricContextMenu(event: MouseEvent): void {
+  const index = resolveLineIndexAt(event.clientY)
+  if (index < 0) return
+  event.preventDefault()
+  lyricMenu.value = { show: true, x: event.clientX, y: event.clientY, index }
+}
+
+const lyricMenuItems = computed<ContextMenuItem[]>(() => [
+  createContextMenuItem(t('lyrics.copy_line'), { id: 'copy-line', icon: 'content_copy' }),
+  createContextMenuItem(t('lyrics.copy_all'), { id: 'copy-all', icon: 'copy_all' }),
+  createContextMenuItem(t('lyrics.seek_here'), { id: 'seek', icon: 'play_arrow' }),
+])
+
+async function handleLyricMenuClick(item: ContextMenuActionItem): Promise<void> {
+  const index = lyricMenu.value.index
+  lyricMenu.value.show = false
+  const line = props.lyrics[index]
+  if (!line) return
+
+  if (item.id === 'seek') {
+    emit('seek', Math.max(0, Math.round(line.startMs)))
+    return
+  }
+  const text = item.id === 'copy-all'
+    ? props.lyrics.map((entry) => displayText(entry)).filter(Boolean).join('\n')
+    : displayText(line)
+  if (!text) return
+  try {
+    await writeText(text)
+  } catch {
+    // 剪贴板不可用时静默失败，复制不是关键路径
+  }
+}
+
 function onLineClick(event: Event): void {
   const lineEvent = event as LyricLineMouseEvent
   if (!lyricPlayer || lineEvent.lineIndex < 0) return
@@ -551,6 +624,15 @@ watch(() => props.seekSeq, (seq, oldSeq) => {
       'lyrics-scroll--ready': isLayoutReady,
     }"
     :style="{ '--lyric-font-scale': settings.lyricFontScale }"
+    @contextmenu="onLyricContextMenu"
+  />
+  <ContextMenu
+    :open="lyricMenu.show"
+    :x="lyricMenu.x"
+    :y="lyricMenu.y"
+    :items="lyricMenuItems"
+    @update:open="lyricMenu.show = $event"
+    @click="handleLyricMenuClick"
   />
 </template>
 

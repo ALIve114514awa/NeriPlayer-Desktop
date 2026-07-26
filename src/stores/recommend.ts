@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { useToastStore } from './toast'
 import { createLogger } from '@/utils/logger'
 import { parseYouTubeLibraryPlaylists as parseYouTubeLibraryPlaylistsShared } from '@/modules/youtube/youtubePlaylistParse'
 
@@ -264,7 +265,10 @@ export const useRecommendStore = defineStore('recommend', () => {
       userPlaylists.value[platform] = playlists
       saveCache()
     } catch (e) {
+      // 静默失败会渲染成"暂无云端歌单"，把登录失效之类的问题藏起来
       log.error(`fetchUserPlaylists(${platform}):`, e)
+      error.value = String(e)
+      useToastStore().error(String(e))
     } finally {
       isLoading.value = false
     }

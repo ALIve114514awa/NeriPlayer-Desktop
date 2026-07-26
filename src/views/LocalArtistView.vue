@@ -2,9 +2,12 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { invoke } from '@tauri-apps/api/core'
-import { normalizeTrack, usePlayerStore, type TrackInfo } from '@/stores/player'
-import { groupLocalArtists, localArtistStableKey } from '@/modules/library/localArtists'
+import { usePlayerStore, type TrackInfo } from '@/stores/player'
+import {
+  groupLocalArtists,
+  loadArtistSourceTracks,
+  localArtistStableKey,
+} from '@/modules/library/localArtists'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import { createLogger } from '@/utils/logger'
 
@@ -14,8 +17,6 @@ const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
 const { t } = useI18n()
-
-const LOCAL_NAMES = ['本地音乐', '本機音樂', 'ローカル音楽', 'Local Music']
 
 const loading = ref(true)
 const tracks = ref<TrackInfo[]>([])
@@ -39,14 +40,7 @@ function formatTotal(ms: number): string {
 async function load() {
   loading.value = true
   try {
-    const playlists = await invoke<Array<{ id: number; name: string }>>('list_playlists')
-    const localPlaylist = playlists.find((pl) => LOCAL_NAMES.includes(pl.name))
-    if (!localPlaylist) {
-      tracks.value = []
-      return
-    }
-    const raw = await invoke<any[]>('get_playlist_tracks', { id: localPlaylist.id })
-    const all = (raw || []).map(normalizeTrack)
+    const all = await loadArtistSourceTracks()
     const wanted = localArtistStableKey(artistName.value)
     const artist = groupLocalArtists(all, t('library.local_artist_unknown')).find(
       (entry) => entry.key === wanted,

@@ -792,5 +792,10 @@
     "shuffle": "隨機播放",
     "repeat": "循環模式",
     "close": "關閉目前彈層"
+  },
+  "lyrics": {
+    "copy_line": "複製這一句",
+    "copy_all": "複製全部歌詞",
+    "seek_here": "跳到這一句"
   }
 }

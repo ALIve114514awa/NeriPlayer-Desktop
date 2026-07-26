@@ -792,5 +792,10 @@
     "shuffle": "Shuffle",
     "repeat": "Repeat mode",
     "close": "Dismiss overlay"
+  },
+  "lyrics": {
+    "copy_line": "Copy this line",
+    "copy_all": "Copy all lyrics",
+    "seek_here": "Jump to this line"
   }
 }

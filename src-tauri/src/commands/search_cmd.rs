@@ -1,4 +1,3 @@
-use crate::api::netease::client::NeteaseClient;
 use crate::error::AppResult;
 use crate::state::AppState;
 use serde::Serialize;
@@ -54,7 +53,7 @@ pub async fn search(
 }
 
 async fn search_netease(query: &str, state: &State<'_, AppState>) -> AppResult<Vec<SearchResult>> {
-    let client = NeteaseClient::new(&state.http());
+    let client = state.netease();
     let results = client.search(query, 30, 0).await?;
 
     Ok(results
