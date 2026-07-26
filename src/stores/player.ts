@@ -422,6 +422,7 @@ export const usePlayerStore = defineStore('player', () => {
   })
   let loadedPlaybackRequestToken = 0
   let deferredPlaybackSeek: DeferredPlaybackSeek | null = null
+  let _speedInvokeTimer: ReturnType<typeof setTimeout> | null = null
 
   function markCommandSource(source: PlaybackCommandSource) {
     lastCommandSource.value = source
@@ -2050,7 +2051,13 @@ export const usePlayerStore = defineStore('player', () => {
         requestGeneration: playbackRequestToken,
       }
     }
-    try { await invoke('set_speed', { speed: next }) } catch {}
+    // 去抖后再下发：后端改速度要从当前位置重建解码会话，滑条 @input
+    // 每 tick 连发会触发连环重建。UI/插值已即时更新，音频落地晚 200ms 无感
+    if (_speedInvokeTimer) clearTimeout(_speedInvokeTimer)
+    _speedInvokeTimer = setTimeout(() => {
+      _speedInvokeTimer = null
+      invoke('set_speed', { speed: playbackSpeed.value }).catch(() => {})
+    }, 200)
   }
 
   // 音效参数（响度增益 + 均衡器）

@@ -317,10 +317,16 @@ const NORMALIZE_TARGET_RMS: f64 = 0.1;
 /// 均衡增益上下限（线性），对应约 -6 dB ~ +6 dB，避免把噪底也抬起来
 const NORMALIZE_MIN_GAIN: f64 = 0.5;
 const NORMALIZE_MAX_GAIN: f64 = 2.0;
-/// RMS 观测窗的 EMA 系数：越小越慢，慢才不会把强弱起伏压平（泵浦感）
-const NORMALIZE_RMS_ALPHA: f64 = 0.000_02;
-/// 增益本身再平滑一次，切换时不会有可听见的台阶
-const NORMALIZE_GAIN_ALPHA: f64 = 0.000_05;
+/// RMS 观测窗的 EMA 系数
+///
+/// 按样本推进（48kHz 立体声 = 每秒 9.6 万次），时间常数 = 1/(96000×α)。
+/// 之前 0.000_02 折合仅 0.5 秒——增益追着乐句的强弱跑，副歌被压、
+/// 间隙被抬，听感「忽大忽小」，正是教科书级的泵浦。响度均衡要对付的是
+/// 「曲与曲之间」的响度差，观测窗必须远大于乐句：取 ~10 秒。
+const NORMALIZE_RMS_ALPHA: f64 = 0.000_001;
+/// 增益平滑系数：时间常数 ~20 秒，一首歌内增益近乎恒定，
+/// 只在曲目交界处缓慢滑向新曲的响度
+const NORMALIZE_GAIN_ALPHA: f64 = 0.000_000_5;
 /// 低于此 RMS 视为静音/前奏，不参与测量也不调整增益
 const NORMALIZE_SILENCE_RMS: f64 = 0.001;
 

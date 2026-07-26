@@ -156,9 +156,6 @@ enum AudioCmd {
     },
 }
 
-/// 参数变更后保留的已缓冲时长：够连续播放，又足够实时
-// 保留极短已处理尾部，目标 <0.5s 内听到新音效/倍速
-const EFFECTS_KEEP_BUFFER: Duration = Duration::from_millis(40);
 
 #[derive(Clone)]
 pub struct PlaybackStarted {
@@ -268,30 +265,6 @@ impl PlaybackShared {
         self.wake.notify_all();
     }
 
-    /// 丢弃 ring 中过旧的已处理 PCM，只留极短尾部；用于 EQ/响度/倍速即时生效
-    fn invalidate_processed_buffer(&self, clock_speed: f32) {
-        let keep_frames = duration_to_frames(EFFECTS_KEEP_BUFFER, self.sample_rate);
-        let keep_samples = keep_frames.saturating_mul(self.channels);
-        let before = self.ring.readable_samples();
-        self.ring.discard_keeping_tail(keep_samples);
-        let after = self.ring.readable_samples();
-        let dropped = before.saturating_sub(after);
-        if dropped > 0 {
-            let dropped_frames = dropped / self.channels.max(1);
-            let speed = clock_speed.clamp(0.25, 3.0);
-            let advance_us = ((dropped_frames as f64 * 1_000_000.0 / f64::from(self.sample_rate))
-                * f64::from(speed)) as u64;
-            self.clock
-                .position_us
-                .fetch_add(advance_us, Ordering::AcqRel);
-        }
-        // 软恢复目标：若 underrun 只补 ~120ms，不主动静音
-        let recover = self.soft_recover_frames().max(keep_frames).max(1);
-        self.buffer_target_frames
-            .store(recover, Ordering::Release);
-        self.buffering.store(false, Ordering::Release);
-        self.wake.notify_all();
-    }
 }
 
 struct PlaybackSession {
@@ -1366,15 +1339,21 @@ fn audio_control_loop(
                 }
             }
             AudioCmd::SetSpeed(next_speed) => {
-                // 先记下旧速：丢弃 ring 时按旧速补时钟，内容位置才对齐
-                let previous_speed = speed;
                 speed = next_speed.clamp(0.25, 3.0);
                 if let Some(session) = &current {
                     session.shared.speed.store(speed);
-                    session
-                        .shared
-                        .invalidate_processed_buffer(previous_speed);
                 }
+                // 速度固化在 ring 的输出帧里，必须从当前位置重解码；
+                // 旧做法「丢缓冲 + 按旧速补时钟」会把缓冲住的内容整段跳过
+                rebuild_session_in_place(
+                    &mut current,
+                    volume,
+                    speed,
+                    &shared_level,
+                    &effects_params,
+                    &playback_generation,
+                    &mut output_profile,
+                );
             }
             AudioCmd::Seek {
                 position_ms,
@@ -1567,11 +1546,19 @@ fn audio_control_loop(
                 let _ = reply.send(current.as_ref().is_none_or(PlaybackSession::is_empty));
             }
             AudioCmd::InvalidateProcessedBuffer => {
-                if let Some(session) = current.as_ref() {
-                    // EQ/响度已改 params；用当前倍速补时钟（丢的是输出帧）
-                    let clock_speed = session.shared.speed.load();
-                    session.shared.invalidate_processed_buffer(clock_speed);
-                }
+                // EQ/响度已改 params。ring 里最多缓着 4 秒按旧参数处理完的
+                // 输出帧，旧做法「丢弃 + 前拨时钟」等于把这段内容直接跳过——
+                // 用户拨一下均衡器歌就快进了。改为从当前位置重建，内容不丢，
+                // 新参数立即可闻。
+                rebuild_session_in_place(
+                    &mut current,
+                    volume,
+                    speed,
+                    &shared_level,
+                    &effects_params,
+                    &playback_generation,
+                    &mut output_profile,
+                );
             }
             AudioCmd::FadeOutPause {
                 duration_ms,
@@ -1624,6 +1611,83 @@ fn audio_control_loop(
 
     if let Some(mut session) = current {
         session.stop();
+    }
+}
+
+/// EQ/响度/速度变化时按当前位置原地重建会话
+///
+/// 这些参数都固化在 ring 的输出帧里，改参数只有两种选择：跳过已缓冲的
+/// 内容（旧做法——ring 容量 4 秒，用户拨一下均衡器歌就快进一大段），
+/// 或者从当前位置重解码。这里选后者。重建失败时降级重试一次原会话，
+/// 宁可参数晚生效，也不能把声音弄停。
+#[allow(clippy::too_many_arguments)]
+fn rebuild_session_in_place(
+    current: &mut Option<PlaybackSession>,
+    volume: f32,
+    speed: f32,
+    shared_level: &Arc<Mutex<SharedAudioLevel>>,
+    effects_params: &Arc<Mutex<AudioEffectsParams>>,
+    playback_generation: &Arc<AtomicU64>,
+    output_profile: &mut Option<OutputDeviceProfile>,
+) {
+    let Some(session) = current.as_ref() else {
+        return;
+    };
+    let latest_generation = session.playback_generation;
+    if ensure_generation(playback_generation, latest_generation).is_err() {
+        return;
+    }
+    let position_ms = session.shared.clock.position_ms();
+    let paused = session.shared.paused.load(Ordering::Acquire);
+    let clock = Arc::clone(&session.shared.clock);
+    let source = session.source.clone();
+
+    let Some(mut previous) = current.take() else {
+        return;
+    };
+    // 先停旧 worker：取消远程读，避免与重建后的解码器抢 in_flight
+    previous.stop();
+    drop(previous);
+
+    let mut build = || {
+        let output = ensure_output_profile(output_profile)?;
+        prepare_session(
+            source.clone(),
+            position_ms,
+            volume,
+            speed,
+            Arc::clone(shared_level),
+            Arc::clone(effects_params),
+            Arc::clone(playback_generation),
+            latest_generation,
+            None,
+            Some(Arc::clone(&clock)),
+            output,
+            Arc::new(AtomicBool::new(false)),
+        )
+    };
+    let prepared = build().or_else(|error| {
+        log::warn!(
+            target: "cpal-output",
+            "effects rebuild failed once, retrying: {error}"
+        );
+        build()
+    });
+    match prepared {
+        Ok(next) => {
+            if !paused {
+                if let Err(error) = next.play() {
+                    log::warn!(target: "cpal-output", "effects rebuild play failed: {error}");
+                }
+            }
+            *current = Some(next);
+        }
+        Err(error) => {
+            log::warn!(
+                target: "cpal-output",
+                "effects rebuild failed, playback session lost: {error}"
+            );
+        }
     }
 }
 

@@ -278,9 +278,12 @@ function syncCurrentTime(forceSeek = false): void {
   if (!lyricPlayer) return
   const time = Math.max(0, Math.round(amllTimeMs.value))
   const drift = Math.abs(time - lastSyncedTime)
-  // 插值时钟与 AMLL 内部时间漂移超过 80ms 时强制 seek, 避免卡在错误行
   if (!forceSeek && drift < 1) return
-  if (!forceSeek && drift >= 80) forceSeek = true
+  // 只有真正的跳转（>500ms）才强制 seek。插值时钟被后端位置事件小幅
+  // 回拉是常态（缓冲、事件节流都会造成 100ms 级摆动），80ms 就强跳的话
+  // 每次回拉歌词都猛抖一下——「一抖一抖」就是它。500ms 以内直接喂时间，
+  // AMLL 按连续播放自行平滑，行切换粒度是秒级，不会因此卡错行。
+  if (!forceSeek && drift >= 500) forceSeek = true
 
   lyricPlayer.setCurrentTime(time, forceSeek)
   lastSyncedTime = time
