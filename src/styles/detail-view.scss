@@ -12,10 +12,25 @@
 }
 
 .detail-header {
+  /* 常驻：返回与搜索是详情页的主要导航，滚走了就得先滚回顶部才能搜 */
+  position: sticky;
+  top: 0;
+  z-index: 11;
   display: flex;
   align-items: center;
   gap: 12px;
   margin-bottom: 20px;
+  padding: 8px 10px;
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--md-surface-container-high) 92%, transparent);
+  backdrop-filter: blur(18px);
+}
+
+/* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .detail-header {
+    background: var(--md-surface-container-high);
+  }
 }
 
 .back-btn {

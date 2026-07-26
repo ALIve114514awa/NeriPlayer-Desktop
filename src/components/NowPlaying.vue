@@ -841,6 +841,12 @@ watch(nowPlayingTrackKey, async (trackKey) => {
     return
   }
 
+  // 换曲瞬间立即撤下旧词：此刻播放位置已归零而旧词还挂着，
+  // LyricsView 会判定大幅回跳、在旧词上硬跳回第一行——开播歌词
+  // 「有概率抽一下」就是这个窗口。缓存命中走同步路径，同一批次
+  // 更新内就把新词赋回，肉眼无感；在线获取则显示空态而不是旧词。
+  fetchedLyrics.value = []
+
   const started = performance.now()
   const cachedLyrics = readCachedLyrics(track)
   const reusedRequest = hasLyricsRequestInFlight(track)

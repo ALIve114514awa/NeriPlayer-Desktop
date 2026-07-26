@@ -916,7 +916,8 @@ onUnmounted(() => {
 
 .selection-toolbar {
   position: sticky;
-  top: 0;
+  /* 排在常驻 detail-header（56px 高）之下，避免两个 sticky 叠死在同一位置 */
+  top: 60px;
   z-index: 10;
   display: flex;
   align-items: center;
