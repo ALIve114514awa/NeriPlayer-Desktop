@@ -84,12 +84,25 @@ async fn search_qq(
 
     let mut results = Vec::with_capacity(songs.len());
     for song in songs {
-        let cover_url = song.album_mid.as_ref().map(|mid| {
-            format!(
-                "https://y.qq.com/music/photo_new/T002R800x800M000{}.jpg",
-                mid
-            )
-        });
+        // 无专辑 mid 的自发行歌曲用歌手头像兜底，避免结果行完全无封面
+        let cover_url = song
+            .album_mid
+            .as_deref()
+            .filter(|mid| !mid.is_empty())
+            .map(|mid| {
+                format!(
+                    "https://y.qq.com/music/photo_new/T002R800x800M000{}.jpg",
+                    mid
+                )
+            })
+            .or_else(|| {
+                song.singer_mid.as_deref().map(|mid| {
+                    format!(
+                        "https://y.qq.com/music/photo_new/T001R500x500M000{}.jpg",
+                        mid
+                    )
+                })
+            });
 
         // QQ 歌词接口较慢：探索/首页搜索默认不预取，仅播放页补全按需开启
         let (synced_lyrics, translated_lyrics) = if include_lyrics {

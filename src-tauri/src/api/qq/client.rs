@@ -25,6 +25,7 @@ pub struct QqSearchResult {
     pub artists: Vec<String>,
     pub album_name: String,
     pub album_mid: Option<String>,
+    pub singer_mid: Option<String>,
     pub duration_ms: u64,
 }
 
@@ -60,6 +61,8 @@ struct QqSongSummary {
 #[derive(Debug, Deserialize)]
 struct QqArtist {
     name: String,
+    #[serde(default)]
+    mid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,13 +142,21 @@ impl QqMusicClient {
 
         Ok(songs
             .into_iter()
-            .map(|song| QqSearchResult {
-                song_mid: song.song_mid,
-                song_name: song.song_name,
-                artists: song.singer.into_iter().map(|a| a.name).collect(),
-                album_name: song.album_name.unwrap_or_default(),
-                album_mid: song.album_mid,
-                duration_ms: song.interval.unwrap_or(0) * 1000,
+            .map(|song| {
+                let singer_mid = song
+                    .singer
+                    .iter()
+                    .find_map(|a| a.mid.as_deref().filter(|mid| !mid.is_empty()))
+                    .map(String::from);
+                QqSearchResult {
+                    song_mid: song.song_mid,
+                    song_name: song.song_name,
+                    artists: song.singer.into_iter().map(|a| a.name).collect(),
+                    album_name: song.album_name.unwrap_or_default(),
+                    album_mid: song.album_mid,
+                    singer_mid,
+                    duration_ms: song.interval.unwrap_or(0) * 1000,
+                }
             })
             .collect())
     }
