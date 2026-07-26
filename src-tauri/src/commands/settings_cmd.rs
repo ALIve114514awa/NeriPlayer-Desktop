@@ -1,6 +1,5 @@
 use crate::api::bilibili::client::{BiliAudioStream, BiliClient};
 use crate::api::netease::client::{NeteaseClient, NeteasePlaybackUnavailableReason};
-use crate::api::qq::client::QqMusicClient;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::settings::store::{self, AppSettings, SettingsLoadResult};
@@ -91,7 +90,7 @@ pub async fn get_qq_song_url(
             return Err(AppError::Audio("Playback request superseded".into()));
         }
     }
-    let client = QqMusicClient::new(&state.http());
+    let client = state.qq();
     let result = client.get_song_url(&song_mid, &quality).await?;
     Ok(SongUrlResult {
         url: result.url,
@@ -141,7 +140,7 @@ pub async fn get_bili_audio_url(
             return Err(AppError::Audio("Playback request superseded".into()));
         }
     }
-    let client = BiliClient::new(&state.http());
+    let client = state.bilibili();
 
     // 确定 bvid 和 cid
     let (real_bvid, real_cid) = if let Some(aid) = avid {

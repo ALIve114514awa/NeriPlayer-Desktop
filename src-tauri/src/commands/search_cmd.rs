@@ -1,7 +1,4 @@
-use crate::api::bilibili::client::BiliClient;
-use crate::api::lrclib::LrcLibClient;
 use crate::api::netease::client::NeteaseClient;
-use crate::api::qq::client::QqMusicClient;
 use crate::error::AppResult;
 use crate::state::AppState;
 use serde::Serialize;
@@ -82,7 +79,7 @@ async fn search_qq(
     state: &State<'_, AppState>,
     include_lyrics: bool,
 ) -> AppResult<Vec<SearchResult>> {
-    let client = QqMusicClient::new(&state.http());
+    let client = state.qq();
     let mut songs = client.search(query, 1, 20).await?;
     songs.truncate(12);
 
@@ -123,7 +120,7 @@ async fn search_qq(
 }
 
 async fn search_bilibili(query: &str, state: &State<'_, AppState>) -> AppResult<Vec<SearchResult>> {
-    let client = BiliClient::new(&state.http());
+    let client = state.bilibili();
     let resp = client.search(query).await?;
 
     let results = resp["data"]["result"]
@@ -178,7 +175,7 @@ async fn search_bilibili(query: &str, state: &State<'_, AppState>) -> AppResult<
 }
 
 async fn search_youtube(_query: &str, state: &State<'_, AppState>) -> AppResult<Vec<SearchResult>> {
-    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
+    let client = state.youtube();
     let resp = client.search(_query).await?;
 
     // InnerTube 搜索结果解析
@@ -256,7 +253,7 @@ async fn search_youtube(_query: &str, state: &State<'_, AppState>) -> AppResult<
 }
 
 async fn search_lrclib(query: &str, state: &State<'_, AppState>) -> AppResult<Vec<SearchResult>> {
-    let client = LrcLibClient::new(&state.http());
+    let client = state.lrclib();
     let results = client.search(query).await?;
 
     Ok(results

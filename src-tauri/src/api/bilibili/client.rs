@@ -5,12 +5,13 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::error::{AppError, AppResult};
+use crate::api::transport::FallbackHttp;
 use super::wbi;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 pub struct BiliClient {
-    http: Client,
+    http: FallbackHttp,
     mixin_key: parking_lot::Mutex<Option<String>>,
 }
 
@@ -34,8 +35,12 @@ pub struct BiliVideoInfo {
 
 impl BiliClient {
     pub fn new(http: &Client) -> Self {
+        Self::with_transport(FallbackHttp::new(http, "bilibili"))
+    }
+
+    pub fn with_transport(http: FallbackHttp) -> Self {
         Self {
-            http: http.clone(),
+            http,
             mixin_key: parking_lot::Mutex::new(None),
         }
     }
@@ -46,12 +51,17 @@ impl BiliClient {
             return Ok(key.clone());
         }
 
-        let resp: Value = self.http
-            .get("https://api.bilibili.com/x/web-interface/nav")
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://www.bilibili.com")
-            .send().await?
-            .json().await?;
+        let resp: Value = self
+            .http
+            .send(|client| {
+                client
+                    .get("https://api.bilibili.com/x/web-interface/nav")
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://www.bilibili.com")
+            })
+            .await?
+            .json()
+            .await?;
 
         let img_url = resp["data"]["wbi_img"]["img_url"].as_str()
             .ok_or_else(|| AppError::Api("No wbi img_url".into()))?;
@@ -80,12 +90,17 @@ impl BiliClient {
             .join("&");
 
         let full_url = format!("{}?{}", url, query);
-        let resp: Value = self.http
-            .get(&full_url)
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://www.bilibili.com")
-            .send().await?
-            .json().await?;
+        let resp: Value = self
+            .http
+            .send(|client| {
+                client
+                    .get(&full_url)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://www.bilibili.com")
+            })
+            .await?
+            .json()
+            .await?;
 
         if resp["code"].as_i64() != Some(0) {
             return Err(AppError::Api(format!("Bili API error: {}", resp["message"])));
@@ -185,11 +200,14 @@ impl BiliClient {
     // 需要登录的 API
     /// 获取登录用户信息（也用于 Wbi key 刷新）
     pub async fn get_user_info(&self) -> AppResult<Value> {
-        let resp = self.http
-            .get("https://api.bilibili.com/x/web-interface/nav")
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://www.bilibili.com")
-            .send()
+        let resp = self
+            .http
+            .send(|client| {
+                client
+                    .get("https://api.bilibili.com/x/web-interface/nav")
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://www.bilibili.com")
+            })
             .await?;
         let body: Value = resp.json().await?;
         Ok(body)

@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use parking_lot::Mutex;
 
 use crate::error::{AppError, AppResult};
+use crate::api::transport::FallbackHttp;
 
 pub use super::account::YouTubeAccountProfile;
 
@@ -16,7 +17,7 @@ const DEFAULT_API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 const DEFAULT_CLIENT_VERSION: &str = "1.20250415.01.00";
 
 pub struct YouTubeClient {
-    http: Client,
+    http: FallbackHttp,
     api_key: Mutex<String>,
     client_version: Mutex<String>,
 }
@@ -41,11 +42,20 @@ pub struct YtAudioStream {
 
 impl YouTubeClient {
     pub fn new(http: &Client) -> Self {
+        Self::with_transport(FallbackHttp::new(http, "youtube"))
+    }
+
+    pub fn with_transport(http: FallbackHttp) -> Self {
         Self {
-            http: http.clone(),
+            http,
             api_key: Mutex::new(DEFAULT_API_KEY.to_string()),
             client_version: Mutex::new(DEFAULT_CLIENT_VERSION.to_string()),
         }
+    }
+
+    /// 底层传输通道，供本模块内的自由函数复用同一套代理兜底
+    pub fn transport(&self) -> &FallbackHttp {
+        &self.http
     }
 
     /// 构建 InnerTube context
@@ -71,15 +81,19 @@ impl YouTubeClient {
         let api_key = self.api_key.lock().clone();
         let url = format!("{}/{}?prettyPrint=false&key={}", INNERTUBE_URL, endpoint, api_key);
 
-        let resp = self.http
-            .post(&url)
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", "application/json")
-            .header("Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/")
-            .header("X-YouTube-Client-Name", "67")
-            .json(body)
-            .send().await?;
+        let resp = self
+            .http
+            .send(|client| {
+                client
+                    .post(&url)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "https://music.youtube.com")
+                    .header("Referer", "https://music.youtube.com/")
+                    .header("X-YouTube-Client-Name", "67")
+                    .json(body)
+            })
+            .await?;
 
         let data: Value = resp.json().await?;
         Ok(data)
@@ -247,19 +261,23 @@ impl YouTubeClient {
         let url = format!("{}/{}?prettyPrint=false&key={}", INNERTUBE_URL, endpoint, api_key);
         let auth_header = Self::authorization_header(auth)?;
 
-        let resp = self.http
-            .post(&url)
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", "application/json")
-            .header("Origin", "https://music.youtube.com")
-            .header("X-Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/")
-            .header("X-YouTube-Client-Name", "67")
-            .header("Authorization", auth_header)
-            .header("X-Goog-AuthUser", "0")
-            .header("Cookie", cookie_header)
-            .json(body)
-            .send().await?;
+        let resp = self
+            .http
+            .send(|client| {
+                client
+                    .post(&url)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "https://music.youtube.com")
+                    .header("X-Origin", "https://music.youtube.com")
+                    .header("Referer", "https://music.youtube.com/")
+                    .header("X-YouTube-Client-Name", "67")
+                    .header("Authorization", &auth_header)
+                    .header("X-Goog-AuthUser", "0")
+                    .header("Cookie", &cookie_header)
+                    .json(body)
+            })
+            .await?;
 
         let set_cookie: Vec<String> = resp
             .headers()

@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use regex::Regex;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::auth::state::{CookieEntry, YouTubeAuth};
 use crate::error::{AppError, AppResult};
+use crate::api::transport::FallbackHttp;
 
 use super::client::USER_AGENT;
 
@@ -61,7 +61,7 @@ impl YouTubeBootstrap {
 }
 
 pub async fn get_account_profile(
-    http: &Client,
+    http: &FallbackHttp,
     auth: &YouTubeAuth,
 ) -> AppResult<YouTubeAccountProfile> {
     let cookie_values = select_cookie_values(&auth.cookies, MUSIC_HOST);
@@ -79,13 +79,18 @@ pub async fn get_account_profile(
         .ok_or_else(|| AppError::Api("YouTube account menu did not contain a profile".into()))
 }
 
-async fn fetch_bootstrap(http: &Client, cookie_header: &str) -> AppResult<YouTubeBootstrap> {
+async fn fetch_bootstrap(
+    http: &FallbackHttp,
+    cookie_header: &str,
+) -> AppResult<YouTubeBootstrap> {
     let response = http
-        .get(format!("{MUSIC_ORIGIN}/"))
-        .header("User-Agent", USER_AGENT)
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("Cookie", cookie_header)
-        .send()
+        .send(|client| {
+            client
+                .get(format!("{MUSIC_ORIGIN}/"))
+                .header("User-Agent", USER_AGENT)
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Cookie", cookie_header)
+        })
         .await?
         .error_for_status()?;
     let html = response.text().await?;
@@ -93,7 +98,7 @@ async fn fetch_bootstrap(http: &Client, cookie_header: &str) -> AppResult<YouTub
 }
 
 async fn fetch_account_menu(
-    http: &Client,
+    http: &FallbackHttp,
     cookie_values: &BTreeMap<String, String>,
     cookie_header: &str,
     bootstrap: &YouTubeBootstrap,
@@ -113,22 +118,24 @@ async fn fetch_account_menu(
     let body = json!({ "context": bootstrap.context() });
 
     let response = http
-        .post(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("Content-Type", "application/json")
-        .header("Origin", MUSIC_ORIGIN)
-        .header("X-Origin", MUSIC_ORIGIN)
-        .header("Referer", format!("{MUSIC_ORIGIN}/"))
-        .header("X-Goog-AuthUser", &bootstrap.session_index)
-        .header("X-Goog-Visitor-Id", &bootstrap.visitor_data)
-        .header("X-YouTube-Client-Name", WEB_REMIX_CLIENT_NAME)
-        .header("X-YouTube-Client-Version", &bootstrap.client_version)
-        .header("X-YouTube-Bootstrap-Logged-In", "true")
-        .header("Authorization", authorization)
-        .header("Cookie", cookie_header)
-        .json(&body)
-        .send()
+        .send(|client| {
+            client
+                .post(&url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Content-Type", "application/json")
+                .header("Origin", MUSIC_ORIGIN)
+                .header("X-Origin", MUSIC_ORIGIN)
+                .header("Referer", format!("{MUSIC_ORIGIN}/"))
+                .header("X-Goog-AuthUser", &bootstrap.session_index)
+                .header("X-Goog-Visitor-Id", &bootstrap.visitor_data)
+                .header("X-YouTube-Client-Name", WEB_REMIX_CLIENT_NAME)
+                .header("X-YouTube-Client-Version", &bootstrap.client_version)
+                .header("X-YouTube-Bootstrap-Logged-In", "true")
+                .header("Authorization", &authorization)
+                .header("Cookie", cookie_header)
+                .json(&body)
+        })
         .await?;
 
     let status = response.status();

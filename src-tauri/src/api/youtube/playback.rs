@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::auth::state::YouTubeAuth;
 use crate::error::{AppError, AppResult};
+use crate::api::transport::FallbackHttp;
 
 use super::client::YtAudioStream;
 
@@ -272,7 +273,7 @@ fn build_player_body(
 
 /// 从 youtube watch 页提取 visitorData (对齐 yt-dlp webpage bootstrap).
 /// ANDROID_VR 无此字段会 LOGIN_REQUIRED; 缓存 30 分钟避免每首歌都打首页.
-async fn fetch_visitor_data(http: &Client) -> AppResult<String> {
+async fn fetch_visitor_data(http: &FallbackHttp) -> AppResult<String> {
     if let Ok(guard) = VISITOR_DATA_CACHE.lock() {
         if let Some(cached) = guard.as_ref() {
             if cached.fetched_at.elapsed() < VISITOR_DATA_TTL && !cached.value.is_empty() {
@@ -282,10 +283,12 @@ async fn fetch_visitor_data(http: &Client) -> AppResult<String> {
     }
 
     let html = http
-        .get("https://www.youtube.com/watch?v=dQw4w9WgXcQ&bpctr=9999999999&has_verified=1")
-        .header("User-Agent", WATCH_PAGE_UA)
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
+        .send(|client| {
+            client
+                .get("https://www.youtube.com/watch?v=dQw4w9WgXcQ&bpctr=9999999999&has_verified=1")
+                .header("User-Agent", WATCH_PAGE_UA)
+                .header("Accept-Language", "en-US,en;q=0.9")
+        })
         .await
         .map_err(|e| AppError::Api(format!("youtube visitor page network: {e}")))?
         .text()
@@ -567,16 +570,31 @@ fn playability_summary(resp: &Value) -> (String, String, String) {
     (status, reason, subreason)
 }
 
-fn playback_http_client() -> AppResult<Client> {
-    Client::builder()
+fn build_playback_client(no_proxy: bool) -> AppResult<Client> {
+    let mut builder = Client::builder()
         // 默认 UA 仅作兜底; 实际请求按 profile 覆盖
         .user_agent("com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)")
-        .no_proxy()
         // 不启用 cookie_store: 登录 Cookie 仅在 player 请求上显式附带,
         // CDN 拉流路径不会被 jar 自动污染
-        .cookie_store(false)
+        .cookie_store(false);
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|e| AppError::Other(format!("build youtube playback client: {e}")))
+}
+
+/// 播放侧专用传输：主路直连，兜底走系统代理
+///
+/// 这条链路刻意独立于 AppState 的共享客户端（不带 cookie jar），
+/// 但同样要能在「必须走代理才能出网」的网络里自愈，所以配一个反向兜底。
+fn playback_http_client() -> AppResult<FallbackHttp> {
+    Ok(FallbackHttp::with_fallback(
+        &build_playback_client(true)?,
+        &build_playback_client(false)?,
+        "youtube-playback",
+    ))
 }
 
 fn build_cookie_header(auth: &YouTubeAuth) -> String {
@@ -603,7 +621,7 @@ fn player_cookie_header(auth: Option<&YouTubeAuth>) -> Option<String> {
 }
 
 async fn player_request(
-    http: &Client,
+    http: &FallbackHttp,
     profile: &PlayerClientProfile,
     video_id: &str,
     auth: Option<&YouTubeAuth>,
@@ -618,31 +636,31 @@ async fn player_request(
     );
     let cookie_header = player_cookie_header(auth);
 
-    let mut req = http
-        .post(&url)
-        .header("User-Agent", profile.user_agent)
-        .header("Content-Type", "application/json")
-        .header("Origin", origin)
-        .header("Referer", format!("{origin}/"))
-        .header("X-YouTube-Client-Name", profile.client_id)
-        .header("X-YouTube-Client-Version", profile.client_version)
-        .header("X-Goog-Api-Format-Version", "2");
+    // build 会被兜底路径重复调用，必须是可重复执行的纯构造
+    let resp = http
+        .send(|client| {
+            let mut req = client
+                .post(&url)
+                .header("User-Agent", profile.user_agent)
+                .header("Content-Type", "application/json")
+                .header("Origin", origin)
+                .header("Referer", format!("{origin}/"))
+                .header("X-YouTube-Client-Name", profile.client_id)
+                .header("X-YouTube-Client-Version", profile.client_version)
+                .header("X-Goog-Api-Format-Version", "2");
 
-    // visitorData 同时放 body 与 header (yt-dlp generate_api_headers 同款)
-    if let Some(vd) = visitor_data.map(str::trim).filter(|s| !s.is_empty()) {
-        req = req.header("X-Goog-Visitor-Id", vd);
-    }
+            // visitorData 同时放 body 与 header (yt-dlp generate_api_headers 同款)
+            if let Some(vd) = visitor_data.map(str::trim).filter(|s| !s.is_empty()) {
+                req = req.header("X-Goog-Visitor-Id", vd);
+            }
 
-    // 仅 Cookie: 让服务端识别登录会话/地区偏好; 不发 SAPISIDHASH 以免 mobile player 400
-    if let Some(cookie) = cookie_header.as_deref() {
-        req = req
-            .header("Cookie", cookie)
-            .header("X-Goog-AuthUser", "0");
-    }
+            // 仅 Cookie: 让服务端识别登录会话/地区偏好; 不发 SAPISIDHASH 以免 mobile player 400
+            if let Some(cookie) = cookie_header.as_deref() {
+                req = req.header("Cookie", cookie).header("X-Goog-AuthUser", "0");
+            }
 
-    let resp = req
-        .json(&body)
-        .send()
+            req.json(&body)
+        })
         .await
         .map_err(|e| AppError::Api(format!("youtube player network: {e}")))?;
 

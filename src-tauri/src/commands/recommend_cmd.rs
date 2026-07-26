@@ -46,7 +46,7 @@ pub async fn get_user_playlists(
                     .and_then(|a| a.mid)
                     .ok_or_else(|| AppError::Api("Bilibili not logged in".into()))?
             };
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
+            let client = state.bilibili();
             let mut resp = client.get_user_favorites(mid).await?;
 
             // For folders with empty cover but non-zero media_count,
@@ -58,7 +58,7 @@ pub async fn get_user_playlists(
                     let media_count = folder["media_count"].as_u64().unwrap_or(0);
                     if cover.is_empty() && media_count > 0 {
                         if let Some(media_id) = folder["id"].as_u64() {
-                            let c = crate::api::bilibili::client::BiliClient::new(&state.http());
+                            let c = state.bilibili();
                             futures.push(async move {
                                 let pic = c.get_fav_folder_info(media_id).await.ok()
                                     .and_then(|r| r["data"]["cover"].as_str().map(|s| s.to_string()))
@@ -90,7 +90,7 @@ pub async fn get_user_playlists(
                     .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
                     .clone()
             };
-            let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
+            let client = state.youtube();
             client.get_library_playlists(&yt_auth).await
         }
         _ => Err(AppError::Api(format!("Unknown platform: {}", platform))),
@@ -109,7 +109,7 @@ pub async fn get_user_account(
             client.get_user_account().await
         }
         "bilibili" => {
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
+            let client = state.bilibili();
             client.get_user_info().await
         }
         _ => Err(AppError::Api(format!("Unsupported platform: {}", platform))),
@@ -127,7 +127,7 @@ pub async fn get_home_feed(app: tauri::AppHandle, state: State<'_, AppState>) ->
             .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
             .clone()
     };
-    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
+    let client = state.youtube();
     client.get_home_feed(&yt_auth).await
 }
 
@@ -213,7 +213,7 @@ pub async fn get_bili_fav_folder_info(
     media_id: u64,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::bilibili::client::BiliClient::new(&state.http());
+    let client = state.bilibili();
     client.get_fav_folder_info(media_id).await
 }
 
@@ -224,7 +224,7 @@ pub async fn get_bili_favorite_items(
     page: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
-    let client = crate::api::bilibili::client::BiliClient::new(&state.http());
+    let client = state.bilibili();
     client.get_favorite_items(media_id, page.unwrap_or(1)).await
 }
 
@@ -294,7 +294,7 @@ pub async fn get_youtube_playlist_detail(
             .clone()
     };
     let browse_id = crate::api::youtube::playlist::ensure_browse_id(&browse_id)?;
-    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
+    let client = state.youtube();
     let (detail, refreshed_auth) = crate::api::youtube::playlist::fetch_playlist_detail_pages(
         &client,
         &browse_id,
@@ -332,7 +332,7 @@ pub async fn validate_auth(
             }
         }
         "bilibili" => {
-            let client = crate::api::bilibili::client::BiliClient::new(&state.http());
+            let client = state.bilibili();
             client.validate_session().await
         }
         "youtube" => {
@@ -343,7 +343,7 @@ pub async fn validate_auth(
             };
             match yt_auth {
                 Some(auth) => {
-                    let client = crate::api::youtube::client::YouTubeClient::new(&state.http());
+                    let client = state.youtube();
                     match client.get_home_feed(&auth).await {
                         Ok(_) => Ok(true),
                         Err(_) => Ok(false),

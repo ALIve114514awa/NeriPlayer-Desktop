@@ -3,11 +3,12 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
+use crate::api::transport::FallbackHttp;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
 pub struct QqMusicClient {
-    http: Client,
+    http: FallbackHttp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,8 +94,12 @@ struct QqMidUrlInfo {
 }
 
 impl QqMusicClient {
+    pub fn with_transport(http: FallbackHttp) -> Self {
+        Self { http }
+    }
+
     pub fn new(http: &Client) -> Self {
-        Self { http: http.clone() }
+        Self::with_transport(FallbackHttp::new(http, "qq"))
     }
 
     pub async fn search(
@@ -103,20 +108,24 @@ impl QqMusicClient {
         page: u32,
         limit: u32,
     ) -> AppResult<Vec<QqSearchResult>> {
+        let limit_text = limit.to_string();
+        let page_text = page.to_string();
         let resp_text = self
             .http
-            .get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp")
-            .query(&[
-                ("format", "json"),
-                ("n", &limit.to_string()),
-                ("p", &page.to_string()),
-                ("w", keyword),
-                ("cr", "1"),
-                ("g_tk", "5381"),
-            ])
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://y.qq.com")
-            .send()
+            .send(|client| {
+                client
+                    .get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp")
+                    .query(&[
+                        ("format", "json"),
+                        ("n", limit_text.as_str()),
+                        ("p", page_text.as_str()),
+                        ("w", keyword),
+                        ("cr", "1"),
+                        ("g_tk", "5381"),
+                    ])
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://y.qq.com")
+            })
             .await?
             .text()
             .await?;
@@ -144,18 +153,20 @@ impl QqMusicClient {
     pub async fn get_lyrics(&self, song_mid: &str) -> AppResult<(Option<String>, Option<String>)> {
         let response_text = self
             .http
-            .get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg")
-            .query(&[
-                ("songmid", song_mid),
-                ("format", "json"),
-                ("inCharset", "utf8"),
-                ("outCharset", "utf-8"),
-                ("nobase64", "1"),
-                ("g_tk", "5381"),
-            ])
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://y.qq.com")
-            .send()
+            .send(|client| {
+                client
+                    .get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg")
+                    .query(&[
+                        ("songmid", song_mid),
+                        ("format", "json"),
+                        ("inCharset", "utf8"),
+                        ("outCharset", "utf-8"),
+                        ("nobase64", "1"),
+                        ("g_tk", "5381"),
+                    ])
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://y.qq.com")
+            })
             .await?
             .text()
             .await?;
@@ -193,13 +204,16 @@ impl QqMusicClient {
                 }
             });
 
+            let data_text = data.to_string();
             let response_text = self
                 .http
-                .get("https://u.y.qq.com/cgi-bin/musicu.fcg")
-                .query(&[("data", data.to_string())])
-                .header("User-Agent", USER_AGENT)
-                .header("Referer", "https://y.qq.com")
-                .send()
+                .send(|client| {
+                    client
+                        .get("https://u.y.qq.com/cgi-bin/musicu.fcg")
+                        .query(&[("data", data_text.as_str())])
+                        .header("User-Agent", USER_AGENT)
+                        .header("Referer", "https://y.qq.com")
+                })
                 .await?
                 .text()
                 .await?;

@@ -3,10 +3,10 @@
 // 不模拟完整浏览器, 因此不会与移动端同账号互相挤掉登录(对齐 Android YouTubeAuthAutoRefreshManager)
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
 
 use crate::auth::state::YouTubeAuth;
 use crate::error::{AppError, AppResult};
+use crate::api::transport::FallbackHttp;
 
 use super::client::USER_AGENT;
 use super::session;
@@ -114,16 +114,18 @@ pub fn html_session_logged_in(html: &str) -> Option<bool> {
 }
 
 async fn fetch_with_cookies(
-    http: &Client,
+    http: &FallbackHttp,
     url: &str,
     cookie_header: &str,
 ) -> AppResult<(Vec<String>, String)> {
     let resp = http
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("Cookie", cookie_header)
-        .send()
+        .send(|client| {
+            client
+                .get(url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Cookie", cookie_header)
+        })
         .await
         .map_err(|e| AppError::Api(format!("youtube refresh network: {e}")))?;
 
@@ -141,7 +143,7 @@ async fn fetch_with_cookies(
 /// 返回 Some(新会话)=cookie 有更新且身份一致; None=无变化;
 /// Err=网络失败或明确游客态(交由调用方计入失败, 触发熔断; 但绝不清除本地登录)
 pub async fn refresh_youtube_session(
-    http: &Client,
+    http: &FallbackHttp,
     auth: &YouTubeAuth,
 ) -> AppResult<Option<YouTubeAuth>> {
     if !auth.has_login() {

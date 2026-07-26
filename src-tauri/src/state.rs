@@ -110,9 +110,35 @@ impl AppState {
         self.alt_http.read().clone()
     }
 
-    /// 预接好代理兜底的网易云客户端
+    /// 带代理兜底的传输通道
+    ///
+    /// 平台客户端一律经由它构造，代理配错或必须走代理两种情况都能自愈。
+    pub fn transport(&self, target: &'static str) -> crate::api::transport::FallbackHttp {
+        crate::api::transport::FallbackHttp::with_fallback(
+            &self.http(),
+            &self.alt_http(),
+            target,
+        )
+    }
+
     pub fn netease(&self) -> crate::api::netease::client::NeteaseClient {
         crate::api::netease::client::NeteaseClient::with_fallback(&self.http(), &self.alt_http())
+    }
+
+    pub fn youtube(&self) -> crate::api::youtube::client::YouTubeClient {
+        crate::api::youtube::client::YouTubeClient::with_transport(self.transport("youtube"))
+    }
+
+    pub fn bilibili(&self) -> crate::api::bilibili::client::BiliClient {
+        crate::api::bilibili::client::BiliClient::with_transport(self.transport("bilibili"))
+    }
+
+    pub fn qq(&self) -> crate::api::qq::client::QqMusicClient {
+        crate::api::qq::client::QqMusicClient::with_transport(self.transport("qq"))
+    }
+
+    pub fn lrclib(&self) -> crate::api::lrclib::LrcLibClient {
+        crate::api::lrclib::LrcLibClient::with_transport(self.transport("lrclib"))
     }
 
     /// 获取当前 HTTP Client 的克隆（O(1)，reqwest::Client 内部是 Arc）
