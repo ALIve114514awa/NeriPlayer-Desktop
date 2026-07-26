@@ -1,5 +1,12 @@
-// Release 构建使用系统凭据存储；Debug 构建完全使用随机路径明文文件
+// Release 构建使用应用侧加密文件存储；Debug 构建完全使用随机路径明文文件
 // 各类凭据使用独立目录，删除 Cookie 时不会影响同步凭据
+//
+// 为什么不用系统钥匙串：未经正式签名的应用每次更新后二进制指纹变化，
+// macOS Keychain 会把它当成新应用反复弹授权框（甚至要求输入登录密码），
+// 用户会以为软件在偷凭据。对标 Android 端的 EncryptedSharedPreferences：
+// 应用侧加密、零系统交互。威胁模型一致——防的是「文件被拷走后可读」，
+// 不承诺抵御同机同用户的恶意进程（Keychain 对未签名应用同样给不出这个承诺）。
+// 旧 Keychain 凭据在首次读取时自动迁入并删除。
 
 const SERVICE_NAME: &str = "moe.ouom.neriplayer.desktop";
 
@@ -8,6 +15,9 @@ pub const GITHUB_TOKEN_KEY: &str = "github-token-v1";
 pub const WEBDAV_PASSWORD_KEY: &str = "webdav-password-v1";
 
 /// 从当前构建配置的凭据存储读取秘密值
+///
+/// Release 首选加密文件；读不到时回退旧 Keychain 并就地迁移——
+/// 老用户升级后第一次读取还会碰一次 Keychain，此后彻底不再触发系统弹窗。
 pub fn get_secret(key: &str) -> Option<String> {
     #[cfg(debug_assertions)]
     {
@@ -16,7 +26,15 @@ pub fn get_secret(key: &str) -> Option<String> {
 
     #[cfg(not(debug_assertions))]
     {
-        get_keyring_secret(key)
+        if let Some(value) = encrypted_secret_storage::get(key) {
+            return Some(value);
+        }
+        let legacy = get_keyring_secret(key)?;
+        if encrypted_secret_storage::set(key, &legacy) {
+            let _ = delete_keyring_secret(key);
+            log::info!(target: "security", "credential migrated off the keychain: {key}");
+        }
+        Some(legacy)
     }
 }
 
@@ -29,7 +47,7 @@ pub fn set_secret(key: &str, value: &str) -> bool {
 
     #[cfg(not(debug_assertions))]
     {
-        set_keyring_secret(key, value)
+        encrypted_secret_storage::set(key, value)
     }
 }
 
@@ -42,7 +60,10 @@ pub fn delete_secret(key: &str) -> bool {
 
     #[cfg(not(debug_assertions))]
     {
-        delete_keyring_secret(key)
+        let removed = encrypted_secret_storage::delete(key);
+        // 旧 Keychain 里可能还留着迁移前的副本，一并清理
+        let _ = delete_keyring_secret(key);
+        removed
     }
 }
 
@@ -57,6 +78,200 @@ pub fn debug_secret_exists(key: &str) -> bool {
     {
         let _ = key;
         false
+    }
+}
+
+/// 应用侧加密凭据存储（Release 默认）
+///
+/// AES-256-CBC + HMAC-SHA256（encrypt-then-MAC），随机 IV。
+/// 密钥派生自机器标识 + 应用盐：文件拷到别的机器无法解密，
+/// 本机不落明文。文件权限收紧到 0600（Unix）。
+/// Debug 构建用明文随机路径存储（见 debug_secret_storage），本模块只在
+/// Release 与测试中编译，避免 debug 下的 dead_code 告警。
+#[cfg(any(not(debug_assertions), test))]
+mod encrypted_secret_storage {
+    use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    use hmac::{Hmac, Mac};
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+    type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+    type HmacSha256 = Hmac<Sha256>;
+
+    const MAGIC: &[u8; 4] = b"NPS1";
+    const APP_SALT: &[u8] = b"moe.ouom.neriplayer.desktop/secret-store/v1";
+
+    fn store_dir() -> PathBuf {
+        let mut path = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
+        path.push("NeriPlayer");
+        path.push("secure");
+        path
+    }
+
+    fn secret_path(key: &str) -> PathBuf {
+        // key 是本模块内的常量（auth-state-v1 等），不含路径成分；
+        // 再做一次散列命名，目录里看不出哪个文件对应哪类凭据
+        let digest = Sha256::digest([APP_SALT, key.as_bytes()].concat());
+        store_dir().join(format!("{}.bin", hex::encode(&digest[..16])))
+    }
+
+    /// 机器标识：跨机器不可复制即可，不要求全球唯一
+    fn machine_identity() -> Vec<u8> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+                return id.trim().as_bytes().to_vec();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = std::process::Command::new("ioreg")
+                .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Some(rest) = line.split("\"IOPlatformUUID\" = \"").nth(1) {
+                        if let Some(uuid) = rest.split('"').next() {
+                            return uuid.as_bytes().to_vec();
+                        }
+                    }
+                }
+            }
+        }
+        // Windows 与兜底：用户与主机的稳定组合。弱于硬件 UUID，
+        // 但仍满足「拷到别的机器/别的账号读不出」
+        let mut fallback = Vec::new();
+        for var in ["COMPUTERNAME", "HOSTNAME", "USER", "USERNAME", "HOME", "USERPROFILE"] {
+            if let Ok(value) = std::env::var(var) {
+                fallback.extend_from_slice(value.as_bytes());
+                fallback.push(0);
+            }
+        }
+        fallback
+    }
+
+    fn derive_keys() -> ([u8; 32], [u8; 32]) {
+        let identity = machine_identity();
+        let enc = Sha256::digest([APP_SALT, b"/enc/", identity.as_slice()].concat());
+        let mac = Sha256::digest([APP_SALT, b"/mac/", identity.as_slice()].concat());
+        (enc.into(), mac.into())
+    }
+
+    pub(super) fn get(key: &str) -> Option<String> {
+        let blob = std::fs::read(secret_path(key)).ok()?;
+        // 布局: MAGIC(4) | IV(16) | MAC(32) | ciphertext
+        if blob.len() < 4 + 16 + 32 + 16 || &blob[..4] != MAGIC {
+            return None;
+        }
+        let (enc_key, mac_key) = derive_keys();
+        let iv: [u8; 16] = blob[4..20].try_into().ok()?;
+        let stored_mac = &blob[20..52];
+        let ciphertext = &blob[52..];
+
+        let mut mac = HmacSha256::new_from_slice(&mac_key).ok()?;
+        mac.update(&iv);
+        mac.update(ciphertext);
+        mac.verify_slice(stored_mac).ok()?;
+
+        let mut buffer = ciphertext.to_vec();
+        let plain = Aes256CbcDec::new(&enc_key.into(), &iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+            .ok()?;
+        String::from_utf8(plain.to_vec()).ok()
+    }
+
+    pub(super) fn set(key: &str, value: &str) -> bool {
+        let dir = store_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let (enc_key, mac_key) = derive_keys();
+        let mut iv = [0_u8; 16];
+        rand::thread_rng().fill_bytes(&mut iv);
+
+        let mut buffer = vec![0_u8; value.len() + 16];
+        let Ok(ciphertext) = Aes256CbcEnc::new(&enc_key.into(), &iv.into())
+            .encrypt_padded_b2b_mut::<Pkcs7>(value.as_bytes(), &mut buffer)
+        else {
+            return false;
+        };
+
+        let Ok(mut mac) = HmacSha256::new_from_slice(&mac_key) else {
+            return false;
+        };
+        mac.update(&iv);
+        mac.update(ciphertext);
+        let tag = mac.finalize().into_bytes();
+
+        let mut blob = Vec::with_capacity(4 + 16 + 32 + ciphertext.len());
+        blob.extend_from_slice(MAGIC);
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&tag);
+        blob.extend_from_slice(ciphertext);
+
+        let path = secret_path(key);
+        if std::fs::write(&path, blob).is_err() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        true
+    }
+
+    pub(super) fn delete(key: &str) -> bool {
+        match std::fs::remove_file(secret_path(key)) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// 密文必须过 MAC 校验：翻转任何一个字节都读不出值
+        #[test]
+        fn tampered_blob_is_rejected() {
+            let key = "test-tamper-v1";
+            assert!(super::set(key, "secret-value"));
+            let path = super::secret_path(key);
+            let mut blob = std::fs::read(&path).unwrap();
+            let last = blob.len() - 1;
+            blob[last] ^= 0x01;
+            std::fs::write(&path, blob).unwrap();
+            assert_eq!(super::get(key), None, "篡改后的密文必须拒收");
+            assert!(super::delete(key));
+        }
+
+        #[test]
+        fn roundtrip_and_isolation() {
+            let key_a = "test-roundtrip-a";
+            let key_b = "test-roundtrip-b";
+            assert!(super::set(key_a, "值A：含中文 / emoji 🎵"));
+            assert!(super::set(key_b, "value-b"));
+            assert_eq!(super::get(key_a).as_deref(), Some("值A：含中文 / emoji 🎵"));
+            assert_eq!(super::get(key_b).as_deref(), Some("value-b"));
+            assert!(super::delete(key_a));
+            assert_eq!(super::get(key_a), None, "删除后不得残留");
+            assert_eq!(super::get(key_b).as_deref(), Some("value-b"));
+            assert!(super::delete(key_b));
+        }
+
+        /// 明文绝不允许出现在落盘文件里
+        #[test]
+        fn plaintext_never_touches_disk() {
+            let key = "test-no-plaintext";
+            let secret = "MUSIC_U=super-secret-cookie-value";
+            assert!(super::set(key, secret));
+            let blob = std::fs::read(super::secret_path(key)).unwrap();
+            let haystack = String::from_utf8_lossy(&blob);
+            assert!(!haystack.contains("super-secret"), "密文文件里不得有明文片段");
+            assert!(super::delete(key));
+        }
     }
 }
 
