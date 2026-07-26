@@ -28,6 +28,7 @@ import {
   mergeParsedLyricsWithTranslations,
 } from '@/modules/lyrics/lyricsFormat'
 import { offsetBucketForSource } from '@/modules/lyrics/lyricOffset'
+import { isEditableTarget } from '@/modules/shortcuts/platform'
 import { persistTrackSyncPayload, withUpdatedCustomInfoPayload } from '@/modules/lyrics/syncTrackPayload'
 import { useLyricOffsetStore } from '@/stores/lyricOffset'
 import HyperBackground from './HyperBackground.vue'
@@ -986,10 +987,37 @@ function animateDisc(timestamp: number) {
   discAnimFrame = requestAnimationFrame(animateDisc)
 }
 
+// ESC 分层关闭: 每次只收起最上层, 全部收起后才由 App 全局回退关闭本页 (对齐 Android 返回语义)
+function handleEscapeLayered(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || event.defaultPrevented) return
+  // 输入框有焦点时交给全局逻辑先失焦
+  if (isEditableTarget(event.target)) return
+  if (contextMenu.value.show) {
+    contextMenu.value.show = false
+    event.preventDefault()
+    return
+  }
+  if (showMoreSheet.value) {
+    if (moreSheetView.value !== 'main') {
+      goBackToMain()
+    } else {
+      showMoreSheet.value = false
+    }
+    event.preventDefault()
+    return
+  }
+  if (showQueue.value || showSleepMenu.value || showVolumeSlider.value || showAudioFxPanel.value) {
+    closeToolbarPopovers()
+    event.preventDefault()
+  }
+}
+
 onMounted(() => {
   discAnimFrame = requestAnimationFrame(animateDisc)
+  document.addEventListener('keydown', handleEscapeLayered)
 })
 onUnmounted(() => {
+  document.removeEventListener('keydown', handleEscapeLayered)
   cancelAnimationFrame(discAnimFrame)
   if (trackSwitchAnimTimer) clearTimeout(trackSwitchAnimTimer)
   if (controlFeedbackPulseTimer) clearTimeout(controlFeedbackPulseTimer)
@@ -1119,14 +1147,14 @@ const applyInfoFields = ref({
   title: true,
   artist: true,
   cover: true,
-  lyrics: false,
+  lyrics: true,
 })
 
 function openInfoSearch() {
   searchQuery.value = player.currentTrack?.title || ''
   searchResults.value = []
   infoApplyCandidate.value = null
-  applyInfoFields.value = { title: true, artist: true, cover: true, lyrics: false }
+  applyInfoFields.value = { title: true, artist: true, cover: true, lyrics: true }
   goToSubView('search')
 }
 
@@ -1158,7 +1186,7 @@ function applySearchResult(result: any) {
     title: !!result.title,
     artist: !!result.artist,
     cover: !!(result.cover_url || result.coverUrl),
-    lyrics: false,
+    lyrics: true,
   }
   // 字段选择面板默认可能在滚动区外, 选中后滚到可见位置
   void nextTick(() => {
@@ -4669,35 +4697,44 @@ const sliderActiveColor = computed(() => {
 .np-more-list-item {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
   width: 100%;
   min-width: 0;
-  margin-top: 6px;
-  padding: 13px 8px;
-  border: 1px solid rgba(255,255,255,0.06);
-  background: rgba(255,255,255,0.025);
-  color: rgba(255,255,255,0.85);
+  margin-top: 4px;
+  padding: 12px 14px 12px 12px;
+  border: none;
+  background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.88);
   cursor: pointer;
-  border-radius: var(--radius-md);
-  transition: background 0.15s, transform 0.15s cubic-bezier(0.2, 0, 0, 1);
+  border-radius: 16px;
+  transition: background 0.18s, transform 0.18s cubic-bezier(0.2, 0, 0, 1);
 
   &:hover {
-    background: rgba(255,255,255,0.08);
-    transform: translateX(2px);
-    .np-more-chevron { color: rgba(255,255,255,0.45) !important; }
+    background: rgba(255,255,255,0.09);
+    .np-more-chevron {
+      color: rgba(255,255,255,0.55) !important;
+      transform: translateX(2px);
+    }
+    > .material-symbols-rounded:first-child {
+      background: color-mix(in srgb, var(--md-primary, #D0BCFF) 26%, transparent);
+      color: var(--md-primary, #D0BCFF);
+    }
   }
 
+  &:active { transform: scale(0.985); }
+
   > .material-symbols-rounded:first-child {
-    font-size: 20px;
-    color: rgba(255,255,255,0.6);
+    font-size: 21px;
+    color: rgba(255,255,255,0.72);
     flex-shrink: 0;
-    width: 36px;
-    height: 36px;
+    width: 40px;
+    height: 40px;
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 50%;
-    background: rgba(255,255,255,0.07);
+    border-radius: 13px;
+    background: rgba(255,255,255,0.08);
+    transition: background 0.18s, color 0.18s;
   }
 }
 
@@ -4711,19 +4748,26 @@ const sliderActiveColor = computed(() => {
 }
 
 .np-more-list-headline {
-  font-size: 15px;
-  font-weight: 500;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .np-more-list-desc {
   font-size: 12px;
-  color: rgba(255,255,255,0.4);
+  color: rgba(255,255,255,0.45);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .np-more-chevron {
   font-size: 20px !important;
-  color: rgba(255,255,255,0.25) !important;
-  transition: color 0.15s;
+  color: rgba(255,255,255,0.28) !important;
+  transition: color 0.18s, transform 0.18s cubic-bezier(0.2, 0, 0, 1);
 }
 
 // 速度选择网格

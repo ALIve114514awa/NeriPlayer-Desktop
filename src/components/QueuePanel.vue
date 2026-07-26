@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { usePlayerStore } from '@/stores/player'
 import { useI18n } from 'vue-i18n'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
@@ -16,6 +16,16 @@ import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 const emit = defineEmits<{ close: [] }>()
 const player = usePlayerStore()
 const { t } = useI18n()
+
+// ESC 只关本面板并消费事件, 阻止全局快捷键继续关闭下层 (对齐 Android 返回语义)
+// 组件仅在面板打开时挂载, 不需要 open 状态判断
+function handleEscKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || event.defaultPrevented) return
+  event.preventDefault()
+  emit('close')
+}
+onMounted(() => document.addEventListener('keydown', handleEscKeydown))
+onUnmounted(() => document.removeEventListener('keydown', handleEscKeydown))
 const queueContextMenuOpen = ref(false)
 const queueContextMenuPosition = ref<ContextMenuPosition>({ x: 0, y: 0 })
 const queueContextMenuIndex = ref(-1)

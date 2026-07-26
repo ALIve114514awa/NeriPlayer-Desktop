@@ -14,7 +14,10 @@ function close() {
 }
 
 function handleKeydown(event: KeyboardEvent) {
-  if (props.open && event.key === 'Escape') close()
+  if (!props.open || event.key !== 'Escape' || event.defaultPrevented) return
+  // 消费掉 ESC, 阻止全局快捷键继续关闭下层 (对齐 Android 返回语义)
+  event.preventDefault()
+  close()
 }
 
 const joinRoomId = ref('')
