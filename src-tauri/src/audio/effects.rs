@@ -8,7 +8,7 @@ use crate::audio::pcm::{PcmSeekError, PcmSource};
 
 // 共享音效参数
 /// 运行时可变的音效参数，通过 Arc<Mutex<>> 共享给音频线程
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct AudioEffectsParams {
     /// 响度增益 (millibels)，范围 0~1500 (0 ~ +15.0 dB)
     pub loudness_gain_mb: i32,
@@ -19,6 +19,26 @@ pub struct AudioEffectsParams {
     pub eq_band_levels_mb: [i32; 5],
     /// 音量均衡：把不同曲目的响度拉到统一目标，避免切歌忽大忽小
     pub normalize_volume: bool,
+}
+
+/// 读取实时参数，并从锁毒化中恢复
+///
+/// `AudioEffectsParams` 全是标量与定长数组，panic 打断一次写入不会留下
+/// 半成品状态，所以毒化后 `into_inner()` 拿到的值照样可用。
+/// 这里必须恢复而不是 panic：这个锁在音频回调路径上，一旦有别的线程
+/// 持锁时 panic，后续每一帧都会跟着炸。也不能静默用默认值——那等于
+/// 用户的 EQ 和响度设置无声失效。
+fn read_params(params: &Mutex<AudioEffectsParams>) -> AudioEffectsParams {
+    match params.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => {
+            log::warn!(
+                target: "audio-effects",
+                "effects params lock was poisoned, recovering the last value",
+            );
+            *poisoned.into_inner()
+        }
+    }
 }
 
 impl AudioEffectsParams {
@@ -168,7 +188,7 @@ where
         let ch = channels as usize;
 
         let (enabled, band_gains_db) = {
-            let p = params.lock().unwrap();
+            let p = read_params(&params);
             let gains: [f64; 5] = std::array::from_fn(|i| p.eq_band_levels_mb[i] as f64 / 100.0);
             (p.eq_enabled, gains)
         };
@@ -328,10 +348,10 @@ where
         let channels = source.channels();
         let sample_rate = source.sample_rate();
 
-        let (gain_mb, normalize_enabled) = params
-            .lock()
-            .map(|p| (p.loudness_gain_mb, p.normalize_volume))
-            .unwrap_or((0, false));
+        let (gain_mb, normalize_enabled) = {
+            let p = read_params(&params);
+            (p.loudness_gain_mb, p.normalize_volume)
+        };
         let gain = mb_to_linear(gain_mb);
 
         Self {
@@ -436,4 +456,40 @@ where
 /// millibels -> 线性增益: gain = 10^(mb / 2000)
 fn mb_to_linear(mb: i32) -> f64 {
     if mb == 0 { 1.0 } else { 10.0_f64.powf(mb as f64 / 2000.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_params, AudioEffectsParams};
+    use std::sync::{Arc, Mutex};
+
+    /// 回归：锁毒化后必须还能读到用户设置，而不是 panic 或退回默认值
+    ///
+    /// 这个锁在音频回调路径上。之前一处 `lock().unwrap()`、另一处
+    /// `unwrap_or((0, false))`，同一个锁两种策略：前者会让毒化之后的每一帧
+    /// 都 panic，后者会让 EQ 与响度设置无声失效。
+    #[test]
+    fn poisoned_params_recover_the_last_written_value() {
+        let params = Arc::new(Mutex::new(AudioEffectsParams {
+            loudness_gain_mb: 900,
+            eq_enabled: true,
+            eq_band_levels_mb: [100, -200, 300, -400, 500],
+            normalize_volume: true,
+        }));
+
+        // 持锁时 panic：标准库会把这个 Mutex 标记为毒化
+        let poisoner = Arc::clone(&params);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic while holding the effects lock");
+        })
+        .join();
+        assert!(params.is_poisoned(), "前置条件：锁应已毒化");
+
+        let recovered = read_params(&params);
+        assert_eq!(recovered.loudness_gain_mb, 900);
+        assert!(recovered.eq_enabled);
+        assert_eq!(recovered.eq_band_levels_mb, [100, -200, 300, -400, 500]);
+        assert!(recovered.normalize_volume);
+    }
 }
