@@ -269,6 +269,10 @@ struct RemoteAudioInner {
     cache_finalize_started: AtomicBool,
     /// 预取世代：seek 时 +1，旧预取任务看到后立刻停
     prefetch_epoch: AtomicU64,
+    /// 远端已明确拒绝访问（HTTP 403/401，直链过期/风控）：
+    /// 该状态对本直链是永久的，置位后停止一切新预取，
+    /// 避免每次读都重新孵化注定 403 的后台请求
+    remote_forbidden: AtomicBool,
     /// demuxer 打开阶段：对 isomp4 隐藏 seekable，避免扫完整 mdat
     demuxer_open_sequential: AtomicBool,
     /// 虚拟 body：逻辑 header_end 对应的远端 moof 起点；0 表示关闭
@@ -648,6 +652,7 @@ impl RemoteAudioSource {
             disk_cache,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -929,6 +934,18 @@ impl RemoteAudioSource {
             ) {
                 Ok(data) if !data.is_empty() => Some(data),
                 Ok(_) => None,
+                // 403/401 对本直链是永久错误：继续配置虚拟 body 只会让
+                // demuxer 打开阶段对同一 range 无限重试刷 403，
+                // 立即终止本次 seek 让上层回滚/换直链
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    log::warn!(
+                        target: "remote-audio",
+                        "virtual-body probe forbidden at {}: {}",
+                        target,
+                        err,
+                    );
+                    return Err(err);
+                }
                 Err(err) => {
                     log::warn!(
                         target: "remote-audio",
@@ -2542,7 +2559,10 @@ impl SymphoniaAudioDecoder {
         let decoded = loop {
             let packet = match probed.format.next_packet() {
                 Ok(p) => p,
-                Err(err) if skipped < MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES => {
+                Err(err)
+                    if skipped < MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES
+                        && splice_skip_retryable(&err) =>
+                {
                     // 可能还在假样本区；再试
                     skipped += 1;
                     if skipped <= 4 {
@@ -2582,7 +2602,10 @@ impl SymphoniaAudioDecoder {
                 Err(SymphoniaError::ResetRequired) => {
                     decoder.reset();
                 }
-                Err(err) if skipped < MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES => {
+                Err(err)
+                    if skipped < MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES
+                        && splice_skip_retryable(&err) =>
+                {
                     // 其它瞬时错误也跳
                     if skipped <= 4 {
                         log::warn!(
@@ -3011,6 +3034,18 @@ async fn fetch_range_block_async(
         return Ok(Vec::new());
     }
 
+    if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
+        // 对齐 Android YouTubeGoogleVideoRangeSupport.shouldRetryChunkError：
+        // 403 是 CDN 拒绝访问（直链过期/远端 range 风控），重试与缩块都无解，
+        // 必须按永久错误上抛让上层回滚或换直链；同时停掉本源后续预取孵化，
+        // 否则每次读都会重新发起注定 403 的后台请求
+        inner.remote_forbidden.store(true, Ordering::Release);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("remote range request forbidden: {}", status),
+        ));
+    }
+
     Err(io::Error::other(format!(
         "unexpected remote range status: {}",
         status
@@ -3119,6 +3154,26 @@ fn halved_fetch_len(len: u64) -> u64 {
 
 /// 超时/传输中断类错误：可通过折半重试恢复；
 /// 4xx/长度变化/取消（Interrupted）等永久失败不在此列
+/// splice 打开期能否把 next_packet/decode 错误当「moov 假样本区」继续跳过：
+/// 解码/格式类错误可跳；IO 错误里只有预取边缘的瞬时类可跳。
+/// PermissionDenied（403 直链失效）、Interrupted（读已被更新操作取消）等
+/// 永久态必须立即上抛——每次重试都会对同一 range 重发注定失败的网络请求，
+/// 4096 次上限等于无限刷 403（实机日志：seek 后每 ~600ms 一次 403 卡死）
+fn splice_skip_retryable(err: &SymphoniaError) -> bool {
+    match err {
+        SymphoniaError::IoError(io_err) => matches!(
+            io_err.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        ),
+        _ => true,
+    }
+}
+
 fn is_transient_fetch_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -3213,6 +3268,10 @@ fn prefetch_plan(
 
 fn replenish_prefetch_window(inner: &Arc<RemoteAudioInner>, read_pos: u64) {
     if inner.playback_cancelled() {
+        return;
+    }
+    // 远端已 403/401：直链对新 range 永久拒绝，不再孵化任何预取
+    if inner.remote_forbidden.load(Ordering::Acquire) {
         return;
     }
     let cached_end = contiguous_cached_end(inner, read_pos);
@@ -4109,8 +4168,8 @@ mod tests {
         claim_prefetch_sequence_start, parse_cache_marker, parse_content_range, prefetch_lane_count,
         prefetch_plan, prefetch_window,
         ranges_cover_source,
-        release_prefetch_start, remember_validated_audio_cache, request_timeout_for,
-        reuse_validated_audio_cache,
+        release_prefetch_start, remember_validated_audio_cache, replenish_prefetch_window,
+        request_timeout_for, reuse_validated_audio_cache, splice_skip_retryable,
         seek_target_time, throughput_sample_bps, track_duration, CacheMarker, CachedRange,
         CachedSegment, HttpByteRange,
         InflightFetch,
@@ -4264,6 +4323,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4317,6 +4377,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4379,6 +4440,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4443,6 +4505,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4511,6 +4574,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4550,6 +4614,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4596,6 +4661,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -4652,6 +4718,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(0),
                 seek_index: Mutex::new(None),
@@ -4702,6 +4769,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(0),
                 seek_index: Mutex::new(None),
@@ -4778,6 +4846,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(0),
                 seek_index: Mutex::new(Some(index)),
@@ -4821,6 +4890,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(5_000),
                 seek_index: Mutex::new(None),
@@ -4901,6 +4971,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 // open 阶段顺序读，避免 symphonia 顺着 moof 链扫完整个文件
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(0),
@@ -4967,6 +5038,7 @@ mod tests {
                     disk_cache: None,
                     cache_finalize_started: AtomicBool::new(false),
                     prefetch_epoch: AtomicU64::new(0),
+                    remote_forbidden: AtomicBool::new(false),
                     demuxer_open_sequential: AtomicBool::new(true),
                     virtual_body_origin: AtomicU64::new(0),
                     seek_index: Mutex::new(Some(RemoteSeekIndex {
@@ -5107,6 +5179,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(25_212_301),
                 seek_index: Mutex::new(None),
@@ -5170,6 +5243,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(ORIGIN),
                 seek_index: Mutex::new(None),
@@ -5225,6 +5299,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(57_047_830),
                 seek_index: Mutex::new(None),
@@ -5327,6 +5402,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(5_000),
                 seek_index: Mutex::new(None),
@@ -5376,6 +5452,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(54_947_352),
                 seek_index: Mutex::new(None),
@@ -5454,6 +5531,7 @@ mod tests {
                 disk_cache: None,
                 cache_finalize_started: AtomicBool::new(false),
                 prefetch_epoch: AtomicU64::new(0),
+                remote_forbidden: AtomicBool::new(false),
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(5_000),
                 seek_index: Mutex::new(None),
@@ -5562,6 +5640,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -5614,6 +5693,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -6173,6 +6253,7 @@ mod tests {
             disk_cache: None,
             cache_finalize_started: AtomicBool::new(false),
             prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
@@ -6203,6 +6284,206 @@ mod tests {
         assert!(inner.in_flight.lock().expect("in-flight lock").is_empty());
         // 成功样本已混入吞吐估计，供后续自适应选块
         assert!(inner.throughput_bps() > 0);
+    }
+
+    /// 起始偏移 >= forbid_from 的 range 一律回 403（模拟 googlevideo
+    /// 直链过期/远端 range 风控），其余按 206 正常切片
+    fn spawn_forbidden_range_server(
+        body: Arc<Vec<u8>>,
+        forbid_from: u64,
+    ) -> (String, SeenRanges) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind range server");
+        let addr = listener.local_addr().expect("range server addr");
+        let requests: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&chunk[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let Some(spec) = text
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|line| line.split('=').nth(1))
+                else {
+                    continue;
+                };
+                let mut bounds = spec.trim().split('-');
+                let start: u64 = bounds.next().unwrap_or("0").parse().unwrap_or(0);
+                let end: u64 = bounds.next().unwrap_or("0").parse().unwrap_or(0);
+                seen.lock().expect("requests lock").push((start, end));
+                if start >= forbid_from {
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = std::io::Write::flush(&mut stream);
+                    continue;
+                }
+                let total = body.len() as u64;
+                let end = end.min(total.saturating_sub(1));
+                let slice = &body[start as usize..=end as usize];
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    start,
+                    end,
+                    total,
+                    slice.len(),
+                );
+                if std::io::Write::write_all(&mut stream, header.as_bytes()).is_err() {
+                    continue;
+                }
+                let _ = std::io::Write::write_all(&mut stream, slice);
+                let _ = std::io::Write::flush(&mut stream);
+            }
+        });
+        (format!("http://{}/audio.bin", addr), requests)
+    }
+
+    fn forbidden_test_inner(url: String, total_len: u64) -> Arc<RemoteAudioInner> {
+        Arc::new(RemoteAudioInner {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("no-proxy client"),
+            url,
+            referer: "https://example.com".into(),
+            total_len,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            remote_forbidden: AtomicBool::new(false),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        })
+    }
+
+    /// 回归（YouTube seek 后 403 无限重试）：403 是永久错误，需求读必须
+    /// 一次失败立即上抛 PermissionDenied——绝不折半重试、绝不重复打请求，
+    /// 并且置位 remote_forbidden 停掉后续预取孵化
+    #[test]
+    fn range_403_fails_fast_without_retry_and_disables_prefetch() {
+        let total_len: u64 = 1024 * 1024;
+        let body: Arc<Vec<u8>> = Arc::new(vec![0u8; total_len as usize]);
+        let (url, requests) = spawn_forbidden_range_server(Arc::clone(&body), 0);
+        let inner = forbidden_test_inner(url, total_len);
+        let mut source = RemoteAudioSource {
+            inner: Arc::clone(&inner),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+        let mut bytes = [0u8; 4];
+
+        let error = source
+            .read_exact(&mut bytes)
+            .expect_err("403 must fail the read");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // 只允许打一发请求：403 不进折半重试循环
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
+        assert!(inner.remote_forbidden.load(Ordering::Acquire));
+        // 置位后 replenish 是空操作：不再孵化注定 403 的后台预取
+        replenish_prefetch_window(&inner, 0);
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
+    }
+
+    /// 回归（YouTube seek 卡死入口）：虚拟 body 探测遇 403 必须让整个
+    /// seek 立即失败（上层回滚/换直链），而不是吞掉错误继续配置、
+    /// 让 demuxer 打开阶段对同一 range 每 ~600ms 无限刷 403
+    #[test]
+    fn virtual_body_probe_403_aborts_seek_configuration() {
+        let total_len: u64 = 1024 * 1024;
+        let body: Arc<Vec<u8>> = Arc::new(vec![0u8; total_len as usize]);
+        // 只有文件头可读，body 一律 403（模拟只允许顺序窗口的直链）
+        let (url, requests) = spawn_forbidden_range_server(Arc::clone(&body), 1);
+        let inner = forbidden_test_inner(url, total_len);
+        inner.header_end.store(64, Ordering::Release);
+        *inner.seek_index.lock().expect("seek index lock") = Some(RemoteSeekIndex {
+            duration_ms: 200_000,
+            entries: vec![
+                SeekIndexEntry {
+                    time_ms: 0,
+                    byte_offset: 64,
+                },
+                SeekIndexEntry {
+                    time_ms: 100_000,
+                    byte_offset: 500_000,
+                },
+            ],
+        });
+        let source = RemoteAudioSource {
+            inner: Arc::clone(&inner),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        let error = source
+            .configure_virtual_body_for_time(120_000)
+            .expect_err("probe 403 must abort the seek");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // 探测只打一发请求，配置未生效（不会留下半配置的虚拟 body）
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
+        assert_eq!(inner.virtual_body_origin.load(Ordering::Acquire), 0);
+        assert!(inner.remote_forbidden.load(Ordering::Acquire));
+    }
+
+    /// splice 打开期的错误分类：解码类可跳；IO 里只有瞬时类可跳，
+    /// 403（PermissionDenied）与取消（Interrupted）必须立即上抛
+    #[test]
+    fn splice_skip_bails_on_permanent_io_errors() {
+        use symphonia::core::errors::Error as SymphoniaError;
+
+        let permanent = SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "remote range request forbidden: 403 Forbidden",
+        ));
+        let cancelled = SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "remote read superseded",
+        ));
+        let transient = SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "prefetch edge",
+        ));
+        let decode = SymphoniaError::DecodeError("moov stco fake sample");
+
+        assert!(!splice_skip_retryable(&permanent));
+        assert!(!splice_skip_retryable(&cancelled));
+        assert!(splice_skip_retryable(&transient));
+        assert!(splice_skip_retryable(&decode));
     }
 
 }

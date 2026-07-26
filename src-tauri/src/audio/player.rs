@@ -36,6 +36,10 @@ const FADE_STEP: Duration = Duration::from_millis(10);
 const ANALYSIS_FRAME_SIZE: usize = 2_048;
 const PLAYBACK_SUPERSEDED: &str = "Playback request superseded";
 const SEEK_SUPERSEDED: &str = "Seek request superseded";
+// 旧 seek 被更新 seek 的代际递增打断时，等待新 Seek 命令入队的宽限：
+// request_seek 里递增代际与发送命令之间只隔几条语句，正常几微秒内可达；
+// 宽限只兜发送线程被调度延迟的极端情况，超时则回滚旧位置，绝不悬空
+const SEEK_ADOPT_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 struct GenerationToken {
@@ -1498,16 +1502,6 @@ fn audio_control_loop(
                         Arc::clone(&session.shared.clock),
                     )
                 };
-                // seek_token 需要在块外，重新构造一次
-                let seek_token = GenerationToken {
-                    generation: Arc::clone(&seek_generation),
-                    expected: latest_seek_generation,
-                };
-                if !seek_token.is_current() {
-                    let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
-                    continue;
-                }
-                // 先停旧会话：取消旧 decode worker 的 remote 读，避免和 seekable 重建抢 in_flight
                 let mut previous = match current.take() {
                     Some(session) => session,
                     None => {
@@ -1515,127 +1509,161 @@ fn audio_control_loop(
                         continue;
                     }
                 };
-                previous.stop();
-                let prepared = (|| {
-                    let output = ensure_output_profile(&mut output_profile)?;
-                    prepare_session(
-                        source,
-                        latest,
-                        volume,
-                        speed,
-                        Arc::clone(&shared_level),
-                        Arc::clone(&effects_params),
-                        Arc::clone(&playback_generation),
-                        latest_generation,
-                        Some(seek_token.clone()),
-                        Some(Arc::clone(&clock)),
-                        output,
-                        Arc::new(AtomicBool::new(false)),
-                        &loopback_tx,
-                    )
-                })();
-                if prepared
-                    .as_ref()
-                    .is_err_and(|error| error.starts_with("Could not build audio output"))
-                {
-                    output_profile = None;
-                }
-                match prepared {
-                    Ok(next) => {
-                        if ensure_generation(&playback_generation, latest_generation).is_err()
-                            || !seek_token.is_current()
+                // 抢占-接管循环：本次 seek 输给更新的 seek 时，接过最新目标重跑；
+                // 接不到（宽限超时）就回滚旧位置重建。任何出口都不允许把会话悬空丢掉
+                // ——否则会出现「旧 seek 被作废丢弃会话、新 seek 到达时 Nothing is
+                // playing」的双亡死局（实机日志：seek 后卡死、预取仍在跑但无 decoder）
+                loop {
+                    // 新 Play 已接管（或接管来的 seek 不属于本会话）：
+                    // 会话交接归 Play 命令处理，这里只需退出
+                    if previous.playback_generation != latest_generation
+                        || ensure_generation(&playback_generation, latest_generation).is_err()
+                    {
+                        let _ = latest_reply.send(Err(PLAYBACK_SUPERSEDED.into()));
+                        break;
+                    }
+                    let seek_token = GenerationToken {
+                        generation: Arc::clone(&seek_generation),
+                        expected: latest_seek_generation,
+                    };
+                    if !seek_token.is_current() {
+                        // 被更新的 seek 超越：旧请求让位，但最新的 seek 必须完整执行
+                        let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
+                        if let Some(adopted) =
+                            wait_for_newer_seek(&receiver, &mut deferred, SEEK_ADOPT_GRACE)
                         {
-                            drop(previous);
-                            let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
+                            latest = adopted.position_ms;
+                            latest_generation = adopted.playback_generation;
+                            latest_seek_generation = adopted.seek_generation;
+                            latest_reply = adopted.reply;
                             continue;
                         }
-                        if !paused {
-                            if let Err(error) = next.play() {
-                                log::warn!(target: "cpal-output", "seek play failed: {error}");
-                                clock.store_ms(rollback_position_ms);
-                                if let Ok(output) = ensure_output_profile(&mut output_profile) {
-                                    if let Ok(restored) = prepare_session(
-                                        previous.source.clone(),
-                                        rollback_position_ms,
-                                        volume,
-                                        speed,
-                                        Arc::clone(&shared_level),
-                                        Arc::clone(&effects_params),
-                                        Arc::clone(&playback_generation),
-                                        latest_generation,
-                                        None,
-                                        Some(Arc::clone(&clock)),
-                                        output,
-                                        Arc::new(AtomicBool::new(false)),
-                                        &loopback_tx,
-                                    ) {
-                                        let _ = restored.play();
-                                        current = Some(restored);
-                                    }
-                                }
-                                drop(previous);
-                                drop(next);
-                                let _ = latest_reply.send(Err(error));
-                                continue;
-                            }
-                        }
-                        drop(previous);
-                        current = Some(next);
-                        let _ = latest_reply.send(Ok(()));
-                    }
-                    Err(error) => {
-                        let superseded = ensure_generation(
+                        // 等不到新 Seek 命令（极端调度竞态）：回滚旧位置，
+                        // 迟到的 Seek 会在恢复出的会话上正常执行
+                        current = rebuild_after_failed_seek(
+                            &previous,
+                            rollback_position_ms,
+                            paused,
+                            volume,
+                            speed,
+                            &shared_level,
+                            &effects_params,
                             &playback_generation,
                             latest_generation,
+                            &clock,
+                            &mut output_profile,
+                            &loopback_tx,
+                        );
+                        break;
+                    }
+                    // 先停旧会话：取消旧 decode worker 的 remote 读，
+                    // 避免和 seekable 重建抢 in_flight（重复 stop 幂等）
+                    previous.stop();
+                    let prepared = (|| {
+                        let output = ensure_output_profile(&mut output_profile)?;
+                        prepare_session(
+                            source.clone(),
+                            latest,
+                            volume,
+                            speed,
+                            Arc::clone(&shared_level),
+                            Arc::clone(&effects_params),
+                            Arc::clone(&playback_generation),
+                            latest_generation,
+                            Some(seek_token.clone()),
+                            Some(Arc::clone(&clock)),
+                            output,
+                            Arc::new(AtomicBool::new(false)),
+                            &loopback_tx,
                         )
-                        .is_err()
-                            || !seek_token.is_current();
-                        log::warn!(target: "cpal-output", "seek failed: {error}");
-                        if superseded {
-                            drop(previous);
-                            let _ = latest_reply.send(Err(SEEK_SUPERSEDED.into()));
-                            continue;
-                        }
-                        // 回滚时钟并重建旧位置
-                        clock.store_ms(rollback_position_ms);
-                        match (|| {
-                            let output = ensure_output_profile(&mut output_profile)?;
-                            prepare_session(
-                                previous.source.clone(),
-                                rollback_position_ms,
-                                volume,
-                                speed,
-                                Arc::clone(&shared_level),
-                                Arc::clone(&effects_params),
-                                Arc::clone(&playback_generation),
-                                latest_generation,
-                                None,
-                                Some(Arc::clone(&clock)),
-                                output,
-                                Arc::new(AtomicBool::new(false)),
-                                &loopback_tx,
-                            )
-                        })() {
-                            Ok(restored) => {
-                                if !paused {
-                                    if let Err(play_error) = restored.play() {
-                                        log::warn!(
-                                            target: "cpal-output",
-                                            "seek rollback play failed: {play_error}"
-                                        );
-                                    }
-                                }
-                                current = Some(restored);
+                    })();
+                    if prepared
+                        .as_ref()
+                        .is_err_and(|error| error.starts_with("Could not build audio output"))
+                    {
+                        output_profile = None;
+                    }
+                    match prepared {
+                        Ok(next) => {
+                            if ensure_generation(&playback_generation, latest_generation)
+                                .is_err()
+                            {
+                                let _ =
+                                    latest_reply.send(Err(PLAYBACK_SUPERSEDED.into()));
+                                break;
                             }
-                            Err(restore_error) => {
+                            if !seek_token.is_current() {
+                                // 会话已就绪但代际又被更新 seek 抬走：
+                                // 丢弃本次结果，回到循环顶部接管最新目标
+                                drop(next);
+                                continue;
+                            }
+                            if !paused {
+                                if let Err(error) = next.play() {
+                                    log::warn!(
+                                        target: "cpal-output",
+                                        "seek play failed: {error}"
+                                    );
+                                    drop(next);
+                                    current = rebuild_after_failed_seek(
+                                        &previous,
+                                        rollback_position_ms,
+                                        paused,
+                                        volume,
+                                        speed,
+                                        &shared_level,
+                                        &effects_params,
+                                        &playback_generation,
+                                        latest_generation,
+                                        &clock,
+                                        &mut output_profile,
+                                        &loopback_tx,
+                                    );
+                                    let _ = latest_reply.send(Err(error));
+                                    break;
+                                }
+                            }
+                            current = Some(next);
+                            let _ = latest_reply.send(Ok(()));
+                            break;
+                        }
+                        Err(error) => {
+                            if ensure_generation(&playback_generation, latest_generation)
+                                .is_err()
+                            {
+                                log::warn!(target: "cpal-output", "seek failed: {error}");
+                                let _ =
+                                    latest_reply.send(Err(PLAYBACK_SUPERSEDED.into()));
+                                break;
+                            }
+                            if !seek_token.is_current() {
+                                // prepare 被更新 seek 的代际递增打断（remote read
+                                // superseded）：回到循环顶部接管最新目标重跑
                                 log::warn!(
                                     target: "cpal-output",
-                                    "seek rollback failed: {restore_error}"
+                                    "seek superseded mid-prepare: {error}"
                                 );
+                                continue;
                             }
+                            log::warn!(target: "cpal-output", "seek failed: {error}");
+                            // 回滚时钟并重建旧位置，绝不静默卡死
+                            current = rebuild_after_failed_seek(
+                                &previous,
+                                rollback_position_ms,
+                                paused,
+                                volume,
+                                speed,
+                                &shared_level,
+                                &effects_params,
+                                &playback_generation,
+                                latest_generation,
+                                &clock,
+                                &mut output_profile,
+                                &loopback_tx,
+                            );
+                            let _ = latest_reply.send(Err(error));
+                            break;
                         }
-                        drop(previous);
-                        let _ = latest_reply.send(Err(error));
                     }
                 }
             }
@@ -1840,6 +1868,66 @@ fn ensure_output_profile(
     output_profile
         .as_ref()
         .ok_or_else(|| "No default audio output device".to_string())
+}
+
+/// seek 失败/让位后的兜底：回拨时钟并在失败前位置重建旧会话
+///
+/// 返回 Some(session) 表示已恢复出可播放的会话；None 表示重建也失败
+/// （只剩日志与上层错误回复，调用方不得再依赖 current 存在）
+#[allow(clippy::too_many_arguments)]
+fn rebuild_after_failed_seek(
+    previous: &PlaybackSession,
+    rollback_position_ms: u64,
+    paused: bool,
+    volume: f32,
+    speed: f32,
+    shared_level: &Arc<Mutex<SharedAudioLevel>>,
+    effects_params: &Arc<Mutex<AudioEffectsParams>>,
+    playback_generation: &Arc<AtomicU64>,
+    expected_generation: u64,
+    clock: &Arc<PlaybackClock>,
+    output_profile: &mut Option<OutputDeviceProfile>,
+    loopback_tx: &mpsc::Sender<AudioCmd>,
+) -> Option<PlaybackSession> {
+    clock.store_ms(rollback_position_ms);
+    let restored = (|| {
+        let output = ensure_output_profile(output_profile)?;
+        prepare_session(
+            previous.source.clone(),
+            rollback_position_ms,
+            volume,
+            speed,
+            Arc::clone(shared_level),
+            Arc::clone(effects_params),
+            Arc::clone(playback_generation),
+            expected_generation,
+            None,
+            Some(Arc::clone(clock)),
+            output,
+            Arc::new(AtomicBool::new(false)),
+            loopback_tx,
+        )
+    })();
+    match restored {
+        Ok(restored) => {
+            if !paused {
+                if let Err(play_error) = restored.play() {
+                    log::warn!(
+                        target: "cpal-output",
+                        "seek rollback play failed: {play_error}"
+                    );
+                }
+            }
+            Some(restored)
+        }
+        Err(restore_error) => {
+            log::warn!(
+                target: "cpal-output",
+                "seek rollback failed: {restore_error}"
+            );
+            None
+        }
+    }
 }
 
 // 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
@@ -2484,6 +2572,48 @@ fn take_latest_seek(
     }
 }
 
+/// 从命令队列接管到的更新 Seek 载荷
+struct AdoptedSeek {
+    position_ms: u64,
+    playback_generation: u64,
+    seek_generation: u64,
+    reply: mpsc::Sender<Result<(), String>>,
+}
+
+/// 旧 seek 被更新 seek 的代际递增打断后，接过队列里那条更新的 Seek 命令
+///
+/// 代际递增（request_seek）与命令入队之间只有微秒级窗口，因此在宽限内
+/// 阻塞等待即可拿到；等到非 Seek 命令则塞回 deferred 并放弃（回滚兜底），
+/// 绝不吞掉其它命令
+fn wait_for_newer_seek(
+    receiver: &mpsc::Receiver<AudioCmd>,
+    deferred: &mut Option<AudioCmd>,
+    grace: Duration,
+) -> Option<AdoptedSeek> {
+    if deferred.is_some() {
+        // 已有待处理命令：不能再阻塞等待，让主循环先消费它
+        return None;
+    }
+    match receiver.recv_timeout(grace) {
+        Ok(AudioCmd::Seek {
+            position_ms,
+            playback_generation,
+            seek_generation,
+            reply,
+        }) => Some(AdoptedSeek {
+            position_ms,
+            playback_generation,
+            seek_generation,
+            reply,
+        }),
+        Ok(command) => {
+            *deferred = Some(command);
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
 fn clamp_position(position_ms: u64, duration_ms: u64) -> u64 {
     if duration_ms > 0 {
         position_ms.min(duration_ms)
@@ -2505,8 +2635,8 @@ fn duration_to_frames(duration: Duration, sample_rate: u32) -> usize {
 mod tests {
     use super::{
         channel_sample, clamp_position, duration_to_frames, ensure_generation,
-        ensure_preparation_current, take_latest_seek, AudioCmd, GenerationToken, PlaybackClock,
-        SEEK_SUPERSEDED,
+        ensure_preparation_current, take_latest_seek, wait_for_newer_seek, AudioCmd,
+        GenerationToken, PlaybackClock, SEEK_SUPERSEDED,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -2524,6 +2654,95 @@ mod tests {
         assert_eq!(channel_sample(&[0.25], 1, 2), 0.25);
         assert!((channel_sample(&[0.25, 0.75], 0, 1) - 0.5).abs() < f32::EPSILON);
         assert_eq!(channel_sample(&[0.25, 0.75], 1, 2), 0.75);
+    }
+
+    /// 回归（seek 双亡死局）：旧 seek 的 prepare 被更新 seek 的代际递增
+    /// 打断后，必须能从命令队列接过那条更新的 Seek 完整重跑，
+    /// 而不是双双失败留下无人重启的空会话
+    #[test]
+    fn wait_for_newer_seek_adopts_queued_seek() {
+        let (sender, receiver) = mpsc::channel();
+        let (reply, _result) = mpsc::channel();
+        sender
+            .send(AudioCmd::Seek {
+                position_ms: 210_641,
+                playback_generation: 7,
+                seek_generation: 4,
+                reply,
+            })
+            .expect("queue newer seek");
+        let mut deferred = None;
+
+        let adopted = wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200))
+            .expect("newer seek must be adopted");
+
+        assert_eq!(
+            (
+                adopted.position_ms,
+                adopted.playback_generation,
+                adopted.seek_generation,
+            ),
+            (210_641, 7, 4),
+        );
+        assert!(deferred.is_none());
+    }
+
+    /// 非 Seek 命令不能被接管路径吞掉：塞回 deferred 并放弃等待，
+    /// 交由主循环按序处理（回滚兜底负责恢复会话）
+    #[test]
+    fn wait_for_newer_seek_defers_non_seek_command() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(AudioCmd::InvalidateProcessedBuffer)
+            .expect("queue non-seek command");
+        let mut deferred = None;
+
+        let adopted =
+            wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200));
+
+        assert!(adopted.is_none());
+        assert!(matches!(
+            deferred,
+            Some(AudioCmd::InvalidateProcessedBuffer)
+        ));
+    }
+
+    /// 宽限超时（极端调度竞态下新 Seek 未入队）：返回 None，
+    /// 调用方走回滚重建，迟到的 Seek 会在恢复出的会话上正常执行
+    #[test]
+    fn wait_for_newer_seek_times_out_on_empty_queue() {
+        let (_sender, receiver) = mpsc::channel::<AudioCmd>();
+        let mut deferred = None;
+
+        let started = std::time::Instant::now();
+        let adopted =
+            wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(30));
+
+        assert!(adopted.is_none());
+        assert!(deferred.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// deferred 已被占用时不得阻塞等待，也不得覆盖已暂存的命令
+    #[test]
+    fn wait_for_newer_seek_yields_to_existing_deferred_command() {
+        let (sender, receiver) = mpsc::channel();
+        let (reply, _result) = mpsc::channel();
+        sender
+            .send(AudioCmd::Seek {
+                position_ms: 1_000,
+                playback_generation: 1,
+                seek_generation: 2,
+                reply,
+            })
+            .expect("queue seek behind deferred");
+        let mut deferred = Some(AudioCmd::Pause);
+
+        let adopted =
+            wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200));
+
+        assert!(adopted.is_none());
+        assert!(matches!(deferred, Some(AudioCmd::Pause)));
     }
 
     #[test]

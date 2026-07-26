@@ -1753,6 +1753,16 @@ export const usePlayerStore = defineStore('player', () => {
         seekSeq,
         lastSeekCommand.value.seq,
       )) return
+      // 远端对目标区间返回 403（googlevideo 直链对远跳 range 的风控）：
+      // 直链本身已不可用于该偏移，唯一出路是重新解析 URL 并从目标位置起播
+      // （对齐 Android YouTubeSeekRefreshPolicy 的 seek 前刷新语义）
+      const message = String((e as Error)?.message ?? e ?? '')
+      if (message.includes('remote range request forbidden')
+        && currentTrack.value && isRemotePlaybackTrack(currentTrack.value)) {
+        log.warn('Seek hit forbidden range, re-resolving stream URL:', message)
+        void play(currentTrack.value, commandSource, safePosMs, true)
+        return
+      }
       pendingSeek = null
       seekGuardUntil = 0
       // seek 失败：停止乐观插值，回到后端真实位置，避免「进度条在走但无声」
