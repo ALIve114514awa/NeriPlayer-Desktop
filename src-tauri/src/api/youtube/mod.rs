@@ -23,3 +23,42 @@ pub mod playback;
 pub mod playlist;
 pub mod session;
 pub mod refresh;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
+
+/// YouTube 国际化模式：开启后强制用海外 locale 访问，关闭则跟随应用语言
+static INTERNATIONAL_MODE: AtomicBool = AtomicBool::new(false);
+static APP_LOCALE: RwLock<String> = RwLock::new(String::new());
+
+pub fn set_locale_preferences(international: bool, locale: &str) {
+    INTERNATIONAL_MODE.store(international, Ordering::Release);
+    if let Ok(mut slot) = APP_LOCALE.write() {
+        *slot = locale.to_string();
+    }
+}
+
+pub fn is_international_mode() -> bool {
+    INTERNATIONAL_MODE.load(Ordering::Acquire)
+}
+
+/// 返回 InnerTube 用的 (hl, gl)
+///
+/// 开启国际化时统一走 en/US，关闭时按应用语言推导区域，
+/// 这样这个开关才真正影响返回的内容目录，而不是摆设。
+pub fn innertube_locale() -> (String, String) {
+    if is_international_mode() {
+        return ("en".into(), "US".into());
+    }
+    let locale = APP_LOCALE
+        .read()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    match locale.as_str() {
+        "zh-TW" => ("zh-TW".into(), "TW".into()),
+        "ja" => ("ja".into(), "JP".into()),
+        "en" => ("en".into(), "US".into()),
+        "zh-CN" => ("zh-CN".into(), "CN".into()),
+        _ => ("en".into(), "US".into()),
+    }
+}

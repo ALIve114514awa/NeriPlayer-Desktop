@@ -16,6 +16,8 @@ pub struct AudioEffectsParams {
     /// 5 频段增益 (millibels)，范围 -1500~1500 per band
     /// 频段中心频率: 60, 230, 910, 3600, 14000 Hz
     pub eq_band_levels_mb: [i32; 5],
+    /// 音量均衡：把不同曲目的响度拉到统一目标，避免切歌忽大忽小
+    pub normalize_volume: bool,
 }
 
 impl Default for AudioEffectsParams {
@@ -24,6 +26,7 @@ impl Default for AudioEffectsParams {
             loudness_gain_mb: 0,
             eq_enabled: false,
             eq_band_levels_mb: [0; 5],
+            normalize_volume: false,
         }
     }
 }
@@ -37,6 +40,7 @@ impl AudioEffectsParams {
     pub fn is_default(&self) -> bool {
         self.loudness_gain_mb == 0
             && !self.eq_enabled
+            && !self.normalize_volume
             && self.eq_band_levels_mb.iter().all(|&v| v == 0)
     }
 
@@ -45,6 +49,7 @@ impl AudioEffectsParams {
         self.loudness_gain_mb = 0;
         self.eq_enabled = false;
         self.eq_band_levels_mb = [0; 5];
+        self.normalize_volume = false;
     }
 }
 
@@ -297,6 +302,18 @@ where
 // LoudnessSource
 // 响度增益：将 millibels 转为线性增益，对每个 sample 乘以增益
 
+/// 音量均衡目标 RMS：约 -20 dBFS，接近流媒体常用的响度基准
+const NORMALIZE_TARGET_RMS: f64 = 0.1;
+/// 均衡增益上下限（线性），对应约 -6 dB ~ +6 dB，避免把噪底也抬起来
+const NORMALIZE_MIN_GAIN: f64 = 0.5;
+const NORMALIZE_MAX_GAIN: f64 = 2.0;
+/// RMS 观测窗的 EMA 系数：越小越慢，慢才不会把强弱起伏压平（泵浦感）
+const NORMALIZE_RMS_ALPHA: f64 = 0.000_02;
+/// 增益本身再平滑一次，切换时不会有可听见的台阶
+const NORMALIZE_GAIN_ALPHA: f64 = 0.000_05;
+/// 低于此 RMS 视为静音/前奏，不参与测量也不调整增益
+const NORMALIZE_SILENCE_RMS: f64 = 0.001;
+
 pub struct LoudnessSource<S> {
     inner: S,
     params: Arc<Mutex<AudioEffectsParams>>,
@@ -306,6 +323,11 @@ pub struct LoudnessSource<S> {
     gain: f64,
     gain_mb: i32,
     sample_counter: usize,
+    normalize_enabled: bool,
+    /// 观测到的信号 RMS（慢 EMA）
+    normalize_rms: f64,
+    /// 实际施加的均衡增益（再平滑一次）
+    normalize_gain: f64,
 }
 
 impl<S> LoudnessSource<S>
@@ -316,7 +338,10 @@ where
         let channels = source.channels();
         let sample_rate = source.sample_rate();
 
-        let gain_mb = params.lock().map(|p| p.loudness_gain_mb).unwrap_or(0);
+        let (gain_mb, normalize_enabled) = params
+            .lock()
+            .map(|p| (p.loudness_gain_mb, p.normalize_volume))
+            .unwrap_or((0, false));
         let gain = mb_to_linear(gain_mb);
 
         Self {
@@ -327,6 +352,9 @@ where
             gain,
             gain_mb,
             sample_counter: 0,
+            normalize_enabled,
+            normalize_rms: 0.0,
+            normalize_gain: 1.0,
         }
     }
 
@@ -336,7 +364,28 @@ where
                 self.gain_mb = p.loudness_gain_mb;
                 self.gain = mb_to_linear(self.gain_mb);
             }
+            if p.normalize_volume != self.normalize_enabled {
+                self.normalize_enabled = p.normalize_volume;
+                // 关掉时把增益收回 1.0，避免残留偏置
+                if !self.normalize_enabled {
+                    self.normalize_gain = 1.0;
+                    self.normalize_rms = 0.0;
+                }
+            }
         }
+    }
+
+    /// 跟踪信号 RMS 并把增益缓慢推向目标响度
+    fn advance_normalizer(&mut self, sample: f32) -> f64 {
+        let magnitude = f64::from(sample).abs();
+        self.normalize_rms += NORMALIZE_RMS_ALPHA * (magnitude - self.normalize_rms);
+        if self.normalize_rms <= NORMALIZE_SILENCE_RMS {
+            return self.normalize_gain;
+        }
+        let desired =
+            (NORMALIZE_TARGET_RMS / self.normalize_rms).clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
+        self.normalize_gain += NORMALIZE_GAIN_ALPHA * (desired - self.normalize_gain);
+        self.normalize_gain
     }
 }
 
@@ -355,11 +404,16 @@ where
             self.update_params();
         }
 
-        if self.gain_mb == 0 {
+        if self.gain_mb == 0 && !self.normalize_enabled {
             return Some(sample);
         }
 
-        let val = f64::from(sample) * self.gain;
+        let normalize_gain = if self.normalize_enabled {
+            self.advance_normalizer(sample)
+        } else {
+            1.0
+        };
+        let val = f64::from(sample) * self.gain * normalize_gain;
         Some(val.clamp(-1.0, 1.0) as f32)
     }
 

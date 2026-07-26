@@ -788,6 +788,13 @@ impl PlayerEngine {
         let _ = self.cmd_tx.send(AudioCmd::InvalidateProcessedBuffer);
     }
 
+    pub fn set_normalize_volume(&self, enabled: bool) {
+        if let Ok(mut params) = self.effects_params.lock() {
+            params.normalize_volume = enabled;
+        }
+        let _ = self.cmd_tx.send(AudioCmd::InvalidateProcessedBuffer);
+    }
+
     pub fn set_equalizer(&self, enabled: bool, bands: &[i32]) {
         if let Ok(mut params) = self.effects_params.lock() {
             params.eq_enabled = enabled;

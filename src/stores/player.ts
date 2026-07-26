@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useHistoryStore } from './history'
@@ -2072,6 +2072,11 @@ export const usePlayerStore = defineStore('player', () => {
     try { await invoke('set_loudness_gain', { gainMb: loudnessGainMb.value }) } catch {}
   }
 
+  // 音量均衡由设置页直接改 settings，这里跟随下发到音频链
+  watch(() => settings.normalizeVolume, (enabled) => {
+    void invoke('set_normalize_volume', { enabled }).catch(() => {})
+  })
+
   async function setEqualizer(enabled: boolean, bands: number[]) {
     equalizerEnabled.value = enabled
     equalizerBands.value = bands.map(v => Math.round(Math.max(-1500, Math.min(1500, v))))
@@ -2118,6 +2123,7 @@ export const usePlayerStore = defineStore('player', () => {
       invoke('set_volume', { level: volume.value }),
       invoke('set_speed', { speed: playbackSpeed.value }),
       invoke('set_loudness_gain', { gainMb: loudnessGainMb.value }),
+      invoke('set_normalize_volume', { enabled: settings.normalizeVolume }),
       invoke('set_equalizer', { enabled: equalizerEnabled.value, bandLevelsMb: equalizerBands.value }),
     ])
   }

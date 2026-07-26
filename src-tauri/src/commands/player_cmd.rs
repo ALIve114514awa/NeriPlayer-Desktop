@@ -998,6 +998,12 @@ pub async fn set_loudness_gain(gain_mb: i32, state: State<'_, AppState>) -> AppR
 }
 
 #[tauri::command]
+pub async fn set_normalize_volume(enabled: bool, state: State<'_, AppState>) -> AppResult<()> {
+    state.player.lock().set_normalize_volume(enabled);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_equalizer(
     enabled: bool,
     band_levels_mb: Vec<i32>,

@@ -1796,7 +1796,7 @@ const sliderActiveColor = computed(() => {
         <span class="material-symbols-rounded">keyboard_arrow_down</span>
       </button>
       <div class="np-header-center">
-        <span class="np-from-label">
+        <span v-if="settings.showNowPlayingTitle" class="np-from-label">
           {{ player.hasPlaybackSession ? t('player.now_playing') : t('player.not_playing') }}
         </span>
         <transition name="np-header-meta-swap" mode="out-in">
@@ -1981,6 +1981,7 @@ const sliderActiveColor = computed(() => {
 
         <!-- 工具栏（对齐 Android 底部：Favorite -> Queue -> Sleep -> Volume -> Speed -> Add） -->
         <div
+          v-if="settings.showToolbarDock"
           class="np-toolbar"
           @click.stop
         >

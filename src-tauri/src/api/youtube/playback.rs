@@ -75,7 +75,10 @@ struct PlayerClientProfile {
     client_version: &'static str,
     user_agent: &'static str,
     platform: &'static str,
+    /// 兜底 locale；实际请求以 innertube_locale() 为准，随国际化开关变化
+    #[allow(dead_code)]
     hl: &'static str,
+    #[allow(dead_code)]
     gl: &'static str,
     host: PlayerHost,
     android_sdk_version: Option<i32>,
@@ -200,11 +203,13 @@ fn player_endpoint(profile: &PlayerClientProfile) -> (&'static str, &'static str
 }
 
 fn build_player_context(profile: &PlayerClientProfile, visitor_data: Option<&str>) -> Value {
+    // 播放侧同样跟随国际化开关，否则库列表和可播曲目的区域会不一致
+    let locale = super::innertube_locale();
     let mut client = json!({
         "clientName": profile.client_name,
         "clientVersion": profile.client_version,
-        "hl": profile.hl,
-        "gl": profile.gl,
+        "hl": locale.0,
+        "gl": locale.1,
         "platform": profile.platform,
         "userAgent": profile.user_agent,
         "utcOffsetMinutes": 0

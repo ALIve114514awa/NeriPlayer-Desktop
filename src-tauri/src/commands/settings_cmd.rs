@@ -9,12 +9,24 @@ use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> AppResult<SettingsLoadResult> {
-    store::load_settings(&app)
+    let loaded = store::load_settings(&app)?;
+    apply_runtime_settings(&loaded.settings);
+    Ok(loaded)
 }
 
 #[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: AppSettings) -> AppResult<AppSettings> {
-    store::save_settings(&app, settings)
+    let saved = store::save_settings(&app, settings)?;
+    apply_runtime_settings(&saved);
+    Ok(saved)
+}
+
+/// 把需要后端立即生效的设置推到各子系统
+pub fn apply_runtime_settings(settings: &AppSettings) {
+    crate::api::youtube::set_locale_preferences(
+        settings.internationalization_enabled,
+        &settings.locale,
+    );
 }
 
 #[tauri::command]

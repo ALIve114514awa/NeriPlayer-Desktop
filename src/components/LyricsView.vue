@@ -235,7 +235,8 @@ function buildTimedWords(line: PlayerLyricLine): AmllLyricWord[] {
 function toAmllLine(line: PlayerLyricLine): AmllLyricLine {
   const startTime = Math.max(0, Math.round(line.startMs))
   const fallbackEndTime = Math.max(startTime + 1, Math.round(line.startMs + line.durationMs))
-  const timedWords = buildTimedWords(line)
+  // 关闭高级歌词动画时整行一次性显示：把逐字时间轴折叠成单个词
+  const timedWords = settings.advancedLyrics ? buildTimedWords(line) : []
   const words = timedWords.length > 0
     ? timedWords
     : [{
@@ -286,7 +287,7 @@ function syncLyricOptions(): void {
   if (!lyricPlayer) return
   lyricPlayer.setEnableBlur(settings.lyricBlur)
   lyricPlayer.setBlurAmount(settings.lyricBlurAmount)
-  lyricPlayer.setWordFadeWidth(AMLL_WORD_FADE_WIDTH)
+  lyricPlayer.setWordFadeWidth(settings.advancedLyrics ? AMLL_WORD_FADE_WIDTH : 0)
 }
 
 function reloadLyrics(): void {
@@ -508,6 +509,10 @@ onUnmounted(() => {
 watch(() => props.lyrics, () => {
   reloadLyrics()
 }, { deep: false })
+
+watch(() => settings.advancedLyrics, () => {
+  reloadLyrics()
+})
 
 watch(() => settings.showTranslation, () => {
   reloadLyrics()

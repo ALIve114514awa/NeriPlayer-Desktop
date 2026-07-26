@@ -51,12 +51,13 @@ impl YouTubeClient {
     /// 构建 InnerTube context
     fn build_context(&self) -> Value {
         let version = self.client_version.lock().clone();
+        let (hl, gl) = super::innertube_locale();
         json!({
             "client": {
                 "clientName": "WEB_REMIX",
                 "clientVersion": version,
-                "hl": "zh-CN",
-                "gl": "JP",
+                "hl": hl,
+                "gl": gl,
                 "platform": "DESKTOP",
                 "userAgent": USER_AGENT,
                 "utcOffsetMinutes": 480
