@@ -37,6 +37,52 @@ export function toBackendTrack(track: TrackInfo) {
  * 将 track 写回所有包含该曲的本地歌单 (playlistId 可选限定)
  * 返回更新条数; 0 表示歌单中没有该曲 (仍可只更新内存中的 currentTrack)
  */
+/**
+ * 把匹配/编辑得到的 歌曲名/歌手/封面 写入 syncPayload 的 custom* 字段
+ * 首次覆盖时保留 original*, 对齐 Android SongItem customName/customArtist/customCoverUrl
+ */
+export function withUpdatedCustomInfoPayload(
+  payload: Record<string, unknown> | null | undefined,
+  updates: { title?: string; artist?: string; coverUrl?: string; matchedSongId?: string },
+  original: { title: string; artist: string; coverUrl: string },
+): Record<string, unknown> {
+  const base: Record<string, unknown> = { ...(payload || {}) }
+
+  if (updates.title !== undefined && updates.title.trim()) {
+    if (base.originalName == null && base.original_name == null && original.title.trim()) {
+      base.originalName = original.title
+    }
+    base.customName = updates.title
+    delete base.custom_name
+  }
+  if (updates.artist !== undefined && updates.artist.trim()) {
+    if (base.originalArtist == null && base.original_artist == null && original.artist.trim()) {
+      base.originalArtist = original.artist
+    }
+    base.customArtist = updates.artist
+    delete base.custom_artist
+  }
+  if (updates.coverUrl !== undefined && updates.coverUrl.trim()) {
+    if (base.originalCoverUrl == null && base.original_cover_url == null && original.coverUrl.trim()) {
+      base.originalCoverUrl = original.coverUrl
+    }
+    base.customCoverUrl = updates.coverUrl
+    delete base.custom_cover_url
+  }
+  if (updates.matchedSongId && updates.matchedSongId.trim()) {
+    base.matchedSongId = updates.matchedSongId
+    delete base.matched_song_id
+  }
+
+  // 写入后标记 CURRENT, 与 Android fromSongItem 一致
+  const version = Number(base.syncMetadataVersion ?? base.sync_metadata_version ?? 0)
+  if (!Number.isFinite(version) || version < 1) {
+    base.syncMetadataVersion = 1
+    delete base.sync_metadata_version
+  }
+  return base
+}
+
 export async function persistTrackSyncPayload(
   track: TrackInfo | null | undefined,
   playlistId?: number | null,

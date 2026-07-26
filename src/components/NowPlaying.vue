@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { usePlayerStore, displayAlbum, type LyricLine, type TrackInfo } from '@/stores/player'
 import { useLikedSongsStore } from '@/stores/likedSongs'
 import { useSettingsStore } from '@/stores/settings'
@@ -28,7 +28,7 @@ import {
   mergeParsedLyricsWithTranslations,
 } from '@/modules/lyrics/lyricsFormat'
 import { offsetBucketForSource } from '@/modules/lyrics/lyricOffset'
-import { persistTrackSyncPayload } from '@/modules/lyrics/syncTrackPayload'
+import { persistTrackSyncPayload, withUpdatedCustomInfoPayload } from '@/modules/lyrics/syncTrackPayload'
 import { useLyricOffsetStore } from '@/stores/lyricOffset'
 import HyperBackground from './HyperBackground.vue'
 import CoverBlurBackground from './CoverBlurBackground.vue'
@@ -353,7 +353,7 @@ async function doLyricFillSearch() {
 
 async function applyLyricFill(result: any) {
   try {
-    const source = String(result?.platform || lyricFillPlatform.value || 'LOCAL_EDIT').toUpperCase()
+    const source = lyricSourceForPlatform(result?.source || result?.platform || lyricFillPlatform.value)
     const direct = await parseLyricsFromSearchResult(result)
     if (direct && direct.lines.length > 0) {
       fetchedLyrics.value = direct.lines
@@ -859,18 +859,9 @@ watch(nowPlayingTrackKey, async (trackKey) => {
     reusedRequest,
   })
   try {
-    // 本地 cache 优先; 有缓存则不再触网/回写云端
-    if (cachedLyrics?.length) {
-      log.info('lyrics from local cache:', {
-        requestId,
-        trackId: track.id,
-        lines: cachedLyrics.length,
-      })
-      return
-    }
-
-    // 同步歌词优先落地为本地歌词(不触网, 不回写云端)
-    // present -> 使用; cleared -> 空词并阻止在线回填; absent -> 继续在线
+    // 同步歌词最优先(不触网, 不回写云端): Android 匹配的歌词经云同步落在 syncPayload,
+    // 必须压过本地旧缓存, 否则历史在线歌词会永久屏蔽同步歌词
+    // present -> 使用; cleared -> 空词并阻止在线回填; absent -> 缓存/在线
     const syncedLyrics = await materializeSyncedLyrics(track)
     if (requestId !== lyricFetchRequestId) return
     if (syncedLyrics !== null) {
@@ -883,6 +874,16 @@ watch(nowPlayingTrackKey, async (trackKey) => {
         trackId: track.id,
         lines: syncedLyrics.length,
         cleared: syncedLyrics.length === 0,
+      })
+      return
+    }
+
+    // 本地 cache 其次; 有缓存则不再触网/回写云端
+    if (cachedLyrics?.length) {
+      log.info('lyrics from local cache:', {
+        requestId,
+        trackId: track.id,
+        lines: cachedLyrics.length,
       })
       return
     }
@@ -1149,6 +1150,8 @@ async function doSearch() {
   }
 }
 
+const fieldPickerRef = ref<HTMLElement | null>(null)
+
 function applySearchResult(result: any) {
   infoApplyCandidate.value = result
   applyInfoFields.value = {
@@ -1157,23 +1160,57 @@ function applySearchResult(result: any) {
     cover: !!(result.cover_url || result.coverUrl),
     lyrics: false,
   }
+  // 字段选择面板默认可能在滚动区外, 选中后滚到可见位置
+  void nextTick(() => {
+    fieldPickerRef.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  })
+}
+
+/** 歌词来源标记: 对齐 Android MusicPlatform 枚举名, 其余平台名 Android 侧解析为 null 亦无害 */
+function lyricSourceForPlatform(source?: string | null): string {
+  const key = String(source || '').toLowerCase()
+  if (key.includes('netease')) return 'CLOUD_MUSIC'
+  if (key.includes('qq')) return 'QQ_MUSIC'
+  return key ? key.toUpperCase() : 'LOCAL_EDIT'
 }
 
 async function confirmApplySearchResult() {
   const result = infoApplyCandidate.value
-  if (!result) return
+  const track = player.currentTrack
+  if (!result || !track) return
+  // 首次覆盖前的原始展示信息, 供 original* 回退
+  const original = {
+    title: track.title || '',
+    artist: track.artist || '',
+    coverUrl: track.coverUrl || '',
+  }
   const patch: Record<string, string> = {}
-  if (applyInfoFields.value.title) patch.title = result.title || player.currentTrack?.title || ''
-  if (applyInfoFields.value.artist) patch.artist = result.artist || player.currentTrack?.artist || ''
-  if (applyInfoFields.value.cover) patch.coverUrl = result.cover_url || result.coverUrl || player.currentTrack?.coverUrl || ''
-  if (Object.keys(patch).length > 0) player.updateCurrentTrackInfo(patch)
+  if (applyInfoFields.value.title) patch.title = result.title || track.title || ''
+  if (applyInfoFields.value.artist) patch.artist = result.artist || track.artist || ''
+  if (applyInfoFields.value.cover) patch.coverUrl = result.cover_url || result.coverUrl || track.coverUrl || ''
+  if (Object.keys(patch).length > 0) {
+    // 展示字段与 syncPayload custom* 一起更新, 并写回本地歌单供同步上传 (对齐 Android)
+    const nextPayload = withUpdatedCustomInfoPayload(
+      track.syncPayload,
+      {
+        title: patch.title,
+        artist: patch.artist,
+        coverUrl: patch.coverUrl,
+        matchedSongId: String(result.id || '') || undefined,
+      },
+      original,
+    )
+    player.updateCurrentTrackInfo(patch)
+    player.patchCurrentTrackSyncPayload(nextPayload)
+    await persistTrackSyncPayload(player.currentTrack)
+  }
   if (applyInfoFields.value.lyrics) {
     try {
+      const source = lyricSourceForPlatform(result.source || result.platform)
       const direct = await parseLyricsFromSearchResult(result)
       if (direct && direct.lines.length > 0) {
         fetchedLyrics.value = direct.lines
         cacheLyricsForTrack(player.currentTrack, direct.lines)
-        const source = String(result?.platform || 'LOCAL_EDIT').toUpperCase()
         await commitLyricsToTrack(direct.rawLyric, direct.rawTranslated, source)
       } else {
         const idText = String(result.id || '')
@@ -1192,6 +1229,12 @@ async function confirmApplySearchResult() {
           const nextLyrics = mapBackendLyrics(lyrics)
           fetchedLyrics.value = nextLyrics
           cacheLyricsForTrack(player.currentTrack, nextLyrics)
+          // 兜底在线歌词同样写回 syncPayload, 否则不同步且重启即丢
+          await commitLyricsToTrack(
+            toEditableLyricsText(nextLyrics),
+            toEditableTranslationText(nextLyrics) || null,
+            source,
+          )
         }
       }
     } catch (e) {
@@ -1215,12 +1258,31 @@ function openEditInfo() {
   goToSubView('editinfo')
 }
 
-function saveEditInfo() {
+async function saveEditInfo() {
+  const track = player.currentTrack
+  if (!track) return
+  const original = {
+    title: track.title || '',
+    artist: track.artist || '',
+    coverUrl: track.coverUrl || '',
+  }
+  // 手工编辑与匹配同路: custom* 进 syncPayload 并落盘, 否则重启即丢且不同步
+  const nextPayload = withUpdatedCustomInfoPayload(
+    track.syncPayload,
+    {
+      title: editTitle.value,
+      artist: editArtist.value,
+      coverUrl: editCoverUrl.value,
+    },
+    original,
+  )
   player.updateCurrentTrackInfo({
     title: editTitle.value,
     artist: editArtist.value,
     coverUrl: editCoverUrl.value,
   })
+  player.patchCurrentTrackSyncPayload(nextPayload)
+  await persistTrackSyncPayload(player.currentTrack)
   toast.success(t('player.info_applied'))
   goBackToMain()
 }
@@ -2537,7 +2599,7 @@ const sliderActiveColor = computed(() => {
             </div>
             <div v-if="isSearching" class="np-more-status">{{ t('player.searching') }}</div>
             <div v-else-if="searchResults.length === 0 && searchQuery" class="np-more-status">{{ t('player.no_results') }}</div>
-            <div class="np-more-search-results">
+            <div class="np-more-search-results" :class="{ compact: !!infoApplyCandidate }">
               <button
                 v-for="(r, ri) in searchResults"
                 :key="ri"
@@ -2553,7 +2615,7 @@ const sliderActiveColor = computed(() => {
                 <span class="np-more-search-source">{{ platformLabel(r.source) }}</span>
               </button>
             </div>
-            <div v-if="infoApplyCandidate" class="np-more-field-picker">
+            <div v-if="infoApplyCandidate" ref="fieldPickerRef" class="np-more-field-picker">
               <div class="np-more-candidate-preview">
                 <BilibiliCoverImage
                   v-if="infoApplyCandidate.cover_url || infoApplyCandidate.coverUrl"
@@ -4561,6 +4623,8 @@ const sliderActiveColor = computed(() => {
   padding: 24px;
   box-shadow: 0 16px 48px rgba(0,0,0,0.5);
   border: 1px solid rgba(255,255,255,0.06);
+  /* 面板恒为深色玻璃, 文字不能继承浅色主题的全局黑字 */
+  color: rgba(255,255,255,0.9);
 
   /* 隐藏滚动条 */
   &::-webkit-scrollbar { width: 0; height: 0; display: none; }
@@ -4807,7 +4871,13 @@ const sliderActiveColor = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  transition: max-height 240ms cubic-bezier(0.2, 0, 0, 1);
   &::-webkit-scrollbar { display: none; }
+
+  /* 选中候选后收紧列表, 给字段选择面板让出高度, 避免按钮被顶出可视区 */
+  &.compact {
+    max-height: 176px;
+  }
 }
 
 .np-more-search-item {
@@ -4852,6 +4922,8 @@ const sliderActiveColor = computed(() => {
 .np-more-search-title {
   font-size: 14px;
   font-weight: 500;
+  /* 显式取色: 候选预览等非按钮容器里不能依赖继承(浅色主题下会变黑) */
+  color: rgba(255,255,255,0.92);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
