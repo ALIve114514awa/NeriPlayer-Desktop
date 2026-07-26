@@ -290,7 +290,7 @@ fn decode_qq_lyric_payload(input: Option<String>) -> Option<String> {
 }
 
 fn decode_base64_lrc(value: &str) -> Option<String> {
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return None;
     }
     if !value.chars().all(|c| {

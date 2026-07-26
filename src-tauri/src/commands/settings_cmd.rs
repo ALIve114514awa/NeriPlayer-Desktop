@@ -200,7 +200,7 @@ fn select_bili_audio_stream(
     mut streams: Vec<BiliAudioStream>,
     quality: Option<&str>,
 ) -> Option<BiliAudioStream> {
-    streams.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+    streams.sort_by_key(|stream| std::cmp::Reverse(stream.bandwidth));
     let fallback = streams.first().cloned();
 
     let is_dolby = |stream: &BiliAudioStream| {
@@ -214,7 +214,7 @@ fn select_bili_audio_stream(
     match quality.unwrap_or("high") {
         "dolby" => streams.iter().find(|stream| is_dolby(stream)).cloned(),
         "lossless" | "hires" => streams.iter().find(|stream| is_lossless(stream)).cloned(),
-        "low" => normal_streams().last().cloned(),
+        "low" => normal_streams().next_back().cloned(),
         "medium" => {
             let normal: Vec<_> = normal_streams().cloned().collect();
             if normal.is_empty() {
@@ -372,6 +372,6 @@ mod tests {
                 page: 7,
             })
         );
-        assert_eq!(split_legacy_bili_song_id(12_345_0000), None);
+        assert_eq!(split_legacy_bili_song_id(123_450_000), None);
     }
 }

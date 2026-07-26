@@ -11,6 +11,12 @@ pub struct PlayQueue {
     shuffle_pos: usize,
 }
 
+impl Default for PlayQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PlayQueue {
     pub fn new() -> Self {
         Self {
@@ -35,6 +41,11 @@ impl PlayQueue {
         self.current_index.and_then(|i| self.tracks.get(i))
     }
 
+    /// 前进到下一首并返回它
+    ///
+    /// 名字容易和 Iterator::next 混淆，但这里带播放模式语义（顺序/随机/
+    /// 单曲循环），不是迭代器；调用点遍布播放器，改名收益不抵风险。
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&TrackInfo> {
         if self.tracks.is_empty() {
             return None;

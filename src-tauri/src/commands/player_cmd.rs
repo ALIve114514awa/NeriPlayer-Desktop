@@ -649,6 +649,8 @@ pub async fn play_url(
 
 /// 快速播放 URL：把响应落到临时文件后按本地文件播放。
 /// 相比 play_url 的整首下载到 Vec 再 Cursor 解码，File + BufReader 通常能减少内存拷贝和解码初始化等待。
+// Tauri 命令签名由 IPC 契约决定：参数必须平铺，改成结构体会同时改掉前端调用点
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn play_url_fast(
     url: String,
@@ -702,6 +704,8 @@ pub async fn play_url_fast(
 }
 
 /// 远程 URL 播放主路径：优先 HTTP Range 按需读取，Range 不可用时再退回增长缓冲
+// Tauri 命令签名由 IPC 契约决定：参数必须平铺，改成结构体会同时改掉前端调用点
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn play_url_streaming(
     url: String,
@@ -1065,6 +1069,8 @@ pub async fn crossfade_url(
     .await
 }
 
+// Tauri 命令签名由 IPC 契约决定：参数必须平铺，改成结构体会同时改掉前端调用点
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn crossfade_url_fast(
     url: String,
@@ -1112,6 +1118,8 @@ pub async fn crossfade_url_fast(
     Ok(if dur > 0 { dur } else { duration_hint_ms })
 }
 
+// Tauri 命令签名由 IPC 契约决定：参数必须平铺，改成结构体会同时改掉前端调用点
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn crossfade_url_streaming(
     url: String,

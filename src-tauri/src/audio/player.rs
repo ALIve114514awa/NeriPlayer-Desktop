@@ -1638,6 +1638,8 @@ fn ensure_output_profile(
         .ok_or_else(|| "No default audio output device".to_string())
 }
 
+// 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+#[allow(clippy::too_many_arguments)]
 fn prepare_session(
     source: AudioSource,
     start_position_ms: u64,
@@ -2061,6 +2063,8 @@ where
         .map_err(|error| format!("Could not build audio output: {error}"))
 }
 
+// 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+#[allow(clippy::too_many_arguments)]
 fn crossfade_sessions(
     previous: Option<&PlaybackSession>,
     next: &PlaybackSession,
@@ -2104,6 +2108,8 @@ fn crossfade_sessions(
     Ok(())
 }
 
+// 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+#[allow(clippy::too_many_arguments)]
 fn fade_gain(
     shared: &PlaybackShared,
     from: f32,

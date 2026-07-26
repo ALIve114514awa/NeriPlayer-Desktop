@@ -245,7 +245,7 @@ fn save_github_config(app: &AppHandle, config: &GitHubSyncConfig) {
     }
 
     if let Ok(s) = app.store(SYNC_STORE) {
-        let _ = s.set(GITHUB_CONFIG_KEY, github_config_store_value(config));
+        s.set(GITHUB_CONFIG_KEY, github_config_store_value(config));
         let _ = s.save();
     }
 }
@@ -289,7 +289,7 @@ fn save_webdav_config(app: &AppHandle, config: &WebDavSyncConfig) {
     }
 
     if let Ok(s) = app.store(SYNC_STORE) {
-        let _ = s.set(WEBDAV_CONFIG_KEY, webdav_config_store_value(config));
+        s.set(WEBDAV_CONFIG_KEY, webdav_config_store_value(config));
         let _ = s.save();
     }
 }
@@ -316,7 +316,7 @@ fn load_sync_preferences(app: &AppHandle) -> SyncPreferencesConfig {
 
 fn save_sync_preferences(app: &AppHandle, config: &SyncPreferencesConfig) {
     if let Ok(store) = app.store(SYNC_STORE) {
-        let _ = store.set(SYNC_PREFERENCES_KEY, sync_preferences_store_value(config));
+        store.set(SYNC_PREFERENCES_KEY, sync_preferences_store_value(config));
         let _ = store.save();
     }
 }

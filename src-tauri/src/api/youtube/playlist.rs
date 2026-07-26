@@ -121,9 +121,11 @@ fn merge_continuation_items(root: &mut Value, next: &Value) {
                                 )
                             })
                         {
-                            section
-                                .pointer_mut(&format!("/{shelf_key}/continuations"))
-                                .map(|slot| *slot = conts.clone());
+                            if let Some(slot) =
+                                section.pointer_mut(&format!("/{shelf_key}/continuations"))
+                            {
+                                *slot = conts.clone();
+                            }
                         } else if let Some(shelf) = section
                             .as_object_mut()
                             .and_then(|obj| obj.get_mut(shelf_key))

@@ -266,7 +266,7 @@ fn downloads_dir(app: &AppHandle, custom_dir: Option<&str>) -> AppResult<PathBuf
         default_downloads_dir(app)?
     };
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| AppError::Io(e))?;
+        std::fs::create_dir_all(&dir).map_err(AppError::Io)?;
     }
     Ok(dir)
 }
@@ -316,7 +316,7 @@ pub async fn get_default_download_dir(app: AppHandle) -> AppResult<String> {
 fn manifest_path(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = default_downloads_dir(app)?;
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| AppError::Io(e))?;
+        std::fs::create_dir_all(&dir).map_err(AppError::Io)?;
     }
     Ok(dir.join("manifest.json"))
 }
@@ -439,6 +439,8 @@ fn emit_download_progress(
     let _ = app.emit("download-progress", payload);
 }
 
+// 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+#[allow(clippy::too_many_arguments)]
 async fn perform_download(
     app: AppHandle,
     client: reqwest::Client,
@@ -620,6 +622,8 @@ async fn perform_download(
 }
 
 /// 下载音频文件并保存到本地
+// Tauri 命令签名由 IPC 契约决定：参数必须平铺，改成结构体会同时改掉前端调用点
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn download_track(
     app: AppHandle,

@@ -26,6 +26,8 @@ impl LyricsManager {
     /// 4. QQ / 网易 搜索(标题+歌手+时长硬门槛)
     /// 5. YouTube 原生歌词(若有 video_id)
     /// 6. LRCLIB 再兜底一次(搜索)
+    // 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_lyrics(
         &self,
         track_title: &str,
@@ -332,7 +334,7 @@ impl LyricsManager {
                 })
                 .filter(|(_, score, _)| *score >= MINIMUM_MATCH_SCORE)
                 .collect();
-            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
             for (r, score, cand_dur) in ranked {
                 let synced = r.synced_lyrics.as_deref().unwrap_or("");
@@ -610,7 +612,7 @@ fn score_lyric_candidate(
         100
     } else if !target_title.is_empty()
         && !candidate_title.is_empty()
-        && (candidate_title.contains(&target_title) || target_title.contains(&candidate_title))
+        && (candidate_title.contains(target_title) || target_title.contains(&candidate_title))
     {
         60
     } else {
@@ -628,7 +630,7 @@ fn score_lyric_candidate(
         } else if !candidate_artists.is_disjoint(target_artists) {
             25
         } else if !target_artist.is_empty()
-            && (candidate_artist_normalized.contains(&target_artist)
+            && (candidate_artist_normalized.contains(target_artist)
                 || target_artist.contains(&candidate_artist_normalized))
         {
             15
@@ -754,7 +756,7 @@ fn normalize_artists(value: &str) -> std::collections::HashSet<String> {
         .replace(" x ", "/")
         .replace(" X ", "/");
     normalized
-        .split(|c: char| matches!(c, '/' | ',' | '、' | '，' | '&'))
+        .split(['/', ',', '、', '，', '&'])
         .map(normalize_match_text)
         .filter(|s| !s.is_empty())
         .collect()

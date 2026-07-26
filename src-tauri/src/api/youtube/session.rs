@@ -55,17 +55,12 @@ fn cookie_key_allowed(name: &str) -> bool {
         || name.starts_with("__Host-")
 }
 
+/// Set-Cookie 没带 Domain 时的兜底域
+///
+/// __Secure-/__Host- 前缀的会话 cookie 归 Google 账号域，其余归 YouTube 域。
 fn domain_for_name(name: &str) -> String {
     if name.starts_with("__Secure-") || name.starts_with("__Host-") {
         ".google.com".into()
-    } else if name.eq_ignore_ascii_case("SAPISID")
-        || name.eq_ignore_ascii_case("APISID")
-        || name.eq_ignore_ascii_case("SID")
-        || name.eq_ignore_ascii_case("HSID")
-        || name.eq_ignore_ascii_case("SSID")
-        || name.eq_ignore_ascii_case("LOGIN_INFO")
-    {
-        ".youtube.com".into()
     } else {
         ".youtube.com".into()
     }

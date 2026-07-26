@@ -21,6 +21,8 @@ pub async fn load_lyrics_file(path: String) -> AppResult<Vec<LyricLine>> {
 }
 
 /// 多源歌词获取
+// Tauri 命令签名由 IPC 契约决定：参数必须平铺，改成结构体会同时改掉前端调用点
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn fetch_lyrics(
     title: String,

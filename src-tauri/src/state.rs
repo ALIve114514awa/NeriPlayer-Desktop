@@ -39,6 +39,12 @@ pub struct AppState {
     pub stats: Mutex<crate::stats::StatsStore>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         let jar = Arc::new(reqwest::cookie::Jar::default());

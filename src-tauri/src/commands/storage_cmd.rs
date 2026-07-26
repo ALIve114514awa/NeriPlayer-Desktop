@@ -474,6 +474,8 @@ fn scan_download_path(path: &Path, stats: &mut DownloadStats) {
     }
 }
 
+// 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+#[allow(clippy::too_many_arguments)]
 fn known_data_paths(
     image_cache: &[PathBuf],
     download_staging: &[PathBuf],

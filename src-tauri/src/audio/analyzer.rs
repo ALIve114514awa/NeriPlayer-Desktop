@@ -83,6 +83,12 @@ const DECAY_PER_CALL: f32 = 0.90;
 const BEAT_LEVEL_BOOST: f32 = 0.08;
 const EPS: f64 = 1e-9;
 
+impl Default for AudioAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioAnalyzer {
     pub fn new() -> Self {
         Self {

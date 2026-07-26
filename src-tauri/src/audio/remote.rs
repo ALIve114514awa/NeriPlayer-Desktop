@@ -2448,7 +2448,7 @@ impl SymphoniaAudioDecoder {
         let mut skipped = 0usize;
         while skipped < max_packets {
             // 已有 buffer 里是好包就直接返回
-            if self.buffer.len() > 0 && self.current_frame_offset < self.buffer.len() {
+            if !self.buffer.is_empty() && self.current_frame_offset < self.buffer.len() {
                 break;
             }
             let packet = match self.format.next_packet() {
@@ -2579,7 +2579,7 @@ impl Iterator for SymphoniaAudioDecoder {
                         if decode_errors < MAX_VIRTUAL_BODY_SKIP_PACKETS =>
                     {
                         decode_errors += 1;
-                        if decode_errors <= 4 || decode_errors % 16 == 0 {
+                        if decode_errors <= 4 || decode_errors.is_multiple_of(16) {
                             log::warn!(
                                 target: "remote-audio",
                                 "virtual-body stream decode skip count={}",

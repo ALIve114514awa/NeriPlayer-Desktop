@@ -14,6 +14,12 @@ pub struct LtSession {
     pub ws_client: Arc<TokioMutex<Option<LtWsClient>>>,
 }
 
+impl Default for LtSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LtSession {
     pub fn new() -> Self {
         Self {

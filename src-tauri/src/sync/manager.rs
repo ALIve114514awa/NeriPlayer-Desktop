@@ -525,7 +525,7 @@ fn get_or_create_device_id(app: &AppHandle) -> String {
 
     let id = uuid::Uuid::new_v4().to_string();
     if let Some(s) = store {
-        let _ = s.set("deviceId", serde_json::json!(id));
+        s.set("deviceId", serde_json::json!(id));
     }
     id
 }
@@ -906,8 +906,8 @@ const SYSTEM_LOCAL_ID: i64 = -1002;
 const FAVORITES_NAMES: &[&str] = &["我喜欢的音乐", "我喜歡的音樂", "お気に入りの曲", "Liked Songs", "My Favorite Music"];
 const LOCAL_NAMES: &[&str] = &["本地音乐", "本機音樂", "ローカル音楽", "Local Music"];
 
-fn is_favorites_name(name: &str) -> bool { FAVORITES_NAMES.iter().any(|n| *n == name) }
-fn is_local_name(name: &str) -> bool { LOCAL_NAMES.iter().any(|n| *n == name) }
+fn is_favorites_name(name: &str) -> bool { FAVORITES_NAMES.contains(&name) }
+fn is_local_name(name: &str) -> bool { LOCAL_NAMES.contains(&name) }
 
 /// 解析 SyncPlaylist ID，识别系统歌单
 fn resolve_system_id(sp_id: &str, sp_name: &str) -> i64 {

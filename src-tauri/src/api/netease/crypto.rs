@@ -40,7 +40,7 @@ fn aes_ecb_encrypt(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
     // PKCS7 填充
     let pad_len = 16 - (data.len() % 16);
     let mut padded = data.to_vec();
-    padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+    padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
 
     // 逐块加密
     for chunk in padded.chunks_exact_mut(16) {
@@ -52,7 +52,7 @@ fn aes_ecb_encrypt(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
 
 /// AES-128-ECB 解密（手动逐块解密 + PKCS7 去填充）
 fn aes_ecb_decrypt(data: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         return None;
     }
     let cipher = aes::Aes128::new(GenericArray::from_slice(key));
@@ -125,7 +125,7 @@ pub fn weapi_encrypt(json: &str) -> (String, String) {
     reversed.reverse();
 
     let modulus = BigUint::parse_bytes(
-        RSA_MODULUS_HEX.replace('\n', "").replace(' ', "").as_bytes(), 16
+        RSA_MODULUS_HEX.replace(['\n', ' '], "").as_bytes(), 16
     ).expect("Invalid modulus");
     let exponent = BigUint::parse_bytes(RSA_PUB_KEY_HEX.as_bytes(), 16)
         .expect("Invalid exponent");

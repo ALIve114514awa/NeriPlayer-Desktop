@@ -309,6 +309,8 @@ fn order_merged_playlists(
         .collect()
 }
 
+// 播放/下载编排函数的参数都是相互独立的运行时上下文，聚成结构体只是换个地方堆字段
+#[allow(clippy::too_many_arguments)]
 fn merge_songs(
     local: &[SyncSong],
     remote: &[SyncSong],
@@ -1113,7 +1115,7 @@ fn merge_playlist_song_deletions(
         if let Some(legacy) = legacy { result.push(legacy); }
         if let Some(causal) = causal { result.push(causal); }
     }
-    result.sort_by(|left, right| deletion_order_cmp(left, right));
+    result.sort_by(deletion_order_cmp);
     result.truncate(MAX_DELETIONS);
     result
 }
@@ -1248,55 +1250,66 @@ fn normalize_bucket_after_clear(bucket: &SyncPlaybackStatBucket, cleared_at: i64
     Some(normalized)
 }
 
-fn merge_counter_values(
-    local_total: i64,
-    local_count: i32,
-    local_first: i64,
-    local_last: i64,
-    local_base_total: i64,
-    local_base_count: i32,
-    local_shards: &[SyncPlaybackCounterShard],
-    remote_total: i64,
-    remote_count: i32,
-    remote_first: i64,
-    remote_last: i64,
-    remote_base_total: i64,
-    remote_base_count: i32,
-    remote_shards: &[SyncPlaybackCounterShard],
-) -> MergedCounters {
-    let shards = merge_counter_shards(local_shards, remote_shards);
-    let local_base_total = if local_shards.is_empty() && local_base_total == 0 {
-        local_total.max(0)
-    } else {
-        local_base_total.max(0)
-    };
-    let remote_base_total = if remote_shards.is_empty() && remote_base_total == 0 {
-        remote_total.max(0)
-    } else {
-        remote_base_total.max(0)
-    };
-    let local_base_count = if local_shards.is_empty() && local_base_count == 0 {
-        local_count.max(0)
-    } else {
-        local_base_count.max(0)
-    };
-    let remote_base_count = if remote_shards.is_empty() && remote_base_count == 0 {
-        remote_count.max(0)
-    } else {
-        remote_base_count.max(0)
-    };
-    let base_total = local_base_total.max(remote_base_total);
-    let base_count = local_base_count.max(remote_base_count);
+/// 参与计数合并的一侧快照
+///
+/// 聚合统计与日分桶字段完全同构，用同一个快照类型描述，避免把 14 个
+/// 平铺参数在调用点排错顺序 —— 这里一旦错位是静默的数据损坏。
+struct CounterSide<'a> {
+    total_listen_ms: i64,
+    play_count: i32,
+    first_played_at: i64,
+    last_played_at: i64,
+    base_listen_ms: i64,
+    base_play_count: i32,
+    shards: &'a [SyncPlaybackCounterShard],
+}
+
+impl CounterSide<'_> {
+    /// 分片机制上线前的历史存量：没有分片且 base 为 0 时，总量本身就是 base
+    fn effective_base_listen_ms(&self) -> i64 {
+        if self.shards.is_empty() && self.base_listen_ms == 0 {
+            self.total_listen_ms.max(0)
+        } else {
+            self.base_listen_ms.max(0)
+        }
+    }
+
+    fn effective_base_play_count(&self) -> i32 {
+        if self.shards.is_empty() && self.base_play_count == 0 {
+            self.play_count.max(0)
+        } else {
+            self.base_play_count.max(0)
+        }
+    }
+}
+
+fn merge_counter_values(local: CounterSide<'_>, remote: CounterSide<'_>) -> MergedCounters {
+    let shards = merge_counter_shards(local.shards, remote.shards);
+    let base_total = local
+        .effective_base_listen_ms()
+        .max(remote.effective_base_listen_ms());
+    let base_count = local
+        .effective_base_play_count()
+        .max(remote.effective_base_play_count());
     let sharded_total = base_total.saturating_add(shards.iter().map(|shard| shard.total_listen_ms).sum::<i64>());
     let sharded_count = base_count.saturating_add(shards.iter().map(|shard| shard.play_count).sum::<i32>());
     MergedCounters {
-        total_listen_ms: sharded_total.max(local_total).max(remote_total).max(0),
-        play_count: sharded_count.max(local_count).max(remote_count).max(0),
+        total_listen_ms: sharded_total
+            .max(local.total_listen_ms)
+            .max(remote.total_listen_ms)
+            .max(0),
+        play_count: sharded_count
+            .max(local.play_count)
+            .max(remote.play_count)
+            .max(0),
         first_played_at: min_positive(
-            min_positive(local_first, remote_first),
+            min_positive(local.first_played_at, remote.first_played_at),
             shards.iter().map(|shard| shard.first_played_at).fold(0, min_positive),
         ),
-        last_played_at: local_last.max(remote_last).max(shards.iter().map(|shard| shard.last_played_at).max().unwrap_or(0)),
+        last_played_at: local
+            .last_played_at
+            .max(remote.last_played_at)
+            .max(shards.iter().map(|shard| shard.last_played_at).max().unwrap_or(0)),
         base_listen_ms: base_total,
         base_play_count: base_count,
         shards,
@@ -1314,20 +1327,24 @@ fn merge_playback_stats(
         if let Some(existing) = grouped.remove(&stat.identity_key) {
             let newer = if stat.last_played_at >= existing.last_played_at { &stat } else { &existing };
             let counters = merge_counter_values(
-                existing.total_listen_ms,
-                existing.play_count,
-                existing.first_played_at,
-                existing.last_played_at,
-                existing.counter_base_listen_ms,
-                existing.counter_base_play_count,
-                &existing.counter_shards,
-                stat.total_listen_ms,
-                stat.play_count,
-                stat.first_played_at,
-                stat.last_played_at,
-                stat.counter_base_listen_ms,
-                stat.counter_base_play_count,
-                &stat.counter_shards,
+                CounterSide {
+                    total_listen_ms: existing.total_listen_ms,
+                    play_count: existing.play_count,
+                    first_played_at: existing.first_played_at,
+                    last_played_at: existing.last_played_at,
+                    base_listen_ms: existing.counter_base_listen_ms,
+                    base_play_count: existing.counter_base_play_count,
+                    shards: &existing.counter_shards,
+                },
+                CounterSide {
+                    total_listen_ms: stat.total_listen_ms,
+                    play_count: stat.play_count,
+                    first_played_at: stat.first_played_at,
+                    last_played_at: stat.last_played_at,
+                    base_listen_ms: stat.counter_base_listen_ms,
+                    base_play_count: stat.counter_base_play_count,
+                    shards: &stat.counter_shards,
+                },
             );
             let mut merged = newer.clone();
             merged.total_listen_ms = counters.total_listen_ms;
@@ -1357,20 +1374,24 @@ fn merge_stat_buckets(
         if let Some(existing) = grouped.remove(&key) {
             let newer = if bucket.last_played_at >= existing.last_played_at { &bucket } else { &existing };
             let counters = merge_counter_values(
-                existing.total_listen_ms,
-                existing.play_count,
-                existing.first_played_at,
-                existing.last_played_at,
-                existing.counter_base_listen_ms,
-                existing.counter_base_play_count,
-                &existing.counter_shards,
-                bucket.total_listen_ms,
-                bucket.play_count,
-                bucket.first_played_at,
-                bucket.last_played_at,
-                bucket.counter_base_listen_ms,
-                bucket.counter_base_play_count,
-                &bucket.counter_shards,
+                CounterSide {
+                    total_listen_ms: existing.total_listen_ms,
+                    play_count: existing.play_count,
+                    first_played_at: existing.first_played_at,
+                    last_played_at: existing.last_played_at,
+                    base_listen_ms: existing.counter_base_listen_ms,
+                    base_play_count: existing.counter_base_play_count,
+                    shards: &existing.counter_shards,
+                },
+                CounterSide {
+                    total_listen_ms: bucket.total_listen_ms,
+                    play_count: bucket.play_count,
+                    first_played_at: bucket.first_played_at,
+                    last_played_at: bucket.last_played_at,
+                    base_listen_ms: bucket.counter_base_listen_ms,
+                    base_play_count: bucket.counter_base_play_count,
+                    shards: &bucket.counter_shards,
+                },
             );
             let mut merged = newer.clone();
             merged.total_listen_ms = counters.total_listen_ms;

@@ -30,6 +30,12 @@ pub struct GrowingAudioReader {
     pos: u64,
 }
 
+impl Default for GrowingAudioBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GrowingAudioBuffer {
     pub fn new() -> Self {
         Self {
@@ -168,13 +174,13 @@ impl Read for GrowingAudioReader {
             .inner
             .state
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stream lock poisoned"))?;
+            .map_err(|_| io::Error::other("stream lock poisoned"))?;
         loop {
             if self.inner.aborted.load(Ordering::SeqCst) {
                 return Ok(0);
             }
             if let Some(err) = &state.error {
-                return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+                return Err(io::Error::other(err.clone()));
             }
 
             let available = state.data.len() as u64;
@@ -194,7 +200,7 @@ impl Read for GrowingAudioReader {
                 .inner
                 .cv
                 .wait(state)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "stream lock poisoned"))?;
+                .map_err(|_| io::Error::other("stream lock poisoned"))?;
         }
     }
 }
@@ -205,7 +211,7 @@ impl Seek for GrowingAudioReader {
             .inner
             .state
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stream lock poisoned"))?;
+            .map_err(|_| io::Error::other("stream lock poisoned"))?;
 
         let next = match pos {
             SeekFrom::Start(offset) => offset as i128,

@@ -8,6 +8,7 @@ use crate::audio::pcm::{PcmSeekError, PcmSource};
 
 // 共享音效参数
 /// 运行时可变的音效参数，通过 Arc<Mutex<>> 共享给音频线程
+#[derive(Default)]
 pub struct AudioEffectsParams {
     /// 响度增益 (millibels)，范围 0~1500 (0 ~ +15.0 dB)
     pub loudness_gain_mb: i32,
@@ -18,17 +19,6 @@ pub struct AudioEffectsParams {
     pub eq_band_levels_mb: [i32; 5],
     /// 音量均衡：把不同曲目的响度拉到统一目标，避免切歌忽大忽小
     pub normalize_volume: bool,
-}
-
-impl Default for AudioEffectsParams {
-    fn default() -> Self {
-        Self {
-            loudness_gain_mb: 0,
-            eq_enabled: false,
-            eq_band_levels_mb: [0; 5],
-            normalize_volume: false,
-        }
-    }
 }
 
 impl AudioEffectsParams {
@@ -217,7 +207,7 @@ where
         }
 
         let sr = self.sample_rate as f64;
-        for i in 0..5 {
+        for (i, &freq) in EQ_FREQS.iter().enumerate() {
             // 关闭时强制按 0dB 更新系数，重新开启前不会带着旧增益
             let new_db = if self.enabled {
                 p.eq_band_levels_mb[i] as f64 / 100.0
@@ -226,7 +216,7 @@ where
             };
             if (new_db - self.band_gains_db[i]).abs() > 0.01 {
                 self.band_gains_db[i] = new_db;
-                self.filters[i].compute_coefficients(EQ_FREQS[i], new_db, sr);
+                self.filters[i].compute_coefficients(freq, new_db, sr);
             }
         }
     }

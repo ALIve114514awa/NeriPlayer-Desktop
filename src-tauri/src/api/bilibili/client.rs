@@ -168,7 +168,7 @@ impl BiliClient {
         }
 
         // 按码率降序
-        streams.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+        streams.sort_by_key(|stream| std::cmp::Reverse(stream.bandwidth));
         Ok(streams)
     }
 

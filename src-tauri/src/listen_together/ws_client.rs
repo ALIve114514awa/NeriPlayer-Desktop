@@ -37,7 +37,7 @@ impl LtWsClient {
                     msg = rx.recv() => {
                         match msg {
                             Some(text) => {
-                                if let Err(e) = ws_write.send(Message::Text(text.into())).await {
+                                if let Err(e) = ws_write.send(Message::Text(text)).await {
                                     log::error!(target: "lt-ws", "write error: {e}");
                                     break;
                                 }
