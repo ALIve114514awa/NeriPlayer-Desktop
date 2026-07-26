@@ -353,6 +353,7 @@ fn normalize_equalizer_preset(value: &str) -> String {
             "hip_hop",
             "jazz",
             "latin",
+            "loudness",
             "lounge",
             "piano",
             "pop",

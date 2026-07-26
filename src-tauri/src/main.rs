@@ -20,11 +20,29 @@ fn main() {
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--enable-gpu --enable-gpu-rasterization --enable-zero-copy --enable-features=CanvasOopRasterization");
 
+    // WebKitGTK 的 DMABUF 渲染在 Nvidia 私有驱动与虚拟机上有已知的白屏/
+    // WebGL 失效问题，而本应用重度依赖 WebGL 背景。取舍：禁用 DMABUF 牺牲
+    // 少量合成性能，换取这类环境下能正常显示。用户已显式设置时尊重用户选择
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     // 在其余插件之前初始化统一日志：启动期直接读取持久化设置决定
     // 是否写文件与日志级别（此时尚无 app handle）
     let log_cfg = neri_player_desktop::logging::load_bootstrap_config();
 
     tauri::Builder::default()
+        // 单实例保护必须最先注册：双实例会共享 deviceId 与 causal counter，
+        // 重复发号 token 造成跨设备同步静默数据损坏，playlists/stats 等
+        // 落盘文件也会互相覆盖。二次启动改为聚焦已有窗口
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(neri_player_desktop::logging::build_plugin(
             log_cfg.log_to_file,
             log_cfg.level,
@@ -221,24 +239,38 @@ fn main() {
                         }
                     }
 
-                    // 慢检测：重新获取锁（is_finished 内部有 200ms recv）
+                    // 慢检测：短锁发起查询，锁外等待结果——旧实现在持锁状态下
+                    // recv_timeout(100ms)，音频线程忙（crossfade/prepare/seek）时
+                    // 每 tick 持锁满 100ms，阻塞 pause/get_player_state 等命令
                     // 中段解码饿死/虚拟 body 落点失败不能当「播完」——只在接近曲尾才 emit track-ended
                     {
-                        let mut player = state.player.lock();
-                        let position_ms = player.position_ms();
-                        let duration_ms = player.duration_ms;
+                        let (finished_rx, position_ms, duration_ms, was_playing) = {
+                            let player = state.player.lock();
+                            (
+                                player.begin_finished_query(),
+                                player.position_ms(),
+                                player.duration_ms,
+                                player.is_playing,
+                            )
+                        }; // <- 锁在此释放，下面的等待不再挡住其他 player 命令
+                        let finished_flag = finished_rx
+                            .map(|rx| {
+                                rx.recv_timeout(Duration::from_millis(100)).unwrap_or(false)
+                            })
+                            .unwrap_or(false);
                         let near_end = duration_ms > 0
                             && (position_ms.saturating_add(5_000) >= duration_ms
                                 || position_ms.saturating_mul(100) / duration_ms.max(1) >= 98);
-                        let finished = player.is_finished()
-                            && player.is_playing
-                            && position_ms > 500
-                            && near_end;
+                        let finished =
+                            finished_flag && was_playing && position_ms > 500 && near_end;
                         if finished && !last_ended {
                             last_ended = true;
-                            let ended_generation = player.loaded_generation().unwrap_or(0);
-                            player.mark_ended();
-                            drop(player);
+                            let ended_generation = {
+                                let mut player = state.player.lock();
+                                let generation = player.loaded_generation().unwrap_or(0);
+                                player.mark_ended();
+                                generation
+                            };
                             let _ = handle_ticker.emit(
                                 "player:track-ended",
                                 serde_json::json!({

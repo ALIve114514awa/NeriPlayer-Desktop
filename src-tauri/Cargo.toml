@@ -51,6 +51,7 @@ tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 tauri-plugin-log = "2.9.0"
+tauri-plugin-single-instance = "2"
 
 [profile.dev.package.symphonia]
 opt-level = 2
