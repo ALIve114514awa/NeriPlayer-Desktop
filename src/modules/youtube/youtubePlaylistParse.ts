@@ -224,6 +224,87 @@ function parseLibraryPlaylistRenderer(
   }
 }
 
+/// 在任意深度找第一个满足条件的节点
+///
+/// YouTube 的 ViewModel 结构层级深且改版频繁，写死路径极易失效，
+/// 这里按"找得到就用"的方式解析，结构小改不会直接把列表打空。
+function findFirst(root: any, predicate: (node: any) => boolean): any {
+  const stack: any[] = [root]
+  const seen = new Set<any>()
+  while (stack.length) {
+    const node = stack.pop()
+    if (!node || typeof node !== 'object' || seen.has(node)) continue
+    seen.add(node)
+    if (predicate(node)) return node
+    for (const value of Object.values(node)) {
+      if (value && typeof value === 'object') stack.push(value)
+    }
+  }
+  return null
+}
+
+function collectStrings(root: any, key: string, limit = 8): string[] {
+  const out: string[] = []
+  const stack: any[] = [root]
+  const seen = new Set<any>()
+  while (stack.length && out.length < limit) {
+    const node = stack.pop()
+    if (!node || typeof node !== 'object' || seen.has(node)) continue
+    seen.add(node)
+    const value = node[key]
+    if (typeof value === 'string' && value.trim()) out.push(value.trim())
+    for (const nested of Object.values(node)) {
+      if (nested && typeof nested === 'object') stack.push(nested)
+    }
+  }
+  return out
+}
+
+/// 解析 lockupViewModel（YouTube 的新 ViewModel 架构）
+///
+/// 库页在 2026 年已从 musicTwoRowItemRenderer 迁到 lockupViewModel，
+/// 只认旧渲染器会让「已登录但云端歌单为空」——请求成功、响应有内容，
+/// 但一条都解析不出来。
+function parseLockupViewModel(lockup: any): YoutubeLibraryPlaylist | null {
+  if (!lockup) return null
+
+  const browseEndpoint = findFirst(lockup, (node) => typeof node?.browseId === 'string')
+  const rawId = String(browseEndpoint?.browseId || lockup?.contentId || '').trim()
+  if (!rawId) return null
+  // contentId 可能是裸的 PL...，YouTube Music 的歌单 browseId 需要 VL 前缀
+  const id = rawId.startsWith('VL') || rawId.startsWith('OLAK5uy_') ? rawId : `VL${rawId}`
+
+  const titleNode = findFirst(
+    lockup?.metadata ?? lockup,
+    (node) => typeof node?.content === 'string' && node.content.trim().length > 0,
+  )
+  const name = String(titleNode?.content || '').trim()
+  if (!name) return null
+
+  const imageNode = findFirst(
+    lockup?.contentImage ?? lockup,
+    (node) => Array.isArray(node?.sources) && node.sources.length > 0,
+  )
+  const coverUrl = String(
+    imageNode?.sources?.[imageNode.sources.length - 1]?.url
+      || imageNode?.sources?.[0]?.url
+      || '',
+  )
+
+  // 第一条 content 是标题本身，后面的才是「N 首歌曲」这类描述
+  const subtitle = collectStrings(lockup?.metadata ?? lockup, 'content')
+    .filter((text) => text !== name)
+    .join(' · ')
+
+  return {
+    id,
+    name,
+    coverUrl,
+    trackCount: parseTrackCount(subtitle),
+    description: subtitle || undefined,
+  }
+}
+
 /** 解析 FEmusic_liked_playlists / 库内歌单列表 */
 export function parseYouTubeLibraryPlaylists(data: any): YoutubeLibraryPlaylist[] {
   const playlists: YoutubeLibraryPlaylist[] = []
@@ -246,6 +327,7 @@ export function parseYouTubeLibraryPlaylists(data: any): YoutubeLibraryPlaylist[
         parseLibraryPlaylistRenderer(item?.musicTwoRowItemRenderer, false),
         false,
       )
+      tryPush(parseLockupViewModel(item?.lockupViewModel), false)
     }
   }
   if (playlists.length > 0) return playlists
@@ -256,6 +338,23 @@ export function parseYouTubeLibraryPlaylists(data: any): YoutubeLibraryPlaylist[
       parseLibraryPlaylistRenderer(item?.musicTwoRowItemRenderer, true),
       true,
     )
+  }
+  if (playlists.length > 0) return playlists
+
+  // 最后回退：深搜 lockupViewModel
+  // 新架构下 grid/shelf 的外层容器也换了名字，按类型深搜才不会漏
+  const stack: any[] = [data]
+  const visited = new Set<any>()
+  while (stack.length) {
+    const node = stack.pop()
+    if (!node || typeof node !== 'object' || visited.has(node)) continue
+    visited.add(node)
+    if (node.lockupViewModel) {
+      tryPush(parseLockupViewModel(node.lockupViewModel), false)
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === 'object') stack.push(value)
+    }
   }
   return playlists
 }

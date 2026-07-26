@@ -236,9 +236,10 @@ impl YouTubeClient {
         // 诊断用：区分「请求没发出」「返回了但目录为空」「返回有内容但前端解析不出」
         log::info!(
             target: "youtube",
-            "library playlists response: shelves={}, has_contents={}",
+            "library playlists response: shelves={}, has_contents={}, node_types=[{}]",
             count_browse_items(&data),
             data.get("contents").is_some(),
+            summarize_node_types(&data),
         );
         Ok(data)
     }
@@ -452,4 +453,39 @@ fn count_browse_items(data: &Value) -> usize {
     let mut count = 0;
     walk(data, &mut count);
     count
+}
+
+/// 列出响应里出现的渲染器 / ViewModel 类型及数量
+///
+/// YouTube 会不打招呼地改渲染结构（例如从 *Renderer 迁到 *ViewModel），
+/// 解析器认不出新类型时表现就是"请求成功但列表为空"。
+/// 把真实类型名打出来，下次结构再变可以一眼定位，不用靠猜。
+fn summarize_node_types(data: &Value) -> String {
+    use std::collections::BTreeMap;
+
+    fn walk(value: &Value, counts: &mut BTreeMap<String, usize>) {
+        match value {
+            Value::Object(map) => {
+                for (key, nested) in map {
+                    if key.ends_with("Renderer") || key.ends_with("ViewModel") {
+                        *counts.entry(key.clone()).or_default() += 1;
+                    }
+                    walk(nested, counts);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|nested| walk(nested, counts)),
+            _ => {}
+        }
+    }
+
+    let mut counts = BTreeMap::new();
+    walk(data, &mut counts);
+    let mut ordered: Vec<_> = counts.into_iter().collect();
+    ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ordered
+        .into_iter()
+        .take(12)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
