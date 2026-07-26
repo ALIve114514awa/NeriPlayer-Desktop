@@ -30,6 +30,7 @@ import {
 } from '@/utils/storage'
 import { switchThemeWithRipple, type ThemeMode } from '@/utils/theme'
 import { THEME_COLORS, getSwatchColor, applyThemeColor, getSavedThemeColor, switchThemeColorWithRipple } from '@/utils/themeColor'
+import { shortcutDescriptors } from '@/modules/shortcuts/globalShortcuts'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('settings-view')
@@ -726,6 +727,14 @@ async function handleIntlToggle(val: boolean) {
   }
 }
 
+// 键盘快捷键说明（修饰键按平台自动切换 ⌘ / Ctrl）
+const keyboardShortcuts = computed(() =>
+  shortcutDescriptors().map((item) => ({
+    ...item,
+    label: t(`shortcuts.${item.id}`),
+  })),
+)
+
 // 封面样式选项
 const coverStyleOptions = computed(() => [
   { value: 'disc', label: t('settings.cover_style_disc') },
@@ -1169,6 +1178,22 @@ function confirmDataSaverChange() {
           <div class="setting-desc">{{ t('settings.np_title_desc') }}</div>
         </div>
         <label class="m3-switch"><input type="checkbox" v-model="showNowPlayingTitle" /><span class="track"><span class="thumb"><span v-if="showNowPlayingTitle" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
+      </div>
+
+      <div class="setting-card shortcut-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">keyboard</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('shortcuts.title') }}</div>
+          <div class="setting-desc">{{ t('shortcuts.desc') }}</div>
+          <ul class="shortcut-list">
+            <li v-for="item in keyboardShortcuts" :key="item.id" class="shortcut-row">
+              <span class="shortcut-label">{{ item.label }}</span>
+              <span class="shortcut-keys">
+                <kbd v-for="key in item.keys" :key="key">{{ key }}</kbd>
+              </span>
+            </li>
+          </ul>
+        </div>
       </div>
 
       <div class="setting-card">
@@ -3527,5 +3552,55 @@ function confirmDataSaverChange() {
   }
 
   .sub-card { margin-left: 20px; }
+}
+
+/* 快捷键说明 */
+.shortcut-card { align-items: flex-start; }
+
+.shortcut-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 6px 20px;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 26px;
+}
+
+.shortcut-label {
+  font-size: 13px;
+  color: var(--md-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shortcut-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.shortcut-keys kbd {
+  min-width: 24px;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm, 8px);
+  background: var(--md-surface-container-highest);
+  border: 1px solid var(--md-outline-variant, rgba(255, 255, 255, 0.12));
+  border-bottom-width: 2px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  color: var(--md-on-surface);
 }
 </style>
