@@ -12,6 +12,16 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 pub struct NeteaseClient {
     http: Client,
+    /// 代理设置相反的备用客户端，仅在主客户端网络层失败时使用
+    fallback: Option<Client>,
+}
+
+/// 是否属于「换个代理设置可能就通」的网络层失败
+///
+/// 只认连接建立阶段的错误：HTTP 状态码错误、解析错误都不该触发重试，
+/// 否则会把一次业务失败放大成两次请求。
+fn is_transport_failure(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || (error.is_request() && !error.is_decode())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +63,35 @@ pub struct NeteaseLyrics {
 
 impl NeteaseClient {
     pub fn new(http: &Client) -> Self {
-        Self { http: http.clone() }
+        Self { http: http.clone(), fallback: None }
+    }
+
+    pub fn with_fallback(http: &Client, fallback: &Client) -> Self {
+        Self {
+            http: http.clone(),
+            fallback: Some(fallback.clone()),
+        }
+    }
+
+    /// 主客户端网络层失败时，用相反代理设置的备用客户端重试一次
+    async fn send_with_fallback(
+        &self,
+        build: impl Fn(&Client) -> reqwest::RequestBuilder,
+    ) -> AppResult<reqwest::Response> {
+        let primary = build(&self.http).send().await;
+        let error = match primary {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let Some(fallback) = self.fallback.as_ref().filter(|_| is_transport_failure(&error)) else {
+            return Err(error.into());
+        };
+        log::warn!(
+            target: "netease",
+            "primary transport failed, retrying with the opposite proxy setting: {}",
+            error,
+        );
+        Ok(build(fallback).send().await?)
     }
 
     /// WEAPI POST 请求
@@ -61,13 +99,15 @@ impl NeteaseClient {
         let json_str = serde_json::to_string(params)?;
         let (encrypted_params, enc_sec_key) = crypto::weapi_encrypt(&json_str);
 
-        let resp = self.http
-            .post(url)
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://music.163.com")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[("params", &encrypted_params), ("encSecKey", &enc_sec_key)])
-            .send()
+        let resp = self
+            .send_with_fallback(|client| {
+                client
+                    .post(url)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://music.163.com")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .form(&[("params", &encrypted_params), ("encSecKey", &enc_sec_key)])
+            })
             .await?;
 
         let body: Value = resp.json().await?;
@@ -153,11 +193,13 @@ impl NeteaseClient {
 
         log::debug!(target: "netease", "get_lyrics: id={}", song_id);
 
-        let resp = self.http
-            .get(&url)
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://music.163.com")
-            .send()
+        let resp = self
+            .send_with_fallback(|client| {
+                client
+                    .get(&url)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://music.163.com")
+            })
             .await?;
 
         let body: Value = resp.json().await
@@ -322,11 +364,13 @@ impl NeteaseClient {
 
     /// 获取专辑详情
     pub async fn get_album_detail(&self, album_id: u64) -> AppResult<Value> {
-        let resp = self.http
-            .get(format!("{}/api/v1/album/{}", BASE_URL, album_id))
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", "https://music.163.com")
-            .send()
+        let resp = self
+            .send_with_fallback(|client| {
+                client
+                    .get(format!("{}/api/v1/album/{}", BASE_URL, album_id))
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://music.163.com")
+            })
             .await?;
         let body: Value = resp.json().await?;
         Ok(body)

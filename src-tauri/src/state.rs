@@ -37,6 +37,11 @@ pub struct AppState {
     pub youtube_refresh: Mutex<crate::api::youtube::refresh::YouTubeRefreshGate>,
     /// 播放统计, 启动时从磁盘恢复
     pub stats: Mutex<crate::stats::StatsStore>,
+    /// 与 http 代理设置相反的备用客户端
+    ///
+    /// 系统代理配错时直连能通，需要代理才能出网时直连不通 —— 两种情况都存在，
+    /// 单一设置无法覆盖。平台请求在网络层失败时用它重试一次，两个方向都能自愈。
+    alt_http: parking_lot::RwLock<reqwest::Client>,
 }
 
 impl Default for AppState {
@@ -55,6 +60,13 @@ impl AppState {
             .build()
             .expect("Failed to create HTTP client");
 
+        // 初始客户端直连，备用客户端走系统代理
+        let alt = reqwest::Client::builder()
+            .cookie_provider(jar.clone())
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("Failed to create fallback HTTP client");
+
         let playback_generation = Arc::new(AtomicU64::new(0));
         Self {
             player: Arc::new(Mutex::new(PlayerEngine::with_playback_generation(
@@ -69,20 +81,38 @@ impl AppState {
             download_tasks: Mutex::new(HashMap::new()),
             youtube_refresh: Mutex::new(crate::api::youtube::refresh::YouTubeRefreshGate::default()),
             stats: Mutex::new(crate::stats::load()),
+            alt_http: parking_lot::RwLock::new(alt),
         }
     }
 
     /// 重建 HTTP Client，切换代理模式
     pub fn rebuild_http(&self, bypass_proxy: bool) {
-        let mut builder = reqwest::Client::builder()
-            .cookie_provider(self.cookie_jar.clone())
-            .user_agent(USER_AGENT);
-        if bypass_proxy {
-            builder = builder.no_proxy();
-        }
-        if let Ok(client) = builder.build() {
+        let build = |no_proxy: bool| {
+            let mut builder = reqwest::Client::builder()
+                .cookie_provider(self.cookie_jar.clone())
+                .user_agent(USER_AGENT);
+            if no_proxy {
+                builder = builder.no_proxy();
+            }
+            builder.build()
+        };
+        if let Ok(client) = build(bypass_proxy) {
             *self.http.write() = client;
         }
+        // 备用客户端始终取相反设置
+        if let Ok(client) = build(!bypass_proxy) {
+            *self.alt_http.write() = client;
+        }
+    }
+
+    /// 代理设置与 http() 相反的备用客户端
+    pub fn alt_http(&self) -> reqwest::Client {
+        self.alt_http.read().clone()
+    }
+
+    /// 预接好代理兜底的网易云客户端
+    pub fn netease(&self) -> crate::api::netease::client::NeteaseClient {
+        crate::api::netease::client::NeteaseClient::with_fallback(&self.http(), &self.alt_http())
     }
 
     /// 获取当前 HTTP Client 的克隆（O(1)，reqwest::Client 内部是 Arc）
