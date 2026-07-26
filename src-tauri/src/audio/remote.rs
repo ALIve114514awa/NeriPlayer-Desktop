@@ -558,7 +558,13 @@ impl RemoteAudioSource {
         if let Some((start, data)) = initial_disk_segment {
             write_disk_range(&inner, start, &data);
         }
-        let needs_seek_index = matches!(access_mode, RemoteAccessMode::LongFormProgressive);
+        // 自带 sidx 的分片流一律不建索引：symphonia 的 isomp4 能原生按 sidx 定位
+        // （日志里的 "stream is segmented with a segment index"）。
+        // 建了索引 prefers_virtual_body_seek() 就会为真，转而走虚拟 body 拼接，
+        // 而拼接出的样本偏移对不上，seek 与回滚双双 end of stream。
+        // 注意长内容也必须排除：>= 45 分钟的分片流同样会落到这里。
+        let needs_seek_index =
+            !sniffed_fragmented && matches!(access_mode, RemoteAccessMode::LongFormProgressive);
         // 分片 MP4 的 sidx 紧跟 moov 位于首包，先用首包建索引；
         // 建成了就不必再为长内容拉 1MB 尾部，直接省掉起播路径上的一次往返
         let head_index_ready = needs_seek_index
@@ -570,6 +576,8 @@ impl RemoteAudioSource {
         if matches!(access_mode, RemoteAccessMode::LongFormProgressive)
             && total_len > 0
             && !head_index_ready
+            // 分片流的 moov/sidx 都在首包，拉尾部只会白白拖慢起播
+            && !sniffed_fragmented
         {
             let tail_len = REMOTE_LONG_FORM_TAIL_BYTES.min(total_len);
             let tail_start = total_len.saturating_sub(tail_len);
@@ -4314,6 +4322,70 @@ mod tests {
             seekable.access_mode.demand_fetch_block_bytes(),
             super::REMOTE_FETCH_BLOCK_BYTES
         );
+    }
+
+    /// 回归：长内容的分片流同样不能走虚拟 body
+    ///
+    /// 上一次只排除了 StandardSeekable，>= 45 分钟的分片流仍落在
+    /// LongFormProgressive 分支里建索引，于是 seek 又变回 end of stream。
+    /// 两种模式必须一视同仁 —— 只要自带 sidx，就交给 symphonia 原生定位。
+    #[test]
+    fn long_form_fragments_must_not_enable_virtual_body_seek() {
+        for mode in [
+            RemoteAccessMode::StandardSeekable,
+            RemoteAccessMode::LongFormProgressive,
+        ] {
+            let source = RemoteAudioSource {
+                inner: Arc::new(RemoteAudioInner {
+                    client: reqwest::Client::new(),
+                    url: "https://rr5---sn-x.googlevideo.com/videoplayback?itag=140".into(),
+                    referer: "https://www.youtube.com".into(),
+                    total_len: 135_169_876,
+                    header_end: AtomicU64::new(10_799),
+                    prefetch_window: PrefetchWindow {
+                        low_water_bytes: 262_144,
+                        target_bytes: 1_048_576,
+                    },
+                    cache: Mutex::new(Vec::new()),
+                    disk_ranges: Mutex::new(Vec::new()),
+                    in_flight: Mutex::new(HashSet::new()),
+                    range_available: Condvar::new(),
+                    last_read_pos: Mutex::new(0),
+                    protected_ranges: Mutex::new(Vec::new()),
+                    disk_cache: None,
+                    cache_finalize_started: AtomicBool::new(false),
+                    prefetch_epoch: AtomicU64::new(0),
+                    demuxer_open_sequential: AtomicBool::new(true),
+                    virtual_body_origin: AtomicU64::new(0),
+                    // 嗅探为分片时不建索引，无论时长落在哪个模式
+                    seek_index: Mutex::new(None),
+                    playback_generation: Arc::new(AtomicU64::new(1)),
+                    expected_generation: 1,
+                }),
+                pos: 0,
+                access_mode: mode,
+                read_cancellation: None,
+            };
+
+            source.finish_demuxer_open();
+            assert!(
+                !source.prefers_virtual_body_seek(),
+                "{mode:?} 不应启用虚拟 body",
+            );
+            let seekable = source.seekable_clone();
+            assert!(
+                !seekable.prefers_virtual_body_seek(),
+                "{mode:?} 升级后仍不应启用虚拟 body",
+            );
+            seekable.finish_demuxer_open();
+            // 升级后必须对 demuxer 可 seek，symphonia 才能按 sidx 跳转
+            assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
+            assert_eq!(
+                seekable.access_mode.demand_fetch_block_bytes(),
+                super::REMOTE_FETCH_BLOCK_BYTES,
+                "{mode:?} 的按需块不得退化成分片用的 8MB",
+            );
+        }
     }
 
     #[test]
