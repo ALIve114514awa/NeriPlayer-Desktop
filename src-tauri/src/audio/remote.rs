@@ -626,13 +626,11 @@ impl RemoteAudioSource {
         let header_end = detect_mp4_header_end(head_bytes).unwrap_or(0);
         // URL 后缀嗅探不到 googlevideo 的分片直链，必须按首包内容再判一次。
         //
-        // 嗅探结果只用于「打开阶段顺序读」这一件事，不改 access_mode 也不建
-        // 虚拟 body 索引：
-        // - 分片模式的按需块是 8MB，那是给 Bilibili 独立 .m4s 分片文件调的，
-        //   套到 YouTube 的单文件上反而拖慢 seek
-        // - 这类流自带完整 sidx，symphonia 的 isomp4 能原生按 sidx 定位
-        //   （日志里的 "stream is segmented with a segment index"），
-        //   再套一层虚拟 body 拼接反而会让样本偏移对不上，直接 end of stream
+        // 嗅探结果只用于「打开阶段顺序读」这一件事，不改 access_mode：
+        // 分片模式的按需块是 8MB，那是给 Bilibili 独立 .m4s 分片文件调的，
+        // 套到 YouTube 的单文件上反而拖慢 seek。
+        // 索引构建不看嗅探结果：所有分片流（嗅探出的 + .m4s 直链）
+        // 统一在下方 needs_seek_index 里按首包 sidx 建索引
         let sniffed_fragmented = !matches!(access_mode, RemoteAccessMode::FragmentedProgressive)
             && detect_fragmented_mp4(head_bytes);
         let inner = Arc::new(RemoteAudioInner {
@@ -699,8 +697,11 @@ impl RemoteAudioSource {
         // try_read_more_segments 一个个 moof 往前爬，代价是 O(文件大小)：
         // 实测 68MB 的 70 分钟音频跳到 37 分钟要顺序读满 30MB。
         // 所以 sidx 必须由我们自己解析成索引，seek 时直接按字节落点开 demuxer。
-        let needs_seek_index =
-            sniffed_fragmented || matches!(access_mode, RemoteAccessMode::LongFormProgressive);
+        //
+        // FragmentedProgressive（Bilibili .m4s 直链）同样必须建：它的 sidx
+        // 一样在首包（header_end 之前），旧代码只认嗅探结果与 LongForm，
+        // 导致 2 小时 118MB 的 fMP4 每次 seek 都顺序爬 moof ~12s
+        let needs_seek_index = needs_head_seek_index(access_mode, sniffed_fragmented);
         // 分片 MP4 的 sidx 紧跟 moov 位于首包，先用首包建索引；
         // 建成了就不必再为长内容拉 1MB 尾部，直接省掉起播路径上的一次往返
         //
@@ -766,7 +767,8 @@ impl RemoteAudioSource {
             }
         }
         // 首包没建成索引时再兜底：长内容可退到尾部 sidx / 线性估算，
-        // 嗅探出的分片内容只接受真实 sidx，解析不到就保持原 format.seek 行为。
+        // 分片内容（嗅探出的 + .m4s 直链）只接受真实 sidx，解析不到就保持
+        // 原 format.seek 顺序行为（函数内部会打 "seek index skipped" 日志）。
         // 线性估算依赖声明时长，hint=0（时长未知）时在函数内部自动禁用
         if needs_seek_index && total_len > 0 && !head_index_ready {
             let allow_linear_fallback =
@@ -855,6 +857,7 @@ impl RemoteAudioSource {
             self.access_mode,
             RemoteAccessMode::LongFormProgressive
                 | RemoteAccessMode::StandardSeekable
+                | RemoteAccessMode::FragmentedProgressive
                 | RemoteAccessMode::FragmentedSeekable
         );
         if !mode_ok {
@@ -3624,6 +3627,22 @@ fn position_is_cached_range(inner: &RemoteAudioInner, start: u64, end: u64) -> b
         }
     }
     disk_cached_len(inner, start, 1).is_some()
+}
+
+/// 哪些流需要在 open 阶段用首包 sidx 建 seek 索引
+///
+/// symphonia 的 isomp4 对分片流的 format.seek 是顺着 moof 链爬的
+/// O(文件大小) 行为，所以凡是分片内容都必须自建索引走字节落点：
+/// - 嗅探出的分片单文件（YouTube DASH 直链，URL 看不出分片）
+/// - LongFormProgressive（长内容渐进，sidx/moov 定位）
+/// - FragmentedProgressive（Bilibili .m4s 直链）——旧代码漏掉了它，
+///   2 小时 118MB 的 fMP4 每次 seek 都要顺序爬 moof ~12s
+fn needs_head_seek_index(access_mode: RemoteAccessMode, sniffed_fragmented: bool) -> bool {
+    sniffed_fragmented
+        || matches!(
+            access_mode,
+            RemoteAccessMode::LongFormProgressive | RemoteAccessMode::FragmentedProgressive
+        )
 }
 
 /// 只用首包的 sidx 建索引，成功返回 true；失败不写入，交给调用方兜底
@@ -6530,6 +6549,46 @@ mod tests {
             index.estimate_segment(15_000).0,
             atom_len + 1024 * 1024,
         );
+    }
+
+    /// 回归（Bilibili 2 小时 fMP4 seek 爬 12s）：FragmentedProgressive
+    /// （.m4s 直链）此前不在建索引名单里，seek 退化为顺序爬 moof。
+    /// 它的 sidx 同样在首包，必须与嗅探分片/LongForm 一致地建索引，
+    /// 且升级前（Progressive）与升级后（Seekable）都要走虚拟 body 落点
+    #[test]
+    fn fragmented_progressive_builds_index_and_prefers_virtual_body() {
+        // 建索引名单矩阵：分片直链与长内容必建；短内容仅嗅探出分片才建
+        use super::{needs_head_seek_index, RemoteAccessMode as Mode};
+        assert!(needs_head_seek_index(Mode::FragmentedProgressive, false));
+        assert!(needs_head_seek_index(Mode::LongFormProgressive, false));
+        assert!(needs_head_seek_index(Mode::StandardSeekable, true));
+        assert!(!needs_head_seek_index(Mode::StandardSeekable, false));
+
+        let total_len: u64 = 4 * 1024 * 1024;
+        let inner = forbidden_test_inner("http://127.0.0.1:1/audio.m4s".into(), total_len);
+        inner
+            .cache
+            .lock()
+            .expect("cache lock")
+            .push(CachedSegment {
+                start: 0,
+                data: sidx_atom_two_segments(),
+            });
+        assert!(super::build_seek_index_from_head(&inner, 0));
+        inner.header_end.store(64, Ordering::Release);
+
+        let source = RemoteAudioSource {
+            inner: Arc::clone(&inner),
+            pos: 0,
+            access_mode: RemoteAccessMode::FragmentedProgressive,
+            read_cancellation: None,
+        };
+        assert!(
+            source.prefers_virtual_body_seek(),
+            "升级前的 .m4s 直链就必须判定为虚拟 body seek，否则误走 format.seek"
+        );
+        let seekable = source.seekable_clone();
+        assert!(seekable.prefers_virtual_body_seek());
     }
 
     /// splice 打开期的错误分类：解码类可跳；IO 里只有瞬时类可跳，

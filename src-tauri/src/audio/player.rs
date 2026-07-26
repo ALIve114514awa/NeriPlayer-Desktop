@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1245,7 +1246,9 @@ fn audio_control_loop(
     let mut current: Option<PlaybackSession> = None;
     let mut volume = 1.0f32;
     let mut speed = 1.0f32;
-    let mut deferred = None;
+    // 被 seek 折叠/接管路径暂存的命令队列：必须保序回放，
+    // 单槽 Option 会让 ticker 的 QueryEmpty 直接打断 seek 接管等待
+    let mut deferred: VecDeque<AudioCmd> = VecDeque::new();
     let mut output_profile = match OutputDeviceProfile::open_default() {
         Ok(profile) => {
             log::info!(
@@ -1264,7 +1267,7 @@ fn audio_control_loop(
     };
 
     loop {
-        let command = match deferred.take() {
+        let command = match deferred.pop_front() {
             Some(command) => command,
             None => match receiver.recv() {
                 Ok(command) => command,
@@ -2562,8 +2565,11 @@ fn take_latest_seek(
     seek_generation: &mut u64,
     reply: &mut mpsc::Sender<Result<(), String>>,
     receiver: &mpsc::Receiver<AudioCmd>,
-    deferred: &mut Option<AudioCmd>,
+    deferred: &mut VecDeque<AudioCmd>,
 ) {
+    // 把队列里已有的 Seek 全部折叠成最新一条；非 Seek 命令保序暂存，
+    // 不能在第一条非 Seek 处停下——ticker 的 QueryEmpty 会夹在两次
+    // 拖动之间，停下就折叠不到真正的最新目标
     loop {
         match receiver.try_recv() {
             Ok(AudioCmd::Seek {
@@ -2578,10 +2584,7 @@ fn take_latest_seek(
                 *seek_generation = next_seek_generation;
                 *reply = next_reply;
             }
-            Ok(command) => {
-                *deferred = Some(command);
-                break;
-            }
+            Ok(command) => deferred.push_back(command),
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
         }
     }
@@ -2598,34 +2601,36 @@ struct AdoptedSeek {
 /// 旧 seek 被更新 seek 的代际递增打断后，接过队列里那条更新的 Seek 命令
 ///
 /// 代际递增（request_seek）与命令入队之间只有微秒级窗口，因此在宽限内
-/// 阻塞等待即可拿到；等到非 Seek 命令则塞回 deferred 并放弃（回滚兜底），
-/// 绝不吞掉其它命令
+/// 阻塞等待即可拿到。等待期间收到的非 Seek 命令保序暂存到 deferred、
+/// 继续等——ticker 每 200ms 必发 QueryEmpty，第一条非 Seek 就放弃的话
+/// 接管几乎必然失败，回滚重建会白跑一次完整 prepare（慢路径下秒级）
 fn wait_for_newer_seek(
     receiver: &mpsc::Receiver<AudioCmd>,
-    deferred: &mut Option<AudioCmd>,
+    deferred: &mut VecDeque<AudioCmd>,
     grace: Duration,
 ) -> Option<AdoptedSeek> {
-    if deferred.is_some() {
-        // 已有待处理命令：不能再阻塞等待，让主循环先消费它
-        return None;
-    }
-    match receiver.recv_timeout(grace) {
-        Ok(AudioCmd::Seek {
-            position_ms,
-            playback_generation,
-            seek_generation,
-            reply,
-        }) => Some(AdoptedSeek {
-            position_ms,
-            playback_generation,
-            seek_generation,
-            reply,
-        }),
-        Ok(command) => {
-            *deferred = Some(command);
-            None
+    let deadline = Instant::now() + grace;
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        match receiver.recv_timeout(remaining) {
+            Ok(AudioCmd::Seek {
+                position_ms,
+                playback_generation,
+                seek_generation,
+                reply,
+            }) => {
+                return Some(AdoptedSeek {
+                    position_ms,
+                    playback_generation,
+                    seek_generation,
+                    reply,
+                })
+            }
+            Ok(command) => deferred.push_back(command),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                return None
+            }
         }
-        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => None,
     }
 }
 
@@ -2653,6 +2658,7 @@ mod tests {
         ensure_preparation_current, take_latest_seek, wait_for_newer_seek, AudioCmd,
         GenerationToken, PlaybackClock, SEEK_SUPERSEDED,
     };
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
@@ -2686,7 +2692,7 @@ mod tests {
                 reply,
             })
             .expect("queue newer seek");
-        let mut deferred = None;
+        let mut deferred = VecDeque::new();
 
         let adopted = wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200))
             .expect("newer seek must be adopted");
@@ -2699,48 +2705,63 @@ mod tests {
             ),
             (210_641, 7, 4),
         );
-        assert!(deferred.is_none());
+        assert!(deferred.is_empty());
     }
 
-    /// 非 Seek 命令不能被接管路径吞掉：塞回 deferred 并放弃等待，
-    /// 交由主循环按序处理（回滚兜底负责恢复会话）
+    /// 非 Seek 命令不能打断接管等待：保序暂存后继续等——ticker 的
+    /// QueryEmpty 会夹在两次拖动之间，第一条非 Seek 就放弃的话
+    /// 接管几乎必然失败（实机日志：每次接管前多跑一次回滚 prepare）
     #[test]
-    fn wait_for_newer_seek_defers_non_seek_command() {
+    fn wait_for_newer_seek_defers_noise_and_still_adopts() {
         let (sender, receiver) = mpsc::channel();
+        let (reply, _result) = mpsc::channel();
         sender
             .send(AudioCmd::InvalidateProcessedBuffer)
             .expect("queue non-seek command");
-        let mut deferred = None;
+        sender
+            .send(AudioCmd::Seek {
+                position_ms: 4_606_826,
+                playback_generation: 7,
+                seek_generation: 9,
+                reply,
+            })
+            .expect("queue newer seek behind noise");
+        let mut deferred = VecDeque::new();
 
-        let adopted =
-            wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200));
+        let adopted = wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200))
+            .expect("seek behind noise must still be adopted");
 
-        assert!(adopted.is_none());
+        assert_eq!(adopted.position_ms, 4_606_826);
+        assert_eq!(deferred.len(), 1);
         assert!(matches!(
-            deferred,
+            deferred.front(),
             Some(AudioCmd::InvalidateProcessedBuffer)
         ));
     }
 
     /// 宽限超时（极端调度竞态下新 Seek 未入队）：返回 None，
-    /// 调用方走回滚重建，迟到的 Seek 会在恢复出的会话上正常执行
+    /// 调用方走回滚重建，迟到的 Seek 会在恢复出的会话上正常执行；
+    /// 期间收到的非 Seek 命令仍保序暂存不丢
     #[test]
     fn wait_for_newer_seek_times_out_on_empty_queue() {
-        let (_sender, receiver) = mpsc::channel::<AudioCmd>();
-        let mut deferred = None;
+        let (sender, receiver) = mpsc::channel::<AudioCmd>();
+        sender
+            .send(AudioCmd::InvalidateProcessedBuffer)
+            .expect("queue non-seek command");
+        let mut deferred = VecDeque::new();
 
         let started = std::time::Instant::now();
         let adopted =
             wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(30));
 
         assert!(adopted.is_none());
-        assert!(deferred.is_none());
+        assert_eq!(deferred.len(), 1);
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
-    /// deferred 已被占用时不得阻塞等待，也不得覆盖已暂存的命令
+    /// 已有暂存命令时继续等待新 Seek：暂存命令保序不丢、不被覆盖
     #[test]
-    fn wait_for_newer_seek_yields_to_existing_deferred_command() {
+    fn wait_for_newer_seek_preserves_existing_deferred_commands() {
         let (sender, receiver) = mpsc::channel();
         let (reply, _result) = mpsc::channel();
         sender
@@ -2751,13 +2772,14 @@ mod tests {
                 reply,
             })
             .expect("queue seek behind deferred");
-        let mut deferred = Some(AudioCmd::Pause);
+        let mut deferred = VecDeque::from([AudioCmd::Pause]);
 
-        let adopted =
-            wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200));
+        let adopted = wait_for_newer_seek(&receiver, &mut deferred, Duration::from_millis(200))
+            .expect("existing deferred must not block adoption");
 
-        assert!(adopted.is_none());
-        assert!(matches!(deferred, Some(AudioCmd::Pause)));
+        assert_eq!(adopted.position_ms, 1_000);
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(deferred.front(), Some(AudioCmd::Pause)));
     }
 
     #[test]
@@ -2795,7 +2817,7 @@ mod tests {
         let mut seek_generation = 0;
         let (initial_reply, initial_result) = mpsc::channel();
         let mut reply = initial_reply;
-        let mut deferred = None;
+        let mut deferred = VecDeque::new();
 
         take_latest_seek(
             &mut latest,
@@ -2823,7 +2845,7 @@ mod tests {
         );
         reply.send(Ok(())).expect("latest reply");
         assert_eq!(third_result.recv().expect("third result"), Ok(()));
-        assert!(deferred.is_none());
+        assert!(deferred.is_empty());
     }
 
     #[test]
