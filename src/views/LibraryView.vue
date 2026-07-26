@@ -279,8 +279,9 @@ const ALL_PROTECTED = [...LIKED_NAMES, ...LOCAL_NAMES]
 
 // 每个 tab 的搜索（对齐 Android 各库页顶部的搜索栏）
 //
-// 按 tab 分别保存关键词，切回来时不会丢；本地页的歌手分类有自己的
-// 搜索框（要同时匹配歌手与其名下曲目），这里不重复接管。
+// 按 tab 分别保存关键词，切回来时不会丢；本地页的歌手分类复用同一个
+// 搜索框实例（位置、尺寸不变，避免布局跳动），但绑定到歌手专用的
+// 关键词（要同时匹配歌手与其名下曲目）
 const tabQueries = ref<Record<number, string>>({})
 const tabQuery = computed({
   get: () => tabQueries.value[activeTab.value] ?? '',
@@ -293,10 +294,19 @@ function matchesQuery(query: string, ...fields: (string | number | undefined | n
   return fields.some((field) => String(field ?? '').toLowerCase().includes(trimmed))
 }
 
-const showTabSearch = computed(() => {
-  if (activeTab.value === 0) return localCategory.value === 'playlists'
-  return activeTab.value !== 2
+// 仅下载页无搜索；其余 tab（含本地的两个分类）搜索栏位置固定不动
+const showTabSearch = computed(() => activeTab.value !== 2)
+const isLocalArtistSearch = computed(() => activeTab.value === 0 && localCategory.value === 'artists')
+const tabSearchModel = computed({
+  get: () => (isLocalArtistSearch.value ? localArtistQuery.value : tabQuery.value),
+  set: (value: string) => {
+    if (isLocalArtistSearch.value) localArtistQuery.value = value
+    else tabQuery.value = value
+  },
 })
+const tabSearchHint = computed(() =>
+  isLocalArtistSearch.value ? t('library.local_artist_search_hint') : t('library.tab_search_hint'),
+)
 
 const filteredPlaylists = computed(() =>
   playlists.value.filter((pl) => matchesQuery(tabQuery.value, displayName(pl))),
@@ -873,28 +883,40 @@ onUnmounted(() => {
       </button>
     </div>
 
-    <!-- 各 tab 的搜索栏 -->
-    <div v-if="showTabSearch" class="tab-search">
-      <span class="material-symbols-rounded" style="font-size: 18px">search</span>
-      <input
-        v-model="tabQuery"
-        type="search"
-        :placeholder="t('library.tab_search_hint')"
-        :aria-label="t('library.tab_search_hint')"
-      />
-      <button
-        v-if="tabQuery"
-        class="tab-search-clear"
-        :aria-label="t('common.clear')"
-        @click="tabQuery = ''"
-      >
-        <span class="material-symbols-rounded" style="font-size: 18px">close</span>
-      </button>
-    </div>
+    <!-- 各 tab 共用的搜索栏：单一实例固定在分类 chips 上方，切换视图只换
+         placeholder 与绑定的关键词，位置尺寸不变；隐藏时用折叠过渡收起 -->
+    <Transition name="lib-collapse">
+      <div v-if="showTabSearch" class="collapse-row">
+        <div class="collapse-clip">
+          <div class="tab-search">
+            <span class="material-symbols-rounded" style="font-size: 18px">search</span>
+            <input
+              v-model="tabSearchModel"
+              type="search"
+              :placeholder="tabSearchHint"
+              :aria-label="tabSearchHint"
+            />
+            <button
+              v-if="tabSearchModel"
+              class="tab-search-clear"
+              :aria-label="t('common.clear')"
+              @click="tabSearchModel = ''"
+            >
+              <span class="material-symbols-rounded" style="font-size: 18px">close</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- tab 内容整体用统一的 fade 过渡（复用 global.scss 的 fade 类），
+         避免 v-if 直切导致整页闪变 -->
+    <Transition name="fade" mode="out-in">
 
     <!-- Tab: 本地 -->
-    <div v-if="activeTab === 0" class="playlist-list">
-      <!-- 歌单 / 歌手分类（对齐 Android 本地页分类切换） -->
+    <div v-if="activeTab === 0" key="tab-local" class="playlist-list">
+      <!-- 歌单 / 歌手分类（对齐 Android 本地页分类切换）；
+           排序按钮常驻在同一行右侧，只在歌手视图内以缩放过渡出现 -->
       <div class="local-category-bar">
         <button
           v-for="category in (['playlists', 'artists'] as const)"
@@ -908,50 +930,55 @@ onUnmounted(() => {
           </span>
           <span>{{ category === 'playlists' ? t('library.local_category_playlists') : t('library.local_category_artists') }}</span>
         </button>
-      </div>
-
-      <!-- 歌手视图 -->
-      <template v-if="localCategory === 'artists'">
-        <div class="artist-toolbar">
-          <div class="artist-search">
-            <span class="material-symbols-rounded" style="font-size: 18px">search</span>
-            <input
-              v-model="localArtistQuery"
-              type="search"
-              :placeholder="t('library.local_artist_search_hint')"
-              :aria-label="t('library.local_artist_search_hint')"
-            />
-          </div>
+        <Transition name="lib-zoom">
           <button
+            v-if="localCategory === 'artists'"
             class="artist-sort-btn"
+            :class="{ active: showLocalArtistSort }"
             :title="t('library.local_artist_sort')"
             :aria-label="t('library.local_artist_sort')"
             @click="showLocalArtistSort = !showLocalArtistSort"
           >
             <span class="material-symbols-rounded" style="font-size: 20px">sort</span>
           </button>
-        </div>
-        <div v-if="showLocalArtistSort" class="artist-sort-options">
-          <button
-            v-for="mode in localArtistSortModes"
-            :key="mode"
-            class="artist-sort-option"
-            :class="{ active: localArtistSort === mode }"
-            @click="localArtistSort = mode; showLocalArtistSort = false"
-          >
-            {{ t(`library.local_artist_sort_${mode}`) }}
-          </button>
-        </div>
+        </Transition>
+      </div>
 
-        <div v-if="localArtistsLoading" class="empty-tab">
+      <!-- 歌单 / 歌手两个子视图之间交叉淡入，消除整块重建的闪变 -->
+      <Transition name="fade" mode="out-in">
+      <!-- 歌手视图 -->
+      <div v-if="localCategory === 'artists'" key="local-artists" class="local-subview">
+        <!-- 排序 chips 行：展开 / 收起走折叠过渡，按钮本身保持常驻 -->
+        <Transition name="lib-collapse">
+          <div v-if="showLocalArtistSort" class="collapse-row">
+            <div class="collapse-clip">
+              <div class="artist-sort-options">
+                <button
+                  v-for="mode in localArtistSortModes"
+                  :key="mode"
+                  class="artist-sort-option"
+                  :class="{ active: localArtistSort === mode }"
+                  @click="localArtistSort = mode; showLocalArtistSort = false"
+                >
+                  {{ t(`library.local_artist_sort_${mode}`) }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </Transition>
+
+        <!-- 加载 / 空态 / 网格三态与排序重排统一走容器级交叉淡入；
+             歌手数可达数百，TransitionGroup 的 FLIP move 会卡，故用整容器淡入 -->
+        <Transition name="lib-fade" mode="out-in">
+        <div v-if="localArtistsLoading" key="loading" class="empty-tab">
           <span class="material-symbols-rounded spinning" style="font-size: 32px">progress_activity</span>
         </div>
-        <div v-else-if="localArtists.length === 0" class="empty-tab">
+        <div v-else-if="localArtists.length === 0" key="empty" class="empty-tab">
           <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">account_circle</span></div>
           <p class="empty-title">{{ t('library.local_artist_empty') }}</p>
           <p class="empty-desc">{{ t('library.local_artist_hint') }}</p>
         </div>
-        <div v-else class="artist-grid">
+        <div v-else :key="`grid-${localArtistSort}`" class="artist-grid">
           <div
             v-for="artist in localArtists"
             :key="artist.key"
@@ -978,9 +1005,11 @@ onUnmounted(() => {
             <div class="artist-count">{{ t('player.track_count', { count: artist.tracks.length }) }}</div>
           </div>
         </div>
-      </template>
+        </Transition>
+      </div>
 
-      <template v-else>
+      <!-- 歌单视图 -->
+      <div v-else key="local-playlists" class="local-subview">
       <div class="new-playlist-row" :class="{ disabled: library.isScanning }" @click="selectAndScanLocalMusic">
         <span class="material-symbols-rounded" :class="{ spinning: library.isScanning }" style="font-size: 20px">
           {{ library.isScanning ? 'progress_activity' : 'folder_open' }}
@@ -998,7 +1027,9 @@ onUnmounted(() => {
       <div class="list-divider" />
       <p v-if="library.scanError" class="scan-error">{{ t('library.scan_failed') }}</p>
 
-      <!-- 歌单列表 -->
+      <!-- 歌单列表：进入 / 移除 / 拖拽重排都走 TransitionGroup，
+           行数有限（几十条），FLIP move 开销可控 -->
+      <TransitionGroup tag="div" name="lib-list" class="lib-list">
       <div
         v-for="(pl, index) in filteredPlaylists"
         :key="pl.id"
@@ -1051,8 +1082,10 @@ onUnmounted(() => {
           <span class="material-symbols-rounded" style="font-size: 20px">more_vert</span>
         </button>
       </div>
+      </TransitionGroup>
 
       <!-- 多选模式底部操作栏 -->
+      <Transition name="lib-fade">
       <div v-if="isMultiSelectMode" class="multi-select-bar">
         <span class="select-count">{{ t('common.selected_count', { count: selectedPlaylists.size }) }}</span>
         <button class="multi-select-action danger" :disabled="selectedPlaylists.size === 0" @click="requestDeleteSelected">
@@ -1060,18 +1093,20 @@ onUnmounted(() => {
           <span>{{ t('common.delete_selected') }}</span>
         </button>
       </div>
+      </Transition>
 
       <div v-if="playlists.length === 0" class="empty-tab">
         <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">library_music</span></div>
         <p class="empty-title">{{ t('library.playlist_empty_title') }}</p>
         <p class="empty-desc">{{ t('library.playlist_empty_desc') }}</p>
       </div>
-      </template>
+      </div>
+      </Transition>
     </div>
 
     <!-- Tab: 收藏（同步的收藏歌单） -->
-    <div v-else-if="activeTab === 1" class="playlist-list">
-      <template v-if="favoritePlaylists.length > 0">
+    <div v-else-if="activeTab === 1" key="tab-favorites" class="playlist-list">
+      <TransitionGroup v-if="favoritePlaylists.length > 0" tag="div" name="lib-list" class="lib-list">
         <div
           v-for="fpl in filteredFavoritePlaylists"
           :key="'fav-' + fpl.id"
@@ -1098,7 +1133,7 @@ onUnmounted(() => {
           </div>
           <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
         </div>
-      </template>
+      </TransitionGroup>
       <div v-else class="empty-tab">
         <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">bookmark</span></div>
         <p class="empty-title">{{ t('explore.no_playlists') }}</p>
@@ -1107,12 +1142,13 @@ onUnmounted(() => {
     </div>
 
     <!-- Tab: 下载 -->
-    <div v-else-if="activeTab === 2" class="playlist-list">
+    <div v-else-if="activeTab === 2" key="tab-downloads" class="playlist-list">
       <template v-if="downloadStore.activeDownloads.length > 0">
         <div class="subsection-label">
           <span class="material-symbols-rounded" style="font-size: 18px">downloading</span>
           <span>{{ t('download.active_tasks', { count: downloadStore.activeDownloads.length }) }}</span>
         </div>
+        <TransitionGroup tag="div" name="lib-list" class="lib-list">
         <div
           v-for="task in downloadStore.activeDownloads"
           :key="'active-' + task.trackId"
@@ -1148,6 +1184,7 @@ onUnmounted(() => {
             <span class="material-symbols-rounded" style="font-size: 20px">close</span>
           </button>
         </div>
+        </TransitionGroup>
         <div v-if="downloadStore.downloads.length > 0" class="subsection-label" style="margin-top: 10px;">
           <span class="material-symbols-rounded" style="font-size: 18px">download_done</span>
           <span>{{ t('download.downloaded_items') }}</span>
@@ -1155,6 +1192,7 @@ onUnmounted(() => {
       </template>
 
       <template v-if="downloadStore.downloads.length > 0">
+        <TransitionGroup tag="div" name="lib-list" class="lib-list">
         <div
           v-for="dl in downloadStore.downloads"
           :key="'dl-' + dl.id"
@@ -1181,6 +1219,7 @@ onUnmounted(() => {
             <span class="material-symbols-rounded" style="font-size: 20px">more_vert</span>
           </button>
         </div>
+        </TransitionGroup>
       </template>
       <div v-else-if="downloadStore.activeDownloads.length === 0" class="empty-tab">
         <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">download</span></div>
@@ -1190,7 +1229,7 @@ onUnmounted(() => {
     </div>
 
     <!-- Tab: 网易云-歌单 -->
-    <div v-else-if="activeTab === 3" class="playlist-list">
+    <div v-else-if="activeTab === 3" key="tab-netease" class="playlist-list">
       <!-- 歌单 / 专辑 分类（对齐 Android 网易云板块内部分类） -->
       <div class="local-category-bar">
         <button
@@ -1207,8 +1246,10 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <template v-if="neteaseCategory === 'albums'">
-        <div v-if="recommend.userAlbums.length > 0">
+      <!-- 歌单 / 专辑分类切换同样走交叉淡入，与本地页保持一致 -->
+      <Transition name="fade" mode="out-in">
+      <div v-if="neteaseCategory === 'albums'" key="ne-albums" class="local-subview">
+        <TransitionGroup v-if="recommend.userAlbums.length > 0" tag="div" name="lib-list" class="lib-list">
           <div
             v-for="album in filteredNeteaseAlbums"
             :key="album.id"
@@ -1232,16 +1273,16 @@ onUnmounted(() => {
             </div>
             <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
           </div>
-        </div>
+        </TransitionGroup>
         <div v-else class="empty-tab">
           <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">album</span></div>
           <p class="empty-title">{{ t('library.empty_title', { type: t('library.albums') }) }}</p>
           <p class="empty-desc">{{ t('library.empty_desc') }}</p>
         </div>
-      </template>
+      </div>
 
-      <template v-else>
-      <template v-if="neteasePlaylists.length > 0">
+      <div v-else key="ne-playlists" class="local-subview">
+      <TransitionGroup v-if="neteasePlaylists.length > 0" tag="div" name="lib-list" class="lib-list">
         <div
           v-for="npl in filteredNeteasePlaylists"
           :key="'ne-' + npl.id"
@@ -1264,17 +1305,18 @@ onUnmounted(() => {
           </div>
           <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
         </div>
-      </template>
+      </TransitionGroup>
       <div v-else class="empty-tab">
         <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">cloud_queue</span></div>
         <p class="empty-title">{{ t('explore.no_playlists') }}</p>
         <p class="empty-desc">{{ t('explore.login_for_playlists') }}</p>
       </div>
-      </template>
+      </div>
+      </Transition>
     </div>
 
     <!-- Tab: Bili 收藏夹 -->
-    <div v-else-if="activeTab === 4" class="playlist-list">
+    <div v-else-if="activeTab === 4" key="tab-bilibili" class="playlist-list">
       <template v-if="biliPlaylists.length > 0">
         <div class="platform-summary bilibili">
           <span class="platform-icon-mask" style="mask-image: url('/icons/ic_bilibili.svg')"></span>
@@ -1283,6 +1325,7 @@ onUnmounted(() => {
             <div class="platform-desc">{{ t('player.video_count', { count: biliPlaylists.reduce((sum, p) => sum + (p.trackCount || 0), 0) }) }}</div>
           </div>
         </div>
+        <TransitionGroup tag="div" name="lib-list" class="lib-list">
         <div
           v-for="bpl in filteredBiliPlaylists"
           :key="'bili-' + bpl.id"
@@ -1301,6 +1344,7 @@ onUnmounted(() => {
           </div>
           <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
         </div>
+        </TransitionGroup>
       </template>
       <div v-else class="empty-tab">
         <div class="empty-circle platform-empty bilibili"><span class="platform-icon-mask" style="mask-image: url('/icons/ic_bilibili.svg')"></span></div>
@@ -1310,7 +1354,7 @@ onUnmounted(() => {
     </div>
 
     <!-- Tab: YouTube Music 歌单 -->
-    <div v-else-if="activeTab === 5" class="playlist-list">
+    <div v-else-if="activeTab === 5" key="tab-youtube" class="playlist-list">
       <template v-if="youtubePlaylists.length > 0">
         <div class="platform-summary youtube">
           <span class="platform-icon-mask" style="mask-image: url('/icons/ic_youtube.svg')"></span>
@@ -1319,6 +1363,7 @@ onUnmounted(() => {
             <div class="platform-desc">{{ t('player.track_count', { count: youtubePlaylists.length }) }}</div>
           </div>
         </div>
+        <TransitionGroup tag="div" name="lib-list" class="lib-list">
         <div
           v-for="ypl in filteredYoutubePlaylists"
           :key="'yt-' + ypl.id"
@@ -1341,6 +1386,7 @@ onUnmounted(() => {
           </div>
           <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
         </div>
+        </TransitionGroup>
       </template>
       <div v-else class="empty-tab">
         <div class="empty-circle platform-empty youtube"><span class="platform-icon-mask" style="mask-image: url('/icons/ic_youtube.svg')"></span></div>
@@ -1348,8 +1394,8 @@ onUnmounted(() => {
         <p class="empty-desc">{{ auth.youtube.loggedIn ? t('explore.no_playlists') : t('explore.login_for_playlists') }}</p>
       </div>
     </div>
+    </Transition>
 
-    <!-- Tab: 网易云-专辑 -->
     <ContextMenu
       :open="dlContextMenu.show"
       :x="dlContextMenu.x"
@@ -1972,50 +2018,26 @@ onUnmounted(() => {
   }
 }
 
-.artist-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.artist-search {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 14px;
-  height: 40px;
-  border-radius: var(--radius-full);
-  background: var(--md-surface-container-high);
-  color: var(--md-on-surface-variant);
-
-  input {
-    flex: 1;
-    min-width: 0;
-    background: transparent;
-    border: none;
-    outline: none;
-    font-size: 13px;
-    color: var(--md-on-surface);
-
-    &::placeholder { color: var(--md-on-surface-variant); opacity: 0.7; }
-    &::-webkit-search-cancel-button { -webkit-appearance: none; }
-  }
-}
-
+// 排序按钮常驻在分类 chips 行右侧，仅在歌手视图内出现
 .artist-sort-btn {
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   flex-shrink: 0;
+  margin-left: auto;
   border-radius: var(--radius-full);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--md-on-surface-variant);
-  transition: background var(--duration-short);
+  transition: background var(--duration-short), color var(--duration-short);
 
   &:hover { background: var(--md-surface-container-high); }
+
+  // 排序 chips 展开时按钮保持高亮，而不是消失
+  &.active {
+    background: var(--md-secondary-container);
+    color: var(--md-on-secondary-container);
+  }
 }
 
 .artist-sort-options {
@@ -2153,5 +2175,92 @@ onUnmounted(() => {
   transition: background var(--duration-short);
 
   &:hover { background: var(--md-surface-container-highest); }
+}
+
+/* ---- 页面统一过渡 ----
+   时长/曲线复用全局动效 token（global.scss）：进入 --ease-decelerate、
+   离开 --ease-accelerate，与全局 fade 过渡的节奏一致 */
+
+// 可折叠行：grid-template-rows 0fr↔1fr 实现内容自适应高度的展开收起
+.collapse-row {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+
+.collapse-clip {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.lib-collapse-enter-active,
+.lib-collapse-leave-active {
+  transition:
+    grid-template-rows 240ms var(--ease-standard),
+    opacity 240ms var(--ease-standard);
+
+  .collapse-clip > * { transition: transform 240ms var(--ease-standard); }
+}
+
+.lib-collapse-enter-from,
+.lib-collapse-leave-to {
+  grid-template-rows: 0fr;
+  opacity: 0;
+
+  .collapse-clip > * { transform: translateY(-6px); }
+}
+
+// 容器级交叉淡入：用于大网格重排与整块内容的状态切换
+.lib-fade-enter-active { transition: opacity 200ms var(--ease-decelerate); }
+.lib-fade-leave-active { transition: opacity 120ms var(--ease-accelerate); }
+.lib-fade-enter-from,
+.lib-fade-leave-to { opacity: 0; }
+
+// 小控件出现 / 消失：淡入 + 缩放（排序按钮）
+.lib-zoom-enter-active {
+  transition:
+    opacity 200ms var(--ease-decelerate),
+    transform 200ms var(--ease-decelerate);
+}
+.lib-zoom-leave-active {
+  transition:
+    opacity 120ms var(--ease-accelerate),
+    transform 120ms var(--ease-accelerate);
+}
+.lib-zoom-enter-from,
+.lib-zoom-leave-to { opacity: 0; transform: scale(0.8); }
+
+// 列表行：进入淡入、移除时脱离文档流让兄弟行平滑补位、重排走 FLIP move
+.lib-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lib-list-enter-active {
+  transition:
+    opacity 200ms var(--ease-decelerate),
+    transform 200ms var(--ease-decelerate);
+}
+.lib-list-leave-active {
+  position: absolute;
+  width: 100%;
+  transition: opacity 120ms var(--ease-accelerate);
+}
+.lib-list-enter-from { opacity: 0; transform: translateY(6px); }
+.lib-list-leave-to { opacity: 0; }
+.lib-list-move { transition: transform var(--duration-medium) var(--ease-standard); }
+
+@media (prefers-reduced-motion: reduce) {
+  .lib-collapse-enter-active,
+  .lib-collapse-leave-active,
+  .lib-collapse-enter-active .collapse-clip > *,
+  .lib-fade-enter-active,
+  .lib-fade-leave-active,
+  .lib-zoom-enter-active,
+  .lib-zoom-leave-active,
+  .lib-list-enter-active,
+  .lib-list-leave-active,
+  .lib-list-move { transition: none; }
 }
 </style>
