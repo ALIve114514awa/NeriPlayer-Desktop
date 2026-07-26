@@ -3,6 +3,7 @@ pub mod audio;
 pub mod auth;
 pub mod commands;
 pub mod error;
+pub mod fsutil;
 pub mod library;
 pub mod listen_together;
 pub mod logging;
