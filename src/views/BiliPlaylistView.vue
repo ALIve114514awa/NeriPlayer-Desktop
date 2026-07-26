@@ -22,6 +22,7 @@ import {
   readPlaylistDetailCache,
   writePlaylistDetailCache,
 } from '@/modules/library/playlistDetailCache'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const route = useRoute()
 const router = useRouter()
@@ -81,11 +82,6 @@ const {
   toggleSelectAllVisible,
   invertSelectionVisible,
 } = useTrackSelection(tracks, filteredTracks)
-
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
-}
 
 // 定位到当前播放
 const viewRef = ref<HTMLElement | null>(null)

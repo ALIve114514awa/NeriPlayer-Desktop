@@ -17,6 +17,7 @@ import {
   type ContextMenuActionItem,
   type ContextMenuItem,
 } from '@/utils/contextMenu'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const router = useRouter()
 const player = usePlayerStore()
@@ -70,11 +71,6 @@ const { fabVisible: locateFabVisible, locate: locateCurrentTrack } = useLocateCu
   currentKey: currentRowKey,
   suppressed: selectionMode,
 })
-
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
-}
 
 function formatRelativeTime(timestamp: number): string {
   const diff = Date.now() - timestamp

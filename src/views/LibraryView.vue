@@ -681,6 +681,11 @@ function openDlContextMenu(e: MouseEvent, track: any) {
   dlContextMenu.value = { show: true, x, y: rect.top, track }
 }
 
+// 行上右键：菜单在光标处弹出（复用 ContextMenu 的边缘翻转与重定位）
+function openDlRowContextMenu(e: MouseEvent, track: any) {
+  dlContextMenu.value = { show: true, x: e.clientX, y: e.clientY, track }
+}
+
 function closeDlContextMenu() {
   dlContextMenu.value.show = false
 }
@@ -1282,7 +1287,7 @@ onUnmounted(() => {
           :key="'dl-' + dl.id"
           class="playlist-item"
           @click="playDownloadedTrack(dl)"
-          @contextmenu.prevent.stop="openDlContextMenu($event, dl)"
+          @contextmenu.prevent.stop="openDlRowContextMenu($event, dl)"
         >
           <div class="pl-icon has-cover" v-if="dl.coverUrl && !isLibraryCoverFailed('download', dl.id, dl.coverUrl)">
             <img

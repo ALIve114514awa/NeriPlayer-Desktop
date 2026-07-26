@@ -73,6 +73,56 @@ function extractColumnText(columns: any[] | undefined | null, index: number, ren
   return extractText(renderer?.text)
 }
 
+/// 在 runs 里从后往前找"3:45"式时长片段
+/// 布局改版后时长常混在副标题 runs（"Artist • Album • 3:45"）里，
+/// 整段拼接后无法通过 looksLikeDuration，需要按 run 粒度扫描
+function extractDurationFromRuns(textNode: any): string {
+  const runs = textNode?.runs
+  if (!Array.isArray(runs)) return ''
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const text = String(runs[i]?.text || '').trim()
+    if (looksLikeDuration(text)) return text
+  }
+  return ''
+}
+
+/// 多路径提取曲目时长文本：fixedColumns 任意列 → flexColumns 整列 → flexColumns runs
+function extractTrackDurationText(renderer: any): string {
+  const fixed = renderer?.fixedColumns
+  if (Array.isArray(fixed)) {
+    for (let i = 0; i < fixed.length; i++) {
+      const text = extractColumnText(fixed, i, 'musicResponsiveListItemFixedColumnRenderer')
+      if (looksLikeDuration(text)) return text
+    }
+  }
+
+  const flex = renderer?.flexColumns
+  if (Array.isArray(flex)) {
+    for (let i = 0; i < flex.length; i++) {
+      const text = extractColumnText(flex, i, 'musicResponsiveListItemFlexColumnRenderer')
+      if (looksLikeDuration(text)) return text
+    }
+    // 跳过第 0 列（标题），避免把形如"3:05"的歌名误判成时长
+    for (let i = 1; i < flex.length; i++) {
+      const text = extractDurationFromRuns(
+        flex[i]?.musicResponsiveListItemFlexColumnRenderer?.text,
+      )
+      if (text) return text
+    }
+  }
+
+  // 普通 YouTube 视频布局兜底（playlistVideoRenderer 等）：
+  // 时长不在列里，而在 lengthText / lengthSeconds 字段
+  const lengthText = extractText(renderer?.lengthText)
+  if (looksLikeDuration(lengthText)) return lengthText
+  const lengthSeconds = Number(renderer?.lengthSeconds)
+  if (Number.isFinite(lengthSeconds) && lengthSeconds > 0) {
+    const total = Math.floor(lengthSeconds)
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
+  }
+  return ''
+}
+
 function firstNonBlank(...values: Array<string | null | undefined>): string {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim()
@@ -397,23 +447,8 @@ function parseListItemTrack(renderer: any): TrackInfo | null {
   ) || extractText(renderer?.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text)
   if (!videoId || !title.trim()) return null
 
-  let durationText = extractColumnText(
-    renderer?.fixedColumns,
-    0,
-    'musicResponsiveListItemFixedColumnRenderer',
-  )
-  if (!looksLikeDuration(durationText)) {
-    const flex = renderer?.flexColumns
-    if (Array.isArray(flex)) {
-      for (let i = 0; i < flex.length; i++) {
-        const text = extractColumnText(flex, i, 'musicResponsiveListItemFlexColumnRenderer')
-        if (looksLikeDuration(text)) {
-          durationText = text
-          break
-        }
-      }
-    }
-  }
+  const durationMs = parseDurationTextToMs(extractTrackDurationText(renderer))
+  const coverUrl = extractMusicThumbnailUrl(renderer?.thumbnail)
 
   const artist = extractColumnText(
     renderer?.flexColumns,
@@ -431,8 +466,8 @@ function parseListItemTrack(renderer: any): TrackInfo | null {
     title: title.trim(),
     artist: artist || '',
     album: album || '',
-    durationMs: parseDurationTextToMs(durationText),
-    coverUrl: extractMusicThumbnailUrl(renderer?.thumbnail),
+    durationMs,
+    coverUrl,
     audioUrl: '',
     source: 'youtube',
     syncPayload: {
@@ -440,8 +475,8 @@ function parseListItemTrack(renderer: any): TrackInfo | null {
       name: title.trim(),
       artist: artist || '',
       album: album || '',
-      durationMs: parseDurationTextToMs(durationText),
-      coverUrl: extractMusicThumbnailUrl(renderer?.thumbnail),
+      durationMs,
+      coverUrl,
       mediaUri: `ytmusic://video/${videoId}`,
       channelId: 'youtube_music',
       audioId: videoId,

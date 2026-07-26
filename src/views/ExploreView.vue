@@ -10,6 +10,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useRecommendStore, type PlaylistInfo } from '@/stores/recommend'
 import { invoke } from '@tauri-apps/api/core'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const router = useRouter()
 const route = useRoute()
@@ -186,11 +187,6 @@ watch(activeTab, (tab) => {
 })
 
 // 工具函数
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
-}
-
 function playResult(r: any) {
   player.play({
     id: r.id,

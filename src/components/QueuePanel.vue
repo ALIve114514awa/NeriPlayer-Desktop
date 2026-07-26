@@ -11,6 +11,7 @@ import {
   type ContextMenuItem,
   type ContextMenuPosition,
 } from '@/utils/contextMenu'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const emit = defineEmits<{ close: [] }>()
 const player = usePlayerStore()
@@ -43,11 +44,6 @@ const queueContextMenuItems = computed<readonly ContextMenuItem[]>(() => {
     }),
   ]
 })
-
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
-}
 
 function playFromQueue(index: number) {
   player.play(player.queue[index])

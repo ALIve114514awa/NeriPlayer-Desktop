@@ -8,3 +8,12 @@ export function formatTimeMs(ms: number): string {
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
 }
+
+/**
+ * 列表行曲目时长格式化
+ * 数据源缺失时长（0 / undefined / NaN）时显示占位 "--:--" 而非误导性的 "0:00"
+ */
+export function formatTrackDuration(ms?: number | null): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '--:--'
+  return formatTimeMs(ms)
+}

@@ -5,9 +5,16 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { normalizeTrack, usePlayerStore, type TrackInfo } from '@/stores/player'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import ContextMenu from '@/components/ui/ContextMenu.vue'
 import LocateTrackFab from '@/components/LocateTrackFab.vue'
 import { useLocateCurrentTrack } from '@/composables/useLocateCurrentTrack'
+import {
+  createContextMenuItem,
+  type ContextMenuActionItem,
+  type ContextMenuItem,
+} from '@/utils/contextMenu'
 import { createLogger } from '@/utils/logger'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const log = createLogger('favorite-playlist-view')
 
@@ -23,11 +30,6 @@ const coverUrl = ref('')
 const tracks = ref<TrackInfo[]>([])
 
 const favoriteId = computed(() => String(route.params.id ?? ''))
-
-function formatDuration(ms: number): string {
-  const seconds = Math.floor(Math.max(0, ms) / 1000)
-  return `${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, '0')}`
-}
 
 function platformLabel(value: string): string {
   const key = value.toLowerCase()
@@ -71,6 +73,41 @@ function shufflePlay() {
 
 function playTrack(index: number) {
   player.playAll(tracks.value, tracks.value[index]?.id)
+}
+
+// 行上右键：光标处弹出（对齐其它列表页）
+const trackMenu = ref<{ show: boolean; x: number; y: number; track: TrackInfo | null }>({
+  show: false,
+  x: 0,
+  y: 0,
+  track: null,
+})
+
+function openTrackContextMenu(e: MouseEvent, track: TrackInfo) {
+  trackMenu.value = { show: true, x: e.clientX, y: e.clientY, track }
+}
+
+function closeTrackMenu() {
+  trackMenu.value.show = false
+}
+
+const trackMenuItems = computed<ContextMenuItem[]>(() => [
+  createContextMenuItem(t('player.play_next'), { id: 'play-next', icon: 'queue_play_next' }),
+  createContextMenuItem(t('player.add_to_queue'), { id: 'add-to-queue', icon: 'add_to_queue' }),
+])
+
+function handleTrackMenuClick(item: ContextMenuActionItem) {
+  const track = trackMenu.value.track
+  if (!track) return
+  switch (item.id) {
+    case 'play-next':
+      player.addToQueueNext(track)
+      break
+    case 'add-to-queue':
+      player.addToQueueEnd(track)
+      break
+  }
+  closeTrackMenu()
 }
 
 // 定位到当前播放
@@ -132,6 +169,7 @@ onMounted(load)
           :class="{ active: player.currentTrack?.id === track.id }"
           :data-track-key="track.id"
           @click="playTrack(index)"
+          @contextmenu.prevent.stop="openTrackContextMenu($event, track)"
         >
           <div class="track-index">
             <div
@@ -159,6 +197,15 @@ onMounted(load)
       :visible="locateFabVisible"
       :label="t('player.locate_current')"
       @click="locateCurrentTrack"
+    />
+
+    <ContextMenu
+      :open="trackMenu.show"
+      :x="trackMenu.x"
+      :y="trackMenu.y"
+      :items="trackMenuItems"
+      @update:open="(value: boolean) => { if (!value) closeTrackMenu() }"
+      @click="handleTrackMenuClick"
     />
   </div>
 </template>

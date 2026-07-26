@@ -25,6 +25,7 @@ import {
   type ContextMenuItem,
 } from '@/utils/contextMenu'
 import { createLogger } from '@/utils/logger'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const log = createLogger('local-playlist-view')
 
@@ -201,11 +202,6 @@ const totalDuration = computed(() => {
   const totalMs = tracks.value.reduce((sum, t) => sum + (t.durationMs || 0), 0)
   return formatTotalDuration(totalMs)
 })
-
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
-}
 
 function formatTotalDuration(ms: number): string {
   const totalMin = Math.floor(ms / 60000)

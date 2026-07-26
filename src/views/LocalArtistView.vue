@@ -10,6 +10,7 @@ import {
 } from '@/modules/library/localArtists'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import { createLogger } from '@/utils/logger'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const log = createLogger('local-artist-view')
 
@@ -25,11 +26,6 @@ const artistName = computed(() => String(route.params.name ?? ''))
 const totalDurationMs = computed(() =>
   tracks.value.reduce((sum, track) => sum + (track.durationMs || 0), 0),
 )
-
-function formatDuration(ms: number): string {
-  const seconds = Math.floor(Math.max(0, ms) / 1000)
-  return `${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, '0')}`
-}
 
 function formatTotal(ms: number): string {
   const minutes = Math.floor(Math.max(0, ms) / 60_000)

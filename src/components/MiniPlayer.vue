@@ -340,13 +340,19 @@ defineExpose({
   transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease, backdrop-filter 320ms ease;
 }
 
-/* 顶部进度条（通栏） */
+/* 顶部进度条（通栏）：静置时降低强调，悬浮/拖拽时恢复全亮 */
 .progress-track {
   height: 5px;
-  background: var(--md-surface-container-highest);
+  background: color-mix(in srgb, var(--md-surface-container-highest) 60%, transparent);
   position: relative;
   cursor: pointer;
   touch-action: none;
+  transition: background 200ms ease;
+
+  &.hovering,
+  &.dragging {
+    background: var(--md-surface-container-highest);
+  }
 
   // 扩大点击区域
   &::before {
@@ -361,14 +367,16 @@ defineExpose({
 
 .progress-fill {
   height: 100%;
-  background: var(--md-primary);
+  /* 静置时降低已播放段亮度，避免通栏主题色过于扎眼 */
+  background: color-mix(in srgb, var(--md-primary) 60%, transparent);
   border-radius: 0 2px 2px 0;
-  transition: none; /* rAF 逐帧更新，不需要 CSS transition */
+  transition: background 200ms ease; /* width 由 rAF 逐帧更新，不参与 transition */
   position: relative;
 
-  // 拖拽时取消 width transition，消除延迟感
+  // 交互时需要清晰：恢复全亮
+  .progress-track.hovering &,
   .progress-track.dragging & {
-    transition: none;
+    background: var(--md-primary);
   }
 
   // thumb 圆点（始终可见）
@@ -381,13 +389,14 @@ defineExpose({
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--md-primary);
+    background: color-mix(in srgb, var(--md-primary) 60%, transparent);
     box-shadow: 0 0 4px rgba(0,0,0,0.15);
-    transition: transform 150ms var(--ease-standard);
+    transition: transform 150ms var(--ease-standard), background 200ms ease;
   }
 
   .progress-track.hovering &::after,
   .progress-track.dragging &::after {
+    background: var(--md-primary);
     transform: translateY(-50%) scale(1.3);
   }
 }

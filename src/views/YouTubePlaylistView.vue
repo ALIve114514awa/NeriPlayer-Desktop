@@ -23,6 +23,7 @@ import {
   writePlaylistDetailCache,
 } from '@/modules/library/playlistDetailCache'
 import { parseYouTubePlaylistTracks, parseYouTubePlaylistMeta } from '@/modules/youtube/youtubePlaylistParse'
+import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
 
 const route = useRoute()
 const router = useRouter()
@@ -83,9 +84,10 @@ const {
   invertSelectionVisible,
 } = useTrackSelection(tracks, filteredTracks)
 
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
+// 正在播放的行优先用 player store 回传的真实时长（列表数据可能缺时长）
+function displayDurationMs(track: TrackInfo): number {
+  if (player.currentTrack?.id === track.id && player.durationMs > 0) return player.durationMs
+  return track.durationMs
 }
 
 // 定位到当前播放
@@ -114,7 +116,8 @@ async function loadDetail() {
   const browseId = route.params.browseId as string
   if (!browseId) return
 
-  const cacheKey = playlistDetailCacheKey('youtube-playlist-v2', browseId)
+  // v3：时长解析修复后必须废弃旧缓存，否则 durationMs=0 的旧详情会一直钉死列表
+  const cacheKey = playlistDetailCacheKey('youtube-playlist-v3', browseId)
   const cached = readPlaylistDetailCache<YouTubeDetailCache>(cacheKey)
   if (cached) {
     applyDetailCache(cached)
@@ -409,7 +412,7 @@ onMounted(() => {
               <div class="track-title">{{ track.title }}</div>
               <div class="track-meta">{{ track.artist }}</div>
             </div>
-            <div class="track-duration">{{ formatDuration(track.durationMs) }}</div>
+            <div class="track-duration">{{ formatDuration(displayDurationMs(track)) }}</div>
             <button v-if="!selectionMode" class="track-more" @click.stop="openTrackMenu($event, track)">
               <span class="material-symbols-rounded">more_vert</span>
             </button>

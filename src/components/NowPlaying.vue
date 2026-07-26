@@ -1757,9 +1757,11 @@ const dynamicColorVars = computed(() => {
 })
 
 // 进度条活跃色（与 --np-primary 同步）
+// 主色直出在深色播放页上过亮刺眼：混入黑色压一档亮度，保持色相不变
 const sliderActiveColor = computed(() => {
   const vars = dynamicColorVars.value
-  return (vars as any)['--np-primary'] || '#fff'
+  const primary = (vars as any)['--np-primary'] || '#fff'
+  return `color-mix(in srgb, ${primary} 72%, black)`
 })
 </script>
 
