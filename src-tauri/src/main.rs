@@ -322,6 +322,7 @@ fn main() {
             debug_cmd::list_crash_reports,
             debug_cmd::read_crash_report,
             debug_cmd::clear_crash_reports,
+            debug_cmd::debug_trigger_crash,
             storage_cmd::get_storage_usage,
             storage_cmd::clear_storage_cache,
             auth_cmd::login_netease,

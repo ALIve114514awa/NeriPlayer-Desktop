@@ -138,6 +138,36 @@ pub fn clear_crash_reports() -> AppResult<usize> {
     Ok(removed)
 }
 
+/// 测试异常触发（对齐 Android 调试页的「测试异常」）
+///
+/// 用来端到端验证崩溃收集：panic 落盘的报告应出现在崩溃列表里。
+/// 只在调试页可达，且 panic 发生在独立线程/命令线程，不拉垮整个应用。
+#[tauri::command]
+pub fn debug_trigger_crash(kind: String) -> AppResult<String> {
+    match kind.as_str() {
+        "handled" => {
+            log::error!(
+                target: "debug-test",
+                "handled test error: 这是调试页触发的受控错误，用于验证日志链路",
+            );
+            Ok("handled error logged".into())
+        }
+        "panic_command" => {
+            // 命令跑在 tokio 阻塞线程上：panic 被钩子捕获落盘，
+            // 前端收到的是 IPC 错误，应用继续存活
+            panic!("debug test panic (command thread)");
+        }
+        "panic_thread" => {
+            std::thread::Builder::new()
+                .name("debug-test-panic".into())
+                .spawn(|| panic!("debug test panic (worker thread)"))
+                .map_err(|error| AppError::Other(format!("spawn failed: {error}")))?;
+            Ok("panic thread spawned".into())
+        }
+        other => Err(AppError::Other(format!("unknown crash kind: {other}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

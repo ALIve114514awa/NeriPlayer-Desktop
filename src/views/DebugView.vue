@@ -9,6 +9,7 @@ import { useSyncStore } from '@/stores/sync'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
+import { useListenTogetherStore } from '@/stores/listenTogether'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('debug-view')
@@ -111,6 +112,7 @@ function goBack() {
 
 function hideDebugMode() {
   settingsStore.devModeEnabled = false
+  toast.success(t('settings.debug_hidden_toast'))
   router.push('/settings')
 }
 
@@ -243,6 +245,105 @@ async function openLogDir() {
     log.error('open log dir failed:', e)
   }
 }
+
+// ===== API 探针详情（对齐 Android 各平台探针页：调真实接口、看/复制返回）=====
+interface ProbeAction { id: string; label: string; run: () => Promise<unknown> }
+interface ProbeResult { status: 'idle' | 'running' | 'success' | 'failed'; elapsedMs: number; body: string }
+const probeResults = ref<Record<string, ProbeResult>>({})
+const expandedProbePlatform = ref('')
+
+// 采样参数与 Android 探针一致：网易 33894312（歌词样例曲）、B站 BV1GJ411x7h7
+const probeGroups: Array<{ platform: string; label: string; actions: ProbeAction[] }> = [
+  {
+    platform: 'netease', label: '网易云',
+    actions: [
+      { id: 'account', label: '账号信息', run: () => invoke('get_user_account', { platform: 'netease' }) },
+      { id: 'playlists', label: '用户歌单', run: () => invoke('get_user_playlists', { platform: 'netease' }) },
+      { id: 'detail', label: '歌曲详情 33894312', run: () => invoke('get_netease_song_detail', { songId: 33894312 }) },
+      { id: 'url', label: '播放地址 33894312', run: () => invoke('get_netease_song_url', { songId: 33894312, quality: 'exhigh' }) },
+      { id: 'search', label: '搜索「鹿乃」', run: () => invoke('search', { query: '鹿乃', platform: 'netease' }) },
+    ],
+  },
+  {
+    platform: 'bilibili', label: '哔哩哔哩',
+    actions: [
+      { id: 'account', label: '账号信息', run: () => invoke('get_user_account', { platform: 'bilibili' }) },
+      { id: 'favs', label: '收藏夹列表', run: () => invoke('get_user_playlists', { platform: 'bilibili' }) },
+      { id: 'audio', label: '音频流 BV1GJ411x7h7', run: () => invoke('get_bili_audio_url', { bvid: 'BV1GJ411x7h7', avid: null, cid: null }) },
+      { id: 'search', label: '搜索「鹿乃」', run: () => invoke('search', { query: '鹿乃', platform: 'bilibili' }) },
+    ],
+  },
+  {
+    platform: 'youtube', label: 'YouTube',
+    actions: [
+      { id: 'account', label: '账号信息', run: () => invoke('get_user_account', { platform: 'youtube' }) },
+      { id: 'library', label: '云端歌单', run: () => invoke('get_user_playlists', { platform: 'youtube' }) },
+      { id: 'player', label: '播放解析 dQw4w9WgXcQ', run: () => invoke('get_youtube_audio_url', { videoId: 'dQw4w9WgXcQ' }) },
+      { id: 'search', label: '搜索「kano」', run: () => invoke('search', { query: 'kano', platform: 'youtube' }) },
+    ],
+  },
+]
+
+function probeKey(platform: string, id: string): string { return `${platform}:${id}` }
+function probeState(platform: string, id: string): ProbeResult {
+  return probeResults.value[probeKey(platform, id)] ?? { status: 'idle', elapsedMs: 0, body: '' }
+}
+
+async function runProbe(platform: string, action: ProbeAction) {
+  const key = probeKey(platform, action.id)
+  probeResults.value = { ...probeResults.value, [key]: { status: 'running', elapsedMs: 0, body: '' } }
+  const started = performance.now()
+  try {
+    const result = await action.run()
+    probeResults.value = {
+      ...probeResults.value,
+      [key]: {
+        status: 'success',
+        elapsedMs: Math.round(performance.now() - started),
+        body: JSON.stringify(result, null, 2) ?? 'null',
+      },
+    }
+  } catch (e) {
+    probeResults.value = {
+      ...probeResults.value,
+      [key]: { status: 'failed', elapsedMs: Math.round(performance.now() - started), body: String(e) },
+    }
+  }
+}
+
+async function copyProbeResult(platform: string, id: string) {
+  const body = probeState(platform, id).body
+  if (!body) return
+  try {
+    const { writeText } = await import('@tauri-apps/plugin-clipboard-manager')
+    await writeText(body)
+    toast.success(t('settings.debug_logs_copied'))
+  } catch (e) {
+    log.error('copy probe result failed:', e)
+  }
+}
+
+// ===== 测试异常（对齐 Android「测试异常」）=====
+async function triggerCrash(kind: string) {
+  if (kind === 'frontend') {
+    // 出了当前调用栈再抛，确保走 window.onerror 而不是被 Vue 捕获
+    setTimeout(() => {
+      throw new Error('debug test: frontend uncaught exception')
+    }, 0)
+    return
+  }
+  try {
+    await invoke('debug_trigger_crash', { kind })
+  } catch (e) {
+    // panic_command 预期走到这里：IPC 报错但应用存活
+    log.warn('crash trigger returned error (expected for panic_command):', e)
+  }
+  // 给 panic 钩子落盘留点时间再刷新列表
+  window.setTimeout(() => void refreshCrashes(), 600)
+}
+
+// ===== 一起听调试 =====
+const ltStore = useListenTogetherStore()
 
 // ===== 崩溃报告 =====
 interface CrashReportInfo { file_name: string; size_bytes: number; modified_ms: number }
@@ -449,6 +550,138 @@ async function clearCrashes() {
             <span class="state-value">{{ formatSyncTime(syncStore.webdav.lastSyncTime) }}</span>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- API 探针详情 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">api</span>
+      <span>{{ t('settings.debug_probe_detail') }}</span>
+    </div>
+    <div class="setting-card">
+      <div class="setting-desc" style="margin-bottom: 8px">{{ t('settings.debug_probe_detail_desc') }}</div>
+      <div v-for="group in probeGroups" :key="group.platform" class="probe-group">
+        <button
+          class="probe-group-header"
+          @click="expandedProbePlatform = expandedProbePlatform === group.platform ? '' : group.platform"
+        >
+          <span class="material-symbols-rounded" style="font-size: 18px">
+            {{ expandedProbePlatform === group.platform ? 'expand_less' : 'expand_more' }}
+          </span>
+          <span>{{ group.label }}</span>
+        </button>
+        <Transition name="probe-expand">
+          <div v-if="expandedProbePlatform === group.platform" class="probe-actions">
+            <div v-for="action in group.actions" :key="action.id" class="probe-action">
+              <div class="probe-action-row">
+                <span class="probe-action-label">{{ action.label }}</span>
+                <span
+                  v-if="probeState(group.platform, action.id).status !== 'idle'"
+                  class="probe-action-status"
+                  :class="probeState(group.platform, action.id).status"
+                >
+                  {{ probeState(group.platform, action.id).status === 'running'
+                    ? t('settings.debug_probe_running')
+                    : `${probeState(group.platform, action.id).elapsedMs}ms` }}
+                </span>
+                <button
+                  class="debug-log-btn"
+                  :disabled="probeState(group.platform, action.id).status === 'running'"
+                  @click="runProbe(group.platform, action)"
+                >
+                  <span class="material-symbols-rounded">play_arrow</span>
+                  {{ t('settings.debug_probe_run') }}
+                </button>
+                <button
+                  v-if="probeState(group.platform, action.id).body"
+                  class="debug-log-btn"
+                  @click="copyProbeResult(group.platform, action.id)"
+                >
+                  <span class="material-symbols-rounded">content_copy</span>
+                  {{ t('settings.debug_probe_copy_result') }}
+                </button>
+              </div>
+              <pre
+                v-if="probeState(group.platform, action.id).body"
+                class="probe-result"
+                :class="{ failed: probeState(group.platform, action.id).status === 'failed' }"
+              >{{ probeState(group.platform, action.id).body.slice(0, 4000) }}</pre>
+            </div>
+          </div>
+        </Transition>
+      </div>
+    </div>
+
+    <!-- 一起听调试 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">group</span>
+      <span>{{ t('settings.debug_lt_panel') }}</span>
+    </div>
+    <div class="setting-card">
+      <div class="state-grid">
+        <div class="state-item">
+          <span class="state-label">{{ t('settings.debug_lt_connection') }}</span>
+          <span class="state-value" :style="{ color: ltStore.isConnected ? 'var(--md-primary)' : 'var(--md-on-surface-variant)' }">
+            {{ ltStore.connectionState }}
+          </span>
+        </div>
+        <div class="state-item">
+          <span class="state-label">{{ t('settings.debug_lt_room') }}</span>
+          <span class="state-value mono">{{ ltStore.roomId || '—' }}</span>
+        </div>
+        <div class="state-item">
+          <span class="state-label">{{ t('settings.debug_lt_role') }}</span>
+          <span class="state-value">{{ ltStore.role || '—' }}</span>
+        </div>
+        <div class="state-item">
+          <span class="state-label">{{ t('settings.debug_lt_version') }}</span>
+          <span class="state-value mono">{{ ltStore.roomState?.version ?? '—' }}</span>
+        </div>
+        <div class="state-item">
+          <span class="state-label">{{ t('settings.debug_lt_members') }}</span>
+          <span class="state-value">{{ ltStore.members.length }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 测试异常 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">warning</span>
+      <span>{{ t('settings.debug_test_exception') }}</span>
+    </div>
+    <div class="setting-card">
+      <div class="setting-desc" style="margin-bottom: 10px">{{ t('settings.debug_test_exception_desc') }}</div>
+      <div class="crash-test-grid">
+        <button class="crash-test-btn" @click="triggerCrash('handled')">
+          <span class="crash-test-title">{{ t('settings.debug_test_handled') }}</span>
+          <span class="crash-test-desc">{{ t('settings.debug_test_handled_desc') }}</span>
+        </button>
+        <button class="crash-test-btn" @click="triggerCrash('frontend')">
+          <span class="crash-test-title">{{ t('settings.debug_test_frontend') }}</span>
+          <span class="crash-test-desc">{{ t('settings.debug_test_frontend_desc') }}</span>
+        </button>
+        <button class="crash-test-btn danger" @click="triggerCrash('panic_command')">
+          <span class="crash-test-title">{{ t('settings.debug_test_panic_command') }}</span>
+          <span class="crash-test-desc">{{ t('settings.debug_test_panic_command_desc') }}</span>
+        </button>
+        <button class="crash-test-btn danger" @click="triggerCrash('panic_thread')">
+          <span class="crash-test-title">{{ t('settings.debug_test_panic_thread') }}</span>
+          <span class="crash-test-desc">{{ t('settings.debug_test_panic_thread_desc') }}</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 始终记录日志（对齐 Android settings_always_record_logs）-->
+    <div class="setting-card">
+      <div class="setting-info" style="display: flex; align-items: center; gap: 12px">
+        <div style="flex: 1; min-width: 0">
+          <div class="setting-title">{{ t('settings.debug_always_log') }}</div>
+          <div class="setting-desc">{{ t('settings.debug_always_log_desc') }}</div>
+        </div>
+        <label class="debug-switch">
+          <input v-model="settingsStore.logToFile" type="checkbox" />
+          <span class="debug-switch-track"><span class="debug-switch-thumb" /></span>
+        </label>
       </div>
     </div>
 
@@ -932,5 +1165,124 @@ async function clearCrashes() {
   word-break: break-all;
   border-top: 1px solid var(--md-outline-variant);
   color: var(--md-on-surface-variant);
+}
+
+.probe-group {
+  border-radius: 12px;
+  background: var(--md-surface-container);
+  margin-bottom: 6px;
+  overflow: hidden;
+}
+
+.probe-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--md-on-surface);
+  transition: background 150ms;
+
+  &:hover { background: var(--md-surface-container-high); }
+}
+
+.probe-actions { padding: 4px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+
+.probe-action-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.probe-action-label { flex: 1; min-width: 0; font-size: 13px; }
+.probe-action-status {
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  color: var(--md-on-surface-variant);
+  &.failed { color: var(--md-error); }
+  &.success { color: var(--md-primary); }
+}
+
+.probe-result {
+  margin: 0;
+  padding: 10px;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--md-surface-container-lowest, var(--md-surface));
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+
+  &.failed { color: var(--md-error); }
+}
+
+.probe-expand-enter-active { transition: opacity 180ms ease-out, transform 200ms cubic-bezier(0.05, 0.7, 0.1, 1); }
+.probe-expand-enter-from { opacity: 0; transform: translateY(-4px); }
+.probe-expand-leave-active { transition: opacity 120ms ease-in; }
+.probe-expand-leave-to { opacity: 0; }
+
+.crash-test-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.crash-test-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--md-surface-container);
+  text-align: left;
+  transition: background 150ms;
+
+  &:hover { background: var(--md-surface-container-high); }
+  &.danger .crash-test-title { color: var(--md-error); }
+}
+
+.crash-test-title { font-size: 13px; font-weight: 600; color: var(--md-on-surface); }
+.crash-test-desc { font-size: 11px; color: var(--md-on-surface-variant); }
+
+.debug-switch {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  cursor: pointer;
+
+  input { position: absolute; opacity: 0; pointer-events: none; }
+}
+
+.debug-switch-track {
+  width: 44px;
+  height: 24px;
+  border-radius: 12px;
+  background: var(--md-surface-container-highest);
+  transition: background 180ms;
+  display: block;
+}
+
+.debug-switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--md-outline);
+  transition: transform 180ms cubic-bezier(0.05, 0.7, 0.1, 1), background 180ms;
+  display: block;
+}
+
+.debug-switch input:checked + .debug-switch-track {
+  background: var(--md-primary);
+  .debug-switch-thumb { transform: translateX(20px); background: var(--md-on-primary); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .probe-expand-enter-active,
+  .probe-expand-leave-active,
+  .debug-switch-thumb { transition: none; }
 }
 </style>
