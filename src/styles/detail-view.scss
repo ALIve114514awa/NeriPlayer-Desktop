@@ -1,10 +1,10 @@
 // 歌单/专辑详情页共享样式
 .detail-view {
-  /* 底部只留选择栏余量；迷你播放器由 .content.has-mini-player 负责 */
-  padding: 16px 28px 72px;
+  /* 迷你播放器间距由 .content.has-mini-player 负责, 这里再叠大额 padding 会在滚到底时露出大片留白 */
+  padding: 16px 28px 24px;
   max-height: 100%;
   overflow-y: auto;
-  scroll-padding-bottom: 72px;
+  scroll-padding-bottom: 24px;
   /* 快滑时避免底层透出白闪 */
   background: var(--md-surface);
   transform: translateZ(0);

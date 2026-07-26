@@ -162,8 +162,8 @@ function expandVisibleTracks(extra = RENDER_CHUNK) {
 function onDetailScroll(e: Event) {
   const el = e.currentTarget as HTMLElement | null
   if (!el || !hasMoreTracks.value) return
-  // 距底部 1200px 内预扩，保持滚动流畅
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 1200) {
+  // 距底部 2400px 内预扩; 阈值太小时快速甩动会先看到底部空白再补渲染
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2400) {
     expandVisibleTracks()
   }
 }

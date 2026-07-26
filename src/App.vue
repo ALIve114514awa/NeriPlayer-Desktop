@@ -543,8 +543,8 @@ onUnmounted(() => {
     padding-bottom 300ms var(--ease-standard),
     opacity 200ms ease;
 
-  /* 预留迷你播放器高度 + 24px 余量，避免最后一行被进度条热区遮挡 */
-  &.has-mini-player { padding-bottom: calc(var(--mini-player-height, 76px) + 24px); }
+  /* 预留迷你播放器高度 + 少量余量避开进度条热区；余量过大会在列表下方露出白带 */
+  &.has-mini-player { padding-bottom: calc(var(--mini-player-height, 76px) + 6px); }
 
   &.content--np-dimmed {
     /* 仅透明度，禁止缩放/位移 */
