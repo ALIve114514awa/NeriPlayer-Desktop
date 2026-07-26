@@ -29,11 +29,6 @@ const REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 const REMOTE_DECODER_BUFFER_BYTES: usize = 128 * 1024;
 /// virtual-body 远程 demuxer 缓冲：需覆盖单段 moof+mdat 回跳
 const REMOTE_VIRTUAL_DECODER_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-/// 拼接 demux 首段 body：必须 < REMOTE_REQUEST_TIMEOUT 能下完，否则 prepare 被取消
-/// 2MB ≈ 几十秒 AAC，足够出声；后续可按需再拼
-const REMOTE_VIRTUAL_SPLICE_BODY_BYTES: u64 = 2 * 1024 * 1024;
-/// 拼接 demux 单次 Range 上限（避免 16MB 一次拉超时）
-const REMOTE_VIRTUAL_SPLICE_FETCH_CHUNK: u64 = 512 * 1024;
 const REMOTE_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // 超长媒体按 bitrate 估算时 low/target 会落到 min；抬高下限保证首帧 moov+音频够解码
 const REMOTE_PREFETCH_LOW_WATER_MS: u64 = 5_000;
@@ -194,6 +189,14 @@ impl RemoteAccessMode {
         } else {
             REMOTE_FETCH_BLOCK_BYTES
         }
+    }
+
+    /// 虚拟 body 生效时的按需块
+    ///
+    /// 虚拟 body 已经把起点对准目标 moof，不需要靠大块去「兜住」整段；
+    /// 继续用 8MB 只会让一次 seek 卡在整块下完之前，与秒 seek 直接冲突。
+    fn seek_fetch_block_bytes(self) -> u64 {
+        REMOTE_FETCH_BLOCK_BYTES
     }
 }
 
@@ -558,13 +561,15 @@ impl RemoteAudioSource {
         if let Some((start, data)) = initial_disk_segment {
             write_disk_range(&inner, start, &data);
         }
-        // 自带 sidx 的分片流一律不建索引：symphonia 的 isomp4 能原生按 sidx 定位
-        // （日志里的 "stream is segmented with a segment index"）。
-        // 建了索引 prefers_virtual_body_seek() 就会为真，转而走虚拟 body 拼接，
-        // 而拼接出的样本偏移对不上，seek 与回滚双双 end of stream。
-        // 注意长内容也必须排除：>= 45 分钟的分片流同样会落到这里。
+        // 分片流必须建索引
+        //
+        // symphonia 0.5.5 的 isomp4 解析完 sidx 就丢掉（demuxer.rs 里只剩一句
+        // "stream is segmented with a segment index" 日志），seek 时只能靠
+        // try_read_more_segments 一个个 moof 往前爬，代价是 O(文件大小)：
+        // 实测 68MB 的 70 分钟音频跳到 37 分钟要顺序读满 30MB。
+        // 所以 sidx 必须由我们自己解析成索引，seek 时直接按字节落点开 demuxer。
         let needs_seek_index =
-            !sniffed_fragmented && matches!(access_mode, RemoteAccessMode::LongFormProgressive);
+            sniffed_fragmented || matches!(access_mode, RemoteAccessMode::LongFormProgressive);
         // 分片 MP4 的 sidx 紧跟 moov 位于首包，先用首包建索引；
         // 建成了就不必再为长内容拉 1MB 尾部，直接省掉起播路径上的一次往返
         let head_index_ready = needs_seek_index
@@ -1017,7 +1022,13 @@ impl RemoteAudioSource {
             }
         }
 
-        let wanted = wanted_len.max(self.access_mode.demand_fetch_block_bytes() as usize) as u64;
+        // 虚拟 body 生效时改用 seek 专用块，避免 8MB 拖垮跳转延迟
+        let block = if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0 {
+            self.access_mode.seek_fetch_block_bytes()
+        } else {
+            self.access_mode.demand_fetch_block_bytes()
+        };
+        let wanted = wanted_len.max(block as usize) as u64;
         let end = physical
             .saturating_add(wanted)
             .saturating_sub(1)
@@ -2034,7 +2045,15 @@ impl SymphoniaAudioDecoder {
         Ok(decoder)
     }
 
-    /// virtual-body：header ∥ 目标 moof/mdat 连续拼接后本地 demux
+    /// virtual-body：header ∥ 目标 moof 的**惰性**拼接视图
+    ///
+    /// 不预先把 body 拉进内存。`RemoteAudioSource` 自己做逻辑↔物理地址翻译
+    /// （`map_logical_to_physical` / `logical_len` / `normalize_seek_offset`），
+    /// demuxer 读到哪就按需拉哪一块。
+    ///
+    /// 之前那版先阻塞拉满 2MB 再交给 `Cursor`，两个后果都致命：
+    /// - 慢：4 次串行 Range 请求，实测 seek 要等 8 秒
+    /// - 错：2MB 处凭空多出一个 EOF，probe 扫 atom 直接撞上 end of stream
     fn new_remote_virtual_spliced(
         source: RemoteAudioSource,
         finish_handle: RemoteAudioSource,
@@ -2044,128 +2063,28 @@ impl SymphoniaAudioDecoder {
         if header_end == 0 || origin == 0 {
             return Err("virtual-body splice requires header_end and body_origin".into());
         }
-        let header = source
-            .header_bytes()
-            .ok_or_else(|| "virtual-body header cache missing".to_string())?;
-        if header.len() < header_end as usize {
-            return Err(format!(
-                "virtual-body header incomplete: got {} need {}",
-                header.len(),
-                header_end
-            ));
-        }
-        let header = header[..header_end as usize].to_vec();
-
-        // 从缓存取 body；分块拉满 want_body（默认 2MB），避免单次 16MB Range 超时被 prepare 取消
-        let mut body = Vec::new();
-        if let Ok(cache) = source.inner.cache.lock() {
-            // 合并所有覆盖 [origin, origin+want) 的段
-            let mut cursor = origin;
-            let want = REMOTE_VIRTUAL_SPLICE_BODY_BYTES;
-            let limit = origin.saturating_add(want).min(source.inner.total_len);
-            while cursor < limit {
-                let Some(seg) = cache.iter().find(|s| {
-                    s.start <= cursor && cursor < s.start + s.data.len() as u64
-                }) else {
-                    break;
-                };
-                let off = (cursor - seg.start) as usize;
-                let take = (limit - cursor).min(seg.data.len() as u64 - off as u64) as usize;
-                body.extend_from_slice(&seg.data[off..off + take]);
-                cursor += take as u64;
-            }
-        }
-        let want_body = REMOTE_VIRTUAL_SPLICE_BODY_BYTES
-            .min(source.inner.total_len.saturating_sub(origin))
-            .max(REMOTE_FETCH_BLOCK_BYTES);
-        if (body.len() as u64) < want_body {
-            let mut cursor = origin.saturating_add(body.len() as u64);
-            let end_target = origin
-                .saturating_add(want_body)
-                .min(source.inner.total_len);
-            while cursor < end_target {
-                source.ensure_read_current().map_err(|err| err.to_string())?;
-                let chunk_end = cursor
-                    .saturating_add(REMOTE_VIRTUAL_SPLICE_FETCH_CHUNK)
-                    .saturating_sub(1)
-                    .min(end_target.saturating_sub(1));
-                log::info!(
-                    target: "remote-audio",
-                    "virtual-body splice fetch chunk {}..{} ({}/{})",
-                    cursor,
-                    chunk_end,
-                    body.len(),
-                    want_body,
-                );
-                let data = fetch_range_block(
-                    &source.inner,
-                    cursor,
-                    chunk_end,
-                    source.read_cancellation.as_ref(),
-                )
-                .map_err(|err| format!("virtual-body body fetch: {err}"))?;
-                if data.is_empty() {
-                    break;
-                }
-                body.extend_from_slice(&data);
-                cursor = cursor.saturating_add(data.len() as u64);
-                write_disk_range(
-                    &source.inner,
-                    cursor.saturating_sub(data.len() as u64),
-                    &data,
-                );
-            }
-            if !body.is_empty() {
-                if let Ok(mut cache) = source.inner.cache.lock() {
-                    if !cache_contains_position(&cache, origin) {
-                        cache.push(CachedSegment {
-                            start: origin,
-                            data: body.clone(),
-                        });
-                        cache.sort_by_key(|segment| segment.start);
-                        trim_cache(&source.inner, &mut cache, origin);
-                    }
-                }
-                protect_cached_range(&source.inner, origin, body.len() as u64);
-            }
-        }
-        if body.len() < 16 || body.get(4..8) != Some(&b"moof"[..]) {
-            // 再 snap 一次
-            if let Some(rel) = find_moof_offset_near(&body, 0, 64 * 1024) {
-                body = body[rel as usize..].to_vec();
-            }
-        }
-        if body.get(4..8) != Some(&b"moof"[..]) {
-            return Err(format!(
-                "virtual-body body does not start with moof (head={:02x?})",
-                &body[..body.len().min(16)]
-            ));
-        }
-
-        let mut spliced = Vec::with_capacity(header.len() + body.len());
-        spliced.extend_from_slice(&header);
-        spliced.extend_from_slice(&body);
         log::info!(
             target: "remote-audio",
-            "virtual-body spliced header={} body={} total={} origin={}",
-            header.len(),
-            body.len(),
-            spliced.len(),
+            "virtual-body lazy view header_end={}, body_origin={}, logical_len={}",
+            header_end,
             origin,
+            source.logical_len(),
         );
 
-        let cursor = std::io::Cursor::new(spliced);
         let options = MediaSourceStreamOptions {
             buffer_len: REMOTE_VIRTUAL_DECODER_BUFFER_BYTES,
         };
-        let mss = MediaSourceStream::new(Box::new(cursor), options);
-        // 本地 Cursor 全程 seekable；init 内已跳过 moov 假样本
-        finish_handle.finish_demuxer_open();
-        let decoder = Self::init_remote_spliced(mss)
+        let mss = MediaSourceStream::new(Box::new(source), options);
+        // 探测期间必须维持 demuxer_open_sequential：
+        // is_seekable 一旦为真，try_new 会把整条逻辑流的顶层 atom 扫一遍去找
+        // 全部 sidx，等于把刚省下的顺序读又加回来。顺序模式下它遇到第一个
+        // moof 就 break，正好停在目标分片上。探测结束后由 init 清标志，
+        // 之后的样本级 Seek 与 ignore_bytes 跳段才能生效。
+        let decoder = Self::init_remote_spliced(mss, Some(finish_handle))
             .map_err(|err| format!("Decode error: {}", err))?;
         log::info!(
             target: "remote-audio",
-            "demuxer open finished sequential_cleared=true virtual_body=true splice=true",
+            "demuxer open finished sequential_cleared=true virtual_body=true lazy=true",
         );
         Ok(decoder)
     }
@@ -2349,6 +2268,7 @@ impl SymphoniaAudioDecoder {
     /// 拼接 demux：本地 Cursor 全程 seekable；首包必须来自 moof（跳过 moov stco 假样本）
     fn init_remote_spliced(
         mss: MediaSourceStream,
+        enable_seek_after_probe: Option<RemoteAudioSource>,
     ) -> symphonia::core::errors::Result<Self> {
         let hint = Hint::new();
         let format_opts = FormatOptions {
@@ -2357,6 +2277,11 @@ impl SymphoniaAudioDecoder {
         };
         let metadata_opts: MetadataOptions = Default::default();
         let mut probed = get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
+
+        // try_new 已结束：放开可 seek，样本级跳转与 ignore_bytes 跳段都要靠它
+        if let Some(handle) = enable_seek_after_probe.as_ref() {
+            handle.finish_demuxer_open();
+        }
 
         let track_id = probed
             .format
@@ -2379,7 +2304,7 @@ impl SymphoniaAudioDecoder {
             track.codec_params.n_frames,
         );
 
-        // 先吞掉 moov 段样本（stco 指向文件头 mdat，在拼接缓冲里是错误数据）
+        // 先吞掉 moov 段样本（stco 指向文件头 mdat，在拼接视图里是错误数据）
         // 策略：连续 DecodeError / Unsupported 都跳；一旦解出好包就停
         let mut skipped = 0usize;
         let mut decode_errors = 0usize;
@@ -3717,6 +3642,7 @@ mod tests {
         release_prefetch_start, remember_validated_audio_cache, reuse_validated_audio_cache,
         seek_target_time, track_duration, CacheMarker, CachedRange, CachedSegment, HttpByteRange,
         PrefetchPlan, PrefetchWindow, RemoteAccessMode, RemoteAudioCache, RemoteAudioInner,
+        RemoteSeekIndex, SeekIndexEntry,
         RemoteAudioSource, RemoteReadCancellation, SymphoniaAudioDecoder, ValidatedCacheFile,
         REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES, REMOTE_PREFETCH_FALLBACK_TARGET_BYTES,
     };
@@ -4324,13 +4250,14 @@ mod tests {
         );
     }
 
-    /// 回归：长内容的分片流同样不能走虚拟 body
+    /// 回归：分片流必须走虚拟 body，且两种模式都不许退化成 8MB 块
     ///
-    /// 上一次只排除了 StandardSeekable，>= 45 分钟的分片流仍落在
-    /// LongFormProgressive 分支里建索引，于是 seek 又变回 end of stream。
-    /// 两种模式必须一视同仁 —— 只要自带 sidx，就交给 symphonia 原生定位。
+    /// symphonia 0.5.5 解析 sidx 后直接丢弃，format.seek 只能逐个 moof 爬，
+    /// 代价 O(文件大小)——实测 68MB 音频跳到中段要顺序读满 30MB。
+    /// 所以只要建得出 sidx 索引就必须改走虚拟 body 的字节跳转；
+    /// 同时按需块要维持 256KB，8MB 会让一次 seek 卡在整块下完之前。
     #[test]
-    fn long_form_fragments_must_not_enable_virtual_body_seek() {
+    fn fragmented_streams_seek_through_the_virtual_body() {
         for mode in [
             RemoteAccessMode::StandardSeekable,
             RemoteAccessMode::LongFormProgressive,
@@ -4357,8 +4284,13 @@ mod tests {
                     prefetch_epoch: AtomicU64::new(0),
                     demuxer_open_sequential: AtomicBool::new(true),
                     virtual_body_origin: AtomicU64::new(0),
-                    // 嗅探为分片时不建索引，无论时长落在哪个模式
-                    seek_index: Mutex::new(None),
+                    seek_index: Mutex::new(Some(RemoteSeekIndex {
+                        duration_ms: 8_352_000,
+                        entries: vec![
+                            SeekIndexEntry { time_ms: 0, byte_offset: 10_799 },
+                            SeekIndexEntry { time_ms: 10_000, byte_offset: 172_000 },
+                        ],
+                    })),
                     playback_generation: Arc::new(AtomicU64::new(1)),
                     expected_generation: 1,
                 }),
@@ -4367,25 +4299,75 @@ mod tests {
                 read_cancellation: None,
             };
 
-            source.finish_demuxer_open();
-            assert!(
-                !source.prefers_virtual_body_seek(),
-                "{mode:?} 不应启用虚拟 body",
-            );
             let seekable = source.seekable_clone();
             assert!(
-                !seekable.prefers_virtual_body_seek(),
-                "{mode:?} 升级后仍不应启用虚拟 body",
+                seekable.prefers_virtual_body_seek(),
+                "{mode:?} 有 sidx 索引就必须走虚拟 body，绝不能退回 format.seek",
+            );
+            assert_eq!(
+                seekable.access_mode.seek_fetch_block_bytes(),
+                super::REMOTE_FETCH_BLOCK_BYTES,
+                "{mode:?} 的 seek 块不得退化成 8MB",
             );
             seekable.finish_demuxer_open();
-            // 升级后必须对 demuxer 可 seek，symphonia 才能按 sidx 跳转
+            // 打开后必须对 demuxer 可 seek，样本才能在拼接视图里回跳
             assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
-            assert_eq!(
-                seekable.access_mode.demand_fetch_block_bytes(),
-                super::REMOTE_FETCH_BLOCK_BYTES,
-                "{mode:?} 的按需块不得退化成分片用的 8MB",
-            );
         }
+    }
+
+    /// 虚拟 body 的逻辑坐标必须连续，且长度不得被截断成已拉取的那一段
+    ///
+    /// 旧实现先把 2MB body 拉进内存再交给 Cursor，demuxer 于是在 2MB 处
+    /// 撞上一个凭空多出来的 EOF，probe 直接 end of stream。
+    #[test]
+    fn virtual_body_reports_the_full_remaining_length() {
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://rr5---sn-x.googlevideo.com/videoplayback".into(),
+                referer: String::new(),
+                total_len: 135_169_876,
+                header_end: AtomicU64::new(10_799),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 262_144,
+                    target_bytes: 1_048_576,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(false),
+                virtual_body_origin: AtomicU64::new(57_047_830),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        // 逻辑长度 = 头部 + 从落点到文件尾，而不是「已经拉下来的那一段」
+        let expected = 10_799 + (135_169_876 - 57_047_830);
+        assert_eq!(
+            symphonia::core::io::MediaSource::byte_len(&source),
+            Some(expected),
+        );
+
+        // [0, header_end) 映射到物理头部，之后按落点平移，坐标必须连续
+        assert_eq!(source.map_logical_to_physical(0), 0);
+        assert_eq!(source.map_logical_to_physical(10_798), 10_798);
+        assert_eq!(source.map_logical_to_physical(10_799), 57_047_830);
+        assert_eq!(source.map_logical_to_physical(10_799 + 4_096), 57_051_926);
+
+        // demuxer 给的绝对 base_data_offset 要能折回逻辑坐标
+        assert_eq!(source.normalize_seek_offset(57_047_830), 10_799);
+        assert_eq!(source.normalize_seek_offset(57_051_926), 10_799 + 4_096);
     }
 
     #[test]
