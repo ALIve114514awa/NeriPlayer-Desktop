@@ -755,36 +755,64 @@ function handleDownloadMenuClick(item: ContextMenuActionItem) {
 }
 
 // 拉取云端歌单
-onMounted(() => {
-  if (auth.netease.loggedIn && !neteasePlaylists.value.length) {
-    recommend.fetchUserPlaylists('netease')
-  }
-  if (auth.bilibili.loggedIn && !biliPlaylists.value.length) {
-    recommend.fetchUserPlaylists('bilibili')
-  }
-  if (auth.youtube.loggedIn && !youtubePlaylists.value.length) {
-    recommend.fetchUserPlaylists('youtube')
-  }
-  // 网易云收藏专辑
-  if (auth.netease.loggedIn && !recommend.userAlbums.length) {
-    recommend.fetchUserAlbums()
-  }
-})
+/// 平台数据按需拉取
+///
+/// 绝不能只在 onMounted 判一次登录态：登录状态是启动后异步拉回来的，
+/// 挂载那一刻通常还是 false，判完就再没有东西重新触发，
+/// 表现就是「明明登录了，云端歌单一直空着」。
+/// 这里改成对（登录态 × 当前 tab）响应式求值，任一变化都会补拉。
+const inFlightPlatforms = new Set<string>()
 
-/// 登录/登出后重新拉取该平台数据；重新登录看到旧的空列表是最常见的抱怨
+function ensurePlatformData(platform: string, loaded: boolean, force = false) {
+  const loggedIn =
+    platform === 'netease' ? auth.netease.loggedIn
+    : platform === 'bilibili' ? auth.bilibili.loggedIn
+    : auth.youtube.loggedIn
+  if (!loggedIn) return
+  if (!force && loaded) return
+  if (inFlightPlatforms.has(platform)) return
+
+  inFlightPlatforms.add(platform)
+  void Promise.resolve(recommend.fetchUserPlaylists(platform))
+    .finally(() => inFlightPlatforms.delete(platform))
+
+  if (platform === 'netease' && (force || !recommend.userAlbums.length)) {
+    void recommend.fetchUserAlbums()
+  }
+}
+
+function syncActiveTabData(force = false) {
+  switch (activeTab.value) {
+    case 3:
+      ensurePlatformData('netease', neteasePlaylists.value.length > 0, force)
+      break
+    case 4:
+      ensurePlatformData('bilibili', biliPlaylists.value.length > 0, force)
+      break
+    case 5:
+      ensurePlatformData('youtube', youtubePlaylists.value.length > 0, force)
+      break
+    default:
+      break
+  }
+}
+
+watch(
+  () => [
+    activeTab.value,
+    auth.netease.loggedIn,
+    auth.bilibili.loggedIn,
+    auth.youtube.loggedIn,
+  ],
+  () => syncActiveTabData(),
+  { immediate: true },
+)
+
+/// 登录/登出后强制重新拉取该平台数据；重新登录看到旧的空列表是最常见的抱怨
 function handleAuthChanged(event: Event) {
   const platform = (event as CustomEvent<{ platform?: string }>).detail?.platform
   if (!platform) return
-  if (platform === 'netease' && auth.netease.loggedIn) {
-    recommend.fetchUserPlaylists('netease')
-    recommend.fetchUserAlbums()
-  }
-  if (platform === 'bilibili' && auth.bilibili.loggedIn) {
-    recommend.fetchUserPlaylists('bilibili')
-  }
-  if (platform === 'youtube' && auth.youtube.loggedIn) {
-    recommend.fetchUserPlaylists('youtube')
-  }
+  ensurePlatformData(platform, false, true)
   void loadFavorites()
 }
 
