@@ -1,5 +1,16 @@
 // 省流模式序列化/反序列化：与 Android SyncDataSerializer.kt 对齐
-// backup.bin: Base64(GZIP(ProtoBuf))
+//
+// 传输产物统一为「原始字节」，不再叠加 Base64：
+// - 省流（backup.bin）: 原始 GZIP(ProtoBuf) 字节
+// - 普通（backup.json）: UTF-8 JSON 字节
+//
+// 读取按内容自动识别（read-both），三种在野格式都要能读：
+// 1. GZIP 魔数 0x1F 0x8B 开头 -> 直接解压 -> ProtoBuf（新 raw 格式）
+// 2. 首个有效字节为 '{' -> JSON（旧 backup.json / 旧 WebDAV JSON）
+// 3. 其余文本 -> 旧 Base64(GZIP(ProtoBuf)) -> 解码 -> 解压（旧 backup.bin）
+//
+// 对端未更新时读到新格式会安全失败（同步空转，不覆盖本地、不回流），
+// 而新版永远读得懂旧备份。详见 docs/SYNC-MODEL-CONTRACT.md
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use flate2::read::GzDecoder;
@@ -17,8 +28,8 @@ pub fn get_filename(data_saver: bool) -> &'static str {
     if data_saver { "backup.bin" } else { "backup.json" }
 }
 
-/// 序列化 SyncData（省流模式: ProtoBuf + GZIP + Base64）
-pub fn serialize_compressed(data: &SyncData) -> AppResult<String> {
+/// 序列化 SyncData（省流模式: ProtoBuf + GZIP，原始字节不再叠 Base64）
+pub fn serialize_compressed(data: &SyncData) -> AppResult<Vec<u8>> {
     let normalized = data.normalized_for_sync();
     let proto = sync_data_to_proto(&normalized);
     let proto_bytes = proto.encode_to_vec();
@@ -30,18 +41,27 @@ pub fn serialize_compressed(data: &SyncData) -> AppResult<String> {
     let compressed = encoder.finish()
         .map_err(|e| AppError::Other(format!("GZIP finish: {}", e)))?;
 
-    // Base64 编码
-    Ok(BASE64.encode(&compressed))
+    Ok(compressed)
 }
 
-/// 反序列化省流模式数据（Base64 -> GZIP -> ProtoBuf -> SyncData）
-pub fn deserialize_compressed(content: &str) -> AppResult<SyncData> {
-    // Base64 解码
-    let compressed = BASE64.decode(content.trim())
-        .map_err(|e| AppError::Other(format!("Base64 decode: {}", e)))?;
+/// 原始 GZIP 字节以魔数 0x1F 0x8B 开头，用于区分新 raw 格式与历史文本格式
+fn looks_like_gzip(bytes: &[u8]) -> bool {
+    matches!(bytes, [0x1F, 0x8B, ..])
+}
 
+/// 跳过前导 UTF-8 BOM 与空白后，首个有效字节为 '{' 即视为 JSON 对象
+fn looks_like_json(bytes: &[u8]) -> bool {
+    let rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    matches!(
+        rest.iter().find(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t')),
+        Some(b'{')
+    )
+}
+
+/// 反序列化省流模式数据（GZIP -> ProtoBuf -> SyncData）
+pub fn deserialize_compressed(compressed: &[u8]) -> AppResult<SyncData> {
     // GZIP 解压
-    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decoder = GzDecoder::new(compressed);
     let mut proto_bytes = Vec::new();
     decoder.read_to_end(&mut proto_bytes)
         .map_err(|e| AppError::Other(format!("GZIP decompress: {}", e)))?;
@@ -69,25 +89,42 @@ pub fn deserialize_compressed(content: &str) -> AppResult<SyncData> {
     }
 }
 
-/// 根据 data_saver 标志选择序列化方式
-pub fn serialize(data: &SyncData, data_saver: bool) -> AppResult<String> {
+/// 根据 data_saver 标志选择序列化方式，产物一律是原始字节
+pub fn serialize(data: &SyncData, data_saver: bool) -> AppResult<Vec<u8>> {
     if data_saver {
         serialize_compressed(data)
     } else {
         serde_json::to_string_pretty(&data.normalized_for_sync())
+            .map(String::into_bytes)
             .map_err(|e| AppError::Other(format!("JSON serialize: {}", e)))
     }
 }
 
-/// 根据文件后缀判断格式并反序列化
-pub fn deserialize(content: &str, is_binary: bool) -> AppResult<SyncData> {
-    if is_binary {
-        deserialize_compressed(content)
-    } else {
-        serde_json::from_str::<SyncData>(content)
-            .map(|data| data.normalized_for_sync())
-            .map_err(|e| AppError::Other(format!("JSON parse: {}", e)))
+/// 按内容自动识别格式并反序列化（read-both）
+///
+/// 不看文件后缀：后缀只说明「本端打算写成什么」，而远端那份可能是对端
+/// 旧版本写的，甚至是用户手动放上去的。按内容判别才能真正做到读旧读新都不炸。
+pub fn deserialize(content: &[u8]) -> AppResult<SyncData> {
+    if looks_like_gzip(content) {
+        return deserialize_compressed(content);
     }
+    if looks_like_json(content) {
+        // 认出来之后必须把 BOM 去掉再解析：serde_json 不接受前导 U+FEFF
+        let body = content.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(content);
+        let text = std::str::from_utf8(body)
+            .map_err(|e| AppError::Other(format!("JSON is not UTF-8: {}", e)))?;
+        return serde_json::from_str::<SyncData>(text)
+            .map(|data| data.normalized_for_sync())
+            .map_err(|e| AppError::Other(format!("JSON parse: {}", e)));
+    }
+    // 旧 backup.bin：Base64(GZIP(ProtoBuf))
+    let text = std::str::from_utf8(content)
+        .map_err(|e| AppError::Other(format!("legacy payload is not UTF-8: {}", e)))?;
+    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let compressed = BASE64
+        .decode(&cleaned)
+        .map_err(|e| AppError::Other(format!("Base64 decode: {}", e)))?;
+    deserialize_compressed(&compressed)
 }
 
 // Android 端 kotlinx.serialization 把「无默认值的属性」视为必填, 缺字段直接抛
@@ -768,6 +805,87 @@ fn proto_to_playlist_song_deletion(p: &ProtoSyncPlaylistSongDeletion) -> SyncPla
 mod compressed_contract_tests {
     use super::*;
 
+    fn sample_sync_data() -> SyncData {
+        let mut data = SyncData {
+            device_id: "desktop-test".into(),
+            device_name: "Desktop".into(),
+            last_modified: 1_700_000_000_000,
+            ..Default::default()
+        };
+        data.playlists.push(SyncPlaylist {
+            id: "101".into(),
+            name: "跨端歌单".into(),
+            songs: Vec::new(),
+            created_at: 1_600_000_000_000,
+            modified_at: 1_700_000_000_000,
+            is_deleted: false,
+            song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
+        });
+        data
+    }
+
+    /// read-both：三种在野格式都必须读得懂
+    ///
+    /// Android 89dcc8f1 起 backup.bin 改成原始 GZIP(ProtoBuf)，不再叠 Base64。
+    /// 但云端可能还躺着任意一端旧版本写的备份，任何一种读不了都会让同步中断，
+    /// 甚至被误判成「远端损坏」。
+    #[test]
+    fn deserialize_reads_raw_gzip_json_and_legacy_base64() {
+        let data = sample_sync_data();
+
+        // 1. 新格式：原始 GZIP(ProtoBuf) 字节
+        let raw = serialize(&data, true).unwrap();
+        assert_eq!(&raw[..2], &[0x1F, 0x8B], "省流产物必须是裸 GZIP，不能再套 Base64");
+        assert_eq!(deserialize(&raw).unwrap().playlists[0].name, "跨端歌单");
+
+        // 2. JSON 文本（旧 backup.json / 旧 WebDAV）
+        let json = serialize(&data, false).unwrap();
+        assert_eq!(json[0], b'{');
+        assert_eq!(deserialize(&json).unwrap().playlists[0].name, "跨端歌单");
+
+        // 3. 旧 backup.bin：Base64(GZIP(ProtoBuf))
+        let legacy = BASE64.encode(&raw);
+        assert_eq!(
+            deserialize(legacy.as_bytes()).unwrap().playlists[0].name,
+            "跨端歌单",
+        );
+    }
+
+    /// 带 BOM 与前导空白的 JSON 仍要认出来
+    ///
+    /// 认错会落进 Base64 兜底分支，报出与真实原因无关的解码错误。
+    #[test]
+    fn json_detection_tolerates_bom_and_leading_whitespace() {
+        let json = serialize(&sample_sync_data(), false).unwrap();
+
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(&json);
+        assert!(deserialize(&with_bom).is_ok());
+
+        let mut padded = b"\n\r\t  ".to_vec();
+        padded.extend_from_slice(&json);
+        assert!(deserialize(&padded).is_ok());
+    }
+
+    /// 损坏的远端报文必须报错，绝不能静默返回空数据
+    ///
+    /// 一旦空数据被当成「远端就是空的」参与合并，本地内容会被判成
+    /// 「本端新增」反复上传，甚至在对端把已删除的条目复活——即回流。
+    #[test]
+    fn corrupt_payload_fails_instead_of_yielding_empty_data() {
+        assert!(deserialize(&[0x1F, 0x8B, 0x08, 0x00, 0xDE, 0xAD]).is_err(), "坏 GZIP");
+        assert!(deserialize(b"{not json at all").is_err(), "坏 JSON");
+        assert!(deserialize(b"!!!not base64!!!").is_err(), "坏 Base64");
+    }
+
+    /// 去掉 Base64 层后体积必须真的变小
+    #[test]
+    fn raw_payload_is_smaller_than_the_legacy_base64_form() {
+        let raw = serialize(&sample_sync_data(), true).unwrap();
+        let legacy_len = BASE64.encode(&raw).len();
+        assert!(raw.len() < legacy_len, "raw={} legacy={}", raw.len(), legacy_len);
+    }
+
     #[test]
     fn compressed_roundtrip_preserves_android_only_song_fields_and_action() {
         let song = SyncSong {
@@ -1030,9 +1148,10 @@ mod compressed_contract_tests {
         };
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&legacy.encode_to_vec()).unwrap();
+        // 走旧 backup.bin 的 Base64 文本形态，验证 read-both 的兜底分支
         let encoded = BASE64.encode(encoder.finish().unwrap());
 
-        let decoded = deserialize_compressed(&encoded).unwrap();
+        let decoded = deserialize(encoded.as_bytes()).unwrap();
         let decoded_song = &decoded.playlists[0].songs[0];
 
         assert_eq!(decoded.playlists[0].song_order_version, 0);

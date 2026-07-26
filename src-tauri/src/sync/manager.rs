@@ -227,6 +227,16 @@ struct GitHubRemoteSnapshot {
 }
 
 /// 严格读取远端快照，仅当两种格式都 404 时才视为首次同步
+/// 远端正文是否为空
+///
+/// 不能对字节直接 `trim`：省流备份是 GZIP 二进制。只判「空或全是 ASCII 空白」，
+/// 二进制正文里出现的 0x20 之类字节不会让整份被误判成空。
+fn is_blank_payload(content: &[u8]) -> bool {
+    content
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+}
+
 async fn fetch_remote_snapshot(
     api: &GitHubApiClient,
     config: &GitHubSyncConfig,
@@ -250,12 +260,13 @@ async fn fetch_remote_snapshot(
         },
     };
 
-    if content.trim().is_empty() {
+    if is_blank_payload(&content) {
         return Err(AppError::Other("Remote backup file is empty".into()));
     }
 
     let mut actual_sha = sha;
-    let data = match serializer::deserialize(&content, actual_file.ends_with(".bin")) {
+    // 按内容识别格式，不看后缀：远端那份可能是对端旧版本写的
+    let data = match serializer::deserialize(&content) {
         Ok(data) => data,
         Err(primary_error) => {
             let fallback_file = serializer::get_filename(!actual_file.ends_with(".bin"));
@@ -266,14 +277,11 @@ async fn fetch_remote_snapshot(
             let Some((fallback_content, fallback_sha)) = fallback else {
                 return Err(primary_error);
             };
-            if fallback_content.trim().is_empty() {
+            if is_blank_payload(&fallback_content) {
                 return Err(primary_error);
             }
-            let fallback_data = serializer::deserialize(
-                &fallback_content,
-                fallback_file.ends_with(".bin"),
-            )
-            .map_err(|_| primary_error)?;
+            let fallback_data =
+                serializer::deserialize(&fallback_content).map_err(|_| primary_error)?;
             actual_file = fallback_file.to_string();
             actual_sha = fallback_sha;
             fallback_data
@@ -303,12 +311,14 @@ pub async fn sync_webdav(
 
     // 拉取远程文件
     let (remote_content, remote_fingerprint) = match api.get_file_content().await? {
-        Some((content, fp)) if !content.trim().is_empty() => (content, fp),
+        Some((content, fp)) if !is_blank_payload(&content) => (content, fp),
         _ => {
             // 首次上传同样要归一化, 否则空串 optional 字段会被写上云
             let initial = local_data.normalized_for_sync();
-            let content = serde_json::to_string_pretty(&initial)?;
-            let fp = api.update_file_content(&content).await?;
+            let content = serializer::serialize(&initial, config.data_saver)?;
+            let fp = api
+                .update_file_content(&content, config.data_saver)
+                .await?;
             save_base_snapshot(&initial, "webdav");
             save_recent_play_history(&initial);
             config.last_remote_fingerprint = fp;
@@ -325,8 +335,8 @@ pub async fn sync_webdav(
         }
     };
 
-    // 解析远程数据（WebDAV 始终 JSON）
-    let remote_data: SyncData = serde_json::from_str(&remote_content)
+    // 按内容识别：对端可能开着省流传 GZIP，也可能是旧版本的 JSON
+    let remote_data: SyncData = serializer::deserialize(&remote_content)
         .map_err(|e| AppError::Other(format!("Failed to parse remote sync data: {}", e)))?;
 
     let remote_changed = remote_fingerprint != config.last_remote_fingerprint;
@@ -350,8 +360,10 @@ pub async fn sync_webdav(
         return Ok(SyncOutcome { result, merged });
     }
 
-    let content = serde_json::to_string_pretty(&merged)?;
-    let fp = api.update_file_content(&content).await?;
+    let content = serializer::serialize(&merged, config.data_saver)?;
+    let fp = api
+        .update_file_content(&content, config.data_saver)
+        .await?;
 
     let playlists_added = merged.playlists.len() as i32 - remote_data.playlists.len() as i32;
     let songs_added = merged.playlists.iter().map(|p| p.songs.len()).sum::<usize>() as i32

@@ -1069,6 +1069,9 @@ pub struct WebDavSyncConfig {
     pub last_sync_time: i64,
     #[serde(default)]
     pub auto_sync: bool,
+    /// 省流模式：与 Android 的全局开关对齐，开启后 WebDAV 也传 GZIP(ProtoBuf)
+    #[serde(default = "default_true")]
+    pub data_saver: bool,
 }
 
 #[cfg(test)]

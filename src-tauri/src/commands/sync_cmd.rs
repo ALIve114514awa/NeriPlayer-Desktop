@@ -117,6 +117,8 @@ struct ConfigWebDavSync {
     last_sync_time: i64,
     #[serde(default)]
     auto_sync: bool,
+    #[serde(default = "config_default_data_saver")]
+    data_saver: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -152,8 +154,14 @@ impl From<&WebDavSyncConfig> for ConfigWebDavSync {
             last_remote_fingerprint: config.last_remote_fingerprint.clone(),
             last_sync_time: config.last_sync_time,
             auto_sync: config.auto_sync,
+            data_saver: config.data_saver,
         }
     }
+}
+
+/// 配置文件缺 dataSaver 时按开启处理，与 Android 默认一致
+fn config_default_data_saver() -> bool {
+    true
 }
 
 impl ConfigWebDavSync {
@@ -166,6 +174,7 @@ impl ConfigWebDavSync {
             last_remote_fingerprint: self.last_remote_fingerprint,
             last_sync_time: self.last_sync_time,
             auto_sync: self.auto_sync,
+            data_saver: self.data_saver,
         }
     }
 }

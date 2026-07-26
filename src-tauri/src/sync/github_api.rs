@@ -176,12 +176,16 @@ impl GitHubApiClient {
     }
 
     /// 获取文件内容和 SHA，只有 404 会返回 None
+    /// 读取文件正文，返回原始字节
+    ///
+    /// 备份可能是原始 GZIP（新格式）也可能是文本（旧格式），
+    /// 一律按字节返回交给序列化层判别；这里做 UTF-8 转换会把 GZIP 直接判死。
     pub async fn get_file_content(
         &self,
         owner: &str,
         repo: &str,
         path: &str,
-    ) -> GitHubResult<Option<(String, String)>> {
+    ) -> GitHubResult<Option<(Vec<u8>, String)>> {
         let response = self
             .request(
                 self.http
@@ -240,6 +244,7 @@ impl GitHubApiClient {
             return Ok(Some((content, sha)));
         }
 
+        // Contents API 的 content 字段永远是 Base64，解一次就得到文件原始字节
         let decoded = BASE64.decode(&cleaned).map_err(|error| {
             GitHubApiError::InvalidResponse(format!("failed to decode file content: {}", error))
         })?;
@@ -248,15 +253,12 @@ impl GitHubApiClient {
                 "remote backup file is too large".into(),
             ));
         }
-        let content = String::from_utf8(decoded).map_err(|error| {
-            GitHubApiError::InvalidResponse(format!("file content is not UTF-8: {}", error))
-        })?;
 
-        Ok(Some((content, sha)))
+        Ok(Some((decoded, sha)))
     }
 
     /// 以 raw 媒体类型读取文件正文, 绕开 Contents API 的 1MB 内联上限
-    async fn get_file_raw(&self, owner: &str, repo: &str, path: &str) -> GitHubResult<String> {
+    async fn get_file_raw(&self, owner: &str, repo: &str, path: &str) -> GitHubResult<Vec<u8>> {
         // 不能复用 request(): reqwest 的 header() 是追加语义,
         // 追加第二个 Accept 会让 GitHub 仍按 JSON 返回
         let response = self
@@ -286,25 +288,27 @@ impl GitHubApiClient {
                 "remote backup file is too large".into(),
             ));
         }
-        String::from_utf8(bytes.to_vec()).map_err(|error| {
-            GitHubApiError::InvalidResponse(format!("file content is not UTF-8: {}", error))
-        })
+        Ok(bytes.to_vec())
     }
 
     /// 创建或更新文件，sha 为空时表示新建
+    ///
+    /// `content` 是文件的原始字节。Contents API 只收 Base64，
+    /// 所以这里编码**一次**——省流备份本身已是 GZIP 二进制，
+    /// 再叠一层 Base64 就是白白多出 1/3 流量。
     pub async fn update_file_content(
         &self,
         owner: &str,
         repo: &str,
         path: &str,
-        content: &str,
+        content: &[u8],
         sha: &str,
         message: &str,
     ) -> GitHubResult<String> {
         let branch = self.check_repository(owner, repo).await?;
         let mut body = serde_json::json!({
             "message": message,
-            "content": BASE64.encode(content.as_bytes()),
+            "content": BASE64.encode(content),
             "branch": branch,
         });
         if !sha.is_empty() {
@@ -506,7 +510,7 @@ mod tests {
 
         assert_eq!(
             result,
-            Some(("RAW-BACKUP-PAYLOAD".to_string(), "deadbeef".to_string()))
+            Some((b"RAW-BACKUP-PAYLOAD".to_vec(), "deadbeef".to_string()))
         );
         let _json_request = requests.recv().await.unwrap();
         let raw_request = requests.recv().await.unwrap();
@@ -530,7 +534,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, Some(("inline".to_string(), "abc123".to_string())));
+        assert_eq!(result, Some((b"inline".to_vec(), "abc123".to_string())));
         server.await.unwrap();
     }
 
@@ -562,7 +566,7 @@ mod tests {
         let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
 
         let error = api
-            .update_file_content("owner", "repo", "backup.bin", "content", "old-sha", "sync")
+            .update_file_content("owner", "repo", "backup.bin", b"content", "old-sha", "sync")
             .await
             .unwrap_err();
 
