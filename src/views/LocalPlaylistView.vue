@@ -54,9 +54,24 @@ const dragStartRowTop = ref(0)
 const dragRowHeight = ref(0)
 const dragOffsetY = ref(0)
 let dragHandleElement: HTMLElement | null = null
-let dragRowSnapshots: Array<{ key: string; top: number; bottom: number; midpoint: number }> = []
+let dragRowSnapshots: Array<{
+  key: string
+  top: number
+  bottom: number
+  midpoint: number
+  layoutTop: number
+  layoutHeight: number
+}> = []
 let dragListBounds: { top: number; bottom: number } | null = null
 let dragLandingTimer: ReturnType<typeof window.setTimeout> | null = null
+// 拖拽行的相邻行 key，用于屏蔽等价于原位的无效落点
+let dragPrevSiblingKey: string | null = null
+let dragNextSiblingKey: string | null = null
+// 单实例落点指示线：位置用 transform 平移，隐藏时保留位置以便原地淡出
+const dropIndicatorVisible = ref(false)
+const dropIndicatorY = ref(0)
+const dropIndicatorSnap = ref(false)
+let dropIndicatorSnapFrame: number | null = null
 let dragGlassStartFrame: number | null = null
 let dragGlassActiveFrame: number | null = null
 
@@ -532,14 +547,26 @@ function captureTrackDragSnapshot() {
 
   const listRect = list.getBoundingClientRect()
   dragListBounds = { top: listRect.top, bottom: listRect.bottom }
-  dragRowSnapshots = [...list.querySelectorAll<HTMLElement>('.track-item')]
+  const rows = [...list.querySelectorAll<HTMLElement>('.track-item')]
+  const draggedIndex = rows.findIndex(row => (row.dataset.trackKey || '') === draggedKey)
+  dragPrevSiblingKey = draggedIndex > 0 ? rows[draggedIndex - 1].dataset.trackKey || null : null
+  dragNextSiblingKey = draggedIndex >= 0 && draggedIndex < rows.length - 1
+    ? rows[draggedIndex + 1].dataset.trackKey || null
+    : null
+  // 用布局位置（offsetTop）而非 getBoundingClientRect：目标行的位移过渡带 transform，
+  // 若采样含 transform 会把视觉位移反馈进目标计算，造成边界处目标来回翻转闪烁
+  dragRowSnapshots = rows
     .map(row => {
-      const rect = row.getBoundingClientRect()
+      const layoutTop = row.offsetTop
+      const layoutHeight = row.offsetHeight
+      const top = listRect.top + layoutTop
       return {
         key: row.dataset.trackKey || '',
-        top: rect.top,
-        bottom: rect.bottom,
-        midpoint: rect.top + rect.height / 2,
+        top,
+        bottom: top + layoutHeight,
+        midpoint: top + layoutHeight / 2,
+        layoutTop,
+        layoutHeight,
       }
     })
     .filter(row => row.key && row.key !== draggedKey)
@@ -561,13 +588,49 @@ function resolveTrackInsertTarget(e: PointerEvent): { key: string; position: 'be
 
 function updateTrackDragTarget(e: PointerEvent) {
   const target = resolveTrackInsertTarget(e)
-  if (!target || target.key === dragTrackKey.value) {
+  // 与原位等价的落点不提示：拖拽行下一行的 before / 上一行的 after 都是无效移动
+  const isNoopTarget =
+    !!target
+    && ((target.position === 'before' && target.key === dragNextSiblingKey)
+      || (target.position === 'after' && target.key === dragPrevSiblingKey))
+  if (!target || isNoopTarget || target.key === dragTrackKey.value) {
     dragOverTrackKey.value = null
     dragInsertPosition.value = null
+    dropIndicatorVisible.value = false
     return
   }
+  // 同一目标不重复更新，避免每帧刷新样式
+  if (target.key === dragOverTrackKey.value && target.position === dragInsertPosition.value) return
   dragOverTrackKey.value = target.key
   dragInsertPosition.value = target.position
+  moveDropIndicatorToTarget(target)
+}
+
+function moveDropIndicatorToTarget(target: { key: string; position: 'before' | 'after' }) {
+  const snap = dragRowSnapshots.find(row => row.key === target.key)
+  if (!snap) {
+    dropIndicatorVisible.value = false
+    return
+  }
+  // 指示线中心对准两行之间 2px 间隙的中点，线高 3px
+  const boundaryCenter = target.position === 'before'
+    ? snap.layoutTop - 1
+    : snap.layoutTop + snap.layoutHeight + 1
+  if (!dropIndicatorVisible.value) {
+    // 从隐藏转为显示时直接落位，避免从上一次的旧位置滑入
+    scheduleDropIndicatorSnap()
+  }
+  dropIndicatorY.value = boundaryCenter - 1.5
+  dropIndicatorVisible.value = true
+}
+
+function scheduleDropIndicatorSnap() {
+  if (dropIndicatorSnapFrame !== null) window.cancelAnimationFrame(dropIndicatorSnapFrame)
+  dropIndicatorSnap.value = true
+  dropIndicatorSnapFrame = window.requestAnimationFrame(() => {
+    dropIndicatorSnapFrame = null
+    dropIndicatorSnap.value = false
+  })
 }
 
 function cleanupTrackDrag() {
@@ -584,6 +647,15 @@ function cleanupTrackDrag() {
   dragTrackKey.value = null
   dragOverTrackKey.value = null
   dragInsertPosition.value = null
+  // 只翻可见标志、保留 dropIndicatorY，让指示线原地淡出而非瞬间消失
+  dropIndicatorVisible.value = false
+  if (dropIndicatorSnapFrame !== null) {
+    window.cancelAnimationFrame(dropIndicatorSnapFrame)
+    dropIndicatorSnapFrame = null
+    dropIndicatorSnap.value = false
+  }
+  dragPrevSiblingKey = null
+  dragNextSiblingKey = null
   cancelDragGlassActivation()
   dragGlassActive.value = false
   dragUnderGlassKeys.value = new Set()
@@ -789,7 +861,7 @@ onUnmounted(() => {
       </div>
       <template v-else>
         <div v-if="selectionMode" class="selection-toolbar">
-          <div class="selection-count">已选择 {{ selectedCount }} 首</div>
+          <div class="selection-count">{{ t('common.selected_count', { count: selectedCount }) }}</div>
           <button class="selection-btn" @click="toggleSelectAllVisible">
             <span class="material-symbols-rounded">{{ allVisibleSelected ? 'deselect' : 'select_all' }}</span>
             {{ allVisibleSelected ? '取消全选' : '全选当前' }}
@@ -821,6 +893,14 @@ onUnmounted(() => {
           <button class="selection-btn ghost" @click="leaveSelectionMode">取消</button>
         </div>
         <div ref="trackListRef" class="track-list">
+        <div
+          class="drop-indicator"
+          :class="{ visible: dropIndicatorVisible, snap: dropIndicatorSnap }"
+          :style="{ transform: `translate3d(0, ${dropIndicatorY}px, 0)` }"
+          aria-hidden="true"
+        />
+        <!-- 拖拽中切到无动画 name，释放后行归位走 move 过渡，避免与指针跟随打架 -->
+        <TransitionGroup :name="dragTrackKey ? 'track-static' : 'track-move'">
         <div
           v-for="(track, index) in visibleTracks"
           :key="trackSelectionKey(track)"
@@ -880,6 +960,7 @@ onUnmounted(() => {
             <span class="material-symbols-rounded">more_vert</span>
           </button>
         </div>
+        </TransitionGroup>
         </div>
       </template>
     </template>
@@ -1089,9 +1170,14 @@ onUnmounted(() => {
   transform: translate3d(0, -5px, 0);
 }
 
-.track-item::after {
-  content: '';
+/* 单实例落点指示线：换目标时整体平移而非逐行显隐，杜绝闪烁 */
+.track-list {
+  position: relative;
+}
+
+.drop-indicator {
   position: absolute;
+  top: 0;
   left: 44px;
   right: 44px;
   z-index: 2;
@@ -1101,19 +1187,23 @@ onUnmounted(() => {
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--md-primary) 12%, transparent);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 140ms ease-out, transform 180ms cubic-bezier(0.2, 0, 0, 1);
+  transition:
+    transform 170ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 120ms ease-out;
+
+  &.visible {
+    opacity: 1;
+  }
+
+  /* 隐藏转显示的首帧直接落位，只保留淡入 */
+  &.snap {
+    transition: opacity 120ms ease-out;
+  }
 }
 
-.track-item.drag-over-before::after {
-  top: -5px;
-  opacity: 1;
-  transform: translateY(-1px);
-}
-
-.track-item.drag-over-after::after {
-  bottom: -5px;
-  opacity: 1;
-  transform: translateY(1px);
+/* 拖拽释放后行归位的 FLIP move 过渡 */
+.track-item.track-move-move {
+  transition: transform 300ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 @keyframes track-glass-release {
