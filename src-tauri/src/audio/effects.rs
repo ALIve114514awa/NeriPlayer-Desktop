@@ -312,23 +312,111 @@ where
 // LoudnessSource
 // 响度增益：将 millibels 转为线性增益，对每个 sample 乘以增益
 
-/// 音量均衡目标 RMS：约 -20 dBFS，接近流媒体常用的响度基准
-const NORMALIZE_TARGET_RMS: f64 = 0.1;
-/// 均衡增益上下限（线性），对应约 -6 dB ~ +6 dB，避免把噪底也抬起来
-const NORMALIZE_MIN_GAIN: f64 = 0.5;
-const NORMALIZE_MAX_GAIN: f64 = 2.0;
-/// RMS 观测窗的 EMA 系数
-///
-/// 按样本推进（48kHz 立体声 = 每秒 9.6 万次），时间常数 = 1/(96000×α)。
-/// 之前 0.000_02 折合仅 0.5 秒——增益追着乐句的强弱跑，副歌被压、
-/// 间隙被抬，听感「忽大忽小」，正是教科书级的泵浦。响度均衡要对付的是
-/// 「曲与曲之间」的响度差，观测窗必须远大于乐句：取 ~10 秒。
-const NORMALIZE_RMS_ALPHA: f64 = 0.000_001;
-/// 增益平滑系数：时间常数 ~20 秒，一首歌内增益近乎恒定，
-/// 只在曲目交界处缓慢滑向新曲的响度
-const NORMALIZE_GAIN_ALPHA: f64 = 0.000_000_5;
-/// 低于此 RMS 视为静音/前奏，不参与测量也不调整增益
-const NORMALIZE_SILENCE_RMS: f64 = 0.001;
+// 音量均衡（对齐 Android VolumeNormalizationAudioProcessor.kt 的代数与常量）
+//
+// 语义是「平衡不同歌曲之间的响度」，一首歌内部的强弱起伏是原声，绝不能动。
+// 因此用**整轨积分 RMS**而不是滑动窗口：积分统计从曲子开头累到当前，
+// 样本越多越稳，播放约半分钟后增益自然收敛为常数——之后副歌再响、
+// 间隙再静，积分值都几乎不动，增益恒定，动态范围原样保留。
+// （此前两版都用 EMA 滑动窗口，无论时间常数多长都在「遗忘旧数据、
+// 追新数据」，本质是慢速压缩器，曲内必然忽大忽小。）
+//
+// 行业同款：ReplayGain 2.0 / EBU R128 也是整轨积分响度 -> 每曲一个静态增益。
+
+/// 目标 RMS：-18 dBFS，与 ReplayGain 2.0 的目标响度一致
+const NORMALIZE_TARGET_RMS: f64 = 0.125_892_54;
+/// 静音门：低于 -55 dBFS 的块不参与积分（前奏留白/淡出不拉偏统计）
+const NORMALIZE_SILENCE_GATE_RMS: f64 = 0.001_778_28;
+/// 增益下限 -12 dB / 上限 +6 dB
+const NORMALIZE_MIN_GAIN: f64 = 0.251_188_64;
+const NORMALIZE_MAX_GAIN: f64 = 1.995_262_3;
+/// 峰值封顶 -2 dBFS：增益不得把已观测峰推过此线，防削波
+const NORMALIZE_PEAK_CEILING: f64 = 0.794_328_2;
+/// 增益下调时间常数（防爆音要快）
+const NORMALIZE_REDUCTION_SECONDS: f64 = 0.25;
+/// 增益上调时间常数（缓慢抬，收敛期不突兀）
+const NORMALIZE_INCREASE_SECONDS: f64 = 4.0;
+/// 积分统计的观测块：每块重算一次目标增益（48kHz 立体声约 43ms）
+const NORMALIZE_BLOCK_SAMPLES: usize = 4_096;
+
+/// 整轨积分归一化器状态
+#[derive(Default)]
+struct IntegratedNormalizer {
+    /// 全曲累积平方和 / 样本数 / 峰值——只增不减，收敛后即为常数
+    accumulated_sum_squares: f64,
+    analyzed_samples: u64,
+    analyzed_peak: f64,
+    /// 当前观测块
+    block_sum_squares: f64,
+    block_peak: f64,
+    block_samples: usize,
+    /// 目标增益与逐样本平滑后的当前增益
+    target_gain: f64,
+    current_gain: f64,
+}
+
+impl IntegratedNormalizer {
+    fn new() -> Self {
+        Self {
+            target_gain: 1.0,
+            current_gain: 1.0,
+            ..Self::default()
+        }
+    }
+
+    /// 推进一个样本，返回应施加的归一化增益
+    ///
+    /// `total_static_gain` 是用户手动响度档的线性增益，峰值封顶要按
+    /// 总增益算，否则手动 +9dB 时归一化以为还有余量。
+    fn advance(&mut self, sample: f32, samples_per_second: f64, total_static_gain: f64) -> f64 {
+        let magnitude = f64::from(sample).abs();
+        self.block_sum_squares += magnitude * magnitude;
+        self.block_peak = self.block_peak.max(magnitude);
+        self.block_samples += 1;
+
+        if self.block_samples >= NORMALIZE_BLOCK_SAMPLES {
+            let block_rms = (self.block_sum_squares / self.block_samples as f64).sqrt();
+            if block_rms >= NORMALIZE_SILENCE_GATE_RMS {
+                self.accumulated_sum_squares += self.block_sum_squares;
+                self.analyzed_samples += self.block_samples as u64;
+                self.analyzed_peak = self.analyzed_peak.max(self.block_peak);
+
+                let integrated_rms =
+                    (self.accumulated_sum_squares / self.analyzed_samples as f64).sqrt();
+                let rms_gain = (NORMALIZE_TARGET_RMS / integrated_rms)
+                    .clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
+                let peak_gain = if self.analyzed_peak > 0.0 {
+                    NORMALIZE_PEAK_CEILING / (self.analyzed_peak * total_static_gain.max(f64::MIN_POSITIVE))
+                } else {
+                    NORMALIZE_MAX_GAIN
+                };
+                self.target_gain = rms_gain
+                    .min(peak_gain)
+                    .clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
+            }
+            self.block_sum_squares = 0.0;
+            self.block_peak = 0.0;
+            self.block_samples = 0;
+        }
+
+        // 非对称逐样本平滑：降快（防爆音）升慢（收敛不突兀）
+        let seconds = if self.target_gain < self.current_gain {
+            NORMALIZE_REDUCTION_SECONDS
+        } else {
+            NORMALIZE_INCREASE_SECONDS
+        };
+        let alpha = 1.0 - (-1.0 / (samples_per_second * seconds)).exp();
+        self.current_gain += alpha * (self.target_gain - self.current_gain);
+
+        // 即时防削波：瞬时新峰还没进积分统计时，单样本先封顶到 -2 dBFS，
+        // 等价于零前瞻限幅，仅极端瞬态触发
+        let total = self.current_gain * total_static_gain;
+        if magnitude * total > NORMALIZE_PEAK_CEILING && magnitude > 0.0 {
+            return NORMALIZE_PEAK_CEILING / (magnitude * total_static_gain);
+        }
+        self.current_gain
+    }
+}
 
 pub struct LoudnessSource<S> {
     inner: S,
@@ -340,10 +428,7 @@ pub struct LoudnessSource<S> {
     gain_mb: i32,
     sample_counter: usize,
     normalize_enabled: bool,
-    /// 观测到的信号 RMS（慢 EMA）
-    normalize_rms: f64,
-    /// 实际施加的均衡增益（再平滑一次）
-    normalize_gain: f64,
+    normalizer: IntegratedNormalizer,
 }
 
 impl<S> LoudnessSource<S>
@@ -369,8 +454,7 @@ where
             gain_mb,
             sample_counter: 0,
             normalize_enabled,
-            normalize_rms: 0.0,
-            normalize_gain: 1.0,
+            normalizer: IntegratedNormalizer::new(),
         }
     }
 
@@ -382,26 +466,12 @@ where
             }
             if p.normalize_volume != self.normalize_enabled {
                 self.normalize_enabled = p.normalize_volume;
-                // 关掉时把增益收回 1.0，避免残留偏置
+                // 关掉时重置：下次开启从头积分，不带旧曲残留
                 if !self.normalize_enabled {
-                    self.normalize_gain = 1.0;
-                    self.normalize_rms = 0.0;
+                    self.normalizer = IntegratedNormalizer::new();
                 }
             }
         }
-    }
-
-    /// 跟踪信号 RMS 并把增益缓慢推向目标响度
-    fn advance_normalizer(&mut self, sample: f32) -> f64 {
-        let magnitude = f64::from(sample).abs();
-        self.normalize_rms += NORMALIZE_RMS_ALPHA * (magnitude - self.normalize_rms);
-        if self.normalize_rms <= NORMALIZE_SILENCE_RMS {
-            return self.normalize_gain;
-        }
-        let desired =
-            (NORMALIZE_TARGET_RMS / self.normalize_rms).clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
-        self.normalize_gain += NORMALIZE_GAIN_ALPHA * (desired - self.normalize_gain);
-        self.normalize_gain
     }
 }
 
@@ -425,7 +495,9 @@ where
         }
 
         let normalize_gain = if self.normalize_enabled {
-            self.advance_normalizer(sample)
+            let samples_per_second =
+                f64::from(self.sample_rate) * f64::from(self.channels.max(1));
+            self.normalizer.advance(sample, samples_per_second, self.gain)
         } else {
             1.0
         };
@@ -466,8 +538,88 @@ fn mb_to_linear(mb: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_params, AudioEffectsParams};
+    use super::{read_params, AudioEffectsParams, IntegratedNormalizer};
     use std::sync::{Arc, Mutex};
+
+    /// 96kHz 采样流（48kHz 立体声），方波信号 RMS 恰等于幅度
+    const SAMPLES_PER_SECOND: f64 = 96_000.0;
+
+    fn feed_square(
+        normalizer: &mut IntegratedNormalizer,
+        amplitude: f32,
+        seconds: f64,
+    ) -> (f64, f64) {
+        let count = (SAMPLES_PER_SECOND * seconds) as usize;
+        let mut last_gain = 1.0;
+        let mut sum_squares = 0.0;
+        for index in 0..count {
+            let sample = if index % 2 == 0 { amplitude } else { -amplitude };
+            last_gain = normalizer.advance(sample, SAMPLES_PER_SECOND, 1.0);
+            let out = f64::from(sample) * last_gain;
+            sum_squares += out * out;
+        }
+        (last_gain, (sum_squares / count as f64).sqrt())
+    }
+
+    /// 语义 1：一首歌内部的强弱是原声，收敛后增益必须近乎恒定
+    ///
+    /// 旧实现是 EMA 滑动窗口——本质是慢速压缩器，副歌被压、间隙被抬，
+    /// 增益在 0.5×~2× 之间来回摆。整轨积分收敛后，乐句强弱对积分值的
+    /// 影响趋近于零，增益不动，动态范围原样保留。
+    #[test]
+    fn gain_stays_flat_across_loud_and_quiet_passages() {
+        let mut normalizer = IntegratedNormalizer::new();
+        // 20 秒 -14dBFS 正文让积分收敛
+        let (converged_gain, _) = feed_square(&mut normalizer, 0.2, 20.0);
+        // 随后 4 秒安静乐句 + 4 秒响乐句
+        let (quiet_gain, _) = feed_square(&mut normalizer, 0.05, 4.0);
+        let (loud_gain, _) = feed_square(&mut normalizer, 0.2, 4.0);
+
+        let swing = (quiet_gain / loud_gain - 1.0).abs();
+        assert!(
+            swing < 0.15,
+            "收敛后乐句强弱不得驱动增益: quiet={quiet_gain:.3} loud={loud_gain:.3} 摆动 {:.1}%",
+            swing * 100.0,
+        );
+        assert!(
+            (converged_gain / loud_gain - 1.0).abs() < 0.15,
+            "收敛值不得漂移: converged={converged_gain:.3} loud={loud_gain:.3}",
+        );
+    }
+
+    /// 语义 2：不同歌曲各自收敛到不同增益，输出响度靠拢同一目标
+    #[test]
+    fn different_tracks_converge_to_the_same_target_loudness() {
+        let mut quiet_track = IntegratedNormalizer::new();
+        let mut loud_track = IntegratedNormalizer::new();
+        let (_, quiet_out_rms) = feed_square(&mut quiet_track, 0.05, 30.0);
+        let (_, loud_out_rms) = feed_square(&mut loud_track, 0.4, 30.0);
+
+        // 输入差 8 倍（18dB），输出差必须收敛到 1.6 倍（4dB）以内
+        let ratio = loud_out_rms / quiet_out_rms;
+        assert!(
+            ratio < 1.6,
+            "曲间响度未对齐: quiet_rms={quiet_out_rms:.4} loud_rms={loud_out_rms:.4} ratio={ratio:.2}",
+        );
+        // 且都朝目标方向移动：安静曲被抬、响曲被压
+        assert!(quiet_out_rms > 0.05 * 1.5, "安静曲应被抬升");
+        assert!(loud_out_rms < 0.4 * 0.7, "响曲应被压低");
+    }
+
+    /// 语义 3：增益不得把峰值推过 -2 dBFS 削波
+    #[test]
+    fn normalization_never_pushes_peaks_into_clipping() {
+        let mut normalizer = IntegratedNormalizer::new();
+        // 安静正文把增益推向上限
+        feed_square(&mut normalizer, 0.05, 20.0);
+        // 突发接近满幅的瞬态
+        let gain = normalizer.advance(0.98, SAMPLES_PER_SECOND, 1.0);
+        assert!(
+            0.98 * gain <= super::NORMALIZE_PEAK_CEILING + 1e-6,
+            "瞬态峰被推过削波线: gain={gain:.3} -> {:.3}",
+            0.98 * gain,
+        );
+    }
 
     /// 回归：锁毒化后必须还能读到用户设置，而不是 panic 或退回默认值
     ///
