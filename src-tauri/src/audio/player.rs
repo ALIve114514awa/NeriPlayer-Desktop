@@ -1737,6 +1737,8 @@ fn prepare_session(
         }),
     )
     .with_external_cancel(Arc::clone(&prepare_cancel));
+    // 留一份句柄：prepare 成功后解除代际守卫（见 disarm_operation_guard 注释）
+    let operation_guard = read_cancellation.clone();
     log::info!(
         target: "cpal-output",
         "decoder begin source={}, generation={}, start_ms={}",
@@ -1877,6 +1879,10 @@ fn prepare_session(
         ready_wait_ms,
         prepare_started.elapsed().as_millis()
     );
+    // 会话已就绪，即将交给调用方提交：解除代际守卫。
+    // 此后哪怕用户马上再 seek，本会话也由 previous.stop() 干净收尾，
+    // 而不是被瞬间递增的代际把按需读掐死在半路
+    operation_guard.disarm_operation_guard();
     Ok(PlaybackSession {
         source,
         stream,

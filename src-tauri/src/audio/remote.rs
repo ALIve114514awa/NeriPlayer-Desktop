@@ -123,6 +123,16 @@ pub struct RemoteAudioSource {
 pub struct RemoteReadCancellation {
     session_cancelled: Arc<AtomicBool>,
     operation_generation: Option<(Arc<AtomicU64>, u64)>,
+    /// prepare 期取消通道（代际检查 + 外部超时旗标）是否仍生效
+    ///
+    /// 两条通道的正当职责都只在 prepare 阶段：代际检查打断「输给更新
+    /// seek 的 prepare」（seek 代际在发送命令的瞬间就递增，不解除的话
+    /// 用户下一次 seek 会先把还在正常播放的会话的按需读杀死——实机日志
+    /// seek 后 6 秒 next_packet fatal: remote read superseded）；外部超时
+    /// 旗标解卡「等不到回包的 prepare」（回包超时与提交存在竞态窗口，
+    /// 迟到的置位会无声杀死已提交的会话）。会话提交后一并解除，
+    /// 生命周期只归 session_cancelled（previous.stop）管。
+    operation_armed: Arc<AtomicBool>,
     /// 外部 prepare 超时取消（不改 generation，仅打断当前 prepare）
     external_cancel: Option<Arc<AtomicBool>>,
 }
@@ -135,8 +145,15 @@ impl RemoteReadCancellation {
         Self {
             session_cancelled,
             operation_generation,
+            operation_armed: Arc::new(AtomicBool::new(true)),
             external_cancel: None,
         }
+    }
+
+    /// prepare 成功、会话即将提交时调用：
+    /// 此后代际递增与迟到的 prepare 超时都不再影响本会话的读
+    pub fn disarm_operation_guard(&self) {
+        self.operation_armed.store(false, Ordering::Release);
     }
 
     pub fn with_external_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
@@ -145,11 +162,16 @@ impl RemoteReadCancellation {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.session_cancelled.load(Ordering::Acquire)
-            || self
-                .external_cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        if self.session_cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        // prepare 期专属的两条取消通道，提交后一并失效
+        if !self.operation_armed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.external_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
             || self
                 .operation_generation
                 .as_ref()
@@ -2498,8 +2520,10 @@ impl Iterator for SymphoniaAudioDecoder {
                     }
                     Err(SymphoniaError::IoError(err))
                         if consecutive_io < MAX_VIRTUAL_BODY_SKIP_PACKETS
+                            // Interrupted 一律是取消令牌（superseded/停会话），对本次
+                            // 操作是永久态：重试 3 次只是把新 seek 的接管拖慢 60ms，
+                            // 还会在日志里刷出误导性的 retry 噪音
                             && (err.kind() == std::io::ErrorKind::UnexpectedEof
-                                || err.kind() == std::io::ErrorKind::Interrupted
                                 || err.kind() == std::io::ErrorKind::WouldBlock) =>
                     {
                         // 预取窗口边缘瞬时 EOF / 被抢占：稍等再试，避免整段饿死
@@ -4329,6 +4353,70 @@ mod tests {
             // 打开后必须对 demuxer 可 seek，样本才能在拼接视图里回跳
             assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
         }
+    }
+
+    /// 回归：代际守卫只许在 prepare 阶段杀读，提交后的会话必须免疫
+    ///
+    /// seek 代际在发送命令的瞬间递增。旧实现的令牌终生生效——用户下一次
+    /// seek 会先把还在正常播放的会话的按需读掐死（实机：seek 后 6 秒
+    /// next_packet fatal: remote read superseded，随后一次可听见的重建）。
+    #[test]
+    fn operation_guard_stops_killing_reads_after_disarm() {
+        let generation = Arc::new(AtomicU64::new(7));
+        let session_cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = RemoteReadCancellation::new(
+            Arc::clone(&session_cancelled),
+            Some((Arc::clone(&generation), 7)),
+        );
+        // 克隆共享同一守卫：prepare 把令牌分发给解码/预取各处后，
+        // 在任何一份上解除都要对全体生效
+        let reader_copy = cancellation.clone();
+
+        // prepare 阶段：代际一致不取消，被更新的 seek 抢先则必须取消
+        assert!(!reader_copy.is_cancelled());
+        generation.store(8, Ordering::Release);
+        assert!(reader_copy.is_cancelled(), "prepare 输给新 seek 时必须可被打断");
+
+        // 会话提交：解除代际守卫，之后代际再怎么涨都不关本会话的事
+        generation.store(7, Ordering::Release);
+        cancellation.disarm_operation_guard();
+        generation.store(99, Ordering::Release);
+        assert!(
+            !reader_copy.is_cancelled(),
+            "已提交会话不得被后续 seek 的代际递增杀死",
+        );
+
+        // 会话自身的收尾通道必须仍然有效
+        session_cancelled.store(true, Ordering::Release);
+        assert!(reader_copy.is_cancelled(), "previous.stop() 仍要能停掉读");
+    }
+
+    /// 回归：迟到的 prepare 超时旗标不得杀死已提交的会话
+    ///
+    /// 回包超时与提交存在竞态窗口：命令侧 recv 超时置位旗标的一瞬，
+    /// 音频线程可能刚提交完会话。旧实现里 external_cancel 终生生效，
+    /// 这一下就把好端端的会话无声杀死——偶发「突然不播了」。
+    #[test]
+    fn late_prepare_timeout_cannot_kill_a_committed_session() {
+        let external = Arc::new(AtomicBool::new(false));
+        let cancellation = RemoteReadCancellation::new(
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .with_external_cancel(Arc::clone(&external));
+
+        // prepare 期内超时旗标必须能打断
+        external.store(true, Ordering::Release);
+        assert!(cancellation.is_cancelled(), "prepare 卡死时必须可被超时解卡");
+        external.store(false, Ordering::Release);
+
+        // 提交后迟到的置位不得再影响
+        cancellation.disarm_operation_guard();
+        external.store(true, Ordering::Release);
+        assert!(
+            !cancellation.is_cancelled(),
+            "迟到的 prepare 超时不得杀死已提交的会话",
+        );
     }
 
     /// 端到端复现：真实 YouTube fMP4 字节走完整虚拟 body 打开 + 解码
