@@ -4259,6 +4259,63 @@ mod tests {
         assert!(super::detect_fragmented_mp4(&mp4_box(b"styp", &[0u8; 8])));
     }
 
+    /// 回归：嗅探到分片只能影响「打开阶段顺序读」，绝不能启用虚拟 body
+    ///
+    /// 曾经因为给这类流建了 seek 索引而走上 virtual-body 拼接，
+    /// 样本偏移对不上导致 seek 与回滚双双 end of stream，播放直接死掉。
+    #[test]
+    fn sniffed_fragments_must_not_enable_virtual_body_seek() {
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://rr1---sn-x.googlevideo.com/videoplayback?itag=140".into(),
+                referer: "https://www.youtube.com".into(),
+                total_len: 4_842_215,
+                header_end: AtomicU64::new(1151),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 262_144,
+                    target_bytes: 1_048_576,
+                },
+                cache: Mutex::new(Vec::new()),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                // open 阶段顺序读，避免 symphonia 顺着 moof 链扫完整个文件
+                demuxer_open_sequential: AtomicBool::new(true),
+                virtual_body_origin: AtomicU64::new(0),
+                // 嗅探路径不建索引，交给 symphonia 原生 sidx 定位
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        // 打开阶段对 demuxer 隐藏 seekable / byte_len，否则会扫全文件
+        assert!(!symphonia::core::io::MediaSource::is_seekable(&source));
+        assert!(symphonia::core::io::MediaSource::byte_len(&source).is_none());
+
+        source.finish_demuxer_open();
+        // 打开完成后恢复可 seek，让 symphonia 自己按 sidx 跳转
+        assert!(symphonia::core::io::MediaSource::is_seekable(&source));
+        assert!(!source.prefers_virtual_body_seek(), "虚拟 body 不适用于自带 sidx 的流");
+
+        let seekable = source.seekable_clone();
+        assert!(!seekable.prefers_virtual_body_seek());
+        // 按需块必须保持 256KB：8MB 是给 Bilibili 独立 .m4s 分片调的
+        assert_eq!(
+            seekable.access_mode.demand_fetch_block_bytes(),
+            super::REMOTE_FETCH_BLOCK_BYTES
+        );
+    }
+
     #[test]
     fn progressive_mp4_is_not_sniffed_as_fragmented() {
         // ftyp + moov(仅 mvhd) + mdat：普通渐进式 MP4

@@ -72,6 +72,54 @@ impl FallbackHttp {
     }
 }
 
+/// 解析 JSON 响应，先判状态码再解析
+///
+/// 直接 `resp.json()` 会把错误响应当成正常内容：
+/// - 4xx/5xx 的 JSON 错误体解析成功后，业务层看到的是"合法但没有内容"，
+///   界面只会渲染成空列表，整条链路不报错（YouTube 云端歌单就栽在这里）
+/// - 返回 HTML 错误页时，用户看到的是「Parse error: expected value」，
+///   完全指不到真正的问题
+pub async fn parse_json_response<T: serde::de::DeserializeOwned>(
+    response: Response,
+    context: &str,
+) -> Result<T, crate::error::AppError> {
+    use crate::error::AppError;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AppError::Api(format!("{context}: failed to read body: {error}")))?;
+
+    if !status.is_success() {
+        return Err(AppError::Api(format!(
+            "{context}: HTTP {status}{}",
+            summarize_body(&body)
+        )));
+    }
+
+    serde_json::from_str(&body).map_err(|error| {
+        AppError::Api(format!(
+            "{context}: invalid JSON ({error}){}",
+            summarize_body(&body)
+        ))
+    })
+}
+
+/// 把响应体压成一行短摘要，避免整页 HTML 灌进错误信息与日志
+fn summarize_body(body: &str) -> String {
+    const MAX: usize = 160;
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return String::new();
+    }
+    if normalized.chars().count() <= MAX {
+        return format!(" - {normalized}");
+    }
+    let truncated: String = normalized.chars().take(MAX).collect();
+    format!(" - {truncated}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +217,50 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 500);
         assert_eq!(hits.load(Ordering::SeqCst), 1, "must not double the request");
+    }
+
+    #[tokio::test]
+    async fn json_parse_rejects_error_statuses_instead_of_returning_empty_content() {
+        // 这正是 YouTube 云端歌单静默变空的形态：错误体也是合法 JSON
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let payload = r#"{"error":{"message":"session expired"}}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let response = client()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let error = parse_json_response::<serde_json::Value>(response, "test")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("401"), "{message}");
+        assert!(message.contains("session expired"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn json_parse_reports_non_json_bodies_readably() {
+        let (url, _) = mock_server("200 OK").await;
+        let response = client().get(&url).send().await.unwrap();
+
+        let error = parse_json_response::<serde_json::Value>(response, "test")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid JSON"), "{error}");
     }
 
     #[tokio::test]

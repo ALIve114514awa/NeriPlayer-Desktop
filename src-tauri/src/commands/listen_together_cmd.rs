@@ -11,7 +11,7 @@ pub async fn lt_create_room(
     initial_snapshot: LtInitialSnapshot,
     state: State<'_, AppState>,
 ) -> Result<LtRoomResponse, String> {
-    let http = state.http();
+    let http = state.transport("listen-together");
     let url = format!("{}/api/rooms", base_url.trim_end_matches('/'));
 
     let body = LtCreateRoomRequest {
@@ -21,13 +21,16 @@ pub async fn lt_create_room(
     };
 
     let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
+        .send(|client| client.post(&url).json(&body))
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
-    let room_resp: LtRoomResponse = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+    // 必须先判状态码：房间服务返回 4xx/5xx 时错误体同样可能是 JSON，
+    // 直接解析会得到 ok=false 却没有原因，用户只看到一句 Parse error
+    let room_resp: LtRoomResponse =
+        crate::api::transport::parse_json_response(resp, "listen-together create room")
+            .await
+            .map_err(|e| e.to_string())?;
 
     if room_resp.ok {
         let mut session = state.lt_session.lock();
@@ -50,7 +53,7 @@ pub async fn lt_join_room(
     nickname: String,
     state: State<'_, AppState>,
 ) -> Result<LtRoomResponse, String> {
-    let http = state.http();
+    let http = state.transport("listen-together");
     let url = format!(
         "{}/api/rooms/{}/join",
         base_url.trim_end_matches('/'),
@@ -63,13 +66,14 @@ pub async fn lt_join_room(
     };
 
     let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
+        .send(|client| client.post(&url).json(&body))
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
-    let room_resp: LtRoomResponse = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+    let room_resp: LtRoomResponse =
+        crate::api::transport::parse_json_response(resp, "listen-together join room")
+            .await
+            .map_err(|e| e.to_string())?;
 
     if room_resp.ok {
         let mut session = state.lt_session.lock();

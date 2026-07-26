@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
 use super::crypto;
-use crate::api::transport::FallbackHttp;
+use crate::api::transport::{parse_json_response, FallbackHttp};
 
 const BASE_URL: &str = "https://music.163.com";
 
@@ -84,8 +84,7 @@ impl NeteaseClient {
             })
             .await?;
 
-        let body: Value = resp.json().await?;
-        Ok(body)
+        parse_json_response(resp, "netease weapi").await
     }
 
     /// 搜索歌曲
@@ -176,10 +175,10 @@ impl NeteaseClient {
             })
             .await?;
 
-        let body: Value = resp.json().await
-            .map_err(|e| {
-                log::error!(target: "netease", "lyrics JSON parse failed: {}", e);
-                AppError::Api(format!("Lyrics parse error: {}", e))
+        let body: Value = parse_json_response(resp, "netease lyrics")
+            .await
+            .inspect_err(|error| {
+                log::error!(target: "netease", "lyrics response invalid: {}", error);
             })?;
 
         let code = body["code"].as_i64().unwrap_or(-1);
@@ -346,8 +345,7 @@ impl NeteaseClient {
                     .header("Referer", "https://music.163.com")
             })
             .await?;
-        let body: Value = resp.json().await?;
-        Ok(body)
+        parse_json_response(resp, "netease album detail").await
     }
 
     /// 获取精品歌单分类标签

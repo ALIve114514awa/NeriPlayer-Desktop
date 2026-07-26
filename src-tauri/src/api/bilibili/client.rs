@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::error::{AppError, AppResult};
-use crate::api::transport::FallbackHttp;
+use crate::api::transport::{parse_json_response, FallbackHttp};
 use super::wbi;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -59,8 +59,8 @@ impl BiliClient {
                     .header("User-Agent", USER_AGENT)
                     .header("Referer", "https://www.bilibili.com")
             })
-            .await?
-            .json()
+            .await
+            .map(|resp| parse_json_response::<Value>(resp, "bilibili nav"))?
             .await?;
 
         let img_url = resp["data"]["wbi_img"]["img_url"].as_str()
@@ -98,8 +98,8 @@ impl BiliClient {
                     .header("User-Agent", USER_AGENT)
                     .header("Referer", "https://www.bilibili.com")
             })
-            .await?
-            .json()
+            .await
+            .map(|response| parse_json_response::<Value>(response, "bilibili wbi"))?
             .await?;
 
         if resp["code"].as_i64() != Some(0) {
@@ -209,8 +209,7 @@ impl BiliClient {
                     .header("Referer", "https://www.bilibili.com")
             })
             .await?;
-        let body: Value = resp.json().await?;
-        Ok(body)
+        parse_json_response(resp, "bilibili nav").await
     }
 
     /// 获取用户创建的收藏夹列表（分页版，包含封面）
