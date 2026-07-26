@@ -508,6 +508,8 @@ onUnmounted(() => {
   justify-content: center;
   background: transparent;
   border: none;
+  /* Windows/Linux 窗口控件按系统惯例是通栏直角，覆盖全局按钮圆角兜底 */
+  border-radius: 0;
   color: inherit;
   opacity: 0.7;
   cursor: pointer;

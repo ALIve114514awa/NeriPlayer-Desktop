@@ -145,10 +145,15 @@ button {
   cursor: pointer;
   color: inherit;
   outline: none;
+  /* 兜底圆角：任何按钮在 hover/active 上色时都不会出现直角色块，
+     组件自己声明 border-radius 时会自然覆盖这里 */
+  border-radius: var(--radius-sm, 8px);
 }
 button:focus-visible {
   outline: 2px solid var(--md-primary);
   outline-offset: 2px;
+  /* 描边跟随元素自身圆角，避免圆角按钮套一个直角焦点框 */
+  border-radius: inherit;
 }
 
 a { color: inherit; text-decoration: none; }
@@ -222,4 +227,25 @@ html.theme-ripple-active .pill {
 
 html.theme-ripple-active::view-transition-new(root) {
   transition: clip-path 500ms cubic-bezier(0.2, 0, 0, 1) !important;
+}
+
+/* 全局降级动效
+   仅 3/29 个含动画的样式文件单独处理过 prefers-reduced-motion，
+   逐个补容易漏；这里做统一兜底，组件里的针对性规则仍然可以更精细。
+   保留极短时长而非 0s，避免依赖 transitionend/animationend 的逻辑收不到事件。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+    transition: none !important;
+  }
 }

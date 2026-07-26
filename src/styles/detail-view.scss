@@ -405,7 +405,7 @@
   border-radius: 12px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.15);
   border: 1px solid var(--md-outline-variant);
-  padding: 4px 0;
+  padding: 4px;
   z-index: 501;
   animation: ctx-in 120ms ease-out;
 }
@@ -420,12 +420,13 @@
   align-items: center;
   gap: 12px;
   width: 100%;
-  padding: 10px 16px;
+  padding: 10px 12px;
   font-size: 14px;
   font-weight: 500;
   color: var(--md-on-surface);
   background: none;
   border: none;
+  border-radius: var(--radius-md, 12px);
   cursor: pointer;
   transition: background 150ms, color 150ms;
   font-family: inherit;
