@@ -1556,6 +1556,10 @@ fn audio_control_loop(
                         );
                         break;
                     }
+                    // 乐观置位目标时间：stop 到 decoder 打开完成之间可达秒级，
+                    // 不置位的话 ticker 会把旧位置事件发给前端，进度条先回跳
+                    // 再跳回目标（回流）。失败路径由 rollback 恢复快照位置
+                    clock.store_ms(latest);
                     // 先停旧会话：取消旧 decode worker 的 remote 读，
                     // 避免和 seekable 重建抢 in_flight（重复 stop 幂等）
                     previous.stop();
@@ -1598,7 +1602,11 @@ fn audio_control_loop(
                                 drop(next);
                                 continue;
                             }
-                            if !paused {
+                            if paused {
+                                // 暂停态 seek：新会话默认非暂停且输出流在跑，
+                                // 必须显式暂停，否则 UI 显示暂停但歌曲已出声
+                                next.pause();
+                            } else {
                                 if let Err(error) = next.play() {
                                     log::warn!(
                                         target: "cpal-output",
@@ -1847,6 +1855,9 @@ fn rebuild_session_in_place(
                 if let Err(error) = next.play() {
                     log::warn!(target: "cpal-output", "effects rebuild play failed: {error}");
                 }
+            } else {
+                // 暂停态重建：保持静音，避免调音效时突然出声
+                next.pause();
             }
             *current = Some(next);
         }
@@ -1917,6 +1928,10 @@ fn rebuild_after_failed_seek(
                         "seek rollback play failed: {play_error}"
                     );
                 }
+            } else {
+                // 新会话的 paused 初始为 false 且输出流建好即在跑：
+                // 暂停态下必须显式暂停，否则「UI 显示暂停但已出声」
+                restored.pause();
             }
             Some(restored)
         }

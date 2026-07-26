@@ -703,9 +703,13 @@ impl RemoteAudioSource {
             sniffed_fragmented || matches!(access_mode, RemoteAccessMode::LongFormProgressive);
         // 分片 MP4 的 sidx 紧跟 moov 位于首包，先用首包建索引；
         // 建成了就不必再为长内容拉 1MB 尾部，直接省掉起播路径上的一次往返
+        //
+        // 不要求 duration_hint_ms > 0：sidx 自带 timescale 与分段时长，
+        // 时长未知（YouTube 前端常传 hint=0）同样能建出精确索引；
+        // 否则这类流会退化到 format.seek 顺序爬 moof，O(文件大小)——
+        // 实测 58MB 一次 seek 要顺序下完全文件耗时 16.6s
         let head_index_ready = needs_seek_index
             && total_len > 0
-            && duration_hint_ms > 0
             && build_seek_index_from_head(&inner, duration_hint_ms);
 
         // 长内容：尾部 moov/sidx 预取进缓存，seek 升级为 seekable 后 demuxer 能直接跳转
@@ -762,8 +766,9 @@ impl RemoteAudioSource {
             }
         }
         // 首包没建成索引时再兜底：长内容可退到尾部 sidx / 线性估算，
-        // 嗅探出的分片内容只接受真实 sidx，解析不到就保持原 format.seek 行为
-        if needs_seek_index && total_len > 0 && duration_hint_ms > 0 && !head_index_ready {
+        // 嗅探出的分片内容只接受真实 sidx，解析不到就保持原 format.seek 行为。
+        // 线性估算依赖声明时长，hint=0（时长未知）时在函数内部自动禁用
+        if needs_seek_index && total_len > 0 && !head_index_ready {
             let allow_linear_fallback =
                 matches!(access_mode, RemoteAccessMode::LongFormProgressive);
             build_seek_index_for_long_form(&inner, duration_hint_ms, allow_linear_fallback);
@@ -3623,7 +3628,9 @@ fn position_is_cached_range(inner: &RemoteAudioInner, start: u64, end: u64) -> b
 
 /// 只用首包的 sidx 建索引，成功返回 true；失败不写入，交给调用方兜底
 fn build_seek_index_from_head(inner: &RemoteAudioInner, duration_hint_ms: u64) -> bool {
-    let Some(index) = parse_sidx_seek_index(inner, duration_hint_ms.max(1)) else {
+    // hint=0（时长未知）原样传入：parse 层只在 >0 时做 clamp。
+    // 旧的 .max(1) 会把索引里所有 time_ms 夹到 ≤1ms，等于毁掉整张索引
+    let Some(index) = parse_sidx_seek_index(inner, duration_hint_ms) else {
         return false;
     };
     if index.entries.is_empty() {
@@ -3647,9 +3654,11 @@ fn build_seek_index_for_long_form(
     duration_hint_ms: u64,
     allow_linear_fallback: bool,
 ) {
-    let duration_ms = duration_hint_ms.max(1);
-    let mut index = parse_sidx_seek_index(inner, duration_ms)
-        .or_else(|| parse_sidx_seek_index_from_tail(inner, duration_ms));
+    // duration_hint_ms=0 表示时长未知：sidx 解析不受影响（自带 timescale，
+    // clamp 在 parse 层按 >0 守卫跳过），但线性估算没有时长就无从落点，禁用
+    let mut index = parse_sidx_seek_index(inner, duration_hint_ms)
+        .or_else(|| parse_sidx_seek_index_from_tail(inner, duration_hint_ms));
+    let allow_linear_fallback = allow_linear_fallback && duration_hint_ms > 0;
     if index.is_none() && !allow_linear_fallback {
         // 分片内容没解析到真实 sidx 时不启用虚拟 body：线性估算落点不可靠，
         // 保持原有的 format.seek 行为，避免把可用路径换成更差的路径
@@ -3660,12 +3669,12 @@ fn build_seek_index_for_long_form(
         return;
     }
     if index.is_none() {
-        // 线性估算兜底：足够让字节跳转落到大致区域
+        // 线性估算兜底：足够让字节跳转落到大致区域（仅时长已知时启用）
         let total = inner.total_len.max(1);
         let steps = 32u64;
         let mut entries = Vec::with_capacity(steps as usize + 1);
         for i in 0..=steps {
-            let time_ms = duration_ms.saturating_mul(i) / steps;
+            let time_ms = duration_hint_ms.saturating_mul(i) / steps;
             let byte_offset = total.saturating_mul(i) / steps;
             entries.push(SeekIndexEntry {
                 time_ms,
@@ -3673,13 +3682,13 @@ fn build_seek_index_for_long_form(
             });
         }
         index = Some(RemoteSeekIndex {
-            duration_ms,
+            duration_ms: duration_hint_ms,
             entries,
         });
         log::info!(
             target: "remote-audio",
             "seek index fallback linear duration_ms={}, entries={}",
-            duration_ms,
+            duration_hint_ms,
             steps + 1
         );
     } else if let Some(ref built) = index {
@@ -6458,6 +6467,69 @@ mod tests {
         assert_eq!(requests.lock().expect("requests lock").len(), 1);
         assert_eq!(inner.virtual_body_origin.load(Ordering::Acquire), 0);
         assert!(inner.remote_forbidden.load(Ordering::Acquire));
+    }
+
+    /// 手工构造 version=0 的 sidx box：timescale=48000，两段各 10s / 1MB
+    fn sidx_atom_two_segments() -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        body.extend_from_slice(&1u32.to_be_bytes()); // reference_ID
+        body.extend_from_slice(&48_000u32.to_be_bytes()); // timescale
+        body.extend_from_slice(&0u32.to_be_bytes()); // earliest_pts
+        body.extend_from_slice(&0u32.to_be_bytes()); // first_offset
+        body.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        body.extend_from_slice(&2u16.to_be_bytes()); // reference_count
+        for _ in 0..2 {
+            body.extend_from_slice(&0x0010_0000u32.to_be_bytes()); // 1MB, media type
+            body.extend_from_slice(&480_000u32.to_be_bytes()); // 10s @48k
+            body.extend_from_slice(&0u32.to_be_bytes()); // SAP
+        }
+        let mut atom = Vec::with_capacity(8 + body.len());
+        atom.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+        atom.extend_from_slice(b"sidx");
+        atom.extend_from_slice(&body);
+        atom
+    }
+
+    /// 回归（YouTube seek 慢 16s）：前端对 YouTube 常传 duration_hint=0，
+    /// 旧代码既要求 hint>0 才建索引、又用 .max(1) 把 time_ms 全 clamp 到 1ms，
+    /// 导致分片流退化到 format.seek 顺序爬完全文件。
+    /// sidx 自带 timescale，时长未知也必须能建出精确索引
+    #[test]
+    fn fragmented_seek_index_builds_without_duration_hint() {
+        let total_len: u64 = 4 * 1024 * 1024;
+        let inner = forbidden_test_inner("http://127.0.0.1:1/audio.m4a".into(), total_len);
+        inner
+            .cache
+            .lock()
+            .expect("cache lock")
+            .push(CachedSegment {
+                start: 0,
+                data: sidx_atom_two_segments(),
+            });
+
+        assert!(
+            super::build_seek_index_from_head(&inner, 0),
+            "sidx index must build with duration_hint_ms=0",
+        );
+
+        let index = inner
+            .seek_index
+            .lock()
+            .expect("seek index lock")
+            .clone()
+            .expect("index stored");
+        // 三个锚点：0s / 10s / 20s，时间来自 sidx 自身 timescale，绝不能被 clamp
+        assert_eq!(index.entries.len(), 3);
+        assert_eq!(index.entries[1].time_ms, 10_000);
+        assert_eq!(index.entries[2].time_ms, 20_000);
+        assert_eq!(index.duration_ms, 20_000);
+        // seek 到 15s 应落在 10s 段起点（首个 moof 后 1MB 处）
+        let atom_len = sidx_atom_two_segments().len() as u64;
+        assert_eq!(
+            index.estimate_segment(15_000).0,
+            atom_len + 1024 * 1024,
+        );
     }
 
     /// splice 打开期的错误分类：解码类可跳；IO 里只有瞬时类可跳，
