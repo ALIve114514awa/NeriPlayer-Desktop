@@ -32,16 +32,60 @@ pub struct DownloadManifestValidation {
     pub removed_count: usize,
 }
 
+/// 流式下载的空闲超时：超过该时长收不到任何数据视为连接假死。
+/// 半开 TCP 下 `stream.next()` 会永久阻塞——任务卡死且因注册表判
+/// "downloading" 无法重试，必须有兜底
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 文件名 stem 的最大字节数（UTF-8）：为扩展名与 " (n)" 后缀留余量，
+/// 避免超出各文件系统 255 字节单文件名 / Windows MAX_PATH 限制
+const MAX_FILENAME_STEM_BYTES: usize = 180;
+
+/// Windows 设备保留名：即使带扩展名（如 CON.mp3）也会创建失败或写入设备
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 按字节数截断，绝不切断多字节字符
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut cut = max_bytes;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
 /// 清理文件名中的非法字符
+///
+/// 覆盖：路径分隔/Windows 非法字符、控制字符（0x00-0x1F 等）、结尾的
+/// `.`/空格（Windows 非法）、Windows 设备保留名（加 `_` 前缀）、
+/// 180 字节截断（扩展名由调用方追加）
 fn sanitize_filename(s: &str) -> String {
-    s.chars()
+    let cleaned: String = s
+        .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect();
+    let cleaned = truncate_at_char_boundary(cleaned.trim(), MAX_FILENAME_STEM_BYTES)
+        .trim_end_matches(['.', ' '])
+        .to_string();
+    // 保留名按首个 `.` 之前的 stem 判定（CON 与 CON.tail 都保留给设备）
+    let stem = cleaned.split('.').next().unwrap_or("");
+    let reserved = WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name));
+    if reserved {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    }
 }
 
 /// 根据模板渲染下载文件名（不含扩展名）
@@ -332,11 +376,11 @@ fn read_manifest(app: &AppHandle) -> AppResult<Vec<DownloadedTrack>> {
     Ok(tracks)
 }
 
-/// 写入 manifest
+/// 写入 manifest（原子写：半截 manifest 会让全部下载记录判损坏丢失）
 fn write_manifest(app: &AppHandle, tracks: &[DownloadedTrack]) -> AppResult<()> {
     let path = manifest_path(app)?;
     let json = serde_json::to_string_pretty(tracks)?;
-    std::fs::write(&path, json)?;
+    crate::fsutil::atomic_write(&path, json)?;
     Ok(())
 }
 
@@ -376,8 +420,61 @@ fn remove_download_artifacts(file_path: &str) {
     let _ = std::fs::remove_file(audio_path);
 }
 
+/// 清扫遗留的 `*.part` 半截下载文件
+///
+/// 只清理最后修改超过 1 小时的：下载中的 .part 由任务自身负责删除，
+/// 且流有 30s 空闲超时——停滞任务会在分钟级内自行失败并清掉自己的
+/// .part；能活过 1 小时的必然是崩溃/断电遗留
+fn sweep_stale_part_files(dirs: impl IntoIterator<Item = PathBuf>) -> usize {
+    const STALE_AFTER: Duration = Duration::from_secs(3_600);
+    let mut removed = 0_usize;
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for dir in dirs {
+        if !seen.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("part") || !path.is_file() {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age >= STALE_AFTER);
+            if stale && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 fn validate_manifest_files(app: &AppHandle) -> AppResult<DownloadManifestValidation> {
     let manifest = read_manifest(app)?;
+
+    // 顺带清扫崩溃/断电遗留的 .part：默认下载目录 + manifest 涉及的自定义目录
+    let mut sweep_dirs: Vec<PathBuf> = manifest
+        .iter()
+        .filter_map(|track| {
+            std::path::Path::new(&track.file_path)
+                .parent()
+                .map(|parent| parent.to_path_buf())
+        })
+        .collect();
+    if let Ok(default_dir) = default_downloads_dir(app) {
+        sweep_dirs.push(default_dir);
+    }
+    let swept = sweep_stale_part_files(sweep_dirs);
+    if swept > 0 {
+        log::info!(target: "download", "swept {} stale .part files", swept);
+    }
+
     let mut valid = Vec::with_capacity(manifest.len());
     let mut removed_count = 0_usize;
     let mut changed = false;
@@ -506,16 +603,33 @@ async fn perform_download(
     // 构造文件名：使用模板
     let base_name =
         render_download_filename(&title, &artist, &album, &source, name_template.as_deref());
-    let filename = format!("{}.{}", base_name, ext);
 
     let dir = downloads_dir(&app, download_dir.as_deref())?;
-    let file_path = dir.join(&filename);
-    let mut file = tokio::fs::File::create(&file_path).await?;
+    // 同名碰撞：本曲目已下载会在函数入口提前返回，走到这里时目标文件若已
+    // 存在则必属于其它曲目（或历史遗留）——直接覆盖会互删数据、manifest
+    // 双记录指向同一文件。追加 " (2)"/" (3)" 后缀避让
+    let mut file_path = dir.join(format!("{}.{}", base_name, ext));
+    let mut collision_suffix = 2_u32;
+    while file_path.exists() {
+        file_path = dir.join(format!("{} ({}).{}", base_name, collision_suffix, ext));
+        collision_suffix += 1;
+        if collision_suffix > 1_000 {
+            return Err(AppError::Other("Too many filename collisions".into()));
+        }
+    }
+    // 先写 `<final>.part` 临时文件，完整收尾后才 rename 为最终名：
+    // 失败/取消/崩溃只会留下可识别清扫的 .part，不会产生半截"成品"文件
+    let part_path = {
+        let mut name = file_path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".part");
+        file_path.with_file_name(name)
+    };
+    let mut file = tokio::fs::File::create(&part_path).await?;
 
-    let mut file_size = 0_u64;
     let mut stream = resp.bytes_stream();
-    let mut last_emit_at = Instant::now() - Duration::from_millis(500);
-    let mut last_emitted_bytes = 0_u64;
     emit_download_progress(
         &app,
         &track_id,
@@ -525,46 +639,74 @@ async fn perform_download(
         Some(0),
         total_bytes,
     );
-    while let Some(chunk) = stream.next().await {
+    // 集中收敛写入阶段的所有失败出口，统一在块外清理 .part
+    let stream_outcome: AppResult<u64> = async {
+        let mut file_size = 0_u64;
+        let mut last_emit_at = Instant::now() - Duration::from_millis(500);
+        let mut last_emitted_bytes = 0_u64;
+        loop {
+            // 空闲超时兜底：半开 TCP 下 next() 会永久挂起（见 STREAM_STALL_TIMEOUT）
+            let next = match tokio::time::timeout(STREAM_STALL_TIMEOUT, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    return Err(AppError::Other(
+                        "Download stalled: no data received for 30s".into(),
+                    ));
+                }
+            };
+            let Some(chunk) = next else { break };
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(AppError::Other("Download cancelled".into()));
+            }
+            let chunk = chunk?;
+            if chunk.is_empty() {
+                continue;
+            }
+            file.write_all(&chunk).await?;
+            file_size += chunk.len() as u64;
+
+            let should_emit = total_bytes.map(|total| file_size >= total).unwrap_or(false)
+                || file_size.saturating_sub(last_emitted_bytes) >= 256 * 1024
+                || last_emit_at.elapsed() >= Duration::from_millis(200);
+
+            if should_emit {
+                emit_download_progress(
+                    &app,
+                    &track_id,
+                    "downloading",
+                    None,
+                    None,
+                    Some(file_size),
+                    total_bytes,
+                );
+                last_emit_at = Instant::now();
+                last_emitted_bytes = file_size;
+            }
+        }
+        file.flush().await?;
+
         if cancel_flag.load(Ordering::Relaxed) {
-            let _ = tokio::fs::remove_file(&file_path).await;
             return Err(AppError::Other("Download cancelled".into()));
         }
-        let chunk = chunk?;
-        if chunk.is_empty() {
-            continue;
+        if file_size == 0 {
+            return Err(AppError::Audio("Empty audio data received".into()));
         }
-        file.write_all(&chunk).await?;
-        file_size += chunk.len() as u64;
+        Ok(file_size)
+    }
+    .await;
 
-        let should_emit = total_bytes.map(|total| file_size >= total).unwrap_or(false)
-            || file_size.saturating_sub(last_emitted_bytes) >= 256 * 1024
-            || last_emit_at.elapsed() >= Duration::from_millis(200);
-
-        if should_emit {
-            emit_download_progress(
-                &app,
-                &track_id,
-                "downloading",
-                None,
-                None,
-                Some(file_size),
-                total_bytes,
-            );
-            last_emit_at = Instant::now();
-            last_emitted_bytes = file_size;
+    // rename 前必须关句柄（Windows 上打开中的文件无法作为 rename 目标源）
+    drop(file);
+    let file_size = match stream_outcome {
+        Ok(size) => size,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(error);
         }
-    }
-    file.flush().await?;
-
-    if cancel_flag.load(Ordering::Relaxed) {
-        let _ = tokio::fs::remove_file(&file_path).await;
-        return Err(AppError::Other("Download cancelled".into()));
-    }
-
-    if file_size == 0 {
-        let _ = tokio::fs::remove_file(&file_path).await;
-        return Err(AppError::Audio("Empty audio data received".into()));
+    };
+    if let Err(error) = tokio::fs::rename(&part_path, &file_path).await {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return Err(AppError::Io(error));
     }
 
     // 下载 sidecar（歌词/翻译歌词/封面），失败不影响主音频
@@ -810,4 +952,82 @@ pub async fn reveal_file(path: String) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 非法字符、控制字符替换为下划线，键盘可见字符原样保留
+    #[test]
+    fn sanitize_replaces_illegal_and_control_chars() {
+        assert_eq!(sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(sanitize_filename("bad\u{0}name\u{1f}\ttail"), "bad_name__tail");
+        assert_eq!(sanitize_filename("正常 - 歌名 (Live)"), "正常 - 歌名 (Live)");
+    }
+
+    /// Windows 不允许结尾的点与空格
+    #[test]
+    fn sanitize_strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_filename("track name. . ."), "track name");
+        assert_eq!(sanitize_filename("  spaced  "), "spaced");
+    }
+
+    /// Windows 设备保留名（含带扩展名的 stem）必须加前缀，大小写不敏感
+    #[test]
+    fn sanitize_prefixes_windows_reserved_names() {
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("con"), "_con");
+        assert_eq!(sanitize_filename("Com1"), "_Com1");
+        assert_eq!(sanitize_filename("NUL.mp3"), "_NUL.mp3");
+        assert_eq!(sanitize_filename("LPT9.flac"), "_LPT9.flac");
+        // 相似但不保留的名字不受影响
+        assert_eq!(sanitize_filename("CONCERT"), "CONCERT");
+        assert_eq!(sanitize_filename("COM10"), "COM10");
+    }
+
+    /// stem 超长时按字节截断到 180，且绝不切断多字节字符
+    #[test]
+    fn sanitize_truncates_stem_to_180_bytes_at_char_boundary() {
+        let long_ascii = "a".repeat(400);
+        assert_eq!(sanitize_filename(&long_ascii).len(), MAX_FILENAME_STEM_BYTES);
+
+        // 中文 3 字节/字：180/3=60 字整除；用 61+ 字验证边界处理
+        let long_cjk = "歌".repeat(100);
+        let out = sanitize_filename(&long_cjk);
+        assert!(out.len() <= MAX_FILENAME_STEM_BYTES);
+        assert!(out.chars().all(|c| c == '歌'), "不得出现被切断的乱码字符");
+
+        // 2 字节字符错位对齐：179 字节处落在字符中间也要安全回退
+        let mixed = format!("{}é", "a".repeat(179));
+        let out = sanitize_filename(&mixed);
+        assert!(out.len() <= MAX_FILENAME_STEM_BYTES);
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    /// 超 1 小时的 .part 会被清扫，新鲜 .part 与正常文件保留
+    #[test]
+    fn stale_part_files_are_swept_but_fresh_ones_kept() {
+        let dir = std::env::temp_dir().join(format!("neri-part-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("old.mp3.part");
+        let fresh = dir.join("new.mp3.part");
+        let audio = dir.join("keep.mp3");
+        std::fs::write(&stale, b"x").unwrap();
+        std::fs::write(&fresh, b"x").unwrap();
+        std::fs::write(&audio, b"x").unwrap();
+        // 把 stale 的 mtime 拨回 2 小时前
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(7_200);
+        let file = std::fs::OpenOptions::new().write(true).open(&stale).unwrap();
+        file.set_modified(old_time).unwrap();
+        drop(file);
+
+        let removed = sweep_stale_part_files([dir.clone()]);
+
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(audio.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

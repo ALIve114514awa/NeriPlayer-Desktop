@@ -14,6 +14,15 @@ use crate::listen_together::session::LtSession;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+/// TCP 建连超时：SYN 黑洞网络下 OS 默认 TCP 超时（macOS 约 75s）太长，
+/// 会拖垮代理兜底通道的切换速度
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 单次读超时：这是「两次读到数据之间」的间隔上限，不是总时长上限——
+/// 流式播放/大文件下载只要在稳定传输就不会触发；只有连接假死
+/// （半开 TCP、服务器停止发数据）才会在 30s 后报错，让上层可重试。
+/// 刻意不设总超时（`.timeout()`），否则会杀掉正常的长流式请求
+const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct DownloadTaskControl {
     pub cancel_flag: Arc<AtomicBool>,
     pub handle: JoinHandle<()>,
@@ -56,6 +65,8 @@ impl AppState {
         let http = reqwest::Client::builder()
             .cookie_provider(jar.clone())
             .user_agent(USER_AGENT)
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .read_timeout(HTTP_READ_TIMEOUT)
             .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
@@ -64,6 +75,8 @@ impl AppState {
         let alt = reqwest::Client::builder()
             .cookie_provider(jar.clone())
             .user_agent(USER_AGENT)
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .read_timeout(HTTP_READ_TIMEOUT)
             .build()
             .expect("Failed to create fallback HTTP client");
 
@@ -90,7 +103,9 @@ impl AppState {
         let build = |no_proxy: bool| {
             let mut builder = reqwest::Client::builder()
                 .cookie_provider(self.cookie_jar.clone())
-                .user_agent(USER_AGENT);
+                .user_agent(USER_AGENT)
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .read_timeout(HTTP_READ_TIMEOUT);
             if no_proxy {
                 builder = builder.no_proxy();
             }

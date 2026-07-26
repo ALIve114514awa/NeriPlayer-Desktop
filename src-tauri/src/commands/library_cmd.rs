@@ -68,33 +68,25 @@ pub async fn list_playlists() -> AppResult<Vec<PlaylistInfo>> {
 }
 
 fn list_playlists_blocking(path: std::path::PathBuf) -> AppResult<Vec<PlaylistInfo>> {
-    let mut store = PlaylistStore::load(&path);
+    let store = PlaylistStore::load_strict(&path)?;
 
-    // 自动清理重复歌单（同名只保留歌曲最多的）
-    let mut needs_save = false;
-    let mut seen_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut to_remove = Vec::new();
-    for (i, pl) in store.playlists.iter().enumerate() {
-        let name = pl.name.trim().to_string();
-        if let Some(&prev_idx) = seen_names.get(&name) {
-            if pl.tracks.len() > store.playlists[prev_idx].tracks.len() {
-                to_remove.push(prev_idx);
-                seen_names.insert(name, i);
-            } else {
-                to_remove.push(i);
+    // 同名歌单不再自动删除：旧逻辑「同名只保留曲目最多的一个并落盘」会在
+    // 多设备同步/导入并存的场景下静默销毁用户数据（曲目数不是新旧的可靠
+    // 判据）。现在仅记录警告并全部保留，由用户自行处置
+    {
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pl in &store.playlists {
+            let name = pl.name.trim().to_string();
+            if !seen_names.insert(name.clone()) {
+                log::warn!(
+                    target: "playlist-io",
+                    "发现同名歌单未合并: name={:?}, id={}, tracks={} (全部保留, 不自动删除)",
+                    name,
+                    pl.id,
+                    pl.tracks.len(),
+                );
             }
-            needs_save = true;
-        } else {
-            seen_names.insert(name, i);
         }
-    }
-    if needs_save {
-        to_remove.sort_unstable();
-        to_remove.dedup();
-        for &idx in to_remove.iter().rev() {
-            store.playlists.remove(idx);
-        }
-        let _ = store.save(&path);
     }
 
     let list: Vec<PlaylistInfo> = store.playlists.iter().map(|p| {
@@ -124,7 +116,7 @@ fn list_playlists_blocking(path: std::path::PathBuf) -> AppResult<Vec<PlaylistIn
 #[tauri::command]
 pub async fn create_playlist(app: AppHandle, name: String) -> AppResult<PlaylistInfo> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     let pl = store.create(name);
     let info = PlaylistInfo {
         id: pl.id,
@@ -141,7 +133,7 @@ pub async fn create_playlist(app: AppHandle, name: String) -> AppResult<Playlist
 #[tauri::command]
 pub async fn delete_playlist(app: AppHandle, id: i64) -> AppResult<bool> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     let deleted = store.delete(id);
     if deleted {
         store.save(&path)?;
@@ -153,7 +145,7 @@ pub async fn delete_playlist(app: AppHandle, id: i64) -> AppResult<bool> {
 #[tauri::command]
 pub async fn rename_playlist(app: AppHandle, id: i64, name: String) -> AppResult<bool> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     if let Some(pl) = store.playlists.iter_mut().find(|p| p.id == id) {
         pl.name = name;
         pl.modified_at = chrono::Utc::now().timestamp_millis() as u64;
@@ -179,7 +171,7 @@ pub async fn get_playlist_tracks(id: i64) -> AppResult<Vec<TrackInfo>> {
             queued_at.elapsed().as_millis(),
         );
         let path = playlists_path();
-        let store = PlaylistStore::load(&path);
+        let store = PlaylistStore::load_strict(&path)?;
         let pl = store.playlists.iter().find(|p| p.id == id)
             .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
         let mut seen = std::collections::HashSet::new();
@@ -215,7 +207,7 @@ pub async fn get_playlist_tracks(id: i64) -> AppResult<Vec<TrackInfo>> {
 #[tauri::command]
 pub async fn add_to_playlist(app: AppHandle, playlist_id: i64, track: TrackInfo) -> AppResult<()> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     let added_at = {
         let pl = store.playlists.iter().find(|p| p.id == playlist_id)
             .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
@@ -252,7 +244,7 @@ pub async fn add_to_playlist(app: AppHandle, playlist_id: i64, track: TrackInfo)
 #[tauri::command]
 pub async fn add_tracks_to_playlist(app: AppHandle, playlist_id: i64, tracks: Vec<TrackInfo>) -> AppResult<usize> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
 
     let mut seen = std::collections::HashSet::new();
     let new_tracks: Vec<TrackInfo> = {
@@ -335,7 +327,7 @@ pub async fn update_playlist_track(
     track: TrackInfo,
 ) -> AppResult<usize> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     let target_key = playlist_track_key(&track);
     let target_id = track.id.clone();
     let mut updated = 0usize;
@@ -391,7 +383,7 @@ pub async fn update_playlist_track(
 #[tauri::command]
 pub async fn remove_from_playlist(app: AppHandle, playlist_id: i64, track_id: String) -> AppResult<()> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     let removed_track = {
         let pl = store.playlists.iter_mut().find(|p| p.id == playlist_id)
             .ok_or_else(|| AppError::NotFound("Playlist not found".into()))?;
@@ -430,7 +422,7 @@ pub async fn remove_from_playlist(app: AppHandle, playlist_id: i64, track_id: St
 #[tauri::command]
 pub async fn remove_tracks_from_playlist(app: AppHandle, playlist_id: i64, track_ids: Vec<String>) -> AppResult<usize> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
     if !store.playlists.iter().any(|playlist| playlist.id == playlist_id) {
         return Err(AppError::NotFound("Playlist not found".into()));
     }
@@ -489,7 +481,7 @@ pub async fn reorder_playlist_tracks(
     ordered_keys: Vec<String>,
 ) -> AppResult<usize> {
     let path = playlists_path();
-    let mut store = PlaylistStore::load(&path);
+    let mut store = PlaylistStore::load_strict(&path)?;
 
     let count = {
         let pl = store

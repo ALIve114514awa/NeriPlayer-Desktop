@@ -66,6 +66,12 @@ pub struct PlaybackStatsSummary {
     pub items: Vec<SyncTrackStat>,
 }
 
+// 按天数据的保留窗口：语义对齐 sync/merge.rs 的 STAT_BUCKET_RETENTION_DAYS
+// （400 天，见 docs/SYNC-MODEL-CONTRACT.md §4）。本地重复定义而不 import
+// sync 模块，避免统计模块与同步模块产生编译期耦合；两处值必须保持一致
+const STAT_RETENTION_DAYS: i64 = 400;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsStore {
@@ -81,6 +87,9 @@ pub struct StatsStore {
     pub daily_shards: HashMap<String, Vec<SyncPlaybackCounterShard>>,
     #[serde(default)]
     pub cleared_at: i64,
+    /// 上次执行保留窗口修剪的「天」零点；仅内存态，不落盘
+    #[serde(skip)]
+    last_pruned_day: i64,
 }
 
 pub fn daily_shard_key(day_start_at: i64, identity_key: &str) -> String {
@@ -161,10 +170,45 @@ fn upsert_shard(
 }
 
 impl StatsStore {
+    /// 按天保留窗口修剪：丢弃超出窗口的 `buckets` 与 `daily_shards`
+    ///
+    /// 「总」口径的 `stats`/`track_shards` 不动——聚合值必须保持全量，
+    /// 否则「年 > 总」类矛盾会重现。仅修剪按「天 × 曲目」无限增长的部分
+    pub fn prune_retention(&mut self, now_ms: i64) {
+        let cutoff = day_start_at(now_ms).saturating_sub(STAT_RETENTION_DAYS * MILLIS_PER_DAY);
+        let before = self.buckets.len() + self.daily_shards.len();
+        self.buckets.retain(|bucket| bucket.day_start_at >= cutoff);
+        self.daily_shards.retain(|key, _| {
+            // key 形如 "dayStartAt|identityKey"；无法解析的键保守保留
+            key.split_once('|')
+                .and_then(|(day, _)| day.parse::<i64>().ok())
+                .is_none_or(|day| day >= cutoff)
+        });
+        let after = self.buckets.len() + self.daily_shards.len();
+        if after < before {
+            log::info!(
+                target: "stats",
+                "retention pruned {} day-scoped entries older than {} days",
+                before - after,
+                STAT_RETENTION_DAYS,
+            );
+        }
+    }
+
+    /// 每天首次记录时顺带修剪一次，避免每笔写入都全表扫描
+    fn maybe_prune_daily(&mut self, now_ms: i64) {
+        let today = day_start_at(now_ms);
+        if self.last_pruned_day != today {
+            self.prune_retention(now_ms);
+            self.last_pruned_day = today;
+        }
+    }
+
     pub fn record(&mut self, session: &PlaybackSession, device_id: &str, played_at: i64) {
         if session.identity_key.trim().is_empty() {
             return;
         }
+        self.maybe_prune_daily(played_at);
         let listened = session.listened_ms.max(0);
         let increment = session.play_count_increment.max(0);
         if listened <= 0 && increment <= 0 {
@@ -514,17 +558,33 @@ pub fn load() -> StatsStore {
     let Ok(content) = std::fs::read_to_string(&path) else {
         return StatsStore::default();
     };
-    serde_json::from_str(&content).unwrap_or_default()
+    let mut store: StatsStore = match serde_json::from_str(&content) {
+        Ok(store) => store,
+        Err(error) => {
+            // 统计可容忍从空重建（分片会随同步找回），但必须保留现场：
+            // 静默清空 + 后续覆盖写会让损坏原因永远无法排查
+            let quarantined = crate::fsutil::quarantine_corrupt_file(&path);
+            log::warn!(
+                target: "stats",
+                "playback-stats.json 解析失败, 现场已隔离到 {:?}, 从空统计重建: {}",
+                quarantined,
+                error,
+            );
+            return StatsStore::default();
+        }
+    };
+    // 启动即修剪保留窗口，避免历史膨胀文件一直原样滚动
+    store.prune_retention(chrono::Utc::now().timestamp_millis());
+    store
 }
 
 pub fn save(store: &StatsStore) {
     let path = stats_path();
-    let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
     if let Ok(content) = serde_json::to_string(store) {
-        let _ = std::fs::write(&path, content);
+        // 原子写：崩溃/断电不能留下半截 JSON（半截会被 load 判损坏隔离）
+        if let Err(error) = crate::fsutil::atomic_write(&path, content) {
+            log::warn!(target: "stats", "playback-stats.json 写入失败: {error}");
+        }
     }
 }
 
@@ -630,6 +690,56 @@ mod tests {
         // 清除后的新增量落在新 epoch 上
         store.record(&session("k", 60_000, 1), "desktop", now + 1_000);
         assert_eq!(store.track_shards["k"][0].epoch_started_at, now);
+    }
+
+    /// 保留窗口修剪：超 400 天的日分桶/日分片被清除，聚合值与窗口内数据保留
+    #[test]
+    fn retention_prunes_day_scoped_data_but_keeps_aggregates() {
+        let mut store = StatsStore::default();
+        let now = chrono::Utc::now().timestamp_millis();
+        let ancient = now - (STAT_RETENTION_DAYS + 10) * MILLIS_PER_DAY;
+        let recent = now - 3 * MILLIS_PER_DAY;
+
+        store.record(&session("old", 60_000, 1), "desktop", ancient);
+        store.record(&session("new", 60_000, 1), "desktop", recent);
+
+        store.prune_retention(now);
+
+        // 日口径：仅窗口内保留
+        assert_eq!(store.buckets.len(), 1);
+        assert_eq!(store.buckets[0].identity_key, "new");
+        assert_eq!(store.daily_shards.len(), 1);
+        assert!(store
+            .daily_shards
+            .keys()
+            .all(|key| key.ends_with("|new")));
+        // 「总」口径不受窗口影响
+        assert_eq!(store.stats.len(), 2);
+        assert_eq!(store.track_shards.len(), 2);
+    }
+
+    /// 每天首次 record 自动触发修剪
+    #[test]
+    fn record_triggers_daily_prune() {
+        let mut store = StatsStore::default();
+        let now = chrono::Utc::now().timestamp_millis();
+        let ancient = now - (STAT_RETENTION_DAYS + 10) * MILLIS_PER_DAY;
+
+        // 直接注入过期分桶（绕过 record 的自动修剪）
+        store.buckets.push(SyncPlaybackStatBucket {
+            day_start_at: day_start_at(ancient),
+            identity_key: "old".into(),
+            total_listen_ms: 1,
+            play_count: 1,
+            ..Default::default()
+        });
+
+        store.record(&session("new", 60_000, 1), "desktop", now);
+
+        assert!(
+            store.buckets.iter().all(|bucket| bucket.identity_key != "old"),
+            "过期分桶必须在当天首次 record 时被修剪"
+        );
     }
 
     #[test]

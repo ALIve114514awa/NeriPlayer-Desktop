@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use crate::state::TrackInfo;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::sync::models::{
     normalize_sync_causal_tokens,
     SyncPlaylistSongDeletion,
@@ -30,19 +30,46 @@ pub struct PlaylistStore {
 }
 
 impl PlaylistStore {
-    pub fn load(path: &PathBuf) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+    /// 严格加载：文件损坏时隔离现场并返回错误，绝不返回空库
+    ///
+    /// 旧实现解析失败静默返回空库，后续任何 save 都会用空库覆盖原文件
+    /// （断电/磁盘满即歌单全灭）。现在解析失败先把原文件移到
+    /// `.corrupt-<ts>` 保留现场，再向上层报错——上层命令报错给前端，
+    /// 不得在失败态上继续 save
+    pub fn load_strict(path: &PathBuf) -> AppResult<Self> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(AppError::Other(format!(
+                    "read playlists store failed: {error}"
+                )));
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(store) => Ok(store),
+            Err(error) => {
+                let quarantined = crate::fsutil::quarantine_corrupt_file(path);
+                log::error!(
+                    target: "playlist-io",
+                    "playlists.json 解析失败, 现场已隔离到 {:?}: {}",
+                    quarantined,
+                    error,
+                );
+                Err(AppError::Other(format!(
+                    "playlists store is corrupt (original preserved as {:?}): {error}",
+                    quarantined,
+                )))
+            }
+        }
     }
 
     pub fn save(&self, path: &PathBuf) -> AppResult<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        // 原子写：temp + fsync + rename，杜绝半截 JSON
+        crate::fsutil::atomic_write(path, json)?;
         Ok(())
     }
 
@@ -166,6 +193,30 @@ mod tests {
         assert!(second > 0);
         assert!(second <= MAX_SAFE_PLAYLIST_ID);
         assert_ne!(second, first);
+    }
+
+    /// 损坏的 playlists.json 必须报错并隔离现场，绝不返回空库（E1 回归）
+    #[test]
+    fn corrupt_store_is_quarantined_and_never_silently_emptied() {
+        let dir = std::env::temp_dir().join(format!("neri-playlist-e1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("playlists.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let result = PlaylistStore::load_strict(&path);
+        assert!(result.is_err(), "corrupt store must surface an error");
+        // 现场已被移走保留，原路径不再存在
+        assert!(!path.exists(), "corrupt file must be moved aside");
+        let quarantined = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "a .corrupt-* file must be preserved");
+
+        // 隔离后视为全新库，可正常创建
+        let store = PlaylistStore::load_strict(&path).unwrap();
+        assert!(store.playlists.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
