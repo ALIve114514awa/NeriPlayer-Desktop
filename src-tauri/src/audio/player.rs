@@ -154,6 +154,9 @@ enum AudioCmd {
         transition_generation: u64,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    /// 输出设备失效（拔掉耳机/蓝牙断连等，由 cpal 流错误回调上报）。
+    /// 控制线程收到后丢弃缓存的设备档案并以当前默认设备原地重建会话
+    DeviceLost { playback_generation: u64 },
 }
 
 
@@ -215,6 +218,8 @@ struct PlaybackShared {
     clock: Arc<PlaybackClock>,
     wake_lock: Mutex<()>,
     wake: Condvar,
+    /// 设备失效只上报一次：cpal 错误回调可能连续触发多次
+    device_lost: AtomicBool,
 }
 
 impl PlaybackShared {
@@ -306,9 +311,35 @@ impl OutputDeviceProfile {
     }
 }
 
+/// 全局收尸线程：接管 stop 时尚未退出的解码 worker 句柄，在后台 join。
+/// stop 的调用者（音频控制线程/命令路径）绝不能被 join 阻塞，
+/// 而直接丢弃句柄又会让阻塞中的孤儿线程无人回收——移交给专用线程两全
+fn reap_worker_handle(handle: JoinHandle<()>) {
+    use std::sync::OnceLock;
+    static REAPER: OnceLock<Option<mpsc::Sender<JoinHandle<()>>>> = OnceLock::new();
+    let sender = REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<JoinHandle<()>>();
+        thread::Builder::new()
+            .name("audio-worker-reaper".into())
+            .spawn(move || {
+                for handle in rx {
+                    let _ = handle.join();
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(sender) = sender {
+        // 发送失败（收尸线程已退出）时退化为旧行为：丢弃句柄
+        let _ = sender.send(handle);
+    }
+}
+
 impl PlaybackSession {
     fn play(&self) -> Result<(), String> {
         self.shared.paused.store(false, Ordering::Release);
+        // 唤醒可能在暂停态长睡的解码线程（见 spawn_decode_worker 的暂停等待）
+        self.shared.wake.notify_all();
         self.stream
             .play()
             .map_err(|error| format!("Could not start audio output: {error}"))
@@ -326,9 +357,13 @@ impl PlaybackSession {
         self.shared.cancelled.store(true, Ordering::Release);
         self.shared.wake.notify_all();
         let _ = self.stream.pause();
-        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.worker.take() {
+            if worker.is_finished() {
                 let _ = worker.join();
+            } else {
+                // worker 尚未退出（可能阻塞在网络读上）：交给全局收尸线程
+                // 后台 join，既不丢句柄也不阻塞 stop 的调用者
+                reap_worker_handle(worker);
             }
         }
     }
@@ -831,11 +866,40 @@ impl PlayerEngine {
             .unwrap_or(false)
     }
 
+    /// 结束查询的非阻塞变体：发送 QueryEmpty 后立即返回接收端，供 ticker
+    /// 在释放 `player` 锁之后再等待结果（避免持锁做 100ms 阻塞 recv）。
+    ///
+    /// - 返回 `None`：当前明确未结束（未在播放或播放不足 500ms），无需等待；
+    /// - 返回 `Some(rx)`：调用方应在锁外 `recv_timeout` 等待，超时按未结束处理。
+    ///   音频线程已断开时接收端会立刻给出 `true`，与 `is_finished` 语义一致。
+    pub fn begin_finished_query(&self) -> Option<mpsc::Receiver<bool>> {
+        if !self.is_playing || self.position_ms() < 500 {
+            return None;
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .cmd_tx
+            .send(AudioCmd::QueryEmpty { reply: reply_tx })
+            .is_err()
+        {
+            // 音频线程断开视为已结束：预填充一个结果通道保持返回类型统一
+            let (tx, rx) = mpsc::channel();
+            let _ = tx.send(true);
+            return Some(rx);
+        }
+        Some(reply_rx)
+    }
+
     pub fn mark_ended(&mut self) {
         self.is_playing = false;
     }
 
-    pub fn pause_with_fade(&mut self, duration_ms: u32) -> AppResult<()> {
+    /// 两段式淡出暂停第一段：仅发送命令并返回结果接收端，不阻塞等待。
+    /// 调用方应在释放 `player` 锁后用 [`receive_fade_result`] 等待完成
+    pub fn request_pause_with_fade(
+        &mut self,
+        duration_ms: u32,
+    ) -> AppResult<mpsc::Receiver<Result<(), String>>> {
         self.ensure_alive();
         let transition_generation =
             self.transition_generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -847,14 +911,14 @@ impl PlayerEngine {
                 reply: reply_tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
-        let result = receive_fade_result(reply_rx, duration_ms);
-        if result.is_ok() {
-            self.is_playing = false;
-        }
-        result
+        Ok(reply_rx)
     }
 
-    pub fn resume_with_fade(&mut self, duration_ms: u32) -> AppResult<()> {
+    /// 两段式淡入恢复第一段：仅发送命令并返回结果接收端，不阻塞等待
+    pub fn request_resume_with_fade(
+        &mut self,
+        duration_ms: u32,
+    ) -> AppResult<mpsc::Receiver<Result<(), String>>> {
         self.ensure_alive();
         let transition_generation =
             self.transition_generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -866,6 +930,30 @@ impl PlayerEngine {
                 reply: reply_tx,
             })
             .map_err(|_| AppError::Audio("Audio thread disconnected".into()))?;
+        Ok(reply_rx)
+    }
+
+    /// 淡化完成后的状态提交（两段式第二段收尾，短锁内调用）
+    pub fn commit_fade_pause(&mut self) {
+        self.is_playing = false;
+    }
+
+    /// 淡化完成后的状态提交（两段式第二段收尾，短锁内调用）
+    pub fn commit_fade_resume(&mut self) {
+        self.is_playing = true;
+    }
+
+    pub fn pause_with_fade(&mut self, duration_ms: u32) -> AppResult<()> {
+        let reply_rx = self.request_pause_with_fade(duration_ms)?;
+        let result = receive_fade_result(reply_rx, duration_ms);
+        if result.is_ok() {
+            self.is_playing = false;
+        }
+        result
+    }
+
+    pub fn resume_with_fade(&mut self, duration_ms: u32) -> AppResult<()> {
+        let reply_rx = self.request_resume_with_fade(duration_ms)?;
         let result = receive_fade_result(reply_rx, duration_ms);
         if result.is_ok() {
             self.is_playing = true;
@@ -1116,12 +1204,15 @@ fn spawn_audio_thread(
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let alive = Arc::new(AtomicBool::new(true));
     let alive_for_thread = Arc::clone(&alive);
+    // 回传句柄：cpal 错误回调用它向控制线程上报 DeviceLost
+    let loopback_tx = cmd_tx.clone();
     thread::Builder::new()
         .name("cpal-playback-control".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 audio_control_loop(
                     cmd_rx,
+                    loopback_tx,
                     shared_level,
                     effects_params,
                     playback_generation,
@@ -1140,6 +1231,7 @@ fn spawn_audio_thread(
 
 fn audio_control_loop(
     receiver: mpsc::Receiver<AudioCmd>,
+    loopback_tx: mpsc::Sender<AudioCmd>,
     shared_level: Arc<Mutex<SharedAudioLevel>>,
     effects_params: Arc<Mutex<AudioEffectsParams>>,
     playback_generation: Arc<AtomicU64>,
@@ -1217,6 +1309,7 @@ fn audio_control_loop(
                         None,
                         output,
                         Arc::clone(&prepare_cancel),
+                        &loopback_tx,
                     )
                 })();
                 if prepared
@@ -1353,6 +1446,7 @@ fn audio_control_loop(
                     &effects_params,
                     &playback_generation,
                     &mut output_profile,
+                    &loopback_tx,
                 );
             }
             AudioCmd::Seek {
@@ -1437,6 +1531,7 @@ fn audio_control_loop(
                         Some(Arc::clone(&clock)),
                         output,
                         Arc::new(AtomicBool::new(false)),
+                        &loopback_tx,
                     )
                 })();
                 if prepared
@@ -1472,6 +1567,7 @@ fn audio_control_loop(
                                         Some(Arc::clone(&clock)),
                                         output,
                                         Arc::new(AtomicBool::new(false)),
+                                        &loopback_tx,
                                     ) {
                                         let _ = restored.play();
                                         current = Some(restored);
@@ -1517,6 +1613,7 @@ fn audio_control_loop(
                                 Some(Arc::clone(&clock)),
                                 output,
                                 Arc::new(AtomicBool::new(false)),
+                                &loopback_tx,
                             )
                         })() {
                             Ok(restored) => {
@@ -1558,6 +1655,7 @@ fn audio_control_loop(
                     &effects_params,
                     &playback_generation,
                     &mut output_profile,
+                    &loopback_tx,
                 );
             }
             AudioCmd::FadeOutPause {
@@ -1606,6 +1704,46 @@ fn audio_control_loop(
                 };
                 let _ = reply.send(result);
             }
+            AudioCmd::DeviceLost {
+                playback_generation: lost_generation,
+            } => {
+                // 只处理当前会话的失效上报：会话切换后旧流的错误回调
+                // 可能还会补发一条陈旧的 DeviceLost
+                let matches_current = current
+                    .as_ref()
+                    .is_some_and(|session| session.playback_generation == lost_generation);
+                if !matches_current {
+                    log::info!(
+                        target: "cpal-output",
+                        "stale DeviceLost ignored generation={lost_generation}",
+                    );
+                    continue;
+                }
+                log::warn!(
+                    target: "cpal-output",
+                    "output device lost generation={lost_generation}, rebuilding on default device",
+                );
+                // 丢弃缓存的设备档案，强制按当前系统默认设备重开
+                output_profile = None;
+                rebuild_session_in_place(
+                    &mut current,
+                    volume,
+                    speed,
+                    &shared_level,
+                    &effects_params,
+                    &playback_generation,
+                    &mut output_profile,
+                    &loopback_tx,
+                );
+                if current.is_none() {
+                    // 重建失败：会话已置空，QueryEmpty 将返回 true，
+                    // ticker 会据此发出结束事件推进队列，不会静默卡死
+                    log::error!(
+                        target: "cpal-output",
+                        "device-lost rebuild failed generation={lost_generation}, session dropped",
+                    );
+                }
+            }
         }
     }
 
@@ -1629,6 +1767,7 @@ fn rebuild_session_in_place(
     effects_params: &Arc<Mutex<AudioEffectsParams>>,
     playback_generation: &Arc<AtomicU64>,
     output_profile: &mut Option<OutputDeviceProfile>,
+    loopback_tx: &mpsc::Sender<AudioCmd>,
 ) {
     let Some(session) = current.as_ref() else {
         return;
@@ -1664,6 +1803,7 @@ fn rebuild_session_in_place(
             Some(Arc::clone(&clock)),
             output,
             Arc::new(AtomicBool::new(false)),
+            loopback_tx,
         )
     };
     let prepared = build().or_else(|error| {
@@ -1717,6 +1857,7 @@ fn prepare_session(
     clock: Option<Arc<PlaybackClock>>,
     output: &OutputDeviceProfile,
     prepare_cancel: Arc<AtomicBool>,
+    loopback_tx: &mpsc::Sender<AudioCmd>,
 ) -> Result<PlaybackSession, String> {
     let prepare_started = Instant::now();
     ensure_preparation_current(
@@ -1749,8 +1890,13 @@ fn prepare_session(
     // 必须先 clone/升级 access_mode，再判断 virtual-body：
     // LongFormProgressive 源在 clone 前也要能选中该路径（prefers 已兼容），
     // 但最终以 decoder_source 上的状态为准，避免误走 format.seek。
-    let decoder_source =
+    let mut decoder_source =
         source.decoder_source_for_position(start_position_ms, read_cancellation);
+    // Growing 源的 probe 需要足够缓冲数据，网络停滞时会在 read 里阻塞；
+    // 注入外部取消标志使播放等待超时能打断 probe（Remote 源已有同类机制）
+    if let AudioSource::Growing(reader, _) = &mut decoder_source {
+        reader.set_prepare_cancel(Arc::clone(&prepare_cancel));
+    }
     let use_byte_seek =
         start_position_ms > 0 && decoder_source.prefers_remote_virtual_body_seek();
     if start_position_ms > 0 {
@@ -1822,6 +1968,7 @@ fn prepare_session(
         clock,
         wake_lock: Mutex::new(()),
         wake: Condvar::new(),
+        device_lost: AtomicBool::new(false),
     });
 
     let processed: Box<dyn PcmSource> = Box::new(LoudnessSource::new(
@@ -1842,6 +1989,8 @@ fn prepare_session(
         config,
         output.sample_format,
         Arc::clone(&shared),
+        loopback_tx.clone(),
+        expected_generation,
     ) {
         Ok(stream) => stream,
         Err(error) => {
@@ -1909,6 +2058,11 @@ fn make_decoder_for_position(
         AudioSource::Growing(reader, _) => {
             SymphoniaAudioDecoder::new(Box::new(reader.clone()), None)
                 .map(|decoder| Box::new(decoder) as Box<dyn PcmSource>)
+                .inspect_err(|_| {
+                    // probe 失败即宣告本流报废：唤醒其余阻塞读者、
+                    // 让 feed 循环尽早停止继续下载
+                    reader.abort();
+                })
         }
         AudioSource::Remote(reader, _) => {
             if use_byte_seek && start_position_ms > 0 {
@@ -1953,7 +2107,21 @@ fn spawn_decode_worker(
                     .is_none_or(GenerationToken::is_current)
             {
                 if shared.ring.writable_samples() < shared.channels {
-                    thread::sleep(DECODE_IDLE_SLEEP);
+                    if shared.paused.load(Ordering::Acquire) {
+                        // 暂停期间输出回调不消费 ring，2ms 忙眠纯耗电；
+                        // 改用 condvar 有界等待，resume/stop 会 notify 立即唤醒。
+                        // 保守选 20ms 上限：即便错过通知，恢复时 ring 是满的
+                        // （4 秒容量），20ms 的解码延迟不可能造成欠载
+                        if let Ok(guard) = shared.wake_lock.lock() {
+                            let _ = shared
+                                .wake
+                                .wait_timeout(guard, Duration::from_millis(20));
+                        } else {
+                            thread::sleep(DECODE_IDLE_SLEEP);
+                        }
+                    } else {
+                        thread::sleep(DECODE_IDLE_SLEEP);
+                    }
                     continue;
                 }
                 if !converter.next_frame(shared.sample_rate, shared.speed.load(), &mut frame) {
@@ -2054,18 +2222,20 @@ fn build_output_stream(
     config: &StreamConfig,
     sample_format: SampleFormat,
     shared: Arc<PlaybackShared>,
+    loopback_tx: mpsc::Sender<AudioCmd>,
+    playback_generation: u64,
 ) -> Result<Stream, String> {
     match sample_format {
-        SampleFormat::I8 => build_typed_stream::<i8>(device, config, shared),
-        SampleFormat::I16 => build_typed_stream::<i16>(device, config, shared),
-        SampleFormat::I32 => build_typed_stream::<i32>(device, config, shared),
-        SampleFormat::I64 => build_typed_stream::<i64>(device, config, shared),
-        SampleFormat::U8 => build_typed_stream::<u8>(device, config, shared),
-        SampleFormat::U16 => build_typed_stream::<u16>(device, config, shared),
-        SampleFormat::U32 => build_typed_stream::<u32>(device, config, shared),
-        SampleFormat::U64 => build_typed_stream::<u64>(device, config, shared),
-        SampleFormat::F32 => build_typed_stream::<f32>(device, config, shared),
-        SampleFormat::F64 => build_typed_stream::<f64>(device, config, shared),
+        SampleFormat::I8 => build_typed_stream::<i8>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::I16 => build_typed_stream::<i16>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::I32 => build_typed_stream::<i32>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::I64 => build_typed_stream::<i64>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::U8 => build_typed_stream::<u8>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::U16 => build_typed_stream::<u16>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::U32 => build_typed_stream::<u32>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::U64 => build_typed_stream::<u64>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::F32 => build_typed_stream::<f32>(device, config, shared, loopback_tx, playback_generation),
+        SampleFormat::F64 => build_typed_stream::<f64>(device, config, shared, loopback_tx, playback_generation),
         other => Err(format!("Unsupported output sample format: {other}")),
     }
 }
@@ -2074,6 +2244,8 @@ fn build_typed_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     shared: Arc<PlaybackShared>,
+    loopback_tx: mpsc::Sender<AudioCmd>,
+    playback_generation: u64,
 ) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -2127,6 +2299,14 @@ where
             move |error| {
                 log::error!(target: "cpal-output", "stream error: {error}");
                 shared.begin_rebuffering();
+                // 输出设备失效（拔耳机/蓝牙断连）恢复：向控制线程上报一次
+                // DeviceLost，由它以默认设备原地重建会话。此回调运行在音频
+                // 线程，仅做无阻塞 send（std mpsc 无界通道，不会等待）
+                if !shared.device_lost.swap(true, Ordering::AcqRel) {
+                    let _ = loopback_tx.send(AudioCmd::DeviceLost {
+                        playback_generation,
+                    });
+                }
             },
             None,
         )
@@ -2209,7 +2389,8 @@ fn fade_gain(
     Ok(())
 }
 
-fn receive_fade_result(
+/// 等待淡化命令完成（两段式第二段，必须在释放 `player` 锁后调用）
+pub fn receive_fade_result(
     receiver: mpsc::Receiver<Result<(), String>>,
     duration_ms: u32,
 ) -> AppResult<()> {

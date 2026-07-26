@@ -12,6 +12,20 @@ pub struct MediaSessionController {
     cmd_tx: mpsc::Sender<MediaSessionCmd>,
 }
 
+/// 将封面标识规整为系统媒体会话可用的 URI：
+/// http(s)/file/data 原样保留，裸本地路径转 file://，无法转换则丢弃
+/// （传裸路径给 souvlaki 在 MPRIS/SMTC 上都不会显示）
+fn normalize_cover_uri(raw: String) -> Option<String> {
+    let is_uri = raw.starts_with("http://")
+        || raw.starts_with("https://")
+        || raw.starts_with("file://")
+        || raw.starts_with("data:");
+    if is_uri {
+        return Some(raw);
+    }
+    url::Url::from_file_path(&raw).ok().map(|uri| uri.to_string())
+}
+
 enum MediaSessionCmd {
     UpdateMetadata {
         title: String,
@@ -107,6 +121,9 @@ impl MediaSessionController {
                             } else {
                                 None
                             };
+                            // 本地封面是裸文件路径，而 MPRIS mpris:artUrl /
+                            // SMTC 缩略图都要求 URI，必须转成 file:// 才能显示
+                            let cover_url = cover_url.and_then(normalize_cover_uri);
                             let _ = controls.set_metadata(MediaMetadata {
                                 title: Some(&title),
                                 artist: Some(&artist),
@@ -173,5 +190,41 @@ impl MediaSessionController {
     /// 停止媒体会话
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(MediaSessionCmd::Stop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_cover_uri;
+
+    #[test]
+    fn remote_and_uri_covers_pass_through() {
+        assert_eq!(
+            normalize_cover_uri("https://example.com/a.jpg".into()),
+            Some("https://example.com/a.jpg".into())
+        );
+        assert_eq!(
+            normalize_cover_uri("file:///tmp/a.jpg".into()),
+            Some("file:///tmp/a.jpg".into())
+        );
+        assert_eq!(
+            normalize_cover_uri("data:image/png;base64,AAAA".into()),
+            Some("data:image/png;base64,AAAA".into())
+        );
+    }
+
+    #[test]
+    fn bare_local_path_becomes_file_uri() {
+        let dir = std::env::temp_dir().join("neri cover.jpg");
+        let raw = dir.to_string_lossy().to_string();
+        let uri = normalize_cover_uri(raw).expect("absolute path converts");
+        assert!(uri.starts_with("file://"), "got {uri}");
+        // 空格等必须百分号转义
+        assert!(!uri.contains(' '));
+    }
+
+    #[test]
+    fn relative_path_is_dropped() {
+        assert_eq!(normalize_cover_uri("covers/a.jpg".into()), None);
     }
 }

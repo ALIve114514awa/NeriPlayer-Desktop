@@ -3,6 +3,7 @@ use crate::error::AppResult;
 use crate::state::TrackInfo;
 use crate::state::TrackSource;
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -25,6 +26,8 @@ struct ParsedFileNameMetadata {
 /// 扫描目录下的所有音频文件，读取元数据
 pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<Vec<TrackInfo>> {
     let mut tracks = Vec::new();
+    // 扫描会话级封面索引缓存：同目录的封面查找只列举一次目录
+    let mut cover_cache = CoverLookupCache::default();
 
     for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -37,7 +40,7 @@ pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<Vec<T
 
         if !AUDIO_EXTENSIONS.contains(&ext.as_str()) { continue; }
 
-        match read_track_info(path, name_template) {
+        match read_track_info(path, name_template, &mut cover_cache) {
             Ok(track) => tracks.push(track),
             Err(e) => log::warn!(target: "scanner", "Skip {}: {}", path.display(), e),
         }
@@ -46,7 +49,11 @@ pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<Vec<T
     Ok(tracks)
 }
 
-fn read_track_info(path: &Path, name_template: Option<&str>) -> AppResult<TrackInfo> {
+fn read_track_info(
+    path: &Path,
+    name_template: Option<&str>,
+    cover_cache: &mut CoverLookupCache,
+) -> AppResult<TrackInfo> {
     use lofty::prelude::*;
     use lofty::probe::Probe;
 
@@ -99,7 +106,8 @@ fn read_track_info(path: &Path, name_template: Option<&str>) -> AppResult<TrackI
     } else {
         raw_album
     };
-    let cover_url = find_nearby_cover(path).map(|p| p.to_string_lossy().to_string());
+    let cover_url =
+        find_nearby_cover(path, cover_cache).map(|p| p.to_string_lossy().to_string());
 
     Ok(TrackInfo {
         id: format!("local:{}", path.display()),
@@ -116,44 +124,72 @@ fn read_track_info(path: &Path, name_template: Option<&str>) -> AppResult<TrackI
     })
 }
 
-fn find_nearby_cover(audio_path: &Path) -> Option<PathBuf> {
-    let dir = audio_path.parent()?;
-    let stem = audio_path.file_stem()?.to_str()?.to_lowercase();
-
-    // 同目录下与音频同名的图片（大小写无关）
-    if let Some(cover) = find_image_in_dir(dir, |name| name == stem) {
-        return Some(cover);
-    }
-
-    // 大小写无关的封面子目录下与音频同名的图片
-    if let Some(sub) = find_cover_subdir(dir) {
-        if let Some(cover) = find_image_in_dir(&sub, |name| name == stem) {
-            return Some(cover);
-        }
-        // 子目录内任意常见封面名
-        if let Some(cover) =
-            find_image_in_dir(&sub, |name| COVER_NAMES.contains(&name))
-        {
-            return Some(cover);
-        }
-    }
-
-    // 同目录下常见封面文件名（cover/folder/front/albumart...，大小写无关）
-    if let Some(cover) = find_image_in_dir(dir, |name| COVER_NAMES.contains(&name)) {
-        return Some(cover);
-    }
-
-    None
+/// 单次扫描会话内按目录缓存的封面索引。
+///
+/// 旧实现每个音频文件最多做 3 轮 `read_dir` 全扫，平铺大目录下整体
+/// 近似 O(N²)；缓存后每个目录只列举一次，整体 O(N)
+#[derive(Default)]
+struct CoverLookupCache {
+    dirs: HashMap<PathBuf, DirCoverIndex>,
 }
 
-/// 在目录中查找文件名（小写、去扩展名）满足断言且扩展名为图片的文件。
-fn find_image_in_dir<F>(dir: &Path, matcher: F) -> Option<PathBuf>
-where
-    F: Fn(&str) -> bool,
-{
-    let entries = std::fs::read_dir(dir).ok()?;
+struct DirCoverIndex {
+    /// (小写去扩展名文件名, 完整路径)，保持 read_dir 原始顺序，
+    /// 维持旧实现「首个命中」的选取行为
+    images: Vec<(String, PathBuf)>,
+    /// 首个大小写无关命中的封面子目录（Covers/cover/artwork/scans）
+    cover_subdir: Option<PathBuf>,
+}
+
+impl CoverLookupCache {
+    fn index_of(&mut self, dir: &Path) -> &DirCoverIndex {
+        self.dirs
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| build_dir_cover_index(dir))
+    }
+
+    /// 在目录中查找文件名（小写、去扩展名）满足断言且扩展名为图片的文件
+    fn find_image<F>(&mut self, dir: &Path, matcher: F) -> Option<PathBuf>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.index_of(dir)
+            .images
+            .iter()
+            .find(|(stem, _)| matcher(stem))
+            .map(|(_, path)| path.clone())
+    }
+
+    /// 大小写无关查找封面子目录（Covers/cover/artwork...）
+    fn cover_subdir(&mut self, dir: &Path) -> Option<PathBuf> {
+        self.index_of(dir).cover_subdir.clone()
+    }
+}
+
+fn build_dir_cover_index(dir: &Path) -> DirCoverIndex {
+    let mut images = Vec::new();
+    let mut cover_subdir = None;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return DirCoverIndex {
+            images,
+            cover_subdir,
+        };
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
+        if path.is_dir() {
+            if cover_subdir.is_none() {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                if COVER_DIR_NAMES.contains(&name.as_str()) {
+                    cover_subdir = Some(path);
+                }
+            }
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
@@ -170,30 +206,39 @@ where
             .and_then(|s| s.to_str())
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
-        if matcher(&stem) {
-            return Some(path);
-        }
+        images.push((stem, path));
     }
-    None
+    DirCoverIndex {
+        images,
+        cover_subdir,
+    }
 }
 
-/// 大小写无关查找封面子目录（Covers/cover/artwork...）。
-fn find_cover_subdir(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+fn find_nearby_cover(audio_path: &Path, cache: &mut CoverLookupCache) -> Option<PathBuf> {
+    let dir = audio_path.parent()?;
+    let stem = audio_path.file_stem()?.to_str()?.to_lowercase();
+
+    // 同目录下与音频同名的图片（大小写无关）
+    if let Some(cover) = cache.find_image(dir, |name| name == stem) {
+        return Some(cover);
+    }
+
+    // 大小写无关的封面子目录下与音频同名的图片
+    if let Some(sub) = cache.cover_subdir(dir) {
+        if let Some(cover) = cache.find_image(&sub, |name| name == stem) {
+            return Some(cover);
         }
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        if COVER_DIR_NAMES.contains(&name.as_str()) {
-            return Some(path);
+        // 子目录内任意常见封面名
+        if let Some(cover) = cache.find_image(&sub, |name| COVER_NAMES.contains(&name)) {
+            return Some(cover);
         }
     }
+
+    // 同目录下常见封面文件名（cover/folder/front/albumart...，大小写无关）
+    if let Some(cover) = cache.find_image(dir, |name| COVER_NAMES.contains(&name)) {
+        return Some(cover);
+    }
+
     None
 }
 
@@ -351,4 +396,63 @@ fn parsed_source_matches_artist(
 
 fn normalize_metadata_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_nearby_cover, CoverLookupCache};
+    use std::path::PathBuf;
+
+    fn temp_scan_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neri-scanner-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn cover_lookup_prefers_same_stem_then_common_names() {
+        let dir = temp_scan_dir("flat");
+        std::fs::write(dir.join("song.jpg"), b"img").expect("write image");
+        std::fs::write(dir.join("cover.png"), b"img").expect("write image");
+        let audio = dir.join("song.mp3");
+        std::fs::write(&audio, b"audio").expect("write audio");
+        let other = dir.join("other.flac");
+        std::fs::write(&other, b"audio").expect("write audio");
+
+        let mut cache = CoverLookupCache::default();
+        assert_eq!(
+            find_nearby_cover(&audio, &mut cache),
+            Some(dir.join("song.jpg"))
+        );
+        // 同名不命中时回退到常见封面名
+        assert_eq!(
+            find_nearby_cover(&other, &mut cache),
+            Some(dir.join("cover.png"))
+        );
+        // 目录只被列举并缓存一次
+        assert_eq!(cache.dirs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cover_lookup_finds_image_in_cover_subdir() {
+        let dir = temp_scan_dir("subdir");
+        let sub = dir.join("Covers");
+        std::fs::create_dir_all(&sub).expect("create cover subdir");
+        std::fs::write(sub.join("track.webp"), b"img").expect("write image");
+        let audio = dir.join("track.mp3");
+        std::fs::write(&audio, b"audio").expect("write audio");
+
+        let mut cache = CoverLookupCache::default();
+        assert_eq!(
+            find_nearby_cover(&audio, &mut cache),
+            Some(sub.join("track.webp"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

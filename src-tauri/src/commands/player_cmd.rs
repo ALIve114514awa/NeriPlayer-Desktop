@@ -1,5 +1,7 @@
 use crate::audio::growing::GrowingAudioBuffer;
-use crate::audio::player::{wait_for_play_result, wait_for_seek_result, PlayRequest, PlayerEngine};
+use crate::audio::player::{
+    receive_fade_result, wait_for_play_result, wait_for_seek_result, PlayRequest, PlayerEngine,
+};
 use crate::audio::remote::{RemoteAudioCache, RemoteAudioSource};
 use crate::error::{AppError, AppResult};
 use crate::settings::store::{MAX_MEDIA_CACHE_SIZE_MB, MIN_MEDIA_CACHE_SIZE_MB};
@@ -17,6 +19,10 @@ use tokio::io::AsyncWriteExt;
 
 const STREAM_START_BUFFER_BYTES: usize = 64 * 1024;
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(12);
+// 流式下载 per-chunk 空闲超时：断网/黑洞网络下 stream.next() 会永久悬挂
+// （全局 client 无读超时），超过此时长无新数据即判定网络停滞并 fail，
+// 使解码侧从阻塞等待中解脱、走 fallback
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(80);
 const MAX_CACHE_LOOKUP_CANDIDATES: usize = 16;
 const PLAYBACK_SUPERSEDED_ERROR: &str = "Playback request superseded";
@@ -1025,16 +1031,37 @@ pub async fn reset_audio_effects(state: State<'_, AppState>) -> AppResult<()> {
 
 #[tauri::command]
 pub async fn pause_with_fade(duration_ms: u32, state: State<'_, AppState>) -> AppResult<()> {
-    run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.pause_with_fade(duration_ms)
+    // 两段式（同 run_player_play）：短锁发命令 -> 锁外等淡化完成 -> 短锁提交。
+    // 旧实现持 player 锁等完整淡化（上限 30s+），会阻塞期间所有播放命令
+    let player = Arc::clone(&state.player);
+    let receiver = run_player_blocking(Arc::clone(&player), move |engine| {
+        engine.request_pause_with_fade(duration_ms)
+    })
+    .await?;
+    tokio::task::spawn_blocking(move || receive_fade_result(receiver, duration_ms))
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))??;
+    run_player_blocking(player, |engine| {
+        engine.commit_fade_pause();
+        Ok(())
     })
     .await
 }
 
 #[tauri::command]
 pub async fn resume_with_fade(duration_ms: u32, state: State<'_, AppState>) -> AppResult<()> {
-    run_player_blocking(Arc::clone(&state.player), move |player| {
-        player.resume_with_fade(duration_ms)
+    // 两段式，理由同 pause_with_fade
+    let player = Arc::clone(&state.player);
+    let receiver = run_player_blocking(Arc::clone(&player), move |engine| {
+        engine.request_resume_with_fade(duration_ms)
+    })
+    .await?;
+    tokio::task::spawn_blocking(move || receive_fade_result(receiver, duration_ms))
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))??;
+    run_player_blocking(player, |engine| {
+        engine.commit_fade_resume();
+        Ok(())
     })
     .await
 }
@@ -1604,7 +1631,23 @@ async fn start_streaming_download(
         let mut first_chunk_logged = false;
         loop {
             let item = tokio::select! {
-                item = stream.next() => item,
+                item = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
+                    match item {
+                        Ok(item) => item,
+                        Err(_) => {
+                            // 空闲超时 = 网络停滞：必须 fail 而非静默挂着，
+                            // 否则 Growing read 侧会带着半首歌永久阻塞
+                            log::error!(
+                                target: tag,
+                                "stream stalled after {} bytes (no data for {}s)",
+                                downloaded,
+                                STREAM_IDLE_TIMEOUT.as_secs(),
+                            );
+                            writer.fail("stream stalled".into());
+                            return;
+                        }
+                    }
+                }
                 () = wait_for_playback_superseded(
                     &playback_generation,
                     request_generation,
@@ -1614,6 +1657,13 @@ async fn start_streaming_download(
                     return;
                 }
             };
+            // 每轮兜底检查代际：select 分支被数据流持续命中时，
+            // superseded 等待分支可能长期得不到调度
+            if playback_generation.load(Ordering::Acquire) != request_generation {
+                writer.abort();
+                log::info!(target: tag, "download superseded after {} bytes", downloaded);
+                return;
+            }
             let Some(item) = item else {
                 break;
             };

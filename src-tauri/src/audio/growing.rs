@@ -28,6 +28,9 @@ struct GrowingAudioState {
 pub struct GrowingAudioReader {
     inner: Arc<GrowingAudioInner>,
     pos: u64,
+    // prepare 路径注入的外部取消标志：symphonia probe 阻塞等数据时，
+    // 播放请求超时可通过它打断 read，避免音频控制线程无限期卡死
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GrowingAudioBuffer {
@@ -56,6 +59,7 @@ impl GrowingAudioBuffer {
         GrowingAudioReader {
             inner: self.inner.clone(),
             pos: 0,
+            cancel: None,
         }
     }
 
@@ -152,7 +156,26 @@ impl GrowingAudioBuffer {
 impl GrowingAudioReader {
     pub fn abort(&self) {
         self.inner.aborted.store(true, Ordering::SeqCst);
-        self.inner.cv.notify_all();
+        // 必须持锁置 complete 后再 notify：read 的临界区存在「已检查
+        // aborted、尚未 wait」窗口，无锁 notify 会命中该窗口而丢失，
+        // 之后 append 因 aborted 提前返回不再唤醒 —— 解码线程带着整首歌
+        // 的缓冲永久阻塞。与 GrowingAudioBuffer::abort 保持一致
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.complete = true;
+            self.inner.cv.notify_all();
+        }
+    }
+
+    /// 注入外部取消标志（prepare 超时路径使用）。置位后阻塞中的 read
+    /// 会在一个轮询周期内返回错误，使 probe 得以失败退出
+    pub fn set_prepare_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
     fn known_byte_len(&self) -> Option<u64> {
@@ -179,6 +202,11 @@ impl Read for GrowingAudioReader {
             if self.inner.aborted.load(Ordering::SeqCst) {
                 return Ok(0);
             }
+            if self.is_cancelled() {
+                // prepare 超时取消：返回错误让 symphonia probe 立即失败，
+                // 不能返回 Ok(0)——那会被误判为正常 EOF
+                return Err(io::Error::other("stream prepare cancelled"));
+            }
             if let Some(err) = &state.error {
                 return Err(io::Error::other(err.clone()));
             }
@@ -196,11 +224,14 @@ impl Read for GrowingAudioReader {
                 return Ok(0);
             }
 
+            // 有界等待而非无限 wait：外部取消标志没有唤醒通道，
+            // 需要按周期醒来轮询；200ms 对 prepare 取消延迟足够小
             state = self
                 .inner
                 .cv
-                .wait(state)
-                .map_err(|_| io::Error::other("stream lock poisoned"))?;
+                .wait_timeout(state, Duration::from_millis(200))
+                .map_err(|_| io::Error::other("stream lock poisoned"))?
+                .0;
         }
     }
 }
@@ -256,7 +287,62 @@ impl MediaSource for GrowingAudioReader {
 #[cfg(test)]
 mod tests {
     use super::GrowingAudioBuffer;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
     use symphonia::core::io::MediaSource;
+
+    // B1 回归：abort 必须能唤醒已经阻塞在 read 中的解码线程
+    #[test]
+    fn reader_abort_wakes_blocked_read() {
+        let buffer = GrowingAudioBuffer::new();
+        buffer.append(&[1, 2, 3]);
+        let mut reader = buffer.reader();
+        let mut scratch = [0u8; 8];
+        assert_eq!(reader.read(&mut scratch).expect("initial read"), 3);
+
+        let blocked_reader = reader.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut reader = blocked_reader;
+            let mut buf = [0u8; 8];
+            // 数据已耗尽且未 complete，此 read 将阻塞等待
+            let _ = result_tx.send(reader.read(&mut buf));
+        });
+        // 给 read 足够时间进入阻塞等待
+        std::thread::sleep(Duration::from_millis(100));
+        reader.abort();
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked read was not woken by abort");
+        assert_eq!(result.expect("aborted read result"), 0);
+        handle.join().expect("reader thread join");
+    }
+
+    // B3 回归：prepare 取消标志置位后，阻塞中的 read 必须在轮询周期内报错返回
+    #[test]
+    fn prepare_cancel_unblocks_pending_read() {
+        let buffer = GrowingAudioBuffer::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut reader = buffer.reader();
+        reader.set_prepare_cancel(Arc::clone(&cancel));
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            let _ = result_tx.send(reader.read(&mut buf));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.store(true, Ordering::Release);
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked read was not woken by prepare cancel");
+        assert!(result.is_err(), "cancelled read must fail, not fake EOF");
+        handle.join().expect("reader thread join");
+    }
 
     #[test]
     fn in_progress_download_is_progressive_until_complete() {
