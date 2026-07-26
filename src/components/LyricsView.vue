@@ -315,30 +315,29 @@ function reloadLyrics(): void {
   scheduleLayoutSync()
 }
 
-/// 右键菜单：AMLL 自绘 DOM，没有 line-index 属性可读，
-/// 用命中点的纵坐标反查最近的一行——比依赖内部类名稳，AMLL 换皮不会失效
+/// 右键菜单：主路径走 AMLL 的 line-contextmenu 事件直接拿 lineIndex；
+/// 命中行间空隙时兜底用行容器（currentLyricGroups[i].element）的纵坐标反查
+/// 最近一行。不再按叶子节点文本反查——逐字歌词下叶子是单字/单词 span，
+/// 文本永远不等于整行，旧算法恒失配
 const lyricMenu = ref<{ show: boolean; x: number; y: number; index: number }>({
   show: false, x: 0, y: 0, index: -1,
 })
 
 function resolveLineIndexAt(clientY: number): number {
   if (!lyricPlayer) return -1
-  const container = lyricPlayer.getElement()
-  const children = Array.from(container.querySelectorAll<HTMLElement>('*'))
-    .filter((element) => element.childElementCount === 0 && element.textContent?.trim())
-  if (!children.length) return -1
+  const groups = lyricPlayer.currentLyricGroups
+  const lineCount = Math.min(groups.length, props.lyrics.length)
 
   let bestIndex = -1
   let bestDistance = Number.POSITIVE_INFINITY
-  const lines = props.lyrics
-  for (const element of children) {
+  for (let index = 0; index < lineCount; index++) {
+    const element = groups[index]?.element
+    // 虚拟化滚动会把视野外的行容器移出 DOM，跳过拿不到几何信息的行
+    if (!element || !element.isConnected) continue
     const rect = element.getBoundingClientRect()
     if (rect.height <= 0) continue
     const distance = Math.abs(clientY - (rect.top + rect.height / 2))
     if (distance >= bestDistance) continue
-    const text = element.textContent?.trim() ?? ''
-    const index = lines.findIndex((line) => displayText(line).trim() === text)
-    if (index < 0) continue
     bestDistance = distance
     bestIndex = index
   }
@@ -350,6 +349,17 @@ function onLyricContextMenu(event: MouseEvent): void {
   if (index < 0) return
   event.preventDefault()
   lyricMenu.value = { show: true, x: event.clientX, y: event.clientY, index }
+}
+
+function onLineContextMenu(event: Event): void {
+  const lineEvent = event as LyricLineMouseEvent
+  const index = lineEvent.lineIndex
+  if (index < 0 || index >= props.lyrics.length) return
+  // preventDefault 经 AMLL 映射回原生事件抑制系统菜单；
+  // stopPropagation 阻止冒泡到宿主的兜底 contextmenu，避免二次开菜单
+  lineEvent.preventDefault()
+  lineEvent.stopPropagation()
+  lyricMenu.value = { show: true, x: lineEvent.clientX, y: lineEvent.clientY, index }
 }
 
 const lyricMenuItems = computed<ContextMenuItem[]>(() => [
@@ -563,6 +573,7 @@ onMounted(() => {
 
     lyricPlayer = new DomLyricPlayer()
     lyricPlayer.addEventListener('line-click', onLineClick as EventListener)
+    lyricPlayer.addEventListener('line-contextmenu', onLineContextMenu as EventListener)
     hostRef.value.appendChild(lyricPlayer.getElement())
 
     startResizeObserver()
@@ -578,6 +589,7 @@ onUnmounted(() => {
   if (!lyricPlayer) return
 
   lyricPlayer.removeEventListener('line-click', onLineClick as EventListener)
+  lyricPlayer.removeEventListener('line-contextmenu', onLineContextMenu as EventListener)
   lyricPlayer.dispose()
   lyricPlayer = null
 })
