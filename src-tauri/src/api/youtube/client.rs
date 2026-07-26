@@ -168,31 +168,24 @@ impl YouTubeClient {
     }
 
     /// 构建 Cookie 头字符串
-    fn build_cookie_header(cookies: &[crate::auth::state::CookieEntry]) -> String {
-        cookies
-            .iter()
-            .filter(|c| !c.name.is_empty() && !c.value.is_empty())
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
-    fn cookie_map(auth: &crate::auth::state::YouTubeAuth) -> std::collections::BTreeMap<String, String> {
-        let mut map = std::collections::BTreeMap::new();
-        for cookie in &auth.cookies {
-            if cookie.name.is_empty() || cookie.value.is_empty() {
-                continue;
-            }
-            map.insert(cookie.name.clone(), cookie.value.clone());
-        }
-        map
+    /// 只取 music.youtube.com 能用的那一份 Cookie
+    ///
+    /// 不做域过滤会把 google.com / accounts.google.com 的同名 cookie 一起塞进来，
+    /// 而 HSID / SSID 这些在两个域下的值并不相同。Cookie 头里出现重名时服务端
+    /// 只认一个，取到 google 那份就等于会话无效 —— 表现是 InnerTube 返回一张
+    /// 「请登录」提示页（messageRenderer），而不是报错，于是界面只剩空列表。
+    fn music_cookies(
+        auth: &crate::auth::state::YouTubeAuth,
+    ) -> std::collections::BTreeMap<String, String> {
+        super::account::select_cookie_values(&auth.cookies, super::account::MUSIC_HOST)
     }
 
     fn authorization_header(
         auth: &crate::auth::state::YouTubeAuth,
         user_session_id: &str,
     ) -> AppResult<String> {
-        let cookies = Self::cookie_map(auth);
+        // 与 Cookie 头同源：跨域混用会让签名和实际发送的会话对不上
+        let cookies = Self::music_cookies(auth);
         crate::auth::youtube_hash::build_youtube_authorization(
             cookies.get("SAPISID").map(String::as_str),
             cookies.get("__Secure-1PAPISID").map(String::as_str),
@@ -241,6 +234,11 @@ impl YouTubeClient {
             data.get("contents").is_some(),
             summarize_node_types(&data),
         );
+        // 返回的是提示页而不是歌单时，把 YouTube 的原话打出来
+        // （「请登录」「暂无内容」是完全不同的问题，不该都表现成空列表）
+        if let Some(message) = extract_message_renderer_text(&data) {
+            log::warn!(target: "youtube", "library returned a message page: {}", message);
+        }
         Ok(data)
     }
 
@@ -268,7 +266,8 @@ impl YouTubeClient {
         if !auth.has_login() {
             return Err(AppError::Api("YouTube not logged in".into()));
         }
-        let cookie_header = Self::build_cookie_header(&auth.cookies);
+        let cookie_values = Self::music_cookies(auth);
+        let cookie_header = super::account::build_cookie_header(&cookie_values);
 
         // 必须用 bootstrap 而不是硬编码常量：InnerTube 对过期的 clientVersion
         // 往往返回 HTTP 200 + 空目录而不是报错，表现就是「登录了但没有云端歌单」。
@@ -488,4 +487,112 @@ fn summarize_node_types(data: &Value) -> String {
         .map(|(name, count)| format!("{name}={count}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+
+/// 抽取 messageRenderer / messageSubtextRenderer 里的可读文案
+fn extract_message_renderer_text(data: &Value) -> Option<String> {
+    fn collect_text(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::String(text)) = map.get("simpleText") {
+                    if !text.trim().is_empty() {
+                        out.push(text.trim().to_string());
+                    }
+                }
+                if let Some(Value::Array(runs)) = map.get("runs") {
+                    let joined: String = runs
+                        .iter()
+                        .filter_map(|run| run.get("text").and_then(Value::as_str))
+                        .collect();
+                    if !joined.trim().is_empty() {
+                        out.push(joined.trim().to_string());
+                    }
+                }
+                for nested in map.values() {
+                    collect_text(nested, out);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|nested| collect_text(nested, out)),
+            _ => {}
+        }
+    }
+
+    fn find_message(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                for (key, nested) in map {
+                    if key == "messageRenderer" || key == "messageSubtextRenderer" {
+                        collect_text(nested, out);
+                    }
+                    find_message(nested, out);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|nested| find_message(nested, out)),
+            _ => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    find_message(data, &mut parts);
+    parts.dedup();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" / "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::state::{CookieEntry, YouTubeAuth};
+
+    fn cookie(name: &str, value: &str, domain: &str) -> CookieEntry {
+        CookieEntry {
+            name: name.into(),
+            value: value.into(),
+            domain: domain.into(),
+        }
+    }
+
+    /// 回归：同名 cookie 在 google.com 与 youtube.com 下的值并不相同
+    ///
+    /// 不做域过滤时 Cookie 头会出现重名，服务端只认一个，取到 google 那份
+    /// 就等于会话无效；InnerTube 不会报错，而是回一张「请登录」提示页
+    /// （messageRenderer），界面于是只剩空列表。
+    #[test]
+    fn music_cookies_never_mix_in_other_domains() {
+        let auth = YouTubeAuth {
+            cookies: vec![
+                cookie("HSID", "google-value", "google.com"),
+                cookie("HSID", "youtube-value", ".youtube.com"),
+                cookie("SSID", "google-ssid", "google.com"),
+                cookie("SSID", "youtube-ssid", ".youtube.com"),
+                cookie("SAPISID", "shared", ".youtube.com"),
+                cookie("__Host-GAPS", "accounts-only", "accounts.google.com"),
+            ],
+            nickname: None,
+            avatar_url: None,
+        };
+
+        let selected = YouTubeClient::music_cookies(&auth);
+
+        assert_eq!(selected.get("HSID").map(String::as_str), Some("youtube-value"));
+        assert_eq!(selected.get("SSID").map(String::as_str), Some("youtube-ssid"));
+        assert_eq!(selected.get("SAPISID").map(String::as_str), Some("shared"));
+        // 其它域的 cookie 不得混入
+        assert!(!selected.contains_key("__Host-GAPS"));
+
+        // 渲染出的 Cookie 头里不能出现重名
+        let header = super::super::account::build_cookie_header(&selected);
+        let names: Vec<&str> = header
+            .split("; ")
+            .filter_map(|pair| pair.split('=').next())
+            .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(names.len(), unique.len(), "duplicate cookie names: {header}");
+    }
 }

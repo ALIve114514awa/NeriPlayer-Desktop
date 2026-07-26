@@ -11,7 +11,7 @@ use crate::api::transport::FallbackHttp;
 use super::client::USER_AGENT;
 
 const MUSIC_ORIGIN: &str = "https://music.youtube.com";
-const MUSIC_HOST: &str = "music.youtube.com";
+pub(super) const MUSIC_HOST: &str = "music.youtube.com";
 const WEB_REMIX_CLIENT_NAME: &str = "67";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,7 +295,7 @@ fn parse_user_session_id(data_sync_id: &str) -> String {
     }
 }
 
-fn select_cookie_values(cookies: &[CookieEntry], host: &str) -> BTreeMap<String, String> {
+pub(super) fn select_cookie_values(cookies: &[CookieEntry], host: &str) -> BTreeMap<String, String> {
     cookies
         .iter()
         .filter(|cookie| cookie_domain_matches_host(&cookie.domain, host))
@@ -309,7 +309,7 @@ fn cookie_domain_matches_host(domain: &str, host: &str) -> bool {
     !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
 }
 
-fn build_cookie_header(cookie_values: &BTreeMap<String, String>) -> String {
+pub(super) fn build_cookie_header(cookie_values: &BTreeMap<String, String>) -> String {
     let mut values = cookie_values.clone();
     values.entry("SOCS".into()).or_insert_with(|| "CAI".into());
     values
