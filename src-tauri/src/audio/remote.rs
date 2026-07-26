@@ -1116,17 +1116,33 @@ impl Read for RemoteAudioSource {
             let logical_pos = self.pos;
             let physical = self.map_logical_to_physical(logical_pos);
 
+            // 单次读绝不许跨过 header_end 的拼接边界
+            //
+            // 虚拟 body 的逻辑地址在 header_end 处不连续，而缓存段在物理空间
+            // 是连续的：从头部起读时若不封顶，read_cached_at 会顺着物理地址
+            // 一路读进「文件开头的第一个 moof」——它也是合法 moof，demuxer
+            // 便按它的 trun 去取样本，解出来的就是真假混杂的 AAC。
+            // 封顶后本轮只读到边界，循环下一轮重新映射，body 从正确落点续读。
+            let mut limit = out.len() - total_read;
+            let header_end = self.inner.header_end.load(Ordering::Acquire);
+            if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0
+                && logical_pos < header_end
+            {
+                limit = limit.min((header_end - logical_pos) as usize);
+            }
+            let window = total_read + limit;
+
             // 全程不改 self.pos 为物理坐标：缓存按 physical 显式寻址
-            let mut read = self.read_cached_at(physical, &mut out[total_read..]);
+            let mut read = self.read_cached_at(physical, &mut out[total_read..window]);
             if read == 0 {
-                read = self.read_disk_cached_at(physical, &mut out[total_read..]);
+                read = self.read_disk_cached_at(physical, &mut out[total_read..window]);
             }
             if read == 0 {
-                match self.fetch_physical_range(physical, out.len() - total_read) {
+                match self.fetch_physical_range(physical, limit) {
                     Ok(()) => {
-                        read = self.read_cached_at(physical, &mut out[total_read..]);
+                        read = self.read_cached_at(physical, &mut out[total_read..window]);
                         if read == 0 {
-                            read = self.read_disk_cached_at(physical, &mut out[total_read..]);
+                            read = self.read_disk_cached_at(physical, &mut out[total_read..window]);
                         }
                     }
                     Err(_err) if total_read > 0 => return Ok(total_read),
@@ -4313,6 +4329,132 @@ mod tests {
             // 打开后必须对 demuxer 可 seek，样本才能在拼接视图里回跳
             assert!(symphonia::core::io::MediaSource::is_seekable(&seekable));
         }
+    }
+
+    /// 端到端复现：真实 YouTube fMP4 字节走完整虚拟 body 打开 + 解码
+    ///
+    /// 需要实机字节（含版权内容，不入库）。运行方式：
+    /// NERI_YT_REPRO_DIR=<dir> cargo test -- --ignored yt_virtual_body
+    /// dir 下需有 yt-head.bin（物理 0..512KB）与 yt-mid.bin（物理 25212301 起 ~1MB）。
+    /// 修复前该流在 ~12k 帧处死于 "unexpected end of bitstream"；
+    /// 修复后应能稳定解出 5 秒以上的 PCM。
+    #[test]
+    #[ignore]
+    fn yt_virtual_body_end_to_end_decodes_real_bytes() {
+        let Ok(dir) = std::env::var("NERI_YT_REPRO_DIR") else {
+            eprintln!("NERI_YT_REPRO_DIR 未设置，跳过");
+            return;
+        };
+        let head = std::fs::read(format!("{dir}/yt-head.bin")).expect("yt-head.bin");
+        let mid = std::fs::read(format!("{dir}/yt-mid.bin")).expect("yt-mid.bin");
+
+        let source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://example.invalid/videoplayback".into(),
+                referer: String::new(),
+                total_len: 68_201_223,
+                header_end: AtomicU64::new(5_831),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 262_144,
+                    target_bytes: 1_048_576,
+                },
+                cache: Mutex::new(vec![
+                    CachedSegment { start: 0, data: head },
+                    CachedSegment { start: 25_212_301, data: mid },
+                ]),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(true),
+                virtual_body_origin: AtomicU64::new(25_212_301),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        let decoder = SymphoniaAudioDecoder::new_remote_virtual(source, true)
+            .expect("virtual body open should succeed");
+        // 5 秒 PCM（44.1kHz 立体声）；坏字节流在 0.25 秒左右就会枯竭
+        let want = 44_100 * 2 * 5;
+        let got = decoder.take(want).count();
+        assert_eq!(got, want, "解码在 {got} 采样处枯竭（应 >= {want}）");
+    }
+
+    /// 回归：单次 read 绝不许跨过 header_end 的拼接边界
+    ///
+    /// 实机症状：seek 后 AAC 全是真假混杂的垃圾帧，0.25 秒后
+    /// "unexpected end of bitstream" 杀死解码器。根因是头部缓存段在物理
+    /// 空间连续（0..512KB），从 logical<header_end 起读时一路读进
+    /// 「文件开头的第一个 moof」——它也是合法 moof，demuxer 便按它的
+    /// trun 取样本。ts=5120 正是文件第一段的时间戳，铁证。
+    #[test]
+    fn reads_never_cross_the_virtual_body_boundary() {
+        const HEADER_END: u64 = 5_831;
+        const ORIGIN: u64 = 25_212_301;
+        // 物理头部缓存（模拟启动时拉的 512KB 首包）：全部填 'H'
+        let head_segment = CachedSegment {
+            start: 0,
+            data: vec![b'H'; 524_288],
+        };
+        // 目标 moof 处的缓存：全部填 'B'
+        let body_segment = CachedSegment {
+            start: ORIGIN,
+            data: vec![b'B'; 262_144],
+        };
+        let mut source = RemoteAudioSource {
+            inner: Arc::new(RemoteAudioInner {
+                client: reqwest::Client::new(),
+                url: "https://example.invalid/audio.m4a".into(),
+                referer: String::new(),
+                total_len: 68_201_223,
+                header_end: AtomicU64::new(HEADER_END),
+                prefetch_window: PrefetchWindow {
+                    low_water_bytes: 262_144,
+                    target_bytes: 1_048_576,
+                },
+                cache: Mutex::new(vec![head_segment, body_segment]),
+                disk_ranges: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(HashSet::new()),
+                range_available: Condvar::new(),
+                last_read_pos: Mutex::new(0),
+                protected_ranges: Mutex::new(Vec::new()),
+                disk_cache: None,
+                cache_finalize_started: AtomicBool::new(false),
+                prefetch_epoch: AtomicU64::new(0),
+                demuxer_open_sequential: AtomicBool::new(true),
+                virtual_body_origin: AtomicU64::new(ORIGIN),
+                seek_index: Mutex::new(None),
+                playback_generation: Arc::new(AtomicU64::new(1)),
+                expected_generation: 1,
+            }),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+
+        // 一次性请求 8KB，跨过 header_end：前 5831 字节必须是 'H'，之后必须是 'B'
+        let mut out = vec![0_u8; 8_192];
+        let mut filled = 0;
+        while filled < out.len() {
+            let read = std::io::Read::read(&mut source, &mut out[filled..]).unwrap();
+            assert!(read > 0, "boundary read stalled at {filled}");
+            filled += read;
+        }
+        assert!(out[..HEADER_END as usize].iter().all(|byte| *byte == b'H'));
+        assert!(
+            out[HEADER_END as usize..].iter().all(|byte| *byte == b'B'),
+            "读取跨过了拼接边界：header 之后必须切到 body 物理段",
+        );
     }
 
     /// 虚拟 body 的逻辑坐标必须连续，且长度不得被截断成已拉取的那一段
