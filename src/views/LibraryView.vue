@@ -317,8 +317,7 @@ function matchesQuery(query: string, ...fields: (string | number | undefined | n
   return fields.some((field) => String(field ?? '').toLowerCase().includes(trimmed))
 }
 
-// 仅下载页无搜索；其余 tab（含本地的两个分类）搜索栏位置固定不动
-const showTabSearch = computed(() => activeTab.value !== 2)
+// 所有 tab（含下载页与本地的两个分类）共用同一搜索栏，位置固定不动
 const isLocalArtistSearch = computed(() => activeTab.value === 0 && localCategory.value === 'artists')
 const tabSearchModel = computed({
   get: () => (isLocalArtistSearch.value ? localArtistQuery.value : tabQuery.value),
@@ -328,7 +327,9 @@ const tabSearchModel = computed({
   },
 })
 const tabSearchHint = computed(() =>
-  isLocalArtistSearch.value ? t('library.local_artist_search_hint') : t('library.tab_search_hint'),
+  isLocalArtistSearch.value ? t('library.local_artist_search_hint')
+  : activeTab.value === 2 ? t('library.download_search_hint')
+  : t('library.tab_search_hint'),
 )
 
 const filteredPlaylists = computed(() =>
@@ -348,6 +349,13 @@ const filteredBiliPlaylists = computed(() =>
 )
 const filteredYoutubePlaylists = computed(() =>
   youtubePlaylists.value.filter((ypl: any) => matchesQuery(tabQuery.value, ypl.name)),
+)
+// 下载页：同一关键词同时过滤进行中任务与已下载文件（标题/歌手不区分大小写）
+const filteredActiveDownloads = computed(() =>
+  downloadStore.activeDownloads.filter((task) => matchesQuery(tabQuery.value, task.title, task.artist)),
+)
+const filteredDownloads = computed(() =>
+  downloadStore.downloads.filter((dl) => matchesQuery(tabQuery.value, dl.title, dl.artist)),
 )
 
 // 本地库分类：歌单 / 歌手（对齐 Android LOCAL_CATEGORY_ARTIST）
@@ -814,6 +822,7 @@ function handleDownloadMenuClick(item: ContextMenuActionItem) {
 /// 表现就是「明明登录了，云端歌单一直空着」。
 /// 这里改成对（登录态 × 当前 tab）响应式求值，任一变化都会补拉。
 const inFlightPlatforms = new Set<string>()
+let albumsInFlight = false
 
 function ensurePlatformData(platform: string, loaded: boolean, force = false) {
   const loggedIn =
@@ -821,16 +830,22 @@ function ensurePlatformData(platform: string, loaded: boolean, force = false) {
     : platform === 'bilibili' ? auth.bilibili.loggedIn
     : auth.youtube.loggedIn
   if (!loggedIn) return
+
+  // 专辑拉取必须独立于歌单的 loaded 早退：歌单会从 localStorage 缓存
+  // 恢复（loaded 直接为 true），若专辑判断挂在早退之后，重启后永远走
+  // 不到，表现为「必须重新登录专辑才出现」
+  if (platform === 'netease' && (force || !recommend.userAlbums.length) && !albumsInFlight) {
+    albumsInFlight = true
+    void Promise.resolve(recommend.fetchUserAlbums())
+      .finally(() => { albumsInFlight = false })
+  }
+
   if (!force && loaded) return
   if (inFlightPlatforms.has(platform)) return
 
   inFlightPlatforms.add(platform)
   void Promise.resolve(recommend.fetchUserPlaylists(platform))
     .finally(() => inFlightPlatforms.delete(platform))
-
-  if (platform === 'netease' && (force || !recommend.userAlbums.length)) {
-    void recommend.fetchUserAlbums()
-  }
 }
 
 function syncActiveTabData(force = false) {
@@ -925,10 +940,9 @@ onUnmounted(() => {
       </button>
     </div>
 
-    <!-- 各 tab 共用的搜索栏：单一实例固定在分类 chips 上方，切换视图只换
-         placeholder 与绑定的关键词，位置尺寸不变；隐藏时用折叠过渡收起 -->
-    <Transition name="lib-collapse">
-      <div v-if="showTabSearch" class="collapse-row">
+    <!-- 各 tab（含下载）共用的搜索栏：单一实例固定在分类 chips 上方，
+         切换视图只换 placeholder 与绑定的关键词，位置尺寸不变 -->
+      <div class="collapse-row">
         <div class="collapse-clip">
           <div class="tab-search">
             <span class="material-symbols-rounded" style="font-size: 18px">search</span>
@@ -949,7 +963,6 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
-    </Transition>
 
     <!-- tab 内容整体用统一的 fade 过渡（复用 global.scss 的 fade 类），
          避免 v-if 直切导致整页闪变 -->
@@ -1209,14 +1222,17 @@ onUnmounted(() => {
 
     <!-- Tab: 下载 -->
     <div v-else-if="activeTab === 2" key="tab-downloads" class="playlist-list">
-      <template v-if="downloadStore.activeDownloads.length > 0">
+      <!-- 进行中分组：过滤后为空时整组折叠隐藏，避免下方列表位置跳变 -->
+      <Transition name="lib-collapse">
+      <div v-if="filteredActiveDownloads.length > 0" class="collapse-row">
+      <div class="collapse-clip">
         <div class="subsection-label">
           <span class="material-symbols-rounded" style="font-size: 18px">downloading</span>
-          <span>{{ t('download.active_tasks', { count: downloadStore.activeDownloads.length }) }}</span>
+          <span>{{ t('download.active_tasks', { count: filteredActiveDownloads.length }) }}</span>
         </div>
         <TransitionGroup tag="div" name="lib-list" class="lib-list">
         <div
-          v-for="task in downloadStore.activeDownloads"
+          v-for="task in filteredActiveDownloads"
           :key="'active-' + task.trackId"
           class="playlist-item active-download-item"
         >
@@ -1255,12 +1271,14 @@ onUnmounted(() => {
           <span class="material-symbols-rounded" style="font-size: 18px">download_done</span>
           <span>{{ t('download.downloaded_items') }}</span>
         </div>
-      </template>
+      </div>
+      </div>
+      </Transition>
 
       <template v-if="downloadStore.downloads.length > 0">
         <TransitionGroup tag="div" name="lib-list" class="lib-list">
         <div
-          v-for="dl in downloadStore.downloads"
+          v-for="dl in filteredDownloads"
           :key="'dl-' + dl.id"
           class="playlist-item"
           @click="playDownloadedTrack(dl)"

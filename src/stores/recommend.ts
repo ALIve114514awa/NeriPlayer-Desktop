@@ -91,6 +91,8 @@ export const useRecommendStore = defineStore('recommend', () => {
       const cache = JSON.parse(raw)
       if (cache.recommendedPlaylists?.length) recommendedPlaylists.value = cache.recommendedPlaylists
       if (cache.userPlaylists && Object.keys(cache.userPlaylists).length) userPlaylists.value = cache.userPlaylists
+      // 专辑与歌单同样入缓存，重启后无需等网络即可显示
+      if (cache.userAlbums?.length) userAlbums.value = cache.userAlbums
       if (cache.homeFeedShelves?.length) homeFeedShelves.value = cache.homeFeedShelves
       if (cache.homeHotSongs?.items?.length) homeHotSongs.value = { ...emptyHomeSongSection(), ...cache.homeHotSongs }
       if (cache.homeRadarSongs?.items?.length) homeRadarSongs.value = { ...emptyHomeSongSection(), ...cache.homeRadarSongs }
@@ -102,6 +104,7 @@ export const useRecommendStore = defineStore('recommend', () => {
       localStorage.setItem(CACHE_KEY, JSON.stringify({
         recommendedPlaylists: recommendedPlaylists.value,
         userPlaylists: userPlaylists.value,
+        userAlbums: userAlbums.value,
         homeFeedShelves: homeFeedShelves.value,
         homeHotSongs: homeHotSongs.value,
         homeRadarSongs: homeRadarSongs.value,
@@ -122,6 +125,8 @@ export const useRecommendStore = defineStore('recommend', () => {
       userAlbums.value = []
       likedSongIds.value = new Set()
     }
+    // 内存清了也要落盘，否则重启后 loadCache 又把旧数据恢复回来
+    saveCache()
   }
 
   function isCacheFresh(): boolean {
@@ -374,6 +379,7 @@ export const useRecommendStore = defineStore('recommend', () => {
         artist: a.artists?.map((ar: any) => ar.name).join(', ') || '',
         trackCount: a.size || 0,
       }))
+      saveCache()
     } catch (e) {
       log.error('fetchUserAlbums:', e)
     }
