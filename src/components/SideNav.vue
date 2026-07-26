@@ -11,16 +11,20 @@ const settings = useSettingsStore()
 
 const navItems = computed(() => {
   const items = [
-    { path: '/', icon: 'home', key: 'nav.home' },
-    { path: '/explore', icon: 'explore', key: 'nav.explore' },
-    { path: '/library', icon: 'library_music', key: 'nav.library' },
-    { path: '/settings', icon: 'settings', key: 'nav.settings' },
+    { path: '/', section: 'home', icon: 'home', key: 'nav.home' },
+    { path: '/explore', section: 'explore', icon: 'explore', key: 'nav.explore' },
+    { path: '/library', section: 'library', icon: 'library_music', key: 'nav.library' },
+    { path: '/settings', section: 'settings', icon: 'settings', key: 'nav.settings' },
   ]
   if (settings.devModeEnabled) {
-    items.push({ path: '/debug', icon: 'bug_report', key: 'settings.debug' })
+    items.push({ path: '/debug', section: 'debug', icon: 'bug_report', key: 'settings.debug' })
   }
   return items
 })
+
+// 按路由的归属板块判高亮：歌单/歌手/统计等二级页都标了 section=library，
+// 进详情后音乐库 TAB 保持点亮；精确比 path 会在任何二级路由上全部熄灭
+const activeSection = computed(() => (route.meta.section as string) ?? route.name)
 </script>
 
 <template>
@@ -30,11 +34,11 @@ const navItems = computed(() => {
         v-for="item in navItems"
         :key="item.path"
         class="nav-item"
-        :class="{ active: route.path === item.path }"
+        :class="{ active: activeSection === item.section }"
         @click="router.push(item.path)"
       >
         <div class="nav-pill">
-          <span class="material-symbols-rounded" :class="{ filled: route.path === item.path }">
+          <span class="material-symbols-rounded" :class="{ filled: activeSection === item.section }">
             {{ item.icon }}
           </span>
         </div>

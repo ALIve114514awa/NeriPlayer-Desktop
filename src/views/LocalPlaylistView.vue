@@ -926,8 +926,10 @@ onUnmounted(() => {
   padding: 10px 12px;
   margin: 0 0 10px;
   border-radius: 18px;
-  background: color-mix(in srgb, var(--md-surface-container-high) 92%, transparent);
-  backdrop-filter: blur(18px);
+  /* 与常驻顶栏同一套毛玻璃配方，两块浮动卡片叠放时质感一致 */
+  background: color-mix(in srgb, var(--md-surface-container-high) 70%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  backdrop-filter: blur(24px) saturate(1.5);
 }
 /* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {

@@ -22,8 +22,10 @@
   margin-bottom: 20px;
   padding: 8px 10px;
   border-radius: 18px;
-  background: color-mix(in srgb, var(--md-surface-container-high) 92%, transparent);
-  backdrop-filter: blur(18px);
+  /* 真毛玻璃：底色留 70% 透明度让 blur 透出内容，92% 时视觉上就是实心板 */
+  background: color-mix(in srgb, var(--md-surface-container-high) 70%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  backdrop-filter: blur(24px) saturate(1.5);
 }
 
 /* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
