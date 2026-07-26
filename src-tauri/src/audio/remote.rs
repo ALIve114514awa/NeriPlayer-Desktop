@@ -492,13 +492,26 @@ impl RemoteAudioSource {
                 });
             }
         }
-        let header_end = detect_mp4_header_end(
-            initial_disk_segment
-                .as_ref()
-                .map(|(_, data)| data.as_slice())
-                .unwrap_or(&[]),
-        )
-        .unwrap_or(0);
+        let head_bytes = initial_disk_segment
+            .as_ref()
+            .map(|(_, data)| data.as_slice())
+            .unwrap_or(&[]);
+        let header_end = detect_mp4_header_end(head_bytes).unwrap_or(0);
+        // URL 后缀嗅探不到 googlevideo 的分片直链，必须按首包内容再判一次。
+        //
+        // 只用来决定要不要建 seek 索引，**不改 access_mode**：
+        // 分片模式的按需块是 8MB，那是给 Bilibili 的独立 .m4s 分片文件调的；
+        // YouTube 是一个几十 MB 的单文件，套 8MB 块反而会把 seek 拖慢。
+        let sniffed_fragmented = !matches!(access_mode, RemoteAccessMode::FragmentedProgressive)
+            && detect_fragmented_mp4(head_bytes);
+        if sniffed_fragmented {
+            log::info!(
+                target: "remote-audio",
+                "fragmented mp4 sniffed from payload host={}, mode={:?}, seek index enabled",
+                host,
+                access_mode,
+            );
+        }
         let inner = Arc::new(RemoteAudioInner {
             client,
             url,
@@ -535,8 +548,20 @@ impl RemoteAudioSource {
         if let Some((start, data)) = initial_disk_segment {
             write_disk_range(&inner, start, &data);
         }
+        let needs_seek_index =
+            sniffed_fragmented || matches!(access_mode, RemoteAccessMode::LongFormProgressive);
+        // 分片 MP4 的 sidx 紧跟 moov 位于首包，先用首包建索引；
+        // 建成了就不必再为长内容拉 1MB 尾部，直接省掉起播路径上的一次往返
+        let head_index_ready = needs_seek_index
+            && total_len > 0
+            && duration_hint_ms > 0
+            && build_seek_index_from_head(&inner, duration_hint_ms);
+
         // 长内容：尾部 moov/sidx 预取进缓存，seek 升级为 seekable 后 demuxer 能直接跳转
-        if matches!(access_mode, RemoteAccessMode::LongFormProgressive) && total_len > 0 {
+        if matches!(access_mode, RemoteAccessMode::LongFormProgressive)
+            && total_len > 0
+            && !head_index_ready
+        {
             let tail_len = REMOTE_LONG_FORM_TAIL_BYTES.min(total_len);
             let tail_start = total_len.saturating_sub(tail_len);
             // 与首包重叠时跳过（极短文件）
@@ -582,8 +607,13 @@ impl RemoteAudioSource {
                     }
                 }
             }
-            // 构建粗粒度时间→字节索引（sidx 优先，否则线性估算）
-            build_seek_index_for_long_form(&inner, duration_hint_ms);
+        }
+        // 首包没建成索引时再兜底：长内容可退到尾部 sidx / 线性估算，
+        // 嗅探出的分片内容只接受真实 sidx，解析不到就保持原 format.seek 行为
+        if needs_seek_index && total_len > 0 && duration_hint_ms > 0 && !head_index_ready {
+            let allow_linear_fallback =
+                matches!(access_mode, RemoteAccessMode::LongFormProgressive);
+            build_seek_index_for_long_form(&inner, duration_hint_ms, allow_linear_fallback);
         }
         replenish_prefetch_window(&inner, 0);
 
@@ -1864,6 +1894,65 @@ fn is_fragmented_mp4_url(value: &str) -> bool {
         })
 }
 
+/// 从首包字节嗅探分片 MP4
+///
+/// 仅靠 URL 后缀不够：Bilibili DASH 用 `.m4s`，但 YouTube 的 googlevideo 直链
+/// 形如 `/videoplayback?itag=140&...`，路径没有任何扩展名，却同样是分片 MP4
+/// （`moov` 里 `stbl` 为空，时间轴全在 `moof` 中）。误判成普通 MP4 会让
+/// demuxer 拿着空样本表做 seek，长内容上表现为 seek 无响应。
+fn detect_fragmented_mp4(data: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + 8 <= data.len() {
+        let Ok(size_bytes) = data[offset..offset + 4].try_into() else {
+            return false;
+        };
+        let size = u32::from_be_bytes(size_bytes) as usize;
+        let kind = &data[offset + 4..offset + 8];
+
+        // styp/sidx/moof 是分片 MP4 的直接标志
+        if kind == b"styp" || kind == b"sidx" || kind == b"moof" {
+            return true;
+        }
+        // moov 内含 mvex 表示后续为 movie fragment
+        if kind == b"moov" {
+            let header_len = if size == 1 { 16 } else { 8 };
+            let end = if size == 0 {
+                data.len()
+            } else {
+                (offset + size).min(data.len())
+            };
+            let body_start = (offset + header_len).min(end);
+            if data[body_start..end]
+                .windows(4)
+                .any(|window| window == b"mvex")
+            {
+                return true;
+            }
+        }
+
+        let header_len = if size == 1 { 16 } else { 8 };
+        let atom_size = if size == 1 {
+            let Ok(size_bytes) = data[offset + 8..offset + 16].try_into() else {
+                return false;
+            };
+            u64::from_be_bytes(size_bytes) as usize
+        } else if size == 0 {
+            return false;
+        } else {
+            size
+        };
+        if atom_size < header_len {
+            return false;
+        }
+        // mdat 之后不会再有头部信息，且首包通常放不下整个 mdat
+        if kind == b"mdat" {
+            return false;
+        }
+        offset += atom_size;
+    }
+    false
+}
+
 pub struct SymphoniaAudioDecoder {
     decoder: Box<dyn Decoder>,
     current_frame_offset: usize,
@@ -3082,10 +3171,44 @@ fn position_is_cached_range(inner: &RemoteAudioInner, start: u64, end: u64) -> b
     disk_cached_len(inner, start, 1).is_some()
 }
 
-fn build_seek_index_for_long_form(inner: &RemoteAudioInner, duration_hint_ms: u64) {
+/// 只用首包的 sidx 建索引，成功返回 true；失败不写入，交给调用方兜底
+fn build_seek_index_from_head(inner: &RemoteAudioInner, duration_hint_ms: u64) -> bool {
+    let Some(index) = parse_sidx_seek_index(inner, duration_hint_ms.max(1)) else {
+        return false;
+    };
+    if index.entries.is_empty() {
+        return false;
+    }
+    log::info!(
+        target: "remote-audio",
+        "seek index from head sidx duration_ms={}, entries={}",
+        index.duration_ms,
+        index.entries.len()
+    );
+    let Ok(mut slot) = inner.seek_index.lock() else {
+        return false;
+    };
+    *slot = Some(index);
+    true
+}
+
+fn build_seek_index_for_long_form(
+    inner: &RemoteAudioInner,
+    duration_hint_ms: u64,
+    allow_linear_fallback: bool,
+) {
     let duration_ms = duration_hint_ms.max(1);
     let mut index = parse_sidx_seek_index(inner, duration_ms)
         .or_else(|| parse_sidx_seek_index_from_tail(inner, duration_ms));
+    if index.is_none() && !allow_linear_fallback {
+        // 分片内容没解析到真实 sidx 时不启用虚拟 body：线性估算落点不可靠，
+        // 保持原有的 format.seek 行为，避免把可用路径换成更差的路径
+        log::info!(
+            target: "remote-audio",
+            "seek index skipped: no sidx found and linear fallback disabled"
+        );
+        return;
+    }
     if index.is_none() {
         // 线性估算兜底：足够让字节跳转落到大致区域
         let total = inner.total_len.max(1);
@@ -4101,6 +4224,52 @@ mod tests {
     }
 
 
+
+    fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn fragmented_mp4_is_sniffed_from_sidx_moof_and_mvex() {
+        // ftyp + sidx（YouTube itag140 的典型头部布局）
+        let mut sidx_head = mp4_box(b"ftyp", &[0u8; 8]);
+        sidx_head.extend_from_slice(&mp4_box(b"sidx", &[0u8; 16]));
+        assert!(super::detect_fragmented_mp4(&sidx_head));
+
+        // ftyp + moov(含 mvex)
+        let moov_body = mp4_box(b"mvex", &[0u8; 8]);
+        let mut mvex_head = mp4_box(b"ftyp", &[0u8; 8]);
+        mvex_head.extend_from_slice(&mp4_box(b"moov", &moov_body));
+        assert!(super::detect_fragmented_mp4(&mvex_head));
+
+        // styp 开头的独立分片
+        assert!(super::detect_fragmented_mp4(&mp4_box(b"styp", &[0u8; 8])));
+    }
+
+    #[test]
+    fn progressive_mp4_is_not_sniffed_as_fragmented() {
+        // ftyp + moov(仅 mvhd) + mdat：普通渐进式 MP4
+        let moov_body = mp4_box(b"mvhd", &[0u8; 16]);
+        let mut head = mp4_box(b"ftyp", &[0u8; 8]);
+        head.extend_from_slice(&mp4_box(b"moov", &moov_body));
+        head.extend_from_slice(&mp4_box(b"mdat", &[0u8; 32]));
+
+        assert!(!super::detect_fragmented_mp4(&head));
+        assert!(!super::detect_fragmented_mp4(&[]));
+        assert!(!super::detect_fragmented_mp4(b"OggS\x00\x02"));
+    }
+
+    #[test]
+    fn youtube_style_url_needs_payload_sniffing() {
+        // googlevideo 直链没有扩展名，仅靠 URL 判不出分片
+        let url = "https://rr5---sn-abc.googlevideo.com/videoplayback?expire=1&itag=140";
+        assert!(!super::is_fragmented_mp4_url(url));
+        assert!(super::is_fragmented_mp4_url("https://cdn.example/audio/seg-1.m4s"));
+    }
 
     #[test]
     fn detect_mp4_header_end_finds_mdat() {
