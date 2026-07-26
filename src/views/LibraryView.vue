@@ -268,6 +268,19 @@ function platformLabel(source?: string) {
   }
 }
 
+/** 收藏来源明文标签 (对齐 Android favoriteSourceLabel, 不露出内部 source 标识) */
+function favoriteSourceLabel(source: string): string {
+  switch (source) {
+    case 'netease': return t('player.source_netease')
+    case 'neteaseAlbum': return `${t('player.source_netease')} · ${t('library.albums')}`
+    case 'neteaseArtist': return `${t('player.source_netease')} · ${t('library.local_category_artists')}`
+    case 'youtubeMusic': return 'YouTube Music'
+    case 'bili': return t('player.source_bilibili')
+    case 'qq': return t('player.source_qq')
+    default: return platformLabel(source)
+  }
+}
+
 // M3 Dialog 创建播放列表
 const showCreateDialog = ref(false)
 const newPlaylistName = ref('')
@@ -335,9 +348,18 @@ const tabSearchHint = computed(() =>
 const filteredPlaylists = computed(() =>
   playlists.value.filter((pl) => matchesQuery(tabQuery.value, displayName(pl))),
 )
-const filteredFavoritePlaylists = computed(() =>
-  favoritePlaylists.value.filter((fpl) => matchesQuery(tabQuery.value, fpl.name, fpl.source)),
+// 收藏分类: 歌单 / 歌手 (对齐 Android FavoritePlaylistList 的二级分类)
+const favoriteCategory = ref<'playlists' | 'artists'>('playlists')
+const playlistFavorites = computed(() =>
+  favoritePlaylists.value.filter((fpl) => fpl.source !== 'neteaseArtist'),
 )
+const artistFavorites = computed(() =>
+  favoritePlaylists.value.filter((fpl) => fpl.source === 'neteaseArtist'),
+)
+const filteredFavoritePlaylists = computed(() => {
+  const pool = favoriteCategory.value === 'artists' ? artistFavorites.value : playlistFavorites.value
+  return pool.filter((fpl) => matchesQuery(tabQuery.value, fpl.name, fpl.source))
+})
 const filteredNeteasePlaylists = computed(() =>
   neteasePlaylists.value.filter((npl: any) => matchesQuery(tabQuery.value, npl.name)),
 )
@@ -631,6 +653,13 @@ function openFavorite(fpl: FavoritePlaylist) {
       return
     case 'neteaseAlbum':
       router.push({ name: 'netease-album', params: { id: fpl.id } })
+      return
+    case 'neteaseArtist':
+      router.push({
+        name: 'netease-artist',
+        params: { id: fpl.id },
+        query: { name: fpl.name, ...(fpl.coverUrl ? { cover: fpl.coverUrl } : {}) },
+      })
       return
     case 'youtubeMusic': {
       const browseId = fpl.browseId || (fpl.playlistId ? `VL${fpl.playlistId}` : '')
@@ -1214,7 +1243,30 @@ onUnmounted(() => {
 
     <!-- Tab: 收藏（同步的收藏歌单） -->
     <div v-else-if="activeTab === 1" key="tab-favorites" class="playlist-list">
-      <TransitionGroup v-if="favoritePlaylists.length > 0" tag="div" name="lib-list" class="lib-list">
+      <!-- 歌单 / 歌手分类 (对齐 Android 收藏页分类切换) -->
+      <div class="local-category-bar">
+        <button
+          v-for="category in (['playlists', 'artists'] as const)"
+          :key="category"
+          class="local-category-chip"
+          :class="{ active: favoriteCategory === category }"
+          @click="favoriteCategory = category"
+        >
+          <span class="material-symbols-rounded" style="font-size: 17px">
+            {{ category === 'playlists' ? 'queue_music' : 'account_circle' }}
+          </span>
+          <span>{{ category === 'playlists' ? t('library.local_category_playlists') : t('library.local_category_artists') }}</span>
+        </button>
+      </div>
+
+      <Transition name="fade" mode="out-in">
+      <TransitionGroup
+        v-if="filteredFavoritePlaylists.length > 0"
+        :key="'fav-' + favoriteCategory"
+        tag="div"
+        name="lib-list"
+        class="lib-list"
+      >
         <div
           v-for="fpl in filteredFavoritePlaylists"
           :key="'fav-' + fpl.id"
@@ -1233,20 +1285,27 @@ onUnmounted(() => {
             />
           </div>
           <div class="pl-icon" v-else>
-            <span class="material-symbols-rounded filled" style="font-size: 22px">bookmark</span>
+            <span class="material-symbols-rounded filled" style="font-size: 22px">
+              {{ favoriteCategory === 'artists' ? 'account_circle' : 'bookmark' }}
+            </span>
           </div>
           <div class="pl-info">
             <div class="pl-name">{{ fpl.name }}</div>
-            <div class="pl-count">{{ t('player.track_count', { count: fpl.trackCount }) }} · {{ platformLabel(fpl.source) }}</div>
+            <div class="pl-count">{{ t('player.track_count', { count: fpl.trackCount }) }} · {{ favoriteSourceLabel(fpl.source) }}</div>
           </div>
           <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
         </div>
       </TransitionGroup>
-      <div v-else class="empty-tab">
-        <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">bookmark</span></div>
+      <div v-else class="empty-tab" :key="'fav-empty-' + favoriteCategory">
+        <div class="empty-circle">
+          <span class="material-symbols-rounded" style="font-size: 40px">
+            {{ favoriteCategory === 'artists' ? 'account_circle' : 'bookmark' }}
+          </span>
+        </div>
         <p class="empty-title">{{ t('explore.no_playlists') }}</p>
         <p class="empty-desc">{{ t('explore.login_for_playlists') }}</p>
       </div>
+      </Transition>
     </div>
 
     <!-- Tab: 下载 -->

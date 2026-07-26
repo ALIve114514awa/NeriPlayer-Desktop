@@ -275,6 +275,43 @@ pub async fn get_netease_playlist_detail(
     Ok(detail)
 }
 
+/// 歌手歌曲最多自动翻页数 (100 首/页)
+const NETEASE_ARTIST_MAX_PAGES: usize = 20;
+
+/// 歌手全部歌曲, 自动翻页合并 (对齐 Android NeteaseArtistDetail)
+#[tauri::command]
+pub async fn get_netease_artist_songs(
+    artist_id: u64,
+    state: State<'_, AppState>,
+) -> AppResult<Value> {
+    let client = state.netease();
+    let page_size: u32 = 100;
+    let mut all_songs: Vec<Value> = Vec::new();
+    let mut offset: u32 = 0;
+
+    for page_index in 0..NETEASE_ARTIST_MAX_PAGES {
+        let page = match client.get_artist_songs(artist_id, "hot", offset, page_size).await {
+            Ok(page) => page,
+            Err(e) if page_index == 0 => return Err(e),
+            Err(e) => {
+                // 后续页失败时保留已取到的部分, 不让整页报错
+                log::warn!(target: "recommend", "get_artist_songs page failed: {}", e);
+                break;
+            }
+        };
+        let songs = page["songs"].as_array().cloned().unwrap_or_default();
+        let count = songs.len();
+        all_songs.extend(songs);
+        let more = page["more"].as_bool().unwrap_or(false);
+        if !more || count == 0 {
+            break;
+        }
+        offset += count as u32;
+    }
+
+    Ok(serde_json::json!({ "songs": all_songs }))
+}
+
 /// 单次歌单详情最多展开的 continuation 页数
 const YOUTUBE_PLAYLIST_MAX_PAGES: usize = 20;
 

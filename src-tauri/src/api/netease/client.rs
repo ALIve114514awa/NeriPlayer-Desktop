@@ -335,6 +335,33 @@ impl NeteaseClient {
         })
     }
 
+    /// 歌手全部歌曲 (对齐 Android getArtistSongs: /api/v1/artist/songs)
+    pub async fn get_artist_songs(
+        &self,
+        artist_id: u64,
+        order: &str,
+        offset: u32,
+        limit: u32,
+    ) -> AppResult<Value> {
+        let resp = self
+            .send_with_fallback(|client| {
+                client
+                    .post(format!("{}/api/v1/artist/songs", BASE_URL))
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://music.163.com")
+                    .form(&[
+                        ("id", artist_id.to_string()),
+                        ("private_cloud", "true".into()),
+                        ("work_type", "1".into()),
+                        ("order", order.to_string()),
+                        ("offset", offset.to_string()),
+                        ("limit", limit.to_string()),
+                    ])
+            })
+            .await?;
+        parse_json_response(resp, "netease artist songs").await
+    }
+
     /// 获取专辑详情
     pub async fn get_album_detail(&self, album_id: u64) -> AppResult<Value> {
         let resp = self
