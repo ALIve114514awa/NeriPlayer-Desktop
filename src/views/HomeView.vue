@@ -8,6 +8,7 @@ import { useLibraryStore } from '@/stores/library'
 import { useAuthStore } from '@/stores/auth'
 import { useRecommendStore, type HomeRecommendationSong } from '@/stores/recommend'
 import { useHistoryStore } from '@/stores/history'
+import { useSettingsStore } from '@/stores/settings'
 import { useI18n } from 'vue-i18n'
 import type { TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
@@ -19,6 +20,7 @@ const library = useLibraryStore()
 const auth = useAuthStore()
 const recommend = useRecommendStore()
 const history = useHistoryStore()
+const settings = useSettingsStore()
 const toast = useToastStore()
 const { t } = useI18n()
 
@@ -109,6 +111,11 @@ const platformHubs = computed(() => [
 ])
 
 const youtubeHomeItems = computed(() => recommend.homeFeedShelves.flatMap(s => s.items).slice(0, 14))
+
+// 国际化开启时 YTM 信息流置顶按分区展示 (对齐 Android HomeScreen isInternational 分支)
+const ytFeedFirst = computed(() => settings.internationalizationEnabled && auth.youtube.loggedIn)
+const youtubeHomeShelves = computed(() =>
+  recommend.homeFeedShelves.filter(shelf => shelf.items.length > 0).slice(0, 3))
 
 // 三列网格分页（每页 3列 x 4行 = 12 项）
 const GRID_PAGE_SIZE = 12
@@ -348,6 +355,41 @@ function formatNotifTime(ts: number): string {
       </div>
     </section>
 
+    <!-- YouTube Music 信息流（国际化开启时置顶按分区展示, 对齐 Android isInternational 分支） -->
+    <template v-if="ytFeedFirst">
+      <section
+        v-for="shelf in youtubeHomeShelves"
+        :key="'ytm-shelf-' + shelf.title"
+        class="section"
+      >
+        <div class="section-header">
+          <h2 class="section-title">
+            <span class="platform-inline-icon" style="--platform-color: #ff0033; mask-image: url('/icons/ic_youtube.svg')"></span>
+            {{ shelf.title || 'YouTube Music' }}
+          </h2>
+          <button class="section-more" @click="router.push({ name: 'explore', query: { platform: 'youtube' } })">
+            <span>{{ t('home.more') }}</span>
+            <span class="material-symbols-rounded" style="font-size: 18px">arrow_forward</span>
+          </button>
+        </div>
+        <div class="daily-scroll">
+          <div
+            v-for="item in shelf.items.slice(0, 14)"
+            :key="item.browseId || item.videoId || item.title"
+            class="daily-card"
+            @click="openYoutubeHomeItem(item)"
+          >
+            <div class="daily-cover">
+              <span class="material-symbols-rounded filled cover-fallback">music_note</span>
+              <BilibiliCoverImage v-if="item.coverUrl" :src="item.coverUrl" loading="lazy" />
+            </div>
+            <div class="daily-name">{{ item.title }}</div>
+            <div class="daily-artist">{{ item.subtitle }}</div>
+          </div>
+        </div>
+      </section>
+    </template>
+
     <!-- 骨架屏（首次加载且无缓存时） -->
     <section v-if="showSkeleton" class="section">
       <div class="skeleton-title" />
@@ -493,8 +535,8 @@ function formatNotifTime(ts: number): string {
       </div>
     </section>
 
-    <!-- YouTube Music 首页 Feed -->
-    <section v-if="youtubeHomeItems.length > 0" class="section">
+    <!-- YouTube Music 首页 Feed（国际化关闭时保持在底部的单分区形态） -->
+    <section v-if="!ytFeedFirst && youtubeHomeItems.length > 0" class="section">
       <div class="section-header">
         <h2 class="section-title">
           <span class="platform-inline-icon" style="--platform-color: #ff0033; mask-image: url('/icons/ic_youtube.svg')"></span>

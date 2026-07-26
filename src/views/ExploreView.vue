@@ -8,6 +8,7 @@ import { useSearchStore } from '@/stores/search'
 import { usePlayerStore } from '@/stores/player'
 import { useAuthStore } from '@/stores/auth'
 import { useRecommendStore, type PlaylistInfo } from '@/stores/recommend'
+import { useSettingsStore } from '@/stores/settings'
 import { invoke } from '@tauri-apps/api/core'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
@@ -19,6 +20,7 @@ const searchStore = useSearchStore()
 const player = usePlayerStore()
 const auth = useAuthStore()
 const recommend = useRecommendStore()
+const settings = useSettingsStore()
 
 // 搜索
 const searchQuery = ref('')
@@ -28,16 +30,24 @@ const isFocused = ref(false)
 // 探索页不含 QQ 音乐（QQ 的搜索/播放/账号能力仍保留在其它模块）
 type PlatformTab = 'netease' | 'bilibili' | 'youtube'
 const PLATFORM_KEYS: PlatformTab[] = ['netease', 'bilibili', 'youtube']
+// 国际化开启时 YouTube Music 为高优先级来源: tab 提前且作为默认平台
+const ytmFirst = settings.internationalizationEnabled
 const initialPlatform = PLATFORM_KEYS.includes(String(route.query.platform) as PlatformTab)
   ? String(route.query.platform) as PlatformTab
-  : 'netease'
+  : (ytmFirst ? 'youtube' : 'netease')
 const activeTab = ref<PlatformTab>(initialPlatform)
 
-const platformTabs = computed(() => [
-  { key: 'netease' as PlatformTab, label: t('settings.netease_account'), icon: '/icons/ic_netease.svg' },
-  { key: 'bilibili' as PlatformTab, label: t('settings.bilibili_account'), icon: '/icons/ic_bilibili.svg' },
-  { key: 'youtube' as PlatformTab, label: t('settings.youtube_account'), icon: '/icons/ic_youtube.svg' },
-])
+const platformTabs = computed(() => {
+  const tabs = [
+    { key: 'netease' as PlatformTab, label: t('settings.netease_account'), icon: '/icons/ic_netease.svg' },
+    { key: 'bilibili' as PlatformTab, label: t('settings.bilibili_account'), icon: '/icons/ic_bilibili.svg' },
+    { key: 'youtube' as PlatformTab, label: t('settings.youtube_account'), icon: '/icons/ic_youtube.svg' },
+  ]
+  if (settings.internationalizationEnabled) {
+    tabs.unshift(...tabs.splice(2, 1))
+  }
+  return tabs
+})
 
 // 网易云歌单 Tag
 const TAG_KEYS = [
