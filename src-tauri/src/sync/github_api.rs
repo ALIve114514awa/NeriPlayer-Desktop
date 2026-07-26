@@ -556,6 +556,64 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// 线格式：上传时 content 必须是「文件原始字节的 Base64」，只编一次
+    ///
+    /// 曾经这里传进来的已经是 Base64 文本，再编一次就成了双层 Base64——
+    /// 流量白多 1/3，且 Android 解一次得到的是 Base64 文本而不是 GZIP 字节。
+    /// 这个断言按字节比对，双端只要有一方改了层数就会立刻失败。
+    #[tokio::test]
+    async fn upload_base64_encodes_the_raw_bytes_exactly_once() {
+        let (base, mut requests, server) = mock_server(vec![
+            response("200 OK", r#"{"default_branch":"main"}"#),
+            response("200 OK", r#"{"content":{"sha":"new-sha"}}"#),
+        ])
+        .await;
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
+
+        // 以 GZIP 魔数开头的原始字节：既非 UTF-8 文本，也不是 Base64
+        let raw: &[u8] = &[0x1F, 0x8B, 0x08, 0x00, 0x00, 0xFF, 0xFE, 0x42];
+        api.update_file_content("owner", "repo", "backup.bin", raw, "", "sync")
+            .await
+            .unwrap();
+
+        let _repository_request = requests.recv().await.unwrap();
+        let update_request = requests.recv().await.unwrap();
+        let expected = BASE64.encode(raw);
+        assert!(
+            update_request.contains(&format!("\"content\":\"{expected}\"")),
+            "content 必须正好是一层 Base64: {update_request}",
+        );
+        // 双层编码的特征：把结果再解一次仍然是合法 Base64 文本
+        assert!(
+            !update_request.contains(&BASE64.encode(expected.as_bytes())),
+            "出现了双层 Base64",
+        );
+        server.await.unwrap();
+    }
+
+    /// 下载路径必须原样吐出文件字节，不做 UTF-8 转换
+    ///
+    /// 新格式的 backup.bin 是裸 GZIP，任何 String::from_utf8 都会把它判死。
+    #[tokio::test]
+    async fn download_returns_raw_bytes_for_non_utf8_payloads() {
+        let raw: &[u8] = &[0x1F, 0x8B, 0x08, 0x00, 0x00, 0xFF, 0xFE, 0x42];
+        let encoded = BASE64.encode(raw);
+        let (base, _requests, server) = mock_server(vec![response(
+            "200 OK",
+            &format!(r#"{{"size":8,"content":"{encoded}","sha":"abc123"}}"#),
+        )])
+        .await;
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
+
+        let result = api
+            .get_file_content("owner", "repo", "backup.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some((raw.to_vec(), "abc123".to_string())));
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn update_uses_default_branch_and_classifies_sha_conflict() {
         let (base, mut requests, server) = mock_server(vec![
