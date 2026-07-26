@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import type { TrackInfo } from '@/stores/player'
 import { useToastStore } from '@/stores/toast'
 import M3Input from '@/components/ui/M3Input.vue'
+import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('add-to-playlist')
@@ -22,7 +23,29 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const toast = useToastStore()
 
-interface PlaylistInfo { id: number; name: string; track_count: number; modified_at: number }
+interface PlaylistInfo {
+  id: number
+  name: string
+  track_count: number
+  modified_at: number
+  cover_url: string | null
+}
+
+/// B 站图床带防盗链，必须走后端代理组件；其余来源直接 img
+function isBilibiliCover(url: string | null): boolean {
+  return !!url && /hdslb\.com/.test(url)
+}
+
+/// 加载失败的封面回退到图标，避免破图占位
+const failedCovers = ref(new Set<number>())
+function markCoverFailed(id: number) {
+  failedCovers.value.add(id)
+  failedCovers.value = new Set(failedCovers.value)
+}
+function coverFor(pl: PlaylistInfo): string | null {
+  if (!pl.cover_url || failedCovers.value.has(pl.id)) return null
+  return pl.cover_url
+}
 
 const playlists = ref<PlaylistInfo[]>([])
 const isLoading = ref(false)
@@ -199,23 +222,40 @@ function toBackendTrack(track: TrackInfo) {
           </div>
 
           <!-- 歌单列表 -->
-          <div v-if="playlists.length > 0" class="atp-list">
+          <TransitionGroup v-if="playlists.length > 0" tag="div" name="atp-list" class="atp-list" appear>
             <div
-              v-for="pl in playlists"
+              v-for="(pl, index) in playlists"
               :key="pl.id"
               class="atp-item"
+              :style="{ '--atp-index': Math.min(index, 12) }"
               :class="{ disabled: isSubmitting }"
               @click="addToPlaylist(pl.id)"
             >
-              <div class="atp-item-icon">
-                <span class="material-symbols-rounded filled" style="font-size: 20px">queue_music</span>
+              <div class="atp-item-icon" :class="{ 'has-cover': coverFor(pl) }">
+                <BilibiliCoverImage
+                  v-if="coverFor(pl) && isBilibiliCover(pl.cover_url)"
+                  :src="pl.cover_url!"
+                  class="atp-item-cover"
+                >
+                  <span class="material-symbols-rounded filled" style="font-size: 20px">queue_music</span>
+                </BilibiliCoverImage>
+                <img
+                  v-else-if="coverFor(pl)"
+                  :src="pl.cover_url!"
+                  referrerpolicy="no-referrer"
+                  loading="lazy"
+                  class="atp-item-cover"
+                  alt=""
+                  @error="markCoverFailed(pl.id)"
+                />
+                <span v-else class="material-symbols-rounded filled" style="font-size: 20px">queue_music</span>
               </div>
               <div class="atp-item-info">
                 <div class="atp-item-name">{{ pl.name }}</div>
                 <div class="atp-item-count">{{ t('library.track_count', { count: pl.track_count }) }}</div>
               </div>
             </div>
-          </div>
+          </TransitionGroup>
 
           <div v-else-if="isLoading" class="atp-loading" role="status">
             <span class="material-symbols-rounded">progress_activity</span>
@@ -383,6 +423,23 @@ function toBackendTrack(track: TrackInfo) {
   justify-content: center;
   flex-shrink: 0;
   color: var(--md-on-surface-variant);
+  overflow: hidden;
+
+  &.has-cover { background: var(--md-surface-container); }
+}
+
+.atp-item-cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+:deep(.atp-item-cover img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .atp-item-info { flex: 1; min-width: 0; }
@@ -421,6 +478,28 @@ function toBackendTrack(track: TrackInfo) {
 
 @keyframes atp-spin {
   to { transform: rotate(360deg); }
+}
+
+// 列表项逐项浮现（appear），刷新/增删时也走同一过渡
+.atp-list-enter-active {
+  transition:
+    opacity 240ms ease-out,
+    transform 280ms cubic-bezier(0.05, 0.7, 0.1, 1);
+  transition-delay: calc(var(--atp-index, 0) * 24ms);
+}
+.atp-list-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.atp-list-leave-active {
+  transition: opacity 120ms ease-in;
+  position: absolute;
+}
+.atp-list-leave-to { opacity: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .atp-list-enter-active,
+  .atp-list-leave-active { transition: none; }
 }
 
 // 过渡动画
