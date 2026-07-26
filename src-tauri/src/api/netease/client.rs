@@ -5,23 +5,14 @@ use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
 use super::crypto;
+use crate::api::transport::FallbackHttp;
 
 const BASE_URL: &str = "https://music.163.com";
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 pub struct NeteaseClient {
-    http: Client,
-    /// 代理设置相反的备用客户端，仅在主客户端网络层失败时使用
-    fallback: Option<Client>,
-}
-
-/// 是否属于「换个代理设置可能就通」的网络层失败
-///
-/// 只认连接建立阶段的错误：HTTP 状态码错误、解析错误都不该触发重试，
-/// 否则会把一次业务失败放大成两次请求。
-fn is_transport_failure(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout() || (error.is_request() && !error.is_decode())
+    http: FallbackHttp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,35 +54,18 @@ pub struct NeteaseLyrics {
 
 impl NeteaseClient {
     pub fn new(http: &Client) -> Self {
-        Self { http: http.clone(), fallback: None }
+        Self { http: FallbackHttp::new(http, "netease") }
     }
 
     pub fn with_fallback(http: &Client, fallback: &Client) -> Self {
-        Self {
-            http: http.clone(),
-            fallback: Some(fallback.clone()),
-        }
+        Self { http: FallbackHttp::with_fallback(http, fallback, "netease") }
     }
 
-    /// 主客户端网络层失败时，用相反代理设置的备用客户端重试一次
     async fn send_with_fallback(
         &self,
         build: impl Fn(&Client) -> reqwest::RequestBuilder,
     ) -> AppResult<reqwest::Response> {
-        let primary = build(&self.http).send().await;
-        let error = match primary {
-            Ok(response) => return Ok(response),
-            Err(error) => error,
-        };
-        let Some(fallback) = self.fallback.as_ref().filter(|_| is_transport_failure(&error)) else {
-            return Err(error.into());
-        };
-        log::warn!(
-            target: "netease",
-            "primary transport failed, retrying with the opposite proxy setting: {}",
-            error,
-        );
-        Ok(build(fallback).send().await?)
+        Ok(self.http.send(build).await?)
     }
 
     /// WEAPI POST 请求
