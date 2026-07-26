@@ -294,3 +294,17 @@ html.theme-ripple-active::view-transition-new(root) {
                 box-shadow .3s ease !important;
   }
 }
+
+/* ===== 定位到当前播放：目标行高亮脉冲（useLocateCurrentTrack 添加/移除类） ===== */
+@keyframes np-locate-pulse {
+  0%, 100% { background-color: transparent; }
+  35% { background-color: color-mix(in srgb, var(--md-primary) 10%, transparent); }
+}
+
+.np-locate-pulse {
+  animation: np-locate-pulse 600ms var(--ease-standard) 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .np-locate-pulse { animation: none; }
+}

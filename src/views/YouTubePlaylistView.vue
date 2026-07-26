@@ -9,7 +9,9 @@ import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import ContextMenu from '@/components/ui/ContextMenu.vue'
 import TrackSelectionToolbar from '@/components/TrackSelectionToolbar.vue'
+import LocateTrackFab from '@/components/LocateTrackFab.vue'
 import { useTrackSelection } from '@/composables/useTrackSelection'
+import { useLocateCurrentTrack } from '@/composables/useLocateCurrentTrack'
 import {
   createContextMenuItem,
   type ContextMenuActionItem,
@@ -85,6 +87,19 @@ function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000)
   return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
 }
+
+// 定位到当前播放
+const viewRef = ref<HTMLElement | null>(null)
+const currentRowKey = computed(() => {
+  const id = player.currentTrack?.id
+  if (!id) return null
+  return filteredTracks.value.some(item => item.id === id) ? id : null
+})
+const { fabVisible: locateFabVisible, locate: locateCurrentTrack } = useLocateCurrentTrack({
+  containerRef: viewRef,
+  currentKey: currentRowKey,
+  suppressed: selectionMode,
+})
 
 // 解析 InnerTube browse 响应, 复用共享解析器统一多端布局
 function parsePlaylistTracks(data: any): TrackInfo[] {
@@ -305,7 +320,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="detail-view">
+  <div ref="viewRef" class="detail-view">
     <header class="detail-header">
       <button class="back-btn" @click="router.back()">
         <span class="material-symbols-rounded">arrow_back</span>
@@ -375,6 +390,7 @@ onMounted(() => {
             :key="track.id"
             class="track-item"
             :class="{ active: player.currentTrack?.id === track.id, selected: selectionMode && selectedIds.has(track.id), 'selection-mode': selectionMode }"
+            :data-track-key="track.id"
             @click="playTrack(track)"
             @contextmenu.prevent.stop="openTrackContextMenu($event, track)"
           >
@@ -401,6 +417,12 @@ onMounted(() => {
         </div>
       </div>
     </template>
+
+    <LocateTrackFab
+      :visible="locateFabVisible"
+      :label="t('player.locate_current')"
+      @click="locateCurrentTrack"
+    />
 
     <ContextMenu
       :open="trackMenu.show"

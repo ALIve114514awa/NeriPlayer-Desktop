@@ -9,7 +9,9 @@ import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import ContextMenu from '@/components/ui/ContextMenu.vue'
 import TrackSelectionToolbar from '@/components/TrackSelectionToolbar.vue'
+import LocateTrackFab from '@/components/LocateTrackFab.vue'
 import { useTrackSelection } from '@/composables/useTrackSelection'
+import { useLocateCurrentTrack } from '@/composables/useLocateCurrentTrack'
 import {
   createContextMenuItem,
   type ContextMenuActionItem,
@@ -55,6 +57,19 @@ const {
   toggleSelectAllVisible,
   invertSelectionVisible,
 } = useTrackSelection(allHistoryTracks, visibleHistoryTracks)
+
+// 定位到当前播放
+const viewRef = ref<HTMLElement | null>(null)
+const currentRowKey = computed(() => {
+  const id = player.currentTrack?.id
+  if (!id) return null
+  return filteredEntries.value.some(entry => entry.track.id === id) ? id : null
+})
+const { fabVisible: locateFabVisible, locate: locateCurrentTrack } = useLocateCurrentTrack({
+  containerRef: viewRef,
+  currentKey: currentRowKey,
+  suppressed: selectionMode,
+})
 
 function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000)
@@ -197,7 +212,7 @@ function handleTrackMenuClick(item: ContextMenuActionItem) {
 </script>
 
 <template>
-  <div class="detail-view">
+  <div ref="viewRef" class="detail-view">
     <header class="detail-header">
       <button class="back-btn" @click="router.back()">
         <span class="material-symbols-rounded">arrow_back</span>
@@ -251,6 +266,7 @@ function handleTrackMenuClick(item: ContextMenuActionItem) {
           :key="entry.track.id + entry.playedAt"
           class="track-item"
           :class="{ active: player.currentTrack?.id === entry.track.id, selected: selectionMode && selectedIds.has(entry.track.id), 'selection-mode': selectionMode }"
+          :data-track-key="entry.track.id"
           @click="playEntry(index)"
           @contextmenu.prevent.stop="openTrackContextMenu($event, entry.track)"
         >
@@ -294,6 +310,12 @@ function handleTrackMenuClick(item: ContextMenuActionItem) {
         </div>
       </div>
     </Teleport>
+
+    <LocateTrackFab
+      :visible="locateFabVisible"
+      :label="t('player.locate_current')"
+      @click="locateCurrentTrack"
+    />
 
     <ContextMenu
       :open="trackMenu.show"

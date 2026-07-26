@@ -17,6 +17,8 @@ import M3Dialog from '@/components/ui/M3Dialog.vue'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
 import ContextMenu from '@/components/ui/ContextMenu.vue'
+import LocateTrackFab from '@/components/LocateTrackFab.vue'
+import { useLocateCurrentTrack } from '@/composables/useLocateCurrentTrack'
 import {
   createContextMenuItem,
   type ContextMenuActionItem,
@@ -164,6 +166,29 @@ function onDetailScroll(e: Event) {
     expandVisibleTracks()
   }
 }
+
+// 定位到当前播放：窗口渐扩列表里目标行未渲染时先扩容再滚动
+const detailViewRef = ref<HTMLElement | null>(null)
+const currentRowKey = computed(() => {
+  const current = player.currentTrack
+  if (!current) return null
+  const key = trackSelectionKey(current)
+  return filteredTracks.value.some(track => trackSelectionKey(track) === key) ? key : null
+})
+const { fabVisible: locateFabVisible, locate: locateCurrentTrack } = useLocateCurrentTrack({
+  containerRef: detailViewRef,
+  currentKey: currentRowKey,
+  suppressed: selectionMode,
+  ensureRendered: key => {
+    const index = filteredTracks.value.findIndex(track => trackSelectionKey(track) === key)
+    if (index < 0) return false
+    if (index >= renderCount.value) {
+      // 多带一段缓冲，居中后目标行下方仍有内容
+      renderCount.value = Math.min(filteredTracks.value.length, index + 20)
+    }
+    return true
+  },
+})
 
 const selectedTracks = computed(() => tracks.value.filter(t => selectedIds.value.has(trackSelectionKey(t))))
 const selectedCount = computed(() => selectedIds.value.size)
@@ -805,7 +830,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="detail-view" @scroll.passive="onDetailScroll">
+  <div ref="detailViewRef" class="detail-view" @scroll.passive="onDetailScroll">
     <header class="detail-header">
       <button class="back-btn" @click="router.back()">
         <span class="material-symbols-rounded">arrow_back</span>
@@ -964,6 +989,12 @@ onUnmounted(() => {
         </div>
       </template>
     </template>
+
+    <LocateTrackFab
+      :visible="locateFabVisible"
+      :label="t('player.locate_current')"
+      @click="locateCurrentTrack"
+    />
 
     <ContextMenu
       :open="trackMenu.show"

@@ -5,6 +5,8 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { normalizeTrack, usePlayerStore, type TrackInfo } from '@/stores/player'
 import BilibiliCoverImage from '@/components/BilibiliCoverImage.vue'
+import LocateTrackFab from '@/components/LocateTrackFab.vue'
+import { useLocateCurrentTrack } from '@/composables/useLocateCurrentTrack'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('favorite-playlist-view')
@@ -71,11 +73,23 @@ function playTrack(index: number) {
   player.playAll(tracks.value, tracks.value[index]?.id)
 }
 
+// 定位到当前播放
+const viewRef = ref<HTMLElement | null>(null)
+const currentRowKey = computed(() => {
+  const id = player.currentTrack?.id
+  if (!id) return null
+  return tracks.value.some(item => item.id === id) ? id : null
+})
+const { fabVisible: locateFabVisible, locate: locateCurrentTrack } = useLocateCurrentTrack({
+  containerRef: viewRef,
+  currentKey: currentRowKey,
+})
+
 onMounted(load)
 </script>
 
 <template>
-  <div class="detail-view">
+  <div ref="viewRef" class="detail-view">
     <div class="detail-header">
       <button class="back-btn" @click="router.back()">
         <span class="material-symbols-rounded">arrow_back</span>
@@ -116,6 +130,7 @@ onMounted(load)
           :key="track.id + '-' + index"
           class="track-item"
           :class="{ active: player.currentTrack?.id === track.id }"
+          :data-track-key="track.id"
           @click="playTrack(index)"
         >
           <div class="track-index">
@@ -139,6 +154,12 @@ onMounted(load)
         </div>
       </div>
     </template>
+
+    <LocateTrackFab
+      :visible="locateFabVisible"
+      :label="t('player.locate_current')"
+      @click="locateCurrentTrack"
+    />
   </div>
 </template>
 
