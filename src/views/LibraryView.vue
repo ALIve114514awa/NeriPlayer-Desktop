@@ -618,27 +618,51 @@ const youtubePlaylists = computed(() => recommend.userPlaylists['youtube'] || []
 interface FavoritePlaylist {
   id: string; name: string; coverUrl: string; trackCount: number; source: string;
   songs: any[]; addedTime: number; modifiedAt: number; isDeleted: boolean;
+  browseId: string; playlistId: string;
 }
 const favoritePlaylists = ref<FavoritePlaylist[]>([])
 
-/// 收藏项的曲目随同步数据落地，直接打开本地详情，不依赖平台接口
+/// 对齐 Android LibraryScreen: 按 source 跳平台详情页懒加载曲目,
+/// 无法定位平台页时才退回同步曲目快照的本地详情
 function openFavorite(fpl: FavoritePlaylist) {
+  switch (fpl.source) {
+    case 'netease':
+      router.push({ name: 'netease-playlist', params: { id: fpl.id } })
+      return
+    case 'neteaseAlbum':
+      router.push({ name: 'netease-album', params: { id: fpl.id } })
+      return
+    case 'youtubeMusic': {
+      const browseId = fpl.browseId || (fpl.playlistId ? `VL${fpl.playlistId}` : '')
+      if (browseId) {
+        router.push({ name: 'youtube-playlist', params: { browseId } })
+        return
+      }
+      break
+    }
+    case 'bili':
+      router.push({ name: 'bili-playlist', params: { mediaId: fpl.id } })
+      return
+  }
   router.push({ name: 'favorite-playlist', params: { id: fpl.id } })
 }
 
 async function loadFavorites() {
   try {
     const raw = await invoke<any[]>('list_favorite_playlists')
+    // 后端序列化为 camelCase; snake_case 仅为兼容旧字段保留
     favoritePlaylists.value = (raw || []).map((f: any) => ({
-      id: f.id ?? '',
+      id: String(f.id ?? ''),
       name: f.name ?? '',
-      coverUrl: f.cover_url ?? '',
-      trackCount: f.track_count ?? f.songs?.length ?? 0,
+      coverUrl: f.coverUrl ?? f.cover_url ?? '',
+      trackCount: f.trackCount ?? f.track_count ?? f.songs?.length ?? 0,
       source: f.source ?? '',
       songs: f.songs ?? [],
-      addedTime: f.added_time ?? 0,
-      modifiedAt: f.modified_at ?? 0,
-      isDeleted: f.is_deleted ?? false,
+      addedTime: f.addedTime ?? f.added_time ?? 0,
+      modifiedAt: f.modifiedAt ?? f.modified_at ?? 0,
+      isDeleted: f.isDeleted ?? f.is_deleted ?? false,
+      browseId: f.browseId ?? f.browse_id ?? '',
+      playlistId: f.playlistId ?? f.playlist_id ?? '',
     }))
   } catch (e) {
     log.error('Load favorites failed:', e)

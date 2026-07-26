@@ -51,10 +51,13 @@ async function load() {
     }
     name.value = found.name ?? ''
     source.value = found.source ?? ''
-    coverUrl.value = found.cover_url ?? ''
+    coverUrl.value = found.coverUrl ?? found.cover_url ?? ''
     // 收藏项的曲目随同步数据一起落地，这里不需要再打平台接口，
     // 断网或平台接口异常时也能正常打开
-    tracks.value = (found.songs || []).map(normalizeTrack).filter((track: TrackInfo) => !!track.id)
+    // tracks 由后端从同步内部模型转换而来 (id/title/coverUrl 可直接播放), songs 是原始同步数据
+    tracks.value = (found.tracks || found.songs || [])
+      .map(normalizeTrack)
+      .filter((track: TrackInfo) => !!track.id && !!track.title)
   } catch (e) {
     log.error('load favorite playlist failed:', e)
     tracks.value = []

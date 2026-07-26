@@ -582,8 +582,27 @@ mod tests {
     }
 }
 
+/// 收藏歌单 + 已转换为播放格式的曲目
+/// songs 是同步内部模型 (camelCase), 前端无法直接播放; tracks 走统一的 SyncSong -> TrackInfo 转换
+#[derive(serde::Serialize)]
+pub struct FavoritePlaylistWithTracks {
+    #[serde(flatten)]
+    pub favorite: SyncFavoritePlaylist,
+    pub tracks: Vec<crate::state::TrackInfo>,
+}
+
 /// 获取收藏歌单列表
 #[tauri::command]
-pub async fn list_favorite_playlists() -> AppResult<Vec<SyncFavoritePlaylist>> {
-    Ok(crate::sync::manager::load_favorite_playlists())
+pub async fn list_favorite_playlists() -> AppResult<Vec<FavoritePlaylistWithTracks>> {
+    Ok(crate::sync::manager::load_favorite_playlists()
+        .into_iter()
+        .map(|favorite| {
+            let tracks = favorite
+                .songs
+                .iter()
+                .map(crate::sync::manager::sync_song_to_track_pub)
+                .collect();
+            FavoritePlaylistWithTracks { favorite, tracks }
+        })
+        .collect())
 }

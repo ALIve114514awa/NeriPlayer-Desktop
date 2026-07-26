@@ -844,6 +844,10 @@ fn bilibili_cid_from_album(album: &str) -> Option<String> {
 ///   - YouTube: mediaUri = "ytmusic://video/{videoId}"
 ///   - B站: album 以 "Bilibili" 开头，id 可能含 channelId 信息
 ///   - 本地: mediaUri 在同步时被清除
+pub fn sync_song_to_track_pub(song: &SyncSong) -> TrackInfo {
+    sync_song_to_track(song)
+}
+
 fn sync_song_to_track(song: &SyncSong) -> TrackInfo {
     use crate::state::TrackSource;
 
