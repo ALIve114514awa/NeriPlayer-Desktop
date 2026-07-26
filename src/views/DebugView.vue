@@ -11,11 +11,12 @@ import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
 import { useListenTogetherStore } from '@/stores/listenTogether'
 import { createLogger } from '@/utils/logger'
+import { formatTimeMs } from '@/utils/timeFormat'
 
 const log = createLogger('debug-view')
 
 const router = useRouter()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const player = usePlayerStore()
 const syncStore = useSyncStore()
 const settingsStore = useSettingsStore()
@@ -101,9 +102,10 @@ function probeStatusColor(status: string): string {
   }
 }
 
-function formatSyncTime(ts: number): string {
-  if (!ts) return t('settings.debug_never')
-  return new Date(ts).toLocaleString()
+// 未配置或从未同步时显示占位符，避免「未配置 + 历史时间」的矛盾展示
+function formatSyncTime(ts: number, configured: boolean): string {
+  if (!configured || !ts) return '—'
+  return new Date(ts).toLocaleString(locale.value)
 }
 
 function goBack() {
@@ -180,6 +182,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (logsTimer) window.clearInterval(logsTimer)
+  if (crashRefreshTimer) window.clearTimeout(crashRefreshTimer)
 })
 
 // ===== 运行日志 =====
@@ -324,6 +327,8 @@ async function copyProbeResult(platform: string, id: string) {
 }
 
 // ===== 测试异常（对齐 Android「测试异常」）=====
+let crashRefreshTimer: number | null = null
+
 async function triggerCrash(kind: string) {
   if (kind === 'frontend') {
     // 出了当前调用栈再抛，确保走 window.onerror 而不是被 Vue 捕获
@@ -338,8 +343,12 @@ async function triggerCrash(kind: string) {
     // panic_command 预期走到这里：IPC 报错但应用存活
     log.warn('crash trigger returned error (expected for panic_command):', e)
   }
-  // 给 panic 钩子落盘留点时间再刷新列表
-  window.setTimeout(() => void refreshCrashes(), 600)
+  // 给 panic 钩子落盘留点时间再刷新列表；句柄纳入卸载清理
+  if (crashRefreshTimer) window.clearTimeout(crashRefreshTimer)
+  crashRefreshTimer = window.setTimeout(() => {
+    crashRefreshTimer = null
+    void refreshCrashes()
+  }, 600)
 }
 
 // ===== 一起听调试 =====
@@ -535,7 +544,7 @@ async function clearCrashes() {
           </div>
           <div class="state-item">
             <span class="state-label">{{ t('settings.debug_last_sync') }} (GitHub)</span>
-            <span class="state-value">{{ formatSyncTime(syncStore.github.lastSyncTime) }}</span>
+            <span class="state-value">{{ formatSyncTime(syncStore.github.lastSyncTime, syncStore.github.configured) }}</span>
           </div>
           <div class="state-item">
             <span class="state-label">{{ t('settings.debug_webdav_sync') }}</span>
@@ -547,7 +556,7 @@ async function clearCrashes() {
           </div>
           <div class="state-item">
             <span class="state-label">{{ t('settings.debug_last_sync') }} (WebDAV)</span>
-            <span class="state-value">{{ formatSyncTime(syncStore.webdav.lastSyncTime) }}</span>
+            <span class="state-value">{{ formatSyncTime(syncStore.webdav.lastSyncTime, syncStore.webdav.configured) }}</span>
           </div>
         </div>
       </div>
@@ -558,7 +567,7 @@ async function clearCrashes() {
       <span class="material-symbols-rounded" style="font-size: 18px">api</span>
       <span>{{ t('settings.debug_probe_detail') }}</span>
     </div>
-    <div class="setting-card">
+    <div class="setting-card stacked">
       <div class="setting-desc" style="margin-bottom: 8px">{{ t('settings.debug_probe_detail_desc') }}</div>
       <div v-for="group in probeGroups" :key="group.platform" class="probe-group">
         <button
@@ -649,7 +658,7 @@ async function clearCrashes() {
       <span class="material-symbols-rounded" style="font-size: 18px">warning</span>
       <span>{{ t('settings.debug_test_exception') }}</span>
     </div>
-    <div class="setting-card">
+    <div class="setting-card stacked">
       <div class="setting-desc" style="margin-bottom: 10px">{{ t('settings.debug_test_exception_desc') }}</div>
       <div class="crash-test-grid">
         <button class="crash-test-btn" @click="triggerCrash('handled')">
@@ -734,7 +743,7 @@ async function clearCrashes() {
       <span class="material-symbols-rounded" style="font-size: 18px">report</span>
       <span>{{ t('settings.debug_crashes') }}</span>
     </div>
-    <div class="setting-card">
+    <div class="setting-card stacked">
       <div class="setting-info" style="display: flex; align-items: center; gap: 12px">
         <div style="flex: 1; min-width: 0">
           <div class="setting-title">{{ t('settings.debug_crashes') }}</div>
@@ -769,27 +778,27 @@ async function clearCrashes() {
       <div class="setting-info">
         <div class="state-grid">
           <div class="state-item">
-            <span class="state-label">Current Track</span>
+            <span class="state-label">{{ t('settings.debug_player_track') }}</span>
             <span class="state-value">{{ player.currentTrack?.title || '—' }}</span>
           </div>
           <div class="state-item">
-            <span class="state-label">Artist</span>
+            <span class="state-label">{{ t('settings.debug_player_artist') }}</span>
             <span class="state-value">{{ player.currentTrack?.artist || '—' }}</span>
           </div>
           <div class="state-item">
-            <span class="state-label">Source</span>
+            <span class="state-label">{{ t('settings.debug_player_source') }}</span>
             <span class="state-value mono">{{ player.currentTrack?.id?.split(':')[0] || '—' }}</span>
           </div>
           <div class="state-item">
-            <span class="state-label">Playing</span>
-            <span class="state-value">{{ player.isPlaying ? 'Yes' : 'No' }}</span>
+            <span class="state-label">{{ t('settings.debug_player_playing') }}</span>
+            <span class="state-value">{{ player.isPlaying ? t('common.yes') : t('common.no') }}</span>
           </div>
           <div class="state-item">
-            <span class="state-label">Position</span>
-            <span class="state-value mono">{{ Math.floor(player.positionMs / 1000) }}s / {{ Math.floor(player.durationMs / 1000) }}s</span>
+            <span class="state-label">{{ t('settings.debug_player_position') }}</span>
+            <span class="state-value mono">{{ formatTimeMs(player.positionMs) }} / {{ formatTimeMs(player.durationMs) }}</span>
           </div>
           <div class="state-item">
-            <span class="state-label">Queue Size</span>
+            <span class="state-label">{{ t('settings.debug_player_queue') }}</span>
             <span class="state-value">{{ player.queue?.length || 0 }}</span>
           </div>
         </div>
@@ -831,6 +840,8 @@ async function clearCrashes() {
 .debug-view {
   padding: 20px 28px 32px;
   max-width: 680px;
+  /* 宽屏下水平居中，避免固定左对齐右侧大空白 */
+  margin-inline: auto;
 }
 
 .debug-header {
@@ -886,6 +897,14 @@ async function clearCrashes() {
   transition: background var(--duration-short);
 
   &:hover { background: var(--md-surface-container-high); }
+
+  /* 纵向内容卡变体：探针详情 / 测试异常 / 崩溃报告共用，
+     修掉 flex-row 单行卡被误用作纵向容器导致的竖排压缩 */
+  &.stacked {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
 }
 
 .sub-card {
@@ -917,7 +936,7 @@ async function clearCrashes() {
 
 .state-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px 24px;
   padding: 4px 0;
 }
@@ -1098,6 +1117,11 @@ async function clearCrashes() {
 
   .material-symbols-rounded { font-size: 16px; }
   &:hover { background: var(--md-surface-container-highest); color: var(--md-on-surface); }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
 }
 
 .debug-crash-clear { color: var(--md-error); }
@@ -1146,6 +1170,11 @@ async function clearCrashes() {
   color: var(--md-on-surface);
   font-size: 13px;
   transition: background 150ms;
+  /* 吸顶 + 不透明背景，展开的日志滚动时不与文件名行重叠 */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--md-surface-container);
 
   &:hover { background: var(--md-surface-container-high); }
 }
@@ -1157,12 +1186,13 @@ async function clearCrashes() {
   margin: 0;
   padding: 12px;
   max-height: 280px;
+  /* 保持原始排版并在容器内滚动，不做逐字符硬折行 */
   overflow: auto;
+  overscroll-behavior: contain;
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   font-size: 11px;
   line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
+  white-space: pre;
   border-top: 1px solid var(--md-outline-variant);
   color: var(--md-on-surface-variant);
 }
@@ -1204,14 +1234,15 @@ async function clearCrashes() {
   margin: 0;
   padding: 10px;
   max-height: 220px;
+  /* JSON 保持缩进原样，超宽在容器内横向滚动 */
   overflow: auto;
+  overscroll-behavior: contain;
   border-radius: 10px;
   background: var(--md-surface-container-lowest, var(--md-surface));
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   font-size: 11px;
   line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
+  white-space: pre;
 
   &.failed { color: var(--md-error); }
 }

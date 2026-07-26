@@ -52,6 +52,9 @@
   --duration-long: 500ms;
   --duration-extra-long: 700ms;
 
+  /* 迷你播放器高度：MiniPlayer 与内容区 padding 共用，改动只需一处 */
+  --mini-player-height: 76px;
+
   --font-family: 'MiSans', 'Inter', -apple-system, BlinkMacSystemFont,
     'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei UI', 'Noto Sans CJK SC', 'Noto Sans', system-ui, sans-serif;
@@ -157,6 +160,17 @@ button:focus-visible {
 }
 
 a { color: inherit; text-decoration: none; }
+
+/* 键盘导航可见焦点环兜底：:where() 归零优先级，组件自有 focus 样式可直接覆盖 */
+:where(:focus-visible) {
+  outline: 2px solid var(--md-primary);
+  outline-offset: 2px;
+}
+
+/* 输入类控件已有自己的 focus 边框高亮，避免双重描边 */
+:where(input, textarea, select):focus-visible {
+  outline: none;
+}
 
 /* 浅色主题变量（中性灰白底，色彩由 themeColor.ts 动态注入） */
 .light-theme {

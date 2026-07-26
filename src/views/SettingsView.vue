@@ -494,6 +494,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   rememberSettingsScrollPosition()
   persistSettingsUiState()
+  // 开发者模式 7-tap 计时器兜底清理
+  if (tapTimer) clearTimeout(tapTimer)
 })
 
 // 网络：绕过代理
@@ -1475,13 +1477,19 @@ function confirmDataSaverChange() {
       <span class="material-symbols-rounded section-arrow" :class="{ expanded: isExpanded('listen_together') }">expand_more</span>
     </div>
 
-    <div class="setting-card">
+    <!-- 摘要卡与展开编辑区互斥，整卡可点击展开 -->
+    <div
+      v-if="!isExpanded('listen_together')"
+      class="setting-card"
+      style="cursor: pointer"
+      @click="toggleSection('listen_together')"
+    >
       <div class="setting-icon-wrap"><span class="material-symbols-rounded">dns</span></div>
       <div class="setting-info">
         <div class="setting-title">{{ t('listen_together.server_url') }}</div>
         <div class="setting-desc" style="word-break: break-all">{{ ltServerUrl || 'https://neriplayer.hancat.work' }}</div>
       </div>
-      <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">edit</span>
+      <span class="material-symbols-rounded" style="font-size: 20px; color: var(--md-on-surface-variant)">edit</span>
     </div>
 
     <Transition @enter="onExpandEnter" @after-enter="onExpandAfterEnter" @leave="onExpandLeave" @after-leave="onExpandAfterLeave"><div v-if="isExpanded('listen_together')">
@@ -1505,12 +1513,13 @@ function confirmDataSaverChange() {
         </div>
         <input
           type="text"
-          class="lt-url-input"
+          class="lt-url-input lt-input-left"
           style="width: 140px"
           :value="ltNickname"
           @change="ltNickname = ($event.target as HTMLInputElement).value"
           maxlength="20"
-          :placeholder="t('listen_together.nickname')"
+          :placeholder="t('listen_together.nickname_placeholder')"
+          :aria-label="t('listen_together.nickname')"
         />
       </div>
 
@@ -1553,7 +1562,7 @@ function confirmDataSaverChange() {
           <div class="setting-title">{{ t('listen_together.reset_identity') }}</div>
           <div class="setting-desc">{{ t('listen_together.reset_identity_desc') }}</div>
         </div>
-        <button class="m3-chip sm" @click="showResetLtIdentityConfirm = true">{{ t('listen_together.reset_btn') }}</button>
+        <button class="m3-chip sm danger" @click="showResetLtIdentityConfirm = true">{{ t('listen_together.reset_btn') }}</button>
       </div>
     </div></Transition>
         </div>
@@ -3043,6 +3052,14 @@ function confirmDataSaverChange() {
     padding: 4px 10px;
     font-size: 12px;
   }
+
+  /* 危险语义变体：error 色 outlined，用于重置身份等破坏性操作 */
+  &.danger {
+    color: var(--md-error);
+    border-color: color-mix(in srgb, var(--md-error) 40%, transparent);
+
+    &:hover { background: color-mix(in srgb, var(--md-error) 10%, transparent); }
+  }
 }
 
 .quality-card {
@@ -3063,6 +3080,9 @@ function confirmDataSaverChange() {
   flex-shrink: 0;
   transition: border-color 150ms;
   &:focus { border-color: var(--md-primary); }
+
+  /* 左对齐变体：昵称等普通文本输入，右对齐只适合 URL */
+  &.lt-input-left { text-align: left; }
 }
 
 /* M3 Slider */

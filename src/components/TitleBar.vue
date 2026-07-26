@@ -140,12 +140,12 @@ onUnmounted(() => {
 
     <!-- 窗口控制（macOS 使用系统原生红绿灯，此处隐藏） -->
     <div v-if="!isMac" class="tb-controls">
-      <button class="tb-ctrl" type="button" @click="minimize" title="最小化">
+      <button class="tb-ctrl" type="button" @click="minimize" :title="t('common.minimize')">
         <svg width="12" height="12" viewBox="0 0 12 12">
           <rect x="2" y="5.5" width="8" height="1" fill="currentColor" />
         </svg>
       </button>
-      <button class="tb-ctrl" type="button" @click="toggleMaximize" :title="isMaximized ? '还原' : '最大化'">
+      <button class="tb-ctrl" type="button" @click="toggleMaximize" :title="isMaximized ? t('common.restore') : t('common.maximize')">
         <svg v-if="!isMaximized" width="12" height="12" viewBox="0 0 12 12">
           <rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" />
         </svg>
@@ -154,7 +154,7 @@ onUnmounted(() => {
           <rect x="2" y="3.5" width="6.5" height="6.5" fill="var(--md-background)" stroke="currentColor" stroke-width="1" />
         </svg>
       </button>
-      <button class="tb-ctrl tb-close" type="button" @click="close" title="关闭">
+      <button class="tb-ctrl tb-close" type="button" @click="close" :title="t('common.close')">
         <svg width="12" height="12" viewBox="0 0 12 12">
           <line x1="2.5" y1="2.5" x2="9.5" y2="9.5" stroke="currentColor" stroke-width="1" />
           <line x1="9.5" y1="2.5" x2="2.5" y2="9.5" stroke="currentColor" stroke-width="1" />

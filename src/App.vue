@@ -190,6 +190,28 @@ function handleBeforeUnload() {
   void usePlaybackStatsStore().flushFinal()
 }
 
+// 关窗流程标志位：flush 完成后 destroy，二次进入直接放行避免死循环
+let closeFlushDone = false
+
+async function handleCloseRequested(event: { preventDefault: () => void }) {
+  if (closeFlushDone) return
+  event.preventDefault()
+  closeFlushDone = true
+  try {
+    // 同步保存播放器状态 + 等待统计落盘后再真正关窗
+    player.flushPlayerState()
+    await usePlaybackStatsStore().flushFinal()
+  } catch {
+    // 落盘失败不阻塞退出
+  }
+  try {
+    await getCurrentWindow().destroy()
+  } catch {
+    // destroy 不可用时退回 close（此时标志位已放行）
+    void getCurrentWindow().close().catch(() => {})
+  }
+}
+
 function scheduleDebouncedSync() {
   const syncStore = useSyncStore()
   // 同步进行中不调度
@@ -272,7 +294,7 @@ onMounted(async () => {
   window.addEventListener('beforeunload', handleBeforeUnload)
   window.addEventListener('pagehide', handleBeforeUnload)
   try {
-    unlistenCloseRequested = await getCurrentWindow().onCloseRequested(handleBeforeUnload)
+    unlistenCloseRequested = await getCurrentWindow().onCloseRequested(handleCloseRequested)
   } catch {
     // 浏览器开发模式没有原生窗口事件时依赖 pagehide/beforeunload
   }
@@ -514,8 +536,8 @@ onUnmounted(() => {
     padding-bottom 300ms var(--ease-standard),
     opacity 200ms ease;
 
-  /* 仅预留迷你播放器高度；详情页自身再处理选择栏 */
-  &.has-mini-player { padding-bottom: 76px; }
+  /* 预留迷你播放器高度 + 24px 余量，避免最后一行被进度条热区遮挡 */
+  &.has-mini-player { padding-bottom: calc(var(--mini-player-height, 76px) + 24px); }
 
   &.content--np-dimmed {
     /* 仅透明度，禁止缩放/位移 */

@@ -39,6 +39,10 @@ const LOCAL_SEEK_REPORT_DEBOUNCE_MS = 450
 
 // 心跳间隔
 const HEARTBEAT_INTERVAL_MS = 10_000
+// listener 侧存活探测间隔（房主走 HEARTBEAT，听众用 ping 保活半开连接检测）
+const LISTENER_PING_INTERVAL_MS = 25_000
+// 已处理转发请求 eventId 上限（对齐 Android ForwardedRequestDeduper 语义）
+const HANDLED_FORWARDED_EVENT_LIMIT = 100
 
 // 重连配置
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]
@@ -81,8 +85,16 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
 
   // 内部状态
   let _heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  let _listenerPingTimer: ReturnType<typeof setInterval> | null = null
   let _reconnectAttempt = 0
   let _reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  // 会话代际：leaveRoom 后递增，让在途的延迟回调失效，不再操作播放器
+  let _sessionGeneration = 0
+  // 出站事件排序字段：实例标识会话内生成一次，序号单调递增（对齐 Android EventFactory）
+  const _clientInstanceId = crypto.randomUUID()
+  let _clientSequence = 0
+  // 已处理的转发请求 eventId -> 处理时间，防重复送达二次执行
+  const _handledForwardedEventIds = new Map<string, number>()
   let _wsUrl: string | null = null
   let _unlistenMessage: UnlistenFn | null = null
   let _unlistenConnected: UnlistenFn | null = null
@@ -207,6 +219,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       const wsUrl = resp.wsUrl || buildWsUrl(baseUrl.value, targetRoomId, resp.token)
       await connectWs(wsUrl)
 
+      startListenerPing()
       setupPlayerWatch()
 
     } catch (e) {
@@ -219,9 +232,16 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
 
   /** 离开房间 */
   async function leaveRoom() {
+    // 递增会话代际，让在途的延迟同步回调失效
+    _sessionGeneration++
     stopHeartbeat()
+    stopListenerPing()
     teardownPlayerWatch()
     teardownListeners()
+    if (_reconnectTimer) {
+      clearTimeout(_reconnectTimer)
+      _reconnectTimer = null
+    }
 
     try {
       await invoke('lt_disconnect_ws')
@@ -248,6 +268,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     _lastSentSeekAt = 0
     clearPendingSeekReport()
     _recentOutboundEventIds.clear()
+    _handledForwardedEventIds.clear()
   }
 
   // WebSocket 连接
@@ -272,11 +293,14 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         markSync('RECONNECTED', lastReconnectAt.value)
       }
       _reconnectAttempt = 0
+      // 重连后恢复 listener 存活探测
+      if (roomId.value && role.value === 'listener') startListenerPing()
     })
 
     _unlistenDisconnected = await listen<{ code: number; reason: string }>('lt:disconnected', (event) => {
       const wasConnected = connectionState.value === 'connected'
       connectionState.value = 'disconnected'
+      stopListenerPing()
 
       // 是否需要重连
       if (wasConnected && roomId.value) {
@@ -410,6 +434,25 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     // 房主处理听众的控制请求
     if (!isController.value) return
 
+    // 鉴权：关闭成员控制时，只放行房主自己发出的请求
+    // （对齐 Android ListenTogetherControlBlockPolicy，防魔改客户端越权控制）
+    if (!roomSettings.value.allowMemberControl && envelope.causedBy?.userUuid !== userUuid.value) {
+      log.warn('member control blocked: allowMemberControl=false, requester=', envelope.causedBy?.userUuid)
+      return
+    }
+
+    // 按 causedBy.eventId 去重：重复送达的转发请求不得二次执行
+    const causeEventId = envelope.causedBy?.eventId
+    if (causeEventId) {
+      if (_handledForwardedEventIds.has(causeEventId)) return
+      _handledForwardedEventIds.set(causeEventId, Date.now())
+      while (_handledForwardedEventIds.size > HANDLED_FORWARDED_EVENT_LIMIT) {
+        const oldest = _handledForwardedEventIds.keys().next().value
+        if (oldest === undefined) break
+        _handledForwardedEventIds.delete(oldest)
+      }
+    }
+
     const player = usePlayerStore()
     const causeType = envelope.causedBy?.type
 
@@ -510,8 +553,10 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         }
         // 使用 remote_sync source 播放
         player.play(remoteTrack, 'remote_sync')
-        // 播放后对齐进度与播放态
+        // 播放后对齐进度与播放态；带会话代际 guard，退出房间后不得再操作播放器
+        const generation = _sessionGeneration
         setTimeout(() => {
+          if (generation !== _sessionGeneration) return
           if (expectedPos > 1000) {
             player.seekTo(expectedPos, 'remote_sync')
           }
@@ -661,6 +706,9 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
   async function sendEvent(event: ListenTogetherEvent) {
     if (!event.eventId) event.eventId = generateEventId()
     if (!event.clientTimeMs) event.clientTimeMs = Date.now()
+    // 乱序保护字段（协议已声明、Android 每事件必带）：实例标识 + 单调递增序号
+    if (!event.clientInstanceId) event.clientInstanceId = _clientInstanceId
+    if (event.clientSequence == null) event.clientSequence = ++_clientSequence
 
     _recentOutboundEventIds.add(event.eventId!)
     // 清理过期 ID（保留最近 50 个）
@@ -847,6 +895,23 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     if (_heartbeatTimer) {
       clearInterval(_heartbeatTimer)
       _heartbeatTimer = null
+    }
+  }
+
+  // listener 侧存活探测：定期 ping 服务端，让 TCP 半开连接尽快暴露为断开
+  function startListenerPing() {
+    stopListenerPing()
+    if (isController.value) return
+    _listenerPingTimer = setInterval(() => {
+      if (connectionState.value !== 'connected') return
+      void invoke('lt_send_ping').catch(() => {})
+    }, LISTENER_PING_INTERVAL_MS)
+  }
+
+  function stopListenerPing() {
+    if (_listenerPingTimer) {
+      clearInterval(_listenerPingTimer)
+      _listenerPingTimer = null
     }
   }
 

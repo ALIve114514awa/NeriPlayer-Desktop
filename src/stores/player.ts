@@ -42,6 +42,7 @@ import {
   type DeferredPlaybackSeek,
 } from '@/modules/playback/playbackRequest'
 import { createLogger } from '@/utils/logger'
+import { formatTimeMs as formatTime } from '@/utils/timeFormat'
 import { getTrackCoverUrl } from '@/utils/trackCover'
 import {
   buildPersistedPlaybackQueue,
@@ -267,6 +268,8 @@ const SEEK_SETTLE_TIMEOUT_MS = 4500
 const SEEK_BACKWARD_TOLERANCE_MS = 600
 const SEEK_FORWARD_TOLERANCE_MS = 1200
 const POSITION_BACKWARD_TOLERANCE_MS = 250
+// 回退超过该值视为时钟跳变（睡眠唤醒），强制重锚
+const CLOCK_JUMP_BACKWARD_MS = 30_000
 const PAUSE_EVENT_GUARD_MS = 2500
 const PAUSE_BACKWARD_TOLERANCE_MS = 250
 
@@ -736,8 +739,13 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     const renderedMs = clampPlaybackPosition(_interpRenderedMs)
+    // 后端位置比渲染值回退超过 30s 视为时钟跳变（睡眠唤醒后 performance.now 大跳
+    // 把渲染值冲到曲末），此时必须强制重锚而非忽略，否则进度永久卡死
+    const isClockJump = _interpIsPlaying && !forceRendered
+      && renderedMs - safePositionMs > CLOCK_JUMP_BACKWARD_MS
     // 倍速播放时后端时钟与插值都应按速度前进；仍拒绝明显回跳
-    if (_interpIsPlaying && !forceRendered && safePositionMs < renderedMs - POSITION_BACKWARD_TOLERANCE_MS) {
+    if (_interpIsPlaying && !forceRendered && !isClockJump
+      && safePositionMs < renderedMs - POSITION_BACKWARD_TOLERANCE_MS) {
       // 仅忽略回跳，不把锚点锁死在旧渲染值（否则倍速歌词会落后）
       return
     }
@@ -747,10 +755,12 @@ export const usePlayerStore = defineStore('player', () => {
     _interpAnchorTime = performance.now()
     _interpDurationMs = Math.max(durationMs.value || _interpDurationMs, safePositionMs)
     // 播放中也允许后端时钟校准插值，保证歌词与倍速同步
-    if (!_interpIsPlaying || forceRendered || Math.abs(safePositionMs - renderedMs) > 80) {
+    if (!_interpIsPlaying || forceRendered || isClockJump || Math.abs(safePositionMs - renderedMs) > 80) {
       _interpRenderedMs = safePositionMs
       interpolatedPositionMs.value = safePositionMs
     }
+    // 播放中位置事件到达即确保插值循环在跑（停表后的兜底重启点）
+    if (_interpIsPlaying) _startInterpolationLoop()
   }
 
   function clampPlaybackPosition(position: number, durationOverride?: number): number {
@@ -774,6 +784,8 @@ export const usePlayerStore = defineStore('player', () => {
       expiresAt: now + SEEK_SETTLE_TIMEOUT_MS,
     }
     seekGuardUntil = now + SEEK_EVENT_GUARD_MS
+    // 停表状态下发起 seek 也要恢复插值循环，等待后端确认
+    _startInterpolationLoop()
   }
 
   function currentRenderedPosition(): number {
@@ -827,6 +839,8 @@ export const usePlayerStore = defineStore('player', () => {
     _interpSpeed = playbackSpeed.value
     _interpIsPlaying = true
     clearPauseGuard()
+    // 从暂停停表状态恢复播放时重启插值循环
+    _startInterpolationLoop()
   }
 
   function normalizePositionAfterPause(nextPositionMs: number): number | null {
@@ -868,12 +882,18 @@ export const usePlayerStore = defineStore('player', () => {
     return accepted
   }
 
-  /** 启动 rAF 插值循环（仅调用一次） */
+  /** 按需启动 rAF 插值循环：暂停且无待确认 seek 时自动停表，状态恢复时重启 */
   function _startInterpolationLoop() {
     if (_interpLoopStarted) return
     _interpLoopStarted = true
 
     function tick() {
+      // 空闲（未播放且无 pendingSeek）时渲染一次最终位置后停表，避免常驻逐帧唤醒
+      if (!_interpIsPlaying && !pendingSeek) {
+        interpolatedPositionMs.value = Math.round(_interpRenderedMs)
+        _interpLoopStarted = false
+        return
+      }
       requestAnimationFrame(tick)
 
       // seek 等待后端确认期间冻结进度条，避免「seek 完成仍空转」
@@ -882,11 +902,6 @@ export const usePlayerStore = defineStore('player', () => {
         _interpRenderedMs = pendingSeek.targetMs
         _interpAnchorMs = pendingSeek.targetMs
         _interpAnchorTime = performance.now()
-        return
-      }
-
-      if (!_interpIsPlaying) {
-        interpolatedPositionMs.value = Math.round(_interpRenderedMs)
         return
       }
 
@@ -1471,6 +1486,7 @@ export const usePlayerStore = defineStore('player', () => {
       _interpSpeed = playbackSpeed.value
       _interpIsPlaying = true
       _interpDurationMs = durationMs.value
+      _startInterpolationLoop()
 
       // 重置连续失败计数
       consecutivePlayFailures = 0
@@ -1529,6 +1545,7 @@ export const usePlayerStore = defineStore('player', () => {
           isPlaying.value = true
           _interpIsPlaying = true
         }
+        if (_interpIsPlaying) _startInterpolationLoop()
       } else {
         isPlaying.value = false
         _interpIsPlaying = false
@@ -1740,6 +1757,7 @@ export const usePlayerStore = defineStore('player', () => {
       seekGuardUntil = 0
       // seek 失败：停止乐观插值，回到后端真实位置，避免「进度条在走但无声」
       _interpIsPlaying = isPlaying.value
+      if (_interpIsPlaying) _startInterpolationLoop()
       void invoke<{
         is_playing?: boolean
         position_ms?: number
@@ -1757,6 +1775,7 @@ export const usePlayerStore = defineStore('player', () => {
         if (typeof state?.is_playing === 'boolean') {
           isPlaying.value = state.is_playing
           _interpIsPlaying = state.is_playing
+          if (_interpIsPlaying) _startInterpolationLoop()
         }
       }).catch(() => {})
       log.error('Seek failed:', e)
@@ -2479,9 +2498,3 @@ function playbackCacheLimitBytes(): number {
   return Math.round(cacheSizeMb * 1024 * 1024)
 }
 
-function formatTime(ms: number): string {
-  const totalSeconds = Math.floor(Math.max(0, ms) / 1000)
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`
-}

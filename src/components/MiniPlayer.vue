@@ -8,6 +8,7 @@ import ListenTogetherPanel from './ListenTogetherPanel.vue'
 import BilibiliCoverImage from './BilibiliCoverImage.vue'
 import EditableRangeValue from './ui/EditableRangeValue.vue'
 import { getTrackCoverUrl } from '@/utils/trackCover'
+import { formatTimeMs as formatTime } from '@/utils/timeFormat'
 
 type CoverSnapshot = {
   rect: { left: number; top: number; width: number; height: number }
@@ -51,14 +52,6 @@ const hoverTimeMs = computed(() => {
   const ratio = isDraggingProgress.value ? dragRatio.value : hoverRatio.value
   return ratio * player.durationMs
 })
-
-/** 格式化 ms 为 m:ss */
-function formatTime(ms: number): string {
-  const totalSeconds = Math.floor(Math.max(0, ms) / 1000)
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`
-}
 
 const hoverTimeFormatted = computed(() => formatTime(hoverTimeMs.value))
 
@@ -339,7 +332,7 @@ defineExpose({
   bottom: 0;
   left: 80px;
   right: 0;
-  height: 76px;
+  height: var(--mini-player-height, 76px);
   background: var(--md-surface-container);
   z-index: 100;
   border-top: 1px solid var(--md-surface-container-highest);

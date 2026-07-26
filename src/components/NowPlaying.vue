@@ -993,6 +993,7 @@ onUnmounted(() => {
   if (trackSwitchAnimTimer) clearTimeout(trackSwitchAnimTimer)
   if (controlFeedbackPulseTimer) clearTimeout(controlFeedbackPulseTimer)
   if (moreSheetSwitchTimer) clearTimeout(moreSheetSwitchTimer)
+  if (previewConvergeTimer) clearTimeout(previewConvergeTimer)
   closeToolbarPopovers()
 })
 
@@ -1370,7 +1371,7 @@ const downloadActionIcon = computed(() => {
 
 const downloadActionLabel = computed(() => {
   if (player.isPlayingFromDownload) return t('player.playing_from_download')
-  if (isCurrentDownloadCancellable.value) return '取消下载'
+  if (isCurrentDownloadCancellable.value) return t('download.cancel_task')
   if (isCurrentDownloading.value) return downloadTaskStatusText(currentDownloadTask.value?.status) || t('download.downloading')
   if (isCurrentDownloaded.value) return t('download.redownload')
   return t('library.tab_downloads')

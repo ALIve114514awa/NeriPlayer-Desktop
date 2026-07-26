@@ -30,6 +30,7 @@ const props = withDefaults(defineProps<{
 const canvas = ref<HTMLCanvasElement>()
 let gl: WebGLRenderingContext | null = null
 let program: WebGLProgram | null = null
+let quadBuffer: WebGLBuffer | null = null
 let animFrame = 0
 let startTime = 0
 let lastFrameMs = 0
@@ -134,13 +135,22 @@ function initGL() {
   gl.linkProgram(program)
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
     log.error('Program link error:', gl.getProgramInfoLog(program))
+    gl.deleteShader(vs)
+    gl.deleteShader(fs)
+    gl.deleteProgram(program)
+    program = null
     return
   }
+  // link 成功后 shader 对象即可释放，避免随组件反复创建而累积
+  gl.detachShader(program, vs)
+  gl.detachShader(program, fs)
+  gl.deleteShader(vs)
+  gl.deleteShader(fs)
   gl.useProgram(program)
 
   // 全屏四边形
-  const buffer = gl.createBuffer()
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+  quadBuffer = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer)
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW)
   const aPos = gl.getAttribLocation(program, 'a_position')
   gl.enableVertexAttribArray(aPos)
@@ -247,8 +257,37 @@ function render() {
   animFrame = requestAnimationFrame(render)
 }
 
-onMounted(initGL)
-onUnmounted(() => cancelAnimationFrame(animFrame))
+// 窗口不可见时暂停 rAF（全屏 shader 是主要功耗项），可见时恢复
+function handleVisibilityChange() {
+  if (document.hidden) {
+    cancelAnimationFrame(animFrame)
+    animFrame = 0
+  } else if (gl && program && !animFrame) {
+    // 重置帧时钟，避免 dt 巨大导致平滑量跳变
+    lastFrameMs = performance.now()
+    animFrame = requestAnimationFrame(render)
+  }
+}
+
+onMounted(() => {
+  initGL()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  cancelAnimationFrame(animFrame)
+  animFrame = 0
+  // 释放 WebGL 资源并主动丢弃 context，防止反复开关正在播放页耗尽 context 配额
+  if (gl) {
+    if (quadBuffer) gl.deleteBuffer(quadBuffer)
+    if (program) gl.deleteProgram(program)
+    gl.getExtension('WEBGL_lose_context')?.loseContext()
+  }
+  quadBuffer = null
+  program = null
+  gl = null
+})
 </script>
 
 <template>

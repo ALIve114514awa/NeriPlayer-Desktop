@@ -87,37 +87,45 @@ onMounted(() => {
   thumbDiv = containerRef.value!.querySelector('.thumb') as HTMLDivElement
   animFrame = requestAnimationFrame(animate)
 })
-onUnmounted(() => { cancelAnimationFrame(animFrame) })
+onUnmounted(() => {
+  cancelAnimationFrame(animFrame)
+  // 拖拽中被重建（切歌时按 key 重建）时兜底复位；pointer capture 随元素销毁自动释放
+  isDragging.value = false
+})
 
+function updateDragProgress(e: PointerEvent): boolean {
+  const el = containerRef.value
+  if (!el) return false
+  const rect = el.getBoundingClientRect()
+  dragProgress.value = clamp01((e.clientX - rect.left) / rect.width)
+  return true
+}
+
+// setPointerCapture 模式（与 MiniPlayer 进度条一致）：
+// 指针离开组件后事件仍派发到本元素，无需在 document 上挂全局监听
 function handlePointerDown(e: PointerEvent) {
   e.preventDefault()
   e.stopPropagation()
-  const rect = containerRef.value!.getBoundingClientRect()
+  if (!updateDragProgress(e)) return
   isDragging.value = true
-  dragProgress.value = clamp01((e.clientX - rect.left) / rect.width)
+  containerRef.value?.setPointerCapture(e.pointerId)
   emit('preview', dragProgress.value)
+}
 
-  // 在 document 上监听后续事件，确保指针离开组件后仍能捕获
-  const onMove = (ev: PointerEvent) => {
-    if (!isDragging.value) return
-    const r = containerRef.value!.getBoundingClientRect()
-    dragProgress.value = clamp01((ev.clientX - r.left) / r.width)
-    emit('preview', dragProgress.value)
-  }
-  const onUp = () => {
-    if (isDragging.value) {
-      const p = dragProgress.value
-      isDragging.value = false
-      emit('seek', p)
-      emit('preview-end')
-    }
-    document.removeEventListener('pointermove', onMove)
-    document.removeEventListener('pointerup', onUp)
-    document.removeEventListener('pointercancel', onUp)
-  }
-  document.addEventListener('pointermove', onMove)
-  document.addEventListener('pointerup', onUp)
-  document.addEventListener('pointercancel', onUp)
+function handlePointerMove(e: PointerEvent) {
+  if (!isDragging.value) return
+  if (!updateDragProgress(e)) return
+  emit('preview', dragProgress.value)
+}
+
+function handlePointerUp(e: PointerEvent) {
+  if (!isDragging.value) return
+  updateDragProgress(e)
+  const p = dragProgress.value
+  isDragging.value = false
+  containerRef.value?.releasePointerCapture(e.pointerId)
+  emit('seek', p)
+  emit('preview-end')
 }
 
 function clamp01(v: number) { return Math.max(0, Math.min(1, v)) }
@@ -129,6 +137,9 @@ function clamp01(v: number) { return Math.max(0, Math.min(1, v)) }
     class="waveform-container"
     :style="{ '--wave-active-color': activeColor, '--wave-inactive-color': inactiveColor }"
     @pointerdown="handlePointerDown"
+    @pointermove="handlePointerMove"
+    @pointerup="handlePointerUp"
+    @pointercancel="handlePointerUp"
   >
     <svg
       ref="svgRef"

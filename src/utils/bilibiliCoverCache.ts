@@ -12,7 +12,8 @@ const PROXIED_COVER_IMAGE_DOMAINS = [
 const DATA_URL_PATTERN = /^data:(image\/(?:avif|gif|jpe?g|png|webp));base64,([a-z0-9+/]+={0,2})$/i
 
 const DEFAULT_MAX_ENTRIES = 200
-const DEFAULT_MAX_DATA_URL_CHARS = 48 * 1024 * 1024
+// JS 字符串按 UTF-16 存储，每字符 2 字节：12M chars ≈ 24MB 堆内存上限
+const DEFAULT_MAX_DATA_URL_CHARS = 12 * 1024 * 1024
 const DEFAULT_TTL_MS = 60 * 60 * 1000
 
 interface CoverCacheEntry {
