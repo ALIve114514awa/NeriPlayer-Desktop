@@ -56,7 +56,25 @@ const MAX_VIRTUAL_BODY_SKIP_PACKETS: usize = 256;
 const MAX_VIRTUAL_BODY_SKIP_MOOV_SAMPLES: usize = 4096;
 // 超长 YouTube 首包探测 2s 容易假失败，放宽到 6s
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
-const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// per-request 超时下限：15s 在实机上被 512KB 块贴脸打穿（成功请求已到
+/// 12.4s），抬到 20s 并按块大小/吞吐向上缩放，避免"块越大越必超时"
+const REMOTE_REQUEST_TIMEOUT_FLOOR: Duration = Duration::from_secs(20);
+const REMOTE_REQUEST_TIMEOUT_CEILING: Duration = Duration::from_secs(60);
+/// 自适应块下限/上限：慢网折半到 64KB 仍拉不动就该报错了；
+/// 上限 1MB 防止快网把单请求撑到超时边缘
+const REMOTE_MIN_BLOCK_BYTES: u64 = 64 * 1024;
+const REMOTE_ADAPTIVE_MAX_BLOCK_BYTES: u64 = 1024 * 1024;
+/// 自适应选块目标：按近期吞吐估计，块应能在 ~8s 内完成（远小于超时预算）
+const REMOTE_BLOCK_FILL_TARGET_SECS: u64 = 8;
+/// 吞吐 EWMA 新样本权重（百分数）：0.3 兼顾收敛速度与抗单样本抖动
+const THROUGHPUT_EWMA_NEW_WEIGHT_PERCENT: u64 = 30;
+/// 失败样本至少跑满该时长才计入吞吐估计：瞬时连接错误会注入天价上界样本
+const THROUGHPUT_FAILURE_MIN_ELAPSED_MS: u64 = 3_000;
+/// 需求读连续失败上限：超时/传输中断类错误折半重试，
+/// 连续失败到该次数才向解码层报 fatal（播放侧表现为 rebuffering 而非死亡）
+const REMOTE_DEMAND_MAX_ATTEMPTS: usize = 5;
+/// 需求读重试退避基数（按次数线性放大）
+const REMOTE_DEMAND_RETRY_BACKOFF_MS: u64 = 150;
 const CACHE_MARKER_VERSION: &str = "v2";
 const CACHE_MIN_DURATION_GAP_MS: u64 = 5_000;
 const CACHE_MIN_DURATION_RATIO_PERCENT: u64 = 85;
@@ -257,6 +275,12 @@ struct RemoteAudioInner {
     virtual_body_origin: AtomicU64,
     /// 粗粒度时间→字节映射（来自 sidx 或线性估算），长内容 seek 用
     seek_index: Mutex<Option<RemoteSeekIndex>>,
+    /// 近期实测下行吞吐 EWMA（bytes/s）；0 表示尚无样本。
+    /// 成功请求按 bytes/elapsed 混入；超时失败只允许向下修正（上界样本）
+    throughput_ewma_bps: AtomicU64,
+    /// 媒体码率估算（bytes/s，total_len/duration_hint）；0 表示未知。
+    /// 预取并发降级用：EWMA 低于码率说明链路喂不饱解码，带宽应让给需求读
+    bitrate_bps: u64,
     playback_generation: Arc<AtomicU64>,
     expected_generation: u64,
 }
@@ -334,6 +358,27 @@ impl RemoteSeekIndex {
 }
 
 impl RemoteAudioInner {
+    fn throughput_bps(&self) -> u64 {
+        self.throughput_ewma_bps.load(Ordering::Acquire)
+    }
+
+    /// 成功请求样本混入 EWMA。读-改-写竞态最多丢一个样本，无碍估计收敛
+    fn record_fetch_success(&self, bytes: u64, elapsed_ms: u64) {
+        let sample = throughput_sample_bps(bytes, elapsed_ms);
+        let old = self.throughput_ewma_bps.load(Ordering::Acquire);
+        self.throughput_ewma_bps
+            .store(ewma_bps_after_success(old, sample), Ordering::Release);
+    }
+
+    /// 超时/中断失败：requested/elapsed 是真实吞吐的上界，只向下修正估计
+    fn record_fetch_failure(&self, requested_bytes: u64, elapsed_ms: u64) {
+        let old = self.throughput_ewma_bps.load(Ordering::Acquire);
+        self.throughput_ewma_bps.store(
+            ewma_bps_after_failure(old, requested_bytes, elapsed_ms),
+            Ordering::Release,
+        );
+    }
+
     fn playback_cancelled(&self) -> bool {
         self.playback_generation.load(Ordering::Acquire) != self.expected_generation
     }
@@ -361,8 +406,10 @@ struct CachedSegment {
 /// 800ms 就强抢重发，同一 range 被拉两次，慢链路上带宽直接减半（实机日志
 /// 同 range 两个响应）。登记后后来者改为等待首个请求完成并共享缓存结果。
 struct InflightFetch {
-    /// 请求覆盖的物理区间尾（含端点）：判断任意偏移是否已被在途请求覆盖
-    end: u64,
+    /// 请求覆盖的物理区间尾（含端点）：判断任意偏移是否已被在途请求覆盖。
+    /// 原子化：需求读折半重试时收缩该边界，让 (新末尾, 旧末尾] 上的等待方
+    /// 立即退出等待、自行 claim，不悬挂在别人的重试循环上
+    end: AtomicU64,
     /// 请求结束（成功数据已入缓存 / 失败 / 被代际作废）后置位，
     /// 配合 range_available 唤醒共享等待方
     done: AtomicBool,
@@ -521,6 +568,16 @@ impl RemoteAudioSource {
             }
         };
 
+        // 用首包探测播种吞吐 EWMA：冷启动第一个自适应块/超时预算就有依据。
+        // 探测耗时含建连与 TTFB，样本偏保守（慢网首块更小），符合预期
+        let initial_throughput_bps = throughput_sample_bps(
+            initial_segment
+                .as_ref()
+                .map(|segment| segment.data.len() as u64)
+                .unwrap_or(0),
+            (probe_started.elapsed().as_millis().max(1)) as u64,
+        );
+
         if let Some(cache) = disk_cache.as_ref().cloned() {
             let cache_started = Instant::now();
             let queued_at = Instant::now();
@@ -594,6 +651,11 @@ impl RemoteAudioSource {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(initial_throughput_bps),
+            bitrate_bps: total_len
+                .saturating_mul(1000)
+                .checked_div(duration_hint_ms)
+                .unwrap_or(0),
             playback_generation,
             expected_generation,
         });
@@ -1062,11 +1124,14 @@ impl RemoteAudioSource {
         }
 
         // 虚拟 body 生效时改用 seek 专用块，避免 8MB 拖垮跳转延迟
-        let block = if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0 {
+        let mode_block = if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0 {
             self.access_mode.seek_fetch_block_bytes()
         } else {
             self.access_mode.demand_fetch_block_bytes()
         };
+        // 慢网自适应：按近期吞吐缩块（8s 可完成），mode 块只作上限；
+        // 无样本时保持 mode 默认块，冷启动行为不变
+        let block = adaptive_block_bytes(self.inner.throughput_bps(), mode_block, mode_block);
         let wanted = wanted_len.max(block as usize) as u64;
         let end = physical
             .saturating_add(wanted)
@@ -1102,12 +1167,61 @@ impl RemoteAudioSource {
 
         // 需求读在网标记：预取 lane 看到后暂缓开新请求，带宽让给解码急需的数据
         let demand_guard = DemandFetchGuard::new(&self.inner);
-        let fetched = fetch_range_block(
-            &self.inner,
-            physical,
-            end,
-            self.read_cancellation.as_ref(),
-        );
+        // 超时/传输中断绝不直接 fatal：对同一起点折半块大小重试（短退避），
+        // 连续 REMOTE_DEMAND_MAX_ATTEMPTS 次失败才把错误抛给解码层。
+        // 播放侧表现为 rebuffering（read 阻塞在重试循环里）而非会话死亡
+        let mut attempt_end = end;
+        let mut attempt = 0usize;
+        let fetched = loop {
+            attempt += 1;
+            match fetch_range_block(
+                &self.inner,
+                physical,
+                attempt_end,
+                self.read_cancellation.as_ref(),
+            ) {
+                Ok(data) => break Ok(data),
+                Err(err)
+                    if attempt < REMOTE_DEMAND_MAX_ATTEMPTS
+                        && is_transient_fetch_error(&err) =>
+                {
+                    let current_len = attempt_end.saturating_sub(physical).saturating_add(1);
+                    let next_len = halved_fetch_len(current_len);
+                    attempt_end = physical
+                        .saturating_add(next_len)
+                        .saturating_sub(1)
+                        .min(self.inner.total_len.saturating_sub(1));
+                    // 收缩在途登记边界并唤醒等待方：落在收缩区外的等待方
+                    // 立即改走自己的 claim，不悬挂在本重试循环上
+                    entry.end.store(attempt_end, Ordering::Release);
+                    self.inner.range_available.notify_all();
+                    log::warn!(
+                        target: "remote-range",
+                        "demand fetch retry attempt={}/{} range={}..{} next_len={} error={}",
+                        attempt,
+                        REMOTE_DEMAND_MAX_ATTEMPTS,
+                        physical,
+                        attempt_end,
+                        next_len,
+                        summarize_remote_error(&err),
+                    );
+                    // 短退避（按次数放大），期间保持取消即时性
+                    let backoff =
+                        Duration::from_millis(REMOTE_DEMAND_RETRY_BACKOFF_MS * attempt as u64);
+                    let backoff_started = Instant::now();
+                    while backoff_started.elapsed() < backoff {
+                        if self.ensure_read_current().is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    if let Err(cancelled) = self.ensure_read_current() {
+                        break Err(cancelled);
+                    }
+                }
+                Err(err) => break Err(err),
+            }
+        };
         drop(demand_guard);
         let data = match fetched {
             Ok(data) => data,
@@ -1161,7 +1275,9 @@ impl RemoteAudioSource {
             };
             in_flight
                 .iter()
-                .find(|(entry_start, entry)| **entry_start <= start && start <= entry.end)
+                .find(|(entry_start, entry)| {
+                    **entry_start <= start && start <= entry.end.load(Ordering::Acquire)
+                })
                 .map(|(_, entry)| Arc::clone(entry))
         };
         let Some(entry) = entry else {
@@ -1169,11 +1285,17 @@ impl RemoteAudioSource {
         };
 
         let started = Instant::now();
-        // 防御上限：发布方的请求自带 15s 超时，正常路径必在此之前发布结果
-        let wait_budget = REMOTE_REQUEST_TIMEOUT + Duration::from_secs(5);
+        // 防御上限：发布方的请求超时上限为 REMOTE_REQUEST_TIMEOUT_CEILING，
+        // 正常路径必在此之前发布结果
+        let wait_budget = REMOTE_REQUEST_TIMEOUT_CEILING + Duration::from_secs(5);
         while !entry.done.load(Ordering::Acquire) && started.elapsed() < wait_budget {
             if self.read_cancelled() {
                 return false;
+            }
+            // 发布方折半重试收缩了区间、本偏移已不被覆盖：立即退出等待，
+            // 走自己的 claim 拉取，不陪发布方的重试循环空等
+            if start > entry.end.load(Ordering::Acquire) {
+                break;
             }
             let Ok(guard) = self.inner.in_flight.lock() else {
                 return false;
@@ -2769,6 +2891,10 @@ async fn fetch_range_block_async(
             "remote read superseded",
         ));
     }
+    let requested_len = end.saturating_sub(start).saturating_add(1);
+    // 超时预算随块大小/近期吞吐缩放：块大或网慢时给足传输时间，
+    // 防止固定 15s 在慢链路上"块越大越必超时"
+    let request_timeout = request_timeout_for(requested_len, inner.throughput_bps());
     let request = async {
         let response = inner
             .client
@@ -2776,7 +2902,7 @@ async fn fetch_range_block_async(
             .header(REFERER, inner.referer.as_str())
             .header(USER_AGENT, playback_user_agent(&inner.url))
             .header(RANGE, format!("bytes={}-{}", start, end))
-            .timeout(REMOTE_REQUEST_TIMEOUT)
+            .timeout(request_timeout)
             .send()
             .await?;
         let status = response.status();
@@ -2793,16 +2919,28 @@ async fn fetch_range_block_async(
             match result {
                 Ok(result) => result,
                 Err(error) => {
+                    let elapsed_ms = request_started.elapsed().as_millis() as u64;
+                    let kind = classify_reqwest_error(&error);
+                    // 超时/中断说明链路吞吐撑不起当前块：向下修正估计，
+                    // 让下一个块（含折半重试）自动缩小
+                    if matches!(
+                        kind,
+                        io::ErrorKind::TimedOut | io::ErrorKind::ConnectionAborted
+                    ) {
+                        inner.record_fetch_failure(requested_len, elapsed_ms);
+                    }
                     log::warn!(
                         target: "remote-range",
-                        "request failed generation={}, range={}..{}, elapsed_ms={}, error={}",
+                        "request failed generation={}, range={}..{}, elapsed_ms={}, timeout_ms={}, kind={:?}, error={}",
                         inner.expected_generation,
                         start,
                         end,
-                        request_started.elapsed().as_millis(),
+                        elapsed_ms,
+                        request_timeout.as_millis(),
+                        kind,
                         summarize_remote_error(&error),
                     );
-                    return Err(io::Error::other(error.to_string()));
+                    return Err(io::Error::new(kind, error.to_string()));
                 }
             }
         }
@@ -2864,6 +3002,7 @@ async fn fetch_range_block_async(
             ));
         }
         validate_http_range_data(content_range, start, end, &data)?;
+        inner.record_fetch_success(data.len() as u64, elapsed_ms.max(1) as u64);
         write_disk_range(inner, start, &data);
         return Ok(data);
     }
@@ -2892,6 +3031,113 @@ async fn wait_for_remote_read_cancellation(
 async fn wait_for_generation_change(generation: &AtomicU64, expected: u64) {
     while generation.load(Ordering::Acquire) == expected {
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 单请求实测吞吐样本（bytes/s）
+fn throughput_sample_bps(bytes: u64, elapsed_ms: u64) -> u64 {
+    if bytes == 0 || elapsed_ms == 0 {
+        return 0;
+    }
+    (u128::from(bytes) * 1000 / u128::from(elapsed_ms)) as u64
+}
+
+/// 成功样本按固定权重混入 EWMA；首个样本直接采纳
+fn ewma_bps_after_success(old_bps: u64, sample_bps: u64) -> u64 {
+    if sample_bps == 0 {
+        return old_bps;
+    }
+    if old_bps == 0 {
+        return sample_bps;
+    }
+    let keep = 100 - THROUGHPUT_EWMA_NEW_WEIGHT_PERCENT;
+    ((u128::from(old_bps) * u128::from(keep)
+        + u128::from(sample_bps) * u128::from(THROUGHPUT_EWMA_NEW_WEIGHT_PERCENT))
+        / 100) as u64
+}
+
+/// 失败样本（超时/传输中断）：requested/elapsed 只是真实吞吐的上界，
+/// 只允许把估计往下拉；跑得太短的失败（连接秒断）不计入
+fn ewma_bps_after_failure(old_bps: u64, requested_bytes: u64, elapsed_ms: u64) -> u64 {
+    if elapsed_ms < THROUGHPUT_FAILURE_MIN_ELAPSED_MS {
+        return old_bps;
+    }
+    let upper_bound = throughput_sample_bps(requested_bytes, elapsed_ms);
+    if upper_bound == 0 {
+        return old_bps;
+    }
+    if old_bps == 0 {
+        return upper_bound;
+    }
+    if upper_bound >= old_bps {
+        return old_bps;
+    }
+    ewma_bps_after_success(old_bps, upper_bound)
+}
+
+/// 按近期吞吐选块：目标 8s 内可完成，64KB 对齐，夹在 [64KB, max_block]。
+/// 无样本时用调用方默认块（保持冷启动行为不变）
+fn adaptive_block_bytes(ewma_bps: u64, default_block: u64, max_block: u64) -> u64 {
+    if ewma_bps == 0 {
+        return default_block.clamp(REMOTE_MIN_BLOCK_BYTES, max_block.max(REMOTE_MIN_BLOCK_BYTES));
+    }
+    let raw = ewma_bps.saturating_mul(REMOTE_BLOCK_FILL_TARGET_SECS);
+    let aligned = (raw / REMOTE_MIN_BLOCK_BYTES) * REMOTE_MIN_BLOCK_BYTES;
+    aligned.clamp(REMOTE_MIN_BLOCK_BYTES, max_block.max(REMOTE_MIN_BLOCK_BYTES))
+}
+
+/// per-request 超时预算：预计传输时长 ×1.5 + 5s 固定裕量，夹在 [20s, 60s]。
+/// 无吞吐样本时用 20s 下限（冷启动块都不大，20s 足够 40KB/s 拉完 512KB）
+fn request_timeout_for(len: u64, ewma_bps: u64) -> Duration {
+    if ewma_bps == 0 {
+        return REMOTE_REQUEST_TIMEOUT_FLOOR;
+    }
+    let expected_ms = (u128::from(len) * 1000 / u128::from(ewma_bps)).min(u128::from(u64::MAX)) as u64;
+    let budget = Duration::from_millis(expected_ms.saturating_mul(3) / 2 + 5_000);
+    budget.clamp(REMOTE_REQUEST_TIMEOUT_FLOOR, REMOTE_REQUEST_TIMEOUT_CEILING)
+}
+
+/// 慢网降低预取并发：EWMA 低于码率时单流都喂不饱，多开只会挤占需求读；
+/// 码率或吞吐未知时维持默认并发（冷启动行为不变）
+fn prefetch_lane_count(ewma_bps: u64, bitrate_bps: u64) -> usize {
+    if ewma_bps == 0 || bitrate_bps == 0 {
+        return REMOTE_PREFETCH_CONCURRENCY;
+    }
+    if ewma_bps < bitrate_bps {
+        1
+    } else if ewma_bps < bitrate_bps.saturating_mul(2) {
+        2
+    } else {
+        REMOTE_PREFETCH_CONCURRENCY
+    }
+}
+
+/// 需求读折半重试的下一个长度（下限 64KB）
+fn halved_fetch_len(len: u64) -> u64 {
+    (len / 2).clamp(REMOTE_MIN_BLOCK_BYTES.min(len), len.max(1))
+}
+
+/// 超时/传输中断类错误：可通过折半重试恢复；
+/// 4xx/长度变化/取消（Interrupted）等永久失败不在此列
+fn is_transient_fetch_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+/// reqwest 错误分类：超时（含 body 读取被 per-request 超时打断的
+/// "error decoding response body"）与传输中断映射为可重试 kind
+fn classify_reqwest_error(error: &reqwest::Error) -> io::ErrorKind {
+    if error.is_timeout() {
+        io::ErrorKind::TimedOut
+    } else if error.is_connect() || error.is_body() || error.is_decode() || error.is_request() {
+        io::ErrorKind::ConnectionAborted
+    } else {
+        io::ErrorKind::Other
     }
 }
 
@@ -2984,19 +3230,20 @@ fn replenish_prefetch_window(inner: &Arc<RemoteAudioInner>, read_pos: u64) {
 
 fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
     // 先占首块：既是 0 号 lane 的首个任务，也天然拒绝重复提交的整段预取
-    let Some((first_start, first_entry)) = claim_prefetch_sequence_start(&inner, plan) else {
+    let Some((first_start, first_end, first_entry)) = claim_prefetch_sequence_start(&inner, plan)
+    else {
         return;
     };
     let epoch = inner.prefetch_epoch.load(Ordering::Acquire);
-    let limit = plan.target_end.min(inner.total_len);
-    // 共享游标：各 lane 从这里领取下一块起点，构成 2-3 路并发流水线，
+    // 共享游标：各 lane 从这里领取下一块起点，构成并发流水线，
     // 掩盖单请求往返延迟（串行 256KB 块的有效吞吐在慢链路上低于码率）
-    let cursor = Arc::new(AtomicU64::new(
-        first_start.saturating_add(prefetch_block_len(first_start, limit)),
-    ));
+    let cursor = Arc::new(AtomicU64::new(first_end.saturating_add(1)));
     let stop = Arc::new(AtomicBool::new(false));
-    for lane in 0..REMOTE_PREFETCH_CONCURRENCY {
-        let preclaimed = (lane == 0).then(|| (first_start, Arc::clone(&first_entry)));
+    // 慢网降并发：EWMA 低于码率时单流都喂不饱，多 lane 只会挤占需求读带宽
+    let lanes = prefetch_lane_count(inner.throughput_bps(), inner.bitrate_bps);
+    for lane in 0..lanes {
+        let preclaimed =
+            (lane == 0).then(|| (first_start, first_end, Arc::clone(&first_entry)));
         let inner = Arc::clone(&inner);
         let cursor = Arc::clone(&cursor);
         let stop = Arc::clone(&stop);
@@ -3006,9 +3253,39 @@ fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
     }
 }
 
+/// 当前预取块大小：按近期吞吐自适应（8s 可完成），无样本时用 512KB 默认
+fn current_prefetch_block_bytes(inner: &RemoteAudioInner) -> u64 {
+    adaptive_block_bytes(
+        inner.throughput_bps(),
+        REMOTE_PREFETCH_BLOCK_BYTES,
+        REMOTE_ADAPTIVE_MAX_BLOCK_BYTES,
+    )
+}
+
 /// 预取块长度：夹到窗口/文件边界
-fn prefetch_block_len(start: u64, limit: u64) -> u64 {
-    REMOTE_PREFETCH_BLOCK_BYTES.min(limit.saturating_sub(start))
+fn prefetch_block_len(block: u64, start: u64, limit: u64) -> u64 {
+    block.min(limit.saturating_sub(start))
+}
+
+/// 从共享游标领取下一块 [start, end]。块大小逐次按最新吞吐估计计算，
+/// CAS 推进游标保证变长块之间无空洞、无重叠
+fn take_prefetch_block(cursor: &AtomicU64, limit: u64, block: u64) -> Option<(u64, u64)> {
+    loop {
+        let start = cursor.load(Ordering::Acquire);
+        if start >= limit {
+            return None;
+        }
+        let len = prefetch_block_len(block, start, limit);
+        if len == 0 {
+            return None;
+        }
+        if cursor
+            .compare_exchange(start, start + len, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some((start, start + len - 1));
+        }
+    }
 }
 
 /// 单条预取 lane：从共享游标领块 → 登记在途 → 拉取 → 入缓存 → 发布。
@@ -3020,7 +3297,7 @@ async fn prefetch_lane(
     epoch: u64,
     cursor: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    preclaimed: Option<(u64, Arc<InflightFetch>)>,
+    preclaimed: Option<(u64, u64, Arc<InflightFetch>)>,
 ) {
     let limit = plan.target_end.min(inner.total_len);
     let mut pending = preclaimed;
@@ -3030,7 +3307,7 @@ async fn prefetch_lane(
                 || inner.playback_cancelled()
                 || inner.prefetch_epoch.load(Ordering::Acquire) != epoch
         };
-        let (start, entry) = match pending.take() {
+        let (start, end, entry) = match pending.take() {
             Some(next) => next,
             None => {
                 // 需求读优先：解码线程正亲自拉块时暂缓开新请求，
@@ -3041,13 +3318,13 @@ async fn prefetch_lane(
                 if lane_cancelled() {
                     break;
                 }
-                let start = cursor.fetch_add(REMOTE_PREFETCH_BLOCK_BYTES, Ordering::AcqRel);
-                if start >= limit {
+                // 每块领取时都按最新吞吐估计选块：慢网自动缩小、快网恢复大块
+                let block = current_prefetch_block_bytes(&inner);
+                let Some((start, end)) = take_prefetch_block(&cursor, limit, block) else {
                     break;
-                }
-                let end = start + prefetch_block_len(start, limit) - 1;
+                };
                 match claim_prefetch_start(&inner, start, end) {
-                    Some(entry) => (start, entry),
+                    Some(entry) => (start, end, entry),
                     // 已缓存或已被别人（需求读）拉着：跳过本块领下一块
                     None => continue,
                 }
@@ -3057,7 +3334,6 @@ async fn prefetch_lane(
             release_prefetch_start(&inner, start, &entry);
             break;
         }
-        let end = start + prefetch_block_len(start, limit) - 1;
         // seek 换代时立刻中止在途预取请求，不让旧位置继续吃带宽
         let fetch = fetch_range_block_async(&inner, start, end, None);
         tokio::pin!(fetch);
@@ -3119,14 +3395,15 @@ async fn prefetch_lane(
 fn claim_prefetch_sequence_start(
     inner: &RemoteAudioInner,
     plan: PrefetchPlan,
-) -> Option<(u64, Arc<InflightFetch>)> {
+) -> Option<(u64, u64, Arc<InflightFetch>)> {
     let limit = plan.target_end.min(inner.total_len);
     let start = plan.start;
     if start >= limit {
         return None;
     }
-    let end = start + prefetch_block_len(start, limit) - 1;
-    claim_prefetch_start(inner, start, end).map(|entry| (start, entry))
+    let block = current_prefetch_block_bytes(inner);
+    let end = start + prefetch_block_len(block, start, limit) - 1;
+    claim_prefetch_start(inner, start, end).map(|entry| (start, end, entry))
 }
 
 fn contiguous_cached_end(inner: &RemoteAudioInner, pos: u64) -> u64 {
@@ -3619,14 +3896,13 @@ fn claim_prefetch_start(
     };
     // 只按「起点被覆盖」判重：部分尾部重叠的少量浪费可接受，
     // 若按整段重叠判重，需求读会在等不到对应登记项时陷入空转
-    if in_flight
-        .iter()
-        .any(|(entry_start, entry)| *entry_start <= start && start <= entry.end)
-    {
+    if in_flight.iter().any(|(entry_start, entry)| {
+        *entry_start <= start && start <= entry.end.load(Ordering::Acquire)
+    }) {
         return None;
     }
     let entry = Arc::new(InflightFetch {
-        end,
+        end: AtomicU64::new(end),
         done: AtomicBool::new(false),
     });
     in_flight.insert(start, Arc::clone(&entry));
@@ -3828,17 +4104,21 @@ fn seek_error(message: String) -> PcmSeekError {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_duration_is_suspicious, format_cache_marker, is_fragmented_mp4_url,
-        claim_prefetch_sequence_start, parse_cache_marker, parse_content_range, prefetch_plan,
-        prefetch_window,
+        adaptive_block_bytes, cache_duration_is_suspicious, ewma_bps_after_failure,
+        ewma_bps_after_success, format_cache_marker, halved_fetch_len, is_fragmented_mp4_url,
+        claim_prefetch_sequence_start, parse_cache_marker, parse_content_range, prefetch_lane_count,
+        prefetch_plan, prefetch_window,
         ranges_cover_source,
-        release_prefetch_start, remember_validated_audio_cache, reuse_validated_audio_cache,
-        seek_target_time, track_duration, CacheMarker, CachedRange, CachedSegment, HttpByteRange,
+        release_prefetch_start, remember_validated_audio_cache, request_timeout_for,
+        reuse_validated_audio_cache,
+        seek_target_time, throughput_sample_bps, track_duration, CacheMarker, CachedRange,
+        CachedSegment, HttpByteRange,
         InflightFetch,
         PrefetchPlan, PrefetchWindow, RemoteAccessMode, RemoteAudioCache, RemoteAudioInner,
         RemoteSeekIndex, SeekIndexEntry,
         RemoteAudioSource, RemoteReadCancellation, SymphoniaAudioDecoder, ValidatedCacheFile,
-        REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES, REMOTE_PREFETCH_FALLBACK_TARGET_BYTES,
+        REMOTE_PREFETCH_CONCURRENCY, REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES,
+        REMOTE_PREFETCH_FALLBACK_TARGET_BYTES,
     };
     use reqwest::header::HeaderValue;
     use std::collections::HashMap;
@@ -3987,6 +4267,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         };
@@ -3995,14 +4277,14 @@ mod tests {
             target_end: 4,
         };
 
-        let (start, entry) =
+        let (start, _end, entry) =
             claim_prefetch_sequence_start(&inner, plan).expect("first sequence claim");
         assert_eq!(start, 0);
         assert!(claim_prefetch_sequence_start(&inner, plan).is_none());
         assert_eq!(inner.in_flight.lock().expect("in-flight lock").len(), 1);
 
         release_prefetch_start(&inner, 0, &entry);
-        let (start, entry) =
+        let (start, _end, entry) =
             claim_prefetch_sequence_start(&inner, plan).expect("reclaim after release");
         assert_eq!(start, 0);
         release_prefetch_start(&inner, 0, &entry);
@@ -4012,7 +4294,7 @@ mod tests {
     fn demand_read_waits_for_matching_prefetch_instead_of_downloading_twice() {
         let playback_generation = Arc::new(AtomicU64::new(1));
         let inflight_entry = Arc::new(InflightFetch {
-            end: 3,
+            end: AtomicU64::new(3),
             done: AtomicBool::new(false),
         });
         let inner = Arc::new(RemoteAudioInner {
@@ -4038,6 +4320,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation,
             expected_generation: 1,
         });
@@ -4072,7 +4356,7 @@ mod tests {
     #[test]
     fn demand_read_shares_inflight_range_covering_its_offset() {
         let inflight_entry = Arc::new(InflightFetch {
-            end: 1023,
+            end: AtomicU64::new(1023),
             done: AtomicBool::new(false),
         });
         let inner = Arc::new(RemoteAudioInner {
@@ -4098,6 +4382,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         });
@@ -4146,7 +4432,7 @@ mod tests {
             in_flight: Mutex::new(HashMap::from([(
                 0,
                 Arc::new(InflightFetch {
-                    end: 3,
+                    end: AtomicU64::new(3),
                     done: AtomicBool::new(false),
                 }),
             )])),
@@ -4160,6 +4446,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         });
@@ -4189,7 +4477,7 @@ mod tests {
         source.read_exact(&mut bytes).expect("read after invalidate");
 
         assert_eq!(bytes, [5, 6, 7, 8]);
-        // 远小于 15s+5s 的防御预算，证明等待方是被 invalidate 主动唤醒的
+        // 远小于 60s+5s 的防御预算，证明等待方是被 invalidate 主动唤醒的
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(invalidator.join().is_ok());
     }
@@ -4212,7 +4500,7 @@ mod tests {
             in_flight: Mutex::new(HashMap::from([(
                 0,
                 Arc::new(InflightFetch {
-                    end: 255,
+                    end: AtomicU64::new(255),
                     done: AtomicBool::new(false),
                 }),
             )])),
@@ -4226,6 +4514,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         };
@@ -4263,6 +4553,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::clone(&playback_generation),
             expected_generation: 1,
         });
@@ -4307,6 +4599,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation,
             expected_generation: 1,
         });
@@ -4361,6 +4655,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(0),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4409,6 +4705,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(0),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4483,6 +4781,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(0),
                 seek_index: Mutex::new(Some(index)),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4524,6 +4824,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(5_000),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4604,6 +4906,8 @@ mod tests {
                 virtual_body_origin: AtomicU64::new(0),
                 // 嗅探路径不建索引，交给 symphonia 原生 sidx 定位
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4672,6 +4976,8 @@ mod tests {
                             SeekIndexEntry { time_ms: 10_000, byte_offset: 172_000 },
                         ],
                     })),
+                    throughput_ewma_bps: AtomicU64::new(0),
+                    bitrate_bps: 0,
                     playback_generation: Arc::new(AtomicU64::new(1)),
                     expected_generation: 1,
                 }),
@@ -4804,6 +5110,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(25_212_301),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4865,6 +5173,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(true),
                 virtual_body_origin: AtomicU64::new(ORIGIN),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -4918,6 +5228,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(57_047_830),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -5018,6 +5330,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(5_000),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -5065,6 +5379,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(54_947_352),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -5141,6 +5457,8 @@ mod tests {
                 demuxer_open_sequential: AtomicBool::new(false),
                 virtual_body_origin: AtomicU64::new(5_000),
                 seek_index: Mutex::new(None),
+                throughput_ewma_bps: AtomicU64::new(0),
+                bitrate_bps: 0,
                 playback_generation: Arc::new(AtomicU64::new(1)),
                 expected_generation: 1,
             }),
@@ -5225,14 +5543,14 @@ mod tests {
                 (
                     0,
                     Arc::new(InflightFetch {
-                        end: 255,
+                        end: AtomicU64::new(255),
                         done: AtomicBool::new(false),
                     }),
                 ),
                 (
                     256,
                     Arc::new(InflightFetch {
-                        end: 511,
+                        end: AtomicU64::new(511),
                         done: AtomicBool::new(false),
                     }),
                 ),
@@ -5247,6 +5565,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         });
@@ -5297,6 +5617,8 @@ mod tests {
             demuxer_open_sequential: AtomicBool::new(false),
             virtual_body_origin: AtomicU64::new(0),
             seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         };
@@ -5660,6 +5982,227 @@ mod tests {
             Some(&sha256),
         )
         .is_none());
+    }
+
+    #[test]
+    fn throughput_ewma_blends_successes_and_only_sinks_on_failures() {
+        // 实机日志样本：512KB / 15s ≈ 34.9KB/s
+        assert_eq!(throughput_sample_bps(524_288, 15_000), 34_952);
+        // 首个样本直接采纳；此后按 30% 权重混入
+        assert_eq!(ewma_bps_after_success(0, 100_000), 100_000);
+        assert_eq!(ewma_bps_after_success(100_000, 50_000), 85_000);
+        // 失败样本是吞吐上界：跑得太短不计入；高于当前估计不上调
+        assert_eq!(ewma_bps_after_failure(100_000, 524_288, 1_000), 100_000);
+        assert_eq!(ewma_bps_after_failure(20_000, 524_288, 15_000), 20_000);
+        // 低于当前估计时按同一权重向下混合
+        assert_eq!(ewma_bps_after_failure(100_000, 524_288, 15_000), 80_485);
+    }
+
+    #[test]
+    fn adaptive_block_shrinks_on_slow_and_recovers_on_fast_networks() {
+        // 无样本：保持调用方默认块（冷启动行为不变）
+        assert_eq!(adaptive_block_bytes(0, 256 * 1024, 256 * 1024), 256 * 1024);
+        assert_eq!(adaptive_block_bytes(0, 512 * 1024, 1024 * 1024), 512 * 1024);
+        // 慢网 50KB/s：8s 目标 → 400KB，向下对齐 64KB → 384KB
+        assert_eq!(
+            adaptive_block_bytes(51_200, 512 * 1024, 1024 * 1024),
+            393_216
+        );
+        // 需求读上限受 mode 块钳制
+        assert_eq!(
+            adaptive_block_bytes(2 * 1024 * 1024, 256 * 1024, 256 * 1024),
+            256 * 1024
+        );
+        // 快网 2MB/s：预取恢复到 1MB 上限
+        assert_eq!(
+            adaptive_block_bytes(2 * 1024 * 1024, 512 * 1024, 1024 * 1024),
+            1024 * 1024
+        );
+        // 极慢网也不低于 64KB 下限
+        assert_eq!(adaptive_block_bytes(1_000, 512 * 1024, 1024 * 1024), 65_536);
+    }
+
+    #[test]
+    fn request_timeout_scales_with_block_size_and_throughput() {
+        // 无吞吐样本：20s 下限（原 15s 已被实机 12.4s 的成功请求贴脸打穿）
+        assert_eq!(request_timeout_for(524_288, 0), Duration::from_secs(20));
+        // 自适应块本身就按 8s 目标选：预算落在下限
+        assert_eq!(
+            request_timeout_for(262_144, 51_200),
+            Duration::from_secs(20)
+        );
+        // 分片 8MB 大块 @ 400KB/s：预计 20.5s ×1.5 + 5s ≈ 35.7s
+        assert_eq!(
+            request_timeout_for(8 * 1024 * 1024, 409_600),
+            Duration::from_millis(35_720)
+        );
+        // 上限 60s：不允许无限拉长
+        assert_eq!(
+            request_timeout_for(8 * 1024 * 1024, 102_400),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn prefetch_concurrency_yields_to_demand_reads_on_slow_networks() {
+        // 吞吐或码率未知：维持默认并发
+        assert_eq!(prefetch_lane_count(0, 45_000), REMOTE_PREFETCH_CONCURRENCY);
+        assert_eq!(
+            prefetch_lane_count(200_000, 0),
+            REMOTE_PREFETCH_CONCURRENCY
+        );
+        // EWMA 低于码率：单 lane，带宽让给需求读
+        assert_eq!(prefetch_lane_count(40_000, 45_000), 1);
+        // 1-2 倍码率之间：2 lane
+        assert_eq!(prefetch_lane_count(60_000, 45_000), 2);
+        // 富余吞吐：恢复满并发
+        assert_eq!(
+            prefetch_lane_count(200_000, 45_000),
+            REMOTE_PREFETCH_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn halved_fetch_len_bottoms_out_at_min_block() {
+        assert_eq!(halved_fetch_len(524_288), 262_144);
+        assert_eq!(halved_fetch_len(131_072), 65_536);
+        assert_eq!(halved_fetch_len(65_536), 65_536);
+    }
+
+    /// 记录到的 range 请求列表 (start, end)
+    type SeenRanges = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// 本地 range 服务器：前 fail_first 个请求发送响应头后只回半个 body
+    /// 即断开（模拟慢网下 per-request 超时打断 body 读取的传输中断），
+    /// 之后的请求正常完整响应；记录每个请求的 range 供断言
+    fn spawn_flaky_range_server(
+        body: Arc<Vec<u8>>,
+        fail_first: usize,
+    ) -> (String, SeenRanges) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind range server");
+        let addr = listener.local_addr().expect("range server addr");
+        let requests: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        thread::spawn(move || {
+            let mut served = 0usize;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&chunk[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let Some(spec) = text
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|line| line.split('=').nth(1))
+                else {
+                    continue;
+                };
+                let mut bounds = spec.trim().split('-');
+                let start: u64 = bounds.next().unwrap_or("0").parse().unwrap_or(0);
+                let end: u64 = bounds.next().unwrap_or("0").parse().unwrap_or(0);
+                seen.lock().expect("requests lock").push((start, end));
+                let total = body.len() as u64;
+                let end = end.min(total.saturating_sub(1));
+                let slice = &body[start as usize..=end as usize];
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    start,
+                    end,
+                    total,
+                    slice.len(),
+                );
+                if std::io::Write::write_all(&mut stream, header.as_bytes()).is_err() {
+                    continue;
+                }
+                served += 1;
+                let payload = if served <= fail_first {
+                    &slice[..slice.len() / 2]
+                } else {
+                    slice
+                };
+                let _ = std::io::Write::write_all(&mut stream, payload);
+                let _ = std::io::Write::flush(&mut stream);
+                // fail_first 内的连接在此 drop：Content-Length 未喂满即断开
+            }
+        });
+        (format!("http://{}/audio.bin", addr), requests)
+    }
+
+    /// 回归：慢网超时/传输中断的需求读绝不 fatal——同一起点折半块大小重试，
+    /// 直到成功；解码层只看到一次变慢的 read，而不是会话死亡
+    #[test]
+    fn demand_fetch_retries_transient_failures_with_halved_blocks() {
+        let total_len: u64 = 1024 * 1024;
+        let body: Arc<Vec<u8>> = Arc::new(
+            (0..total_len).map(|index| (index % 251) as u8).collect(),
+        );
+        // 前两个请求（256KB、128KB）中途断开，第三个（64KB）放行
+        let (url, requests) = spawn_flaky_range_server(Arc::clone(&body), 2);
+        let inner = Arc::new(RemoteAudioInner {
+            // 必须绕过系统代理：本地回环服务器走代理会拿到 502
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("no-proxy client"),
+            url,
+            referer: "https://example.com".into(),
+            total_len,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            throughput_ewma_bps: AtomicU64::new(0),
+            bitrate_bps: 0,
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        });
+        let mut source = RemoteAudioSource {
+            inner: Arc::clone(&inner),
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+        let mut bytes = [0u8; 4];
+
+        source
+            .read_exact(&mut bytes)
+            .expect("demand read must survive transient failures");
+
+        assert_eq!(bytes, [0, 1, 2, 3]);
+        // 断言折半序列：256KB → 128KB → 64KB
+        assert_eq!(
+            requests.lock().expect("requests lock").clone(),
+            vec![(0, 262_143), (0, 131_071), (0, 65_535)],
+        );
+        // 成功后在途登记必须清空（等待方不会悬挂在残留登记上）
+        assert!(inner.in_flight.lock().expect("in-flight lock").is_empty());
+        // 成功样本已混入吞吐估计，供后续自适应选块
+        assert!(inner.throughput_bps() > 0);
     }
 
 }
