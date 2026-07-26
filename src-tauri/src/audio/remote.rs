@@ -499,19 +499,15 @@ impl RemoteAudioSource {
         let header_end = detect_mp4_header_end(head_bytes).unwrap_or(0);
         // URL 后缀嗅探不到 googlevideo 的分片直链，必须按首包内容再判一次。
         //
-        // 只用来决定要不要建 seek 索引，**不改 access_mode**：
-        // 分片模式的按需块是 8MB，那是给 Bilibili 的独立 .m4s 分片文件调的；
-        // YouTube 是一个几十 MB 的单文件，套 8MB 块反而会把 seek 拖慢。
+        // 嗅探结果只用于「打开阶段顺序读」这一件事，不改 access_mode 也不建
+        // 虚拟 body 索引：
+        // - 分片模式的按需块是 8MB，那是给 Bilibili 独立 .m4s 分片文件调的，
+        //   套到 YouTube 的单文件上反而拖慢 seek
+        // - 这类流自带完整 sidx，symphonia 的 isomp4 能原生按 sidx 定位
+        //   （日志里的 "stream is segmented with a segment index"），
+        //   再套一层虚拟 body 拼接反而会让样本偏移对不上，直接 end of stream
         let sniffed_fragmented = !matches!(access_mode, RemoteAccessMode::FragmentedProgressive)
             && detect_fragmented_mp4(head_bytes);
-        if sniffed_fragmented {
-            log::info!(
-                target: "remote-audio",
-                "fragmented mp4 sniffed from payload host={}, mode={:?}, seek index enabled",
-                host,
-                access_mode,
-            );
-        }
         let inner = Arc::new(RemoteAudioInner {
             client,
             url,
@@ -542,14 +538,27 @@ impl RemoteAudioSource {
                 header_end,
             );
         }
+        if sniffed_fragmented {
+            // 打开阶段隐藏 seekable，避免 symphonia 顺着 moof 链把整个文件读完；
+            // sidx 位于 header_end 之前，顺序读同样能拿到，不影响后续按 sidx seek。
+            // finish_demuxer_open() 会在打开完成后恢复可 seek。
+            inner
+                .demuxer_open_sequential
+                .store(true, Ordering::Release);
+            log::info!(
+                target: "remote-audio",
+                "fragmented mp4 sniffed from payload host={}, mode={:?}, opening sequentially",
+                host,
+                access_mode,
+            );
+        }
         inner
             .ensure_playback_current()
             .map_err(|err| AppError::Audio(err.to_string()))?;
         if let Some((start, data)) = initial_disk_segment {
             write_disk_range(&inner, start, &data);
         }
-        let needs_seek_index =
-            sniffed_fragmented || matches!(access_mode, RemoteAccessMode::LongFormProgressive);
+        let needs_seek_index = matches!(access_mode, RemoteAccessMode::LongFormProgressive);
         // 分片 MP4 的 sidx 紧跟 moov 位于首包，先用首包建索引；
         // 建成了就不必再为长内容拉 1MB 尾部，直接省掉起播路径上的一次往返
         let head_index_ready = needs_seek_index
