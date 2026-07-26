@@ -53,6 +53,10 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 tauri-plugin-log = "2.9.0"
 tauri-plugin-single-instance = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSToolbar", "NSWindow"] }
+
 [profile.dev.package.symphonia]
 opt-level = 2
 

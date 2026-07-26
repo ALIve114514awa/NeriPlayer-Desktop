@@ -2981,6 +2981,8 @@ dependencies = [
  "lofty",
  "log",
  "md-5",
+ "objc2",
+ "objc2-app-kit",
  "parking_lot",
  "prost",
  "rand 0.8.6",
