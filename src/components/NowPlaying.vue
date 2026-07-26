@@ -2297,7 +2297,7 @@ const sliderActiveColor = computed(() => {
       <QueuePanel v-if="player.hasPlaybackSession && showQueue" @close="showQueue = false" />
     </Teleport>
     <AddToPlaylistDialog v-if="player.hasPlaybackSession" v-model:open="showAddToPlaylist" :track="player.currentTrack" />
-    <ListenTogetherPanel v-if="player.hasPlaybackSession && showLtPanel" class="np-lt-panel" @close="showLtPanel = false" />
+    <ListenTogetherPanel v-if="player.hasPlaybackSession" v-model:open="showLtPanel" />
 
     <!-- 更多选项面板（对齐 Android MoreOptionsSheet） -->
     <Teleport to="body">
@@ -5242,11 +5242,4 @@ const sliderActiveColor = computed(() => {
   }
 }
 
-.np-lt-panel {
-  right: 24px;
-  bottom: 92px;
-  z-index: 9100;
-  border-radius: 20px;
-  box-shadow: 0 20px 56px rgba(0,0,0,0.35);
-}
 </style>

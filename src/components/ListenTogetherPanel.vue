@@ -1,10 +1,21 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useListenTogetherStore } from '@/stores/listenTogether'
 import { useI18n } from 'vue-i18n'
 
+const props = defineProps<{ open: boolean }>()
+const emit = defineEmits<{ 'update:open': [value: boolean] }>()
+
 const lt = useListenTogetherStore()
 const { t } = useI18n()
+
+function close() {
+  emit('update:open', false)
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  if (props.open && event.key === 'Escape') close()
+}
 
 const joinRoomId = ref('')
 const nowTick = ref(Date.now())
@@ -139,30 +150,54 @@ function formatRelativeTime(timestamp?: number | null) {
   return t('recent.days_ago', { count: days })
 }
 
+// 组件常驻挂载, 剪贴板检测跟随弹窗打开时机
+watch(() => props.open, (open) => {
+  if (open) checkClipboard()
+})
+
+function checkClipboardWhenOpen() {
+  if (props.open) checkClipboard()
+}
+
 onMounted(() => {
   nowTimer = setInterval(() => {
     nowTick.value = Date.now()
   }, 15_000)
-  checkClipboard()
-  window.addEventListener('focus', checkClipboard)
+  if (props.open) checkClipboard()
+  window.addEventListener('focus', checkClipboardWhenOpen)
+  document.addEventListener('keydown', handleKeydown)
 })
 
 onUnmounted(() => {
   if (nowTimer) clearInterval(nowTimer)
-  window.removeEventListener('focus', checkClipboard)
+  window.removeEventListener('focus', checkClipboardWhenOpen)
+  document.removeEventListener('keydown', handleKeydown)
 })
 </script>
 
 <template>
-  <div class="lt-panel">
+  <Teleport to="body">
+    <Transition name="dialog">
+      <div v-if="open" class="lt-overlay" @click="close">
+        <div
+          class="lt-dialog"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="t('listen_together.title')"
+          @click.stop
+        >
     <header class="lt-header">
-      <h3>{{ t('listen_together.title') }}</h3>
-      <div class="lt-status">
-        <span class="lt-status-dot" :style="{ background: statusColor }" />
-        <span class="lt-status-text">{{ statusText }}</span>
+      <div class="lt-header-icon">
+        <span class="material-symbols-rounded">speaker_group</span>
       </div>
-      <div style="flex: 1" />
-      <button class="lt-close" @click="$emit('close')">
+      <div class="lt-header-text">
+        <h3>{{ t('listen_together.title') }}</h3>
+        <div class="lt-status">
+          <span class="lt-status-dot" :style="{ background: statusColor }" />
+          <span class="lt-status-text">{{ statusText }}</span>
+        </div>
+      </div>
+      <button class="lt-close" @click="close">
         <span class="material-symbols-rounded">close</span>
       </button>
     </header>
@@ -309,77 +344,112 @@ onUnmounted(() => {
         {{ t('listen_together.leave_room') }}
       </button>
     </div>
-  </div>
+        </div>
+      </div>
+    </Transition>
+  </Teleport>
 </template>
 
 <style scoped lang="scss">
-.lt-panel {
+.lt-overlay {
   position: fixed;
-  right: 0;
-  bottom: 76px;
-  width: 360px;
-  max-width: 90vw;
-  max-height: calc(100vh - 112px);
-  background: var(--md-surface-container);
-  border: 1px solid var(--md-outline-variant);
-  border-radius: 16px 16px 0 0;
-  box-shadow: 0 -4px 24px rgba(0,0,0,0.15);
-  z-index: 200;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+}
+
+.lt-dialog {
+  width: 400px;
+  max-width: calc(100vw - 48px);
+  max-height: min(80vh, 680px);
+  background: var(--md-surface-container-high);
+  border-radius: 28px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.35),
+    0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .lt-header {
   display: flex;
   align-items: center;
-  padding: 12px 16px;
-  gap: 8px;
-  border-bottom: 1px solid var(--md-surface-container-highest);
+  gap: 14px;
+  padding: 22px 24px 14px;
 
   h3 {
-    font-size: 15px;
-    font-weight: 600;
+    font-size: 17px;
+    font-weight: 700;
     margin: 0;
+    letter-spacing: -0.2px;
   }
+}
+
+.lt-header-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+
+  .material-symbols-rounded { font-size: 24px; }
+}
+
+.lt-header-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
 .lt-status {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
 }
 
 .lt-status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  transition: background var(--duration-short, 150ms);
 }
 
 .lt-status-text {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--md-on-surface-variant);
 }
 
 .lt-close {
-  width: 28px;
-  height: 28px;
+  width: 34px;
+  height: 34px;
   border-radius: var(--radius-full);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--md-on-surface-variant);
-  &:hover { background: var(--md-surface-variant); }
-  .material-symbols-rounded { font-size: 18px; }
+  transition: background var(--duration-short, 150ms);
+  &:hover { background: var(--md-surface-container-highest); }
+  .material-symbols-rounded { font-size: 20px; }
 }
 
 .lt-body {
   flex: 1;
   overflow-y: auto;
-  padding: 12px 16px;
+  padding: 8px 24px 24px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 
 .lt-center {
@@ -397,31 +467,39 @@ onUnmounted(() => {
 .lt-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 
   label {
     font-size: 12px;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--md-on-surface-variant);
+    margin-left: 4px;
   }
 }
 
 .lt-input {
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--md-outline-variant);
-  background: var(--md-surface-container-low);
+  height: 46px;
+  padding: 0 16px;
+  border-radius: 14px;
+  border: 1.5px solid transparent;
+  background: var(--md-surface-container);
   color: var(--md-on-surface);
-  font-size: 13px;
+  font-size: 14px;
   outline: none;
-  transition: border-color 150ms;
+  transition: border-color 160ms, background 160ms;
 
-  &:focus { border-color: var(--md-primary); }
+  &::placeholder { color: var(--md-on-surface-variant); opacity: 0.55; }
+  &:hover { background: var(--md-surface-container-highest); }
+  &:focus {
+    border-color: var(--md-primary);
+    background: var(--md-surface-container-low);
+  }
 }
 
 .lt-actions {
   display: flex;
-  gap: 8px;
+  gap: 10px;
+  margin-top: 4px;
 }
 
 .lt-btn {
@@ -430,30 +508,31 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 8px 12px;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 500;
-  background: var(--md-surface-container-high);
-  color: var(--md-on-surface);
-  transition: background 150ms, transform 100ms;
+  height: 46px;
+  padding: 0 16px;
+  border-radius: var(--radius-full);
+  font-size: 14px;
+  font-weight: 600;
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+  transition: background 150ms, filter 150ms, transform 120ms var(--easing-emphasized, cubic-bezier(0.2, 0, 0, 1));
 
-  .material-symbols-rounded { font-size: 18px; }
+  .material-symbols-rounded { font-size: 19px; }
 
-  &:hover { background: var(--md-surface-container-highest); }
+  &:hover { filter: brightness(1.05); }
   &:active { transform: scale(0.97); }
   &:disabled { opacity: 0.4; pointer-events: none; }
 
   &.primary {
     background: var(--md-primary);
     color: var(--md-on-primary);
-    &:hover { opacity: 0.9; }
+    &:hover { filter: brightness(1.06); }
   }
 
   &.danger {
     background: var(--md-error-container);
     color: var(--md-on-error-container);
-    &:hover { opacity: 0.9; }
+    &:hover { filter: brightness(1.04); }
   }
 }
 
@@ -650,4 +729,29 @@ onUnmounted(() => {
 }
 
 @keyframes spin { to { transform: rotate(360deg); } }
+
+// 过渡动画（对齐 AddToPlaylistDialog 的房屋风格）
+.dialog-enter-active {
+  transition: opacity 200ms ease-out;
+  .lt-dialog { transition: transform 300ms cubic-bezier(0.05, 0.7, 0.1, 1), opacity 200ms; }
+}
+.dialog-leave-active {
+  transition: opacity 150ms ease-in;
+  .lt-dialog { transition: transform 200ms cubic-bezier(0.3, 0, 0.8, 0.15), opacity 150ms; }
+}
+.dialog-enter-from {
+  opacity: 0;
+  .lt-dialog { transform: scale(0.85); opacity: 0; }
+}
+.dialog-leave-to {
+  opacity: 0;
+  .lt-dialog { transform: scale(0.92); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dialog-enter-active,
+  .dialog-leave-active,
+  .dialog-enter-active .lt-dialog,
+  .dialog-leave-active .lt-dialog { transition: none; }
+}
 </style>

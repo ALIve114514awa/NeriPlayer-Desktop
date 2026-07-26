@@ -319,10 +319,8 @@ defineExpose({
       <QueuePanel v-if="showQueue" @close="showQueue = false" />
     </Teleport>
 
-    <!-- 一起听面板 -->
-    <Teleport to="body">
-      <ListenTogetherPanel v-if="showLtPanel" @close="showLtPanel = false" />
-    </Teleport>
+    <!-- 一起听弹窗（组件内部自带 Teleport） -->
+    <ListenTogetherPanel v-model:open="showLtPanel" />
   </div>
 </template>
 

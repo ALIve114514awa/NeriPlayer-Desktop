@@ -67,7 +67,11 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     set: (v: string) => { settings.ltServerUrl = v },
   })
   const nickname = computed({
-    get: () => settings.ltNickname || `User-${userUuid.value.slice(0, 4)}`,
+    // 默认名从持久化 UUID 派生, 稳定不随机; 仅作展示回退, 不写入 settings
+    // 注意: Android 昵称白名单不含连字符, 用户手动保存含 '-' 的昵称经云同步到
+    // Android 端会被 sanitize 丢弃 (ListenTogetherPreferences.restore), 回退值不落盘无此问题
+    get: () => settings.ltNickname
+      || `NERI-PC-${userUuid.value.replace(/-/g, '').slice(0, 4).toUpperCase()}`,
     set: (v: string) => { settings.ltNickname = v },
   })
   const roomSettings = computed({
