@@ -10,8 +10,8 @@
 //! 在启动时构建，运行时切换开关需重启生效；日志级别则可运行时调整。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use log::LevelFilter;
 use serde::Serialize;
@@ -35,8 +35,34 @@ pub struct RecentLogEntry {
     pub message: String,
 }
 
+/// 敏感信息打码：值替换为 `[REDACTED]`，键名保留
+///
+/// cookie_store 等第三方 crate 在 Debug 级别会把完整 cookie 值打进日志，
+/// 而内存日志环会随崩溃报告与「导出诊断报告」明文带出。除 `level_for`
+/// 降噪外，在入环处再做一道纵深防御——两道闸任何一道失守都不致泄漏。
+fn redact_sensitive(text: &str) -> String {
+    // Cookie/Authorization 整段打码：值里可能含空格（如 `Bearer xxx`）或
+    // 多个分号分隔的属性，保守起见冒号/等号之后整行替换
+    static FULL_LINE: OnceLock<regex::Regex> = OnceLock::new();
+    // 键值打码：已知敏感键名后的单个值（分隔符前）替换
+    static SENSITIVE_KV: OnceLock<regex::Regex> = OnceLock::new();
+    let full_line = FULL_LINE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b((?:set-)?cookie|authorization)\b(\s*[:=]\s*)[^\r\n]+")
+            .expect("full-line redact regex")
+    });
+    let kv = SENSITIVE_KV.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)\b(MUSIC_U|MUSIC_A|SESSDATA|bili_jct|SAPISID|APISID|__Secure-[\w-]+|__Host-[\w-]+|access_token|refresh_token|id_token|csrf_token|__csrf|NMTID)\b(\s*[=:]\s*)[^;,\s"'&]+"#,
+        )
+        .expect("sensitive kv redact regex")
+    });
+    let pass1 = full_line.replace_all(text, "$1$2[REDACTED]");
+    let pass2 = kv.replace_all(&pass1, "$1$2[REDACTED]");
+    pass2.into_owned()
+}
+
 fn push_recent(record: &log::Record, message: &std::fmt::Arguments) {
-    let mut text = message.to_string();
+    let mut text = redact_sensitive(&message.to_string());
     if text.len() > RECENT_LOG_MESSAGE_CAP {
         let mut cut = RECENT_LOG_MESSAGE_CAP;
         // 不能在多字节字符中间截断
@@ -141,8 +167,39 @@ pub fn install_panic_hook(app_version: &'static str) {
             chrono::Local::now().format("%Y%m%d-%H%M%S%.3f")
         );
         let _ = std::fs::write(dir.join(name), report);
+        // 写完即轮转：debug 命令或循环崩溃不能把磁盘写满
+        rotate_crash_reports(&dir);
         default_hook(info);
     }));
+}
+
+/// 崩溃目录最多保留的报告份数，超出删最旧
+const MAX_CRASH_REPORTS: usize = 20;
+
+/// 崩溃报告轮转：仅保留最新 `MAX_CRASH_REPORTS` 个 `crash-*.txt`
+///
+/// 文件名内嵌 `%Y%m%d-%H%M%S%.3f` 时间戳，字典序即时间序，
+/// 不依赖 mtime（用户拷贝/恢复文件会污染 mtime）
+fn rotate_crash_reports(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (name.starts_with("crash-") && name.ends_with(".txt"))
+                .then_some((name, entry.path()))
+        })
+        .collect();
+    if files.len() <= MAX_CRASH_REPORTS {
+        return;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let excess = files.len() - MAX_CRASH_REPORTS;
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 日志文件所在目录：与项目其余数据一致，统一落到 `<data_dir>/NeriPlayer/logs`
@@ -315,6 +372,12 @@ pub fn build_plugin<R: Runtime>(
         .level_for("rustls", LevelFilter::Warn)
         .level_for("tao", LevelFilter::Warn)
         .level_for("wry", LevelFilter::Warn)
+        // cookie_store 在 Debug 级别会打印非 Secure cookie 的完整值（P0 隐私），
+        // 必须压到 Warn；打码兜底见 redact_sensitive
+        .level_for("cookie_store", LevelFilter::Warn)
+        .level_for("hyper_util", LevelFilter::Info)
+        .level_for("tungstenite", LevelFilter::Info)
+        .level_for("tokio_tungstenite", LevelFilter::Info)
         .timezone_strategy(TimezoneStrategy::UseLocal)
         .max_file_size(MAX_LOG_FILE_SIZE)
         .rotation_strategy(RotationStrategy::KeepSome(KEEP_LOG_FILES))
@@ -328,4 +391,60 @@ pub fn build_plugin<R: Runtime>(
     };
 
     builder.targets(targets).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_sensitive;
+
+    /// Set-Cookie 行必须整段打码，键名保留（cookie_store P0 泄漏路径）
+    #[test]
+    fn set_cookie_lines_are_redacted() {
+        let input = "cookie_store Set-Cookie: __Secure-YNID=abc123; Path=/; HttpOnly";
+        let output = redact_sensitive(input);
+        assert!(output.contains("Set-Cookie: [REDACTED]"), "got: {output}");
+        assert!(!output.contains("abc123"));
+
+        let input = "request header cookie=MUSIC_U=deadbeef; NMTID=xyz";
+        let output = redact_sensitive(input);
+        assert!(!output.contains("deadbeef"), "got: {output}");
+        assert!(!output.contains("xyz"));
+    }
+
+    /// Authorization 值可能含空格（Bearer xxx），必须整行打码
+    #[test]
+    fn authorization_header_is_fully_redacted() {
+        let output = redact_sensitive("Authorization: Bearer eyJhbGciOi.secret.sig");
+        assert!(output.contains("Authorization: [REDACTED]"), "got: {output}");
+        assert!(!output.contains("eyJhbGciOi"));
+    }
+
+    /// 已知敏感键的键值对：值打码、键名保留
+    #[test]
+    fn sensitive_key_values_are_redacted_keeping_key_names() {
+        for (input, key) in [
+            ("got MUSIC_U=0011223344556677", "MUSIC_U"),
+            ("SESSDATA: 8f%2Cxyz refreshed", "SESSDATA"),
+            ("query SAPISID=abcd/efgh done", "SAPISID"),
+            ("token access_token=ya29.a0Af persists", "access_token"),
+            ("jar has __Secure-3PSID=g.a000secret", "__Secure-3PSID"),
+        ] {
+            let output = redact_sensitive(input);
+            assert!(output.contains(key), "key name lost in: {output}");
+            assert!(output.contains("[REDACTED]"), "value kept in: {output}");
+        }
+        assert!(!redact_sensitive("got MUSIC_U=0011223344556677").contains("0011"));
+    }
+
+    /// 普通日志不受影响
+    #[test]
+    fn normal_lines_pass_through_unchanged() {
+        for input in [
+            "player started track id=42 duration=200000",
+            "sync finished: 3 playlists updated",
+            "cookie jar loaded from disk",
+        ] {
+            assert_eq!(redact_sensitive(input), input);
+        }
+    }
 }

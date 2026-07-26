@@ -138,12 +138,32 @@ pub fn clear_crash_reports() -> AppResult<usize> {
     Ok(removed)
 }
 
+/// 后端侧开发者模式校验
+///
+/// debug 命令对任意 webview JS 都是可 invoke 的，只靠前端隐藏入口不构成
+/// 鉴权；崩溃触发类命令必须在后端确认 `devModeEnabled` 已开启。
+fn ensure_dev_mode(app: &tauri::AppHandle) -> AppResult<()> {
+    let enabled = crate::settings::store::load_settings(app)
+        .map(|result| result.settings.dev_mode_enabled)
+        .unwrap_or(false);
+    if enabled {
+        Ok(())
+    } else {
+        Err(AppError::Other(
+            "developer mode is disabled; enable it in settings first".into(),
+        ))
+    }
+}
+
 /// 测试异常触发（对齐 Android 调试页的「测试异常」）
 ///
 /// 用来端到端验证崩溃收集：panic 落盘的报告应出现在崩溃列表里。
-/// 只在调试页可达，且 panic 发生在独立线程/命令线程，不拉垮整个应用。
+/// 后端校验开发者模式后才执行；`panic_command` 的 panic 发生在
+/// `spawn_blocking` 的 tokio 阻塞线程上——panic 钩子照常落盘，JoinError
+/// 被本命令捕获转成 IPC 错误返回，进程存活。
 #[tauri::command]
-pub fn debug_trigger_crash(kind: String) -> AppResult<String> {
+pub async fn debug_trigger_crash(app: tauri::AppHandle, kind: String) -> AppResult<String> {
+    ensure_dev_mode(&app)?;
     match kind.as_str() {
         "handled" => {
             log::error!(
@@ -153,9 +173,22 @@ pub fn debug_trigger_crash(kind: String) -> AppResult<String> {
             Ok("handled error logged".into())
         }
         "panic_command" => {
-            // 命令跑在 tokio 阻塞线程上：panic 被钩子捕获落盘，
-            // 前端收到的是 IPC 错误，应用继续存活
-            panic!("debug test panic (command thread)");
+            // 不能直接在命令上下文 panic：tauri 命令路径没有 catch_unwind，
+            // macOS 上 panic 穿过 objc FFI 边界可能直接 abort 整个进程。
+            // 放进阻塞线程后 panic 只终结该线程，tokio 把它包成 JoinError
+            let joined = tauri::async_runtime::spawn_blocking(|| {
+                panic!("debug test panic (command thread)");
+            })
+            .await;
+            match joined {
+                // panic 必然让 join 失败；走到 Ok 说明 panic 未发生
+                Ok(()) => Err(AppError::Other(
+                    "debug test panic did not fire (unexpected)".into(),
+                )),
+                Err(_) => Err(AppError::Other(
+                    "debug test panic (command thread): captured, process alive".into(),
+                )),
+            }
         }
         "panic_thread" => {
             std::thread::Builder::new()

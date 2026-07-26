@@ -95,6 +95,7 @@ mod encrypted_secret_storage {
     use rand::RngCore;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
     type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -103,11 +104,35 @@ mod encrypted_secret_storage {
     const MAGIC: &[u8; 4] = b"NPS1";
     const APP_SALT: &[u8] = b"moe.ouom.neriplayer.desktop/secret-store/v1";
 
+    // 凭据文件读写全程互斥：8 处 save_auth 调用点可能并发，
+    // 无锁时两笔写互相覆盖会损坏文件（凭据损坏 = 用户被登出且不可恢复）
+    static SECRET_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_store() -> MutexGuard<'static, ()> {
+        SECRET_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn store_dir() -> PathBuf {
-        let mut path = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
-        path.push("NeriPlayer");
-        path.push("secure");
-        path
+        // 测试注入点：单测绝不写真实用户 data_dir
+        #[cfg(test)]
+        {
+            static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
+            return TEST_ROOT
+                .get_or_init(|| {
+                    std::env::temp_dir()
+                        .join(format!("neri-secure-store-test-{}", std::process::id()))
+                })
+                .clone();
+        }
+        #[cfg(not(test))]
+        {
+            let mut path = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
+            path.push("NeriPlayer");
+            path.push("secure");
+            path
+        }
     }
 
     fn secret_path(key: &str) -> PathBuf {
@@ -118,7 +143,16 @@ mod encrypted_secret_storage {
     }
 
     /// 机器标识：跨机器不可复制即可，不要求全球唯一
-    fn machine_identity() -> Vec<u8> {
+    ///
+    /// OnceLock 缓存首次结果：macOS 每次派生都 spawn `ioreg` 太重，
+    /// 且中途一次失败会静默切到 env 回退派生、导致同进程内新旧密文
+    /// 密钥漂移——缓存后单进程内密钥必然一致
+    fn machine_identity() -> &'static [u8] {
+        static IDENTITY: OnceLock<Vec<u8>> = OnceLock::new();
+        IDENTITY.get_or_init(compute_machine_identity)
+    }
+
+    fn compute_machine_identity() -> Vec<u8> {
         #[cfg(target_os = "linux")]
         {
             if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
@@ -155,39 +189,88 @@ mod encrypted_secret_storage {
 
     fn derive_keys() -> ([u8; 32], [u8; 32]) {
         let identity = machine_identity();
-        let enc = Sha256::digest([APP_SALT, b"/enc/", identity.as_slice()].concat());
-        let mac = Sha256::digest([APP_SALT, b"/mac/", identity.as_slice()].concat());
+        let enc = Sha256::digest([APP_SALT, b"/enc/", identity].concat());
+        let mac = Sha256::digest([APP_SALT, b"/mac/", identity].concat());
         (enc.into(), mac.into())
     }
 
     pub(super) fn get(key: &str) -> Option<String> {
-        let blob = std::fs::read(secret_path(key)).ok()?;
-        // 布局: MAGIC(4) | IV(16) | MAC(32) | ciphertext
+        let _guard = lock_store();
+        get_inner(key)
+    }
+
+    fn get_inner(key: &str) -> Option<String> {
+        let path = secret_path(key);
+        let blob = std::fs::read(&path).ok()?;
+        match decode_blob(key, &blob) {
+            Ok((plain, legacy)) => {
+                if legacy {
+                    // 旧格式（MAC 未绑定 key 名）验证通过：透明重写为新格式，
+                    // 之后 blob 改名冒充其它凭据不再可行
+                    let _ = set_inner(key, &plain);
+                }
+                Some(plain)
+            }
+            Err(reason) => {
+                // 校验失败的文件不可再用：隔离现场（保排查线索），
+                // 同时让后续读取直接 miss 走 keyring 迁移路径而非反复失败
+                let quarantined = crate::fsutil::quarantine_corrupt_file(&path);
+                log::warn!(
+                    target: "security",
+                    "加密凭据校验失败({reason}), 文件已隔离: {quarantined:?}",
+                );
+                None
+            }
+        }
+    }
+
+    /// 解码 blob，返回 `(明文, 是否旧格式)`
+    ///
+    /// 布局: MAGIC(4) | IV(16) | MAC(32) | ciphertext。
+    /// 新格式 MAC 覆盖 `key 名 + IV + 密文`；旧格式仅 `IV + 密文`。
+    /// 先按新格式验，失败退回旧格式（向后兼容存量文件）
+    fn decode_blob(key: &str, blob: &[u8]) -> Result<(String, bool), &'static str> {
         if blob.len() < 4 + 16 + 32 + 16 || &blob[..4] != MAGIC {
-            return None;
+            return Err("bad header");
         }
         let (enc_key, mac_key) = derive_keys();
-        let iv: [u8; 16] = blob[4..20].try_into().ok()?;
+        let iv: [u8; 16] = blob[4..20].try_into().map_err(|_| "bad iv")?;
         let stored_mac = &blob[20..52];
         let ciphertext = &blob[52..];
 
-        let mut mac = HmacSha256::new_from_slice(&mac_key).ok()?;
-        mac.update(&iv);
-        mac.update(ciphertext);
-        mac.verify_slice(stored_mac).ok()?;
+        let verify = |bind_key: bool| -> bool {
+            let Ok(mut mac) = HmacSha256::new_from_slice(&mac_key) else {
+                return false;
+            };
+            if bind_key {
+                mac.update(key.as_bytes());
+            }
+            mac.update(&iv);
+            mac.update(ciphertext);
+            mac.verify_slice(stored_mac).is_ok()
+        };
+        let legacy = if verify(true) {
+            false
+        } else if verify(false) {
+            true
+        } else {
+            return Err("mac mismatch");
+        };
 
         let mut buffer = ciphertext.to_vec();
         let plain = Aes256CbcDec::new(&enc_key.into(), &iv.into())
             .decrypt_padded_mut::<Pkcs7>(&mut buffer)
-            .ok()?;
-        String::from_utf8(plain.to_vec()).ok()
+            .map_err(|_| "decrypt failed")?;
+        let plain = String::from_utf8(plain.to_vec()).map_err(|_| "invalid utf8")?;
+        Ok((plain, legacy))
     }
 
     pub(super) fn set(key: &str, value: &str) -> bool {
-        let dir = store_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return false;
-        }
+        let _guard = lock_store();
+        set_inner(key, value)
+    }
+
+    fn set_inner(key: &str, value: &str) -> bool {
         let (enc_key, mac_key) = derive_keys();
         let mut iv = [0_u8; 16];
         rand::thread_rng().fill_bytes(&mut iv);
@@ -202,6 +285,8 @@ mod encrypted_secret_storage {
         let Ok(mut mac) = HmacSha256::new_from_slice(&mac_key) else {
             return false;
         };
+        // 新格式：MAC 同时覆盖 key 名，blob 改名后无法冒充其它凭据
+        mac.update(key.as_bytes());
         mac.update(&iv);
         mac.update(ciphertext);
         let tag = mac.finalize().into_bytes();
@@ -212,19 +297,13 @@ mod encrypted_secret_storage {
         blob.extend_from_slice(&tag);
         blob.extend_from_slice(ciphertext);
 
-        let path = secret_path(key);
-        if std::fs::write(&path, blob).is_err() {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        true
+        // 原子写 + 以 0600 创建：消除旧实现「0644 写入后再 chmod」的
+        // 明文权限窗口，也消除崩溃/断电半写损坏（凭据损坏 = 不可恢复登出）
+        crate::fsutil::atomic_write_private(secret_path(key), &blob).is_ok()
     }
 
     pub(super) fn delete(key: &str) -> bool {
+        let _guard = lock_store();
         match std::fs::remove_file(secret_path(key)) {
             Ok(()) => true,
             Err(error) => error.kind() == std::io::ErrorKind::NotFound,
@@ -272,6 +351,79 @@ mod encrypted_secret_storage {
             assert!(!haystack.contains("super-secret"), "密文文件里不得有明文片段");
             assert!(super::delete(key));
         }
+
+        /// 按旧格式（MAC 不含 key 名）手工构造 blob，模拟升级前的存量文件
+        fn write_legacy_blob(key: &str, value: &str) {
+            use super::{Aes256CbcEnc, HmacSha256, MAGIC};
+            use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+            use hmac::Mac;
+            use rand::RngCore;
+
+            let (enc_key, mac_key) = super::derive_keys();
+            let mut iv = [0_u8; 16];
+            rand::thread_rng().fill_bytes(&mut iv);
+            let mut buffer = vec![0_u8; value.len() + 16];
+            let ciphertext = Aes256CbcEnc::new(&enc_key.into(), &iv.into())
+                .encrypt_padded_b2b_mut::<Pkcs7>(value.as_bytes(), &mut buffer)
+                .unwrap();
+            let mut mac = HmacSha256::new_from_slice(&mac_key).unwrap();
+            mac.update(&iv);
+            mac.update(ciphertext);
+            let tag = mac.finalize().into_bytes();
+            let mut blob = Vec::new();
+            blob.extend_from_slice(MAGIC);
+            blob.extend_from_slice(&iv);
+            blob.extend_from_slice(&tag);
+            blob.extend_from_slice(ciphertext);
+            crate::fsutil::atomic_write_private(super::secret_path(key), &blob).unwrap();
+        }
+
+        /// 旧格式 blob 可读，且读取后透明升级为新格式（key 参与 MAC）
+        #[test]
+        fn legacy_blob_is_readable_and_transparently_upgraded() {
+            let key = "test-legacy-upgrade";
+            write_legacy_blob(key, "legacy-secret");
+            assert_eq!(super::get(key).as_deref(), Some("legacy-secret"));
+
+            let blob = std::fs::read(super::secret_path(key)).unwrap();
+            let (plain, legacy) = super::decode_blob(key, &blob).expect("upgraded blob decodes");
+            assert_eq!(plain, "legacy-secret");
+            assert!(!legacy, "读取后必须已重写为新格式");
+            assert!(super::delete(key));
+        }
+
+        /// 新格式 MAC 绑定 key 名：blob 拷到别的 key 路径读不出且被隔离
+        #[test]
+        fn renamed_blob_cannot_impersonate_another_key() {
+            let key_src = "test-impersonate-src";
+            let key_dst = "test-impersonate-dst";
+            assert!(super::set(key_src, "value-src"));
+            std::fs::copy(super::secret_path(key_src), super::secret_path(key_dst)).unwrap();
+
+            assert_eq!(super::get(key_dst), None, "改名冒充必须拒收");
+            assert!(
+                !super::secret_path(key_dst).exists(),
+                "校验失败的文件必须被隔离"
+            );
+            assert_eq!(super::get(key_src).as_deref(), Some("value-src"));
+            assert!(super::delete(key_src));
+        }
+
+        /// 落盘文件必须以 0600 原子创建，不存在权限宽松窗口
+        #[cfg(unix)]
+        #[test]
+        fn secret_file_is_created_private() {
+            use std::os::unix::fs::PermissionsExt;
+            let key = "test-private-mode";
+            assert!(super::set(key, "v"));
+            let mode = std::fs::metadata(super::secret_path(key))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+            assert!(super::delete(key));
+        }
     }
 }
 
@@ -279,14 +431,6 @@ mod encrypted_secret_storage {
 fn get_keyring_secret(key: &str) -> Option<String> {
     let entry = keyring::Entry::new(SERVICE_NAME, key).ok()?;
     entry.get_password().ok()
-}
-
-#[cfg(not(debug_assertions))]
-fn set_keyring_secret(key: &str, value: &str) -> bool {
-    let Ok(entry) = keyring::Entry::new(SERVICE_NAME, key) else {
-        return false;
-    };
-    entry.set_password(value).is_ok()
 }
 
 #[cfg(not(debug_assertions))]
