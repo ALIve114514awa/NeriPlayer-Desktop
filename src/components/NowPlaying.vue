@@ -1610,6 +1610,31 @@ async function openCurrentAlbum() {
   }
 }
 
+async function openCurrentArtist() {
+  const songId = currentNeteaseSongNumericId.value
+  if (!songId) return
+  try {
+    const detail = await invoke<any>('get_netease_song_detail', { songId })
+    const song = detail?.songs?.[0]
+    const artist = (song?.ar || []).find((a: any) => a?.id)
+    if (!artist?.id) {
+      toast.error(t('player.not_available'))
+      return
+    }
+    hideMoreSheet()
+    // 先收起正在播放页，再跳转歌手页，避免详情盖在 NP 下面
+    emit('collapse')
+    await router.push({
+      name: 'netease-artist',
+      params: { id: String(artist.id) },
+      query: { name: artist.name || primaryArtistName.value },
+    })
+  } catch (e) {
+    log.error('Open artist failed:', e)
+    toast.error(String(e))
+  }
+}
+
 function openListenTogetherFromMore() {
   hideMoreSheet()
   if (moreSheetSwitchTimer) clearTimeout(moreSheetSwitchTimer)
@@ -1653,6 +1678,14 @@ const albumName = computed(() => {
   return displayAlbum(album)
 })
 const canViewNeteaseAlbum = computed(() => currentSource.value === 'netease' && !!albumName.value && !!currentNeteaseSongNumericId.value)
+
+// 主歌手名 (展示用, 多歌手取第一个)
+const primaryArtistName = computed(() => {
+  const artist = player.currentTrack?.artist || ''
+  return artist.split(/\s*[/,、·]\s*/)[0] || ''
+})
+const canViewNeteaseArtist = computed(() =>
+  currentSource.value === 'netease' && !!primaryArtistName.value && !!currentNeteaseSongNumericId.value)
 
 // 进度条下方音质信息（不展示 Local / download 占位）
 // 纸面规格: 最高/极高/杜比… + 可选编解码; 不展示 kbps 数字
@@ -2053,7 +2086,7 @@ const sliderActiveColor = computed(() => {
           <button class="play-btn play-btn--transport" :class="{ 'play-btn--switching': isTrackSwitchAnimating }" @click="handleTogglePlayPause()" :disabled="player.isLoadingAudio">
             <transition name="play-icon">
               <span
-                v-if="player.isLoadingAudio"
+                v-if="player.isLoadingAudioSlow"
                 class="material-symbols-rounded spinning play-icon-inner"
                 key="loading"
               >progress_activity</span>
@@ -2373,6 +2406,14 @@ const sliderActiveColor = computed(() => {
               <span class="material-symbols-rounded">library_music</span>
               <div class="np-more-list-info">
                 <span class="np-more-list-headline">{{ t('player.view_album', { name: albumName }) }}</span>
+              </div>
+            </button>
+
+            <!-- 查看歌手（对齐 Android：网易云来源显示） -->
+            <button v-if="canViewNeteaseArtist" class="np-more-list-item" @click="openCurrentArtist">
+              <span class="material-symbols-rounded">artist</span>
+              <div class="np-more-list-info">
+                <span class="np-more-list-headline">{{ t('player.view_artist', { name: primaryArtistName }) }}</span>
               </div>
             </button>
 

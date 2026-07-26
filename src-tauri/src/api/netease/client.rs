@@ -335,6 +335,38 @@ impl NeteaseClient {
         })
     }
 
+    /// 歌手头部信息 (对齐 Android getArtistDetail: /api/artist/head/info/get)
+    pub async fn get_artist_detail(&self, artist_id: u64) -> AppResult<Value> {
+        let resp = self
+            .send_with_fallback(|client| {
+                client
+                    .post(format!("{}/api/artist/head/info/get", BASE_URL))
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://music.163.com")
+                    .form(&[("id", artist_id.to_string())])
+            })
+            .await?;
+        parse_json_response(resp, "netease artist detail").await
+    }
+
+    /// 歌手专辑列表 (对齐 Android getArtistAlbums: /api/artist/albums/{id})
+    pub async fn get_artist_albums(&self, artist_id: u64, offset: u32, limit: u32) -> AppResult<Value> {
+        let resp = self
+            .send_with_fallback(|client| {
+                client
+                    .post(format!("{}/api/artist/albums/{}", BASE_URL, artist_id))
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", "https://music.163.com")
+                    .form(&[
+                        ("limit", limit.to_string()),
+                        ("offset", offset.to_string()),
+                        ("total", "true".into()),
+                    ])
+            })
+            .await?;
+        parse_json_response(resp, "netease artist albums").await
+    }
+
     /// 歌手全部歌曲 (对齐 Android getArtistSongs: /api/v1/artist/songs)
     pub async fn get_artist_songs(
         &self,

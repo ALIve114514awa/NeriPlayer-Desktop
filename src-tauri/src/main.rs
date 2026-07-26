@@ -406,6 +406,8 @@ fn main() {
             recommend_cmd::like_song,
             recommend_cmd::get_liked_song_ids,
             recommend_cmd::get_album_detail,
+            recommend_cmd::get_netease_artist_detail,
+            recommend_cmd::get_netease_artist_albums,
             recommend_cmd::get_netease_artist_songs,
             recommend_cmd::get_netease_song_detail,
             recommend_cmd::get_user_stared_albums,

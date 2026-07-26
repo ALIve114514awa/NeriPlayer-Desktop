@@ -23,8 +23,9 @@ import {
   writePlaylistDetailCache,
 } from '@/modules/library/playlistDetailCache'
 import { formatTrackDuration as formatDuration } from '@/utils/timeFormat'
+import { resolveNeteaseCover } from '@/utils/neteaseCover'
 
-const props = defineProps<{ isAlbum?: boolean; isArtist?: boolean }>()
+const props = defineProps<{ isAlbum?: boolean }>()
 const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
@@ -125,38 +126,11 @@ function formatTotalDuration(ms: number): string {
   return `${totalMin}${t('common.minute_short')}`
 }
 
-/** 网易云封面字段兼容：picUrl / blurPicUrl / coverImgUrl / pic 数字 ID */
-function resolveNeteaseCover(...candidates: unknown[]): string {
-  for (const raw of candidates) {
-    if (raw == null) continue
-    if (typeof raw === 'string') {
-      const value = raw.trim()
-      if (!value) continue
-      if (value.startsWith('http://') || value.startsWith('https://') || value.startsWith('//')) {
-        return value.startsWith('//') ? `https:${value}` : value
-      }
-      // 少数接口只返回 pic 哈希/数字串
-      if (/^[A-Za-z0-9_-]+$/.test(value) && value.length >= 8) {
-        return `https://p1.music.126.net/${value}.jpg`
-      }
-      continue
-    }
-    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
-      // 纯数字 pic 字段无法稳定还原 URL，跳过
-      continue
-    }
-  }
-  return ''
-}
-
 async function loadDetail() {
   const id = Number(route.params.id)
   if (!id) return
 
-  const cacheKey = playlistDetailCacheKey(
-    props.isArtist ? 'netease-artist' : props.isAlbum ? 'netease-album' : 'netease-playlist',
-    id,
-  )
+  const cacheKey = playlistDetailCacheKey(props.isAlbum ? 'netease-album' : 'netease-playlist', id)
   const cached = readPlaylistDetailCache<NeteaseDetailCache>(cacheKey)
   if (cached) {
     applyDetailCache(cached)
@@ -167,27 +141,7 @@ async function loadDetail() {
   error.value = null
 
   try {
-    if (props.isArtist) {
-      // 歌手模式: 曲目从歌手热门歌曲接口取, 名称/封面来自收藏项 (经路由 query 传入)
-      const data = await invoke<any>('get_netease_artist_songs', { artistId: id })
-      const songs = data?.songs || []
-      playlistName.value = String(route.query.name || '') || playlistName.value
-      description.value = ''
-      creator.value = ''
-      tracks.value = songs.map((s: any) => ({
-        id: `netease:${s.id}`,
-        title: s.name || '',
-        artist: (s.ar || []).map((a: any) => a.name).join(', '),
-        album: s.al?.name || '',
-        durationMs: s.dt || 0,
-        coverUrl: resolveNeteaseCover(s.al?.picUrl, s.al?.pic),
-        audioUrl: '',
-      }))
-      trackCount.value = tracks.value.length
-      coverUrl.value = String(route.query.cover || '')
-        || tracks.value.find(track => track.coverUrl)?.coverUrl
-        || ''
-    } else if (props.isAlbum) {
+    if (props.isAlbum) {
       const data = await invoke<any>('get_album_detail', { albumId: id })
       const album = data?.album || {}
       playlistName.value = album.name || ''

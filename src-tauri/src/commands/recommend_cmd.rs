@@ -275,6 +275,51 @@ pub async fn get_netease_playlist_detail(
     Ok(detail)
 }
 
+/// 歌手头部信息 (名称/封面/头像/别名/简介/统计)
+#[tauri::command]
+pub async fn get_netease_artist_detail(
+    artist_id: u64,
+    state: State<'_, AppState>,
+) -> AppResult<Value> {
+    state.netease().get_artist_detail(artist_id).await
+}
+
+/// 歌手专辑最多自动翻页数 (60 张/页)
+const NETEASE_ARTIST_ALBUM_MAX_PAGES: usize = 10;
+
+/// 歌手全部专辑, 自动翻页合并
+#[tauri::command]
+pub async fn get_netease_artist_albums(
+    artist_id: u64,
+    state: State<'_, AppState>,
+) -> AppResult<Value> {
+    let client = state.netease();
+    let page_size: u32 = 60;
+    let mut all_albums: Vec<Value> = Vec::new();
+    let mut offset: u32 = 0;
+
+    for page_index in 0..NETEASE_ARTIST_ALBUM_MAX_PAGES {
+        let page = match client.get_artist_albums(artist_id, offset, page_size).await {
+            Ok(page) => page,
+            Err(e) if page_index == 0 => return Err(e),
+            Err(e) => {
+                log::warn!(target: "recommend", "get_artist_albums page failed: {}", e);
+                break;
+            }
+        };
+        let albums = page["hotAlbums"].as_array().cloned().unwrap_or_default();
+        let count = albums.len();
+        all_albums.extend(albums);
+        let more = page["more"].as_bool().unwrap_or(false);
+        if !more || count == 0 {
+            break;
+        }
+        offset += count as u32;
+    }
+
+    Ok(serde_json::json!({ "hotAlbums": all_albums }))
+}
+
 /// 歌手歌曲最多自动翻页数 (100 首/页)
 const NETEASE_ARTIST_MAX_PAGES: usize = 20;
 
