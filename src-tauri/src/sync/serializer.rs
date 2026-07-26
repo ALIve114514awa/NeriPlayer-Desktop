@@ -23,6 +23,15 @@ use crate::error::{AppError, AppResult};
 use super::models::*;
 use super::proto_models::*;
 
+/// 压缩正文上限，与 Android `MAX_COMPRESSED_BYTES` 一致
+const MAX_COMPRESSED_BYTES: usize = 12 * 1024 * 1024;
+
+/// 解压后上限，与 Android `MAX_DECOMPRESSED_BYTES` 一致
+///
+/// 没有这个护栏，损坏或恶意构造的 GZIP 能把几百 KB 膨胀成几 GB，
+/// 一次同步就把内存吃光。`read_to_end` 本身不设上限，必须靠 `take` 截断。
+const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+
 /// 返回省流模式使用的文件名
 pub fn get_filename(data_saver: bool) -> &'static str {
     if data_saver { "backup.bin" } else { "backup.json" }
@@ -60,11 +69,25 @@ fn looks_like_json(bytes: &[u8]) -> bool {
 
 /// 反序列化省流模式数据（GZIP -> ProtoBuf -> SyncData）
 pub fn deserialize_compressed(compressed: &[u8]) -> AppResult<SyncData> {
-    // GZIP 解压
-    let mut decoder = GzDecoder::new(compressed);
+    if compressed.len() > MAX_COMPRESSED_BYTES {
+        return Err(AppError::Other(format!(
+            "compressed backup is too large: {} bytes",
+            compressed.len()
+        )));
+    }
+
+    // GZIP 解压；多读 1 字节用于判定是否越界，避免把超限数据当成正常内容
     let mut proto_bytes = Vec::new();
-    decoder.read_to_end(&mut proto_bytes)
+    GzDecoder::new(compressed)
+        .take(MAX_DECOMPRESSED_BYTES + 1)
+        .read_to_end(&mut proto_bytes)
         .map_err(|e| AppError::Other(format!("GZIP decompress: {}", e)))?;
+    if proto_bytes.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(AppError::Other(format!(
+            "decompressed backup exceeds {} bytes",
+            MAX_DECOMPRESSED_BYTES
+        )));
+    }
 
     let current = ProtoSyncData::decode(&proto_bytes[..]).map(|proto| proto_to_sync_data(&proto));
     match current {
@@ -876,6 +899,22 @@ mod compressed_contract_tests {
         assert!(deserialize(&[0x1F, 0x8B, 0x08, 0x00, 0xDE, 0xAD]).is_err(), "坏 GZIP");
         assert!(deserialize(b"{not json at all").is_err(), "坏 JSON");
         assert!(deserialize(b"!!!not base64!!!").is_err(), "坏 Base64");
+    }
+
+    /// 压缩炸弹必须被挡住，而不是把内存吃光
+    ///
+    /// Android 有 MAX_DECOMPRESSED_BYTES，桌面此前没有等价护栏：
+    /// read_to_end 不设上限，几百 KB 的 GZIP 能膨胀到几 GB。
+    #[test]
+    fn decompression_bomb_is_rejected_by_the_size_guard() {
+        // 17 MB 的零字节压完只有几十 KB，正好越过 16 MB 上限
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![0_u8; 17 * 1024 * 1024]).unwrap();
+        let bomb = encoder.finish().unwrap();
+        assert!(bomb.len() < 128 * 1024, "构造前提：压缩后应远小于解压后");
+
+        let error = deserialize(&bomb).unwrap_err().to_string();
+        assert!(error.contains("exceeds"), "{error}");
     }
 
     /// 去掉 Base64 层后体积必须真的变小
