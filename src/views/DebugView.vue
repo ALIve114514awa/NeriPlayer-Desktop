@@ -53,31 +53,27 @@ const webviewVersion = (() => {
 
 async function testNetease() {
   probes.value.netease = 'testing'
-  try {
-    await invoke('get_netease_song_url', { songId: 1, quality: 'standard' })
-    probes.value.netease = 'success'
-  } catch {
-    probes.value.netease = 'success'
-  }
+  probes.value.netease = await probePlatform('netease')
 }
 
 async function testBilibili() {
   probes.value.bilibili = 'testing'
-  try {
-    await invoke('get_bili_audio_url', { bvid: 'BV1GJ411x7h7', avid: null, cid: null })
-    probes.value.bilibili = 'success'
-  } catch {
-    probes.value.bilibili = 'failed'
-  }
+  probes.value.bilibili = await probePlatform('bilibili')
 }
 
 async function testYouTube() {
   probes.value.youtube = 'testing'
+  probes.value.youtube = await probePlatform('youtube')
+}
+
+// 探针语义：收到任何 HTTP 响应都算连通，只有传输层失败才算不通。
+// 之前调「取具体视频播放地址」，视频下架/缺参这类业务失败被误报成不通
+async function probePlatform(platform: string): Promise<'success' | 'failed'> {
   try {
-    await invoke('get_youtube_audio_url', { videoId: 'dQw4w9WgXcQ' })
-    probes.value.youtube = 'success'
+    const reachable = await invoke<boolean>('probe_platform_connectivity', { platform })
+    return reachable ? 'success' : 'failed'
   } catch {
-    probes.value.youtube = 'failed'
+    return 'failed'
   }
 }
 

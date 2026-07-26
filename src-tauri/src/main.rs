@@ -314,6 +314,7 @@ fn main() {
             settings_cmd::save_file_bytes,
             settings_cmd::set_bypass_proxy,
             settings_cmd::get_build_info,
+            settings_cmd::probe_platform_connectivity,
             storage_cmd::get_storage_usage,
             storage_cmd::clear_storage_cache,
             auth_cmd::login_netease,

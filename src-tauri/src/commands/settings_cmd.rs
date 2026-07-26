@@ -6,6 +6,36 @@ use crate::settings::store::{self, AppSettings, SettingsLoadResult};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
+/// 平台连通性探针
+///
+/// 语义只测传输层：收到任何 HTTP 响应（哪怕 401/业务错误码）都算连通，
+/// 只有连接建立失败才算不通。此前探针调的是「取某个具体视频的播放地址」，
+/// 视频下架/缺 cid/地区限制这类业务失败全被误报成「不能连通」。
+/// 走与真实请求相同的 FallbackHttp，代理兜底的可达性也如实反映。
+#[tauri::command]
+pub async fn probe_platform_connectivity(
+    state: State<'_, AppState>,
+    platform: String,
+) -> AppResult<bool> {
+    // 轻量端点：不依赖特定内容存在、未登录也有响应
+    let url = match platform.as_str() {
+        "netease" => "https://music.163.com/api/pub/search/keyword/get",
+        "bilibili" => "https://api.bilibili.com/x/web-interface/nav",
+        "youtube" => "https://www.youtube.com/generate_204",
+        other => {
+            return Err(AppError::Api(format!("unknown probe platform: {other}")));
+        }
+    };
+    let transport = state.transport("probe");
+    match transport.send(|client| client.get(url)).await {
+        Ok(_response) => Ok(true),
+        Err(error) => {
+            log::warn!(target: "probe", "{platform} unreachable: {error}");
+            Ok(false)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> AppResult<SettingsLoadResult> {
     let loaded = store::load_settings(&app)?;
