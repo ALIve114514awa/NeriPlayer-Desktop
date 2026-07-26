@@ -26,6 +26,9 @@ use super::proto_models::*;
 /// 压缩正文上限，与 Android `MAX_COMPRESSED_BYTES` 一致
 const MAX_COMPRESSED_BYTES: usize = 12 * 1024 * 1024;
 
+/// JSON 正文上限，与 Android `MAX_JSON_BYTES` 一致
+const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+
 /// 解压后上限，与 Android `MAX_DECOMPRESSED_BYTES` 一致
 ///
 /// 没有这个护栏，损坏或恶意构造的 GZIP 能把几百 KB 膨胀成几 GB，
@@ -51,6 +54,26 @@ pub fn serialize_compressed(data: &SyncData) -> AppResult<Vec<u8>> {
         .map_err(|e| AppError::Other(format!("GZIP finish: {}", e)))?;
 
     Ok(compressed)
+}
+
+/// 远端正文体积护栏，按内容类型选上限（对齐 Android `ensureRemoteContentSize`）
+///
+/// 放在 deserialize 入口而不是各传输层：GitHub、WebDAV 以及以后新增的通道
+/// 都会自动受保护，不必每处各写一遍、也就不会漏掉某一处。
+pub fn ensure_remote_content_size(content: &[u8]) -> AppResult<()> {
+    let max = if looks_like_json(content) {
+        MAX_JSON_BYTES
+    } else {
+        MAX_COMPRESSED_BYTES
+    };
+    if content.len() > max {
+        return Err(AppError::Other(format!(
+            "remote sync data is too large: {} bytes (limit {})",
+            content.len(),
+            max
+        )));
+    }
+    Ok(())
 }
 
 /// 原始 GZIP 字节以魔数 0x1F 0x8B 开头，用于区分新 raw 格式与历史文本格式
@@ -128,6 +151,7 @@ pub fn serialize(data: &SyncData, data_saver: bool) -> AppResult<Vec<u8>> {
 /// 不看文件后缀：后缀只说明「本端打算写成什么」，而远端那份可能是对端
 /// 旧版本写的，甚至是用户手动放上去的。按内容判别才能真正做到读旧读新都不炸。
 pub fn deserialize(content: &[u8]) -> AppResult<SyncData> {
+    ensure_remote_content_size(content)?;
     if looks_like_gzip(content) {
         return deserialize_compressed(content);
     }
@@ -915,6 +939,28 @@ mod compressed_contract_tests {
 
         let error = deserialize(&bomb).unwrap_err().to_string();
         assert!(error.contains("exceeds"), "{error}");
+    }
+
+    /// 超大正文按内容类型分别设限（对齐 Android ensureRemoteContentSize）
+    #[test]
+    fn oversized_payloads_are_rejected_by_content_type() {
+        // JSON 上限 8 MB
+        let mut huge_json = b"{\"playlists\":[".to_vec();
+        huge_json.resize(MAX_JSON_BYTES + 1, b' ');
+        let error = deserialize(&huge_json).unwrap_err().to_string();
+        assert!(error.contains("too large"), "{error}");
+
+        // 非 JSON 走压缩档，上限 12 MB
+        let mut huge_binary = vec![0x1F, 0x8B];
+        huge_binary.resize(MAX_COMPRESSED_BYTES + 1, 0);
+        let error = deserialize(&huge_binary).unwrap_err().to_string();
+        assert!(error.contains("too large"), "{error}");
+
+        // 8~12 MB 之间的二进制不该被 JSON 档误伤
+        let mut mid_binary = vec![0x1F, 0x8B];
+        mid_binary.resize(MAX_JSON_BYTES + 1, 0);
+        let error = deserialize(&mid_binary).unwrap_err().to_string();
+        assert!(!error.contains("too large"), "不应按 JSON 档拒收: {error}");
     }
 
     /// 去掉 Base64 层后体积必须真的变小

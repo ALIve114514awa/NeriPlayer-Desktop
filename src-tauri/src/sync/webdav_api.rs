@@ -1,6 +1,12 @@
 // WebDAV API 客户端
 use reqwest::Client;
 use sha2::{Sha256, Digest};
+
+/// WebDAV 响应正文上限，取序列化层两档限制中较大的一档
+///
+/// 具体格式的精确上限由 `serializer::ensure_remote_content_size` 判定；
+/// 这里只负责不让一个超大响应在到达那一步之前就把内存吃满。
+const MAX_REMOTE_BODY_BYTES: u64 = 12 * 1024 * 1024;
 use crate::error::{AppError, AppResult};
 
 pub struct WebDavApiClient {
@@ -77,8 +83,24 @@ impl WebDavApiClient {
             return Err(AppError::Api(format!("WebDAV GET failed ({})", status)));
         }
 
+        // 服务端声明的体积就已超限时直接拒收，不必先把整个响应读进内存
+        if let Some(declared) = resp.content_length() {
+            if declared > MAX_REMOTE_BODY_BYTES {
+                return Err(AppError::Api(format!(
+                    "WebDAV backup is too large: {declared} bytes"
+                )));
+            }
+        }
+
         // 按字节读：省流备份是 GZIP 二进制，走 text() 会被 UTF-8 转换毁掉
         let content = resp.bytes().await?.to_vec();
+        // Content-Length 可缺失或撒谎，落地后再判一次
+        if content.len() as u64 > MAX_REMOTE_BODY_BYTES {
+            return Err(AppError::Api(format!(
+                "WebDAV backup is too large: {} bytes",
+                content.len()
+            )));
+        }
         let fingerprint = Self::sha256_fingerprint(&content);
         Ok(Some((content, fingerprint)))
     }
