@@ -244,7 +244,7 @@ defineExpose({
         <button class="mp-play-btn" @click="player.togglePlayPause()" :disabled="player.isLoadingAudio">
           <transition name="mp-icon">
             <span
-              v-if="player.isLoadingAudio"
+              v-if="player.isLoadingAudioSlow"
               class="material-symbols-rounded mp-icon-abs spinning"
               key="loading"
             >progress_activity</span>

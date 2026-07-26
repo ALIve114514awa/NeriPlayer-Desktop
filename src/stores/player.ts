@@ -330,6 +330,25 @@ export const usePlayerStore = defineStore('player', () => {
   const playError = ref<string | null>(null)
   // 是否正在加载音频（下载/解码中）
   const isLoadingAudio = ref(false)
+  // 加载持续超过 1s 才置真, 供播放按钮转圈; 短加载不闪 spinner
+  const isLoadingAudioSlow = ref(false)
+  let loadingSpinnerTimer: number | null = null
+  watch(isLoadingAudio, (loading) => {
+    if (loading) {
+      if (loadingSpinnerTimer === null) {
+        loadingSpinnerTimer = window.setTimeout(() => {
+          loadingSpinnerTimer = null
+          isLoadingAudioSlow.value = isLoadingAudio.value
+        }, 1000)
+      }
+    } else {
+      if (loadingSpinnerTimer !== null) {
+        clearTimeout(loadingSpinnerTimer)
+        loadingSpinnerTimer = null
+      }
+      isLoadingAudioSlow.value = false
+    }
+  })
   // 是否存在可见播放上下文；恢复态由 _needsReload 标记后端尚未装载
   const hasPlaybackSession = ref(false)
 
@@ -2350,7 +2369,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   return {
     isPlaying, currentTrack, positionMs, durationMs, queue, queueIndex,
-    repeatMode, shuffleEnabled, volume, lyrics, playError, isLoadingAudio,
+    repeatMode, shuffleEnabled, volume, lyrics, playError, isLoadingAudio, isLoadingAudioSlow,
     hasPlaybackSession,
     audioLevel, beatImpulse, audioInfo, isPlayingFromDownload, isPlayingFromCache,
     lastCommandSource, lastSeekCommand, isRemoteSyncGuardActive,
