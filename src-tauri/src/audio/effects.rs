@@ -338,6 +338,8 @@ const NORMALIZE_REDUCTION_SECONDS: f64 = 0.25;
 const NORMALIZE_INCREASE_SECONDS: f64 = 4.0;
 /// 积分统计的观测块：每块重算一次目标增益（48kHz 立体声约 43ms）
 const NORMALIZE_BLOCK_SAMPLES: usize = 4_096;
+/// 起播预热窗：先测后放，避免响曲以全响度起头再被压下
+const NORMALIZE_WARMUP_SECONDS: f64 = 0.2;
 
 /// 整轨积分归一化器状态
 #[derive(Default)]
@@ -364,6 +366,64 @@ impl IntegratedNormalizer {
         }
     }
 
+    /// 预热期只累计统计，不产生增益决策
+    fn observe(&mut self, sample: f32) {
+        let magnitude = f64::from(sample).abs();
+        self.block_sum_squares += magnitude * magnitude;
+        self.block_peak = self.block_peak.max(magnitude);
+        self.block_samples += 1;
+        if self.block_samples >= NORMALIZE_BLOCK_SAMPLES {
+            self.fold_block();
+        }
+    }
+
+    /// 预热结束：用已观测的统计直接定初始增益，当前增益与目标同时落位
+    ///
+    /// 没有这一步，响曲会以 1.0 全响度开播、43ms 后才被 0.25s 时间常数
+    /// 压下来——「开头特别响然后忽然压下去」。预热样本先测后放，
+    /// 第一个可闻样本就是正确响度。
+    fn seed_from_observations(&mut self, total_static_gain: f64) {
+        // 把不足一块的残余也算进去，短预热窗不浪费
+        if self.block_samples > 0 {
+            self.fold_block();
+        }
+        if self.analyzed_samples > 0 {
+            self.recompute_target(total_static_gain);
+            self.current_gain = self.target_gain;
+        }
+    }
+
+    fn fold_block(&mut self) {
+        let block_rms = (self.block_sum_squares / self.block_samples.max(1) as f64).sqrt();
+        if block_rms >= NORMALIZE_SILENCE_GATE_RMS {
+            self.accumulated_sum_squares += self.block_sum_squares;
+            self.analyzed_samples += self.block_samples as u64;
+            self.analyzed_peak = self.analyzed_peak.max(self.block_peak);
+        }
+        self.block_sum_squares = 0.0;
+        self.block_peak = 0.0;
+        self.block_samples = 0;
+    }
+
+    fn recompute_target(&mut self, total_static_gain: f64) {
+        if self.analyzed_samples == 0 {
+            return;
+        }
+        let integrated_rms =
+            (self.accumulated_sum_squares / self.analyzed_samples as f64).sqrt();
+        let rms_gain = (NORMALIZE_TARGET_RMS / integrated_rms)
+            .clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
+        let peak_gain = if self.analyzed_peak > 0.0 {
+            NORMALIZE_PEAK_CEILING
+                / (self.analyzed_peak * total_static_gain.max(f64::MIN_POSITIVE))
+        } else {
+            NORMALIZE_MAX_GAIN
+        };
+        self.target_gain = rms_gain
+            .min(peak_gain)
+            .clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
+    }
+
     /// 推进一个样本，返回应施加的归一化增益
     ///
     /// `total_static_gain` 是用户手动响度档的线性增益，峰值封顶要按
@@ -375,28 +435,11 @@ impl IntegratedNormalizer {
         self.block_samples += 1;
 
         if self.block_samples >= NORMALIZE_BLOCK_SAMPLES {
-            let block_rms = (self.block_sum_squares / self.block_samples as f64).sqrt();
-            if block_rms >= NORMALIZE_SILENCE_GATE_RMS {
-                self.accumulated_sum_squares += self.block_sum_squares;
-                self.analyzed_samples += self.block_samples as u64;
-                self.analyzed_peak = self.analyzed_peak.max(self.block_peak);
-
-                let integrated_rms =
-                    (self.accumulated_sum_squares / self.analyzed_samples as f64).sqrt();
-                let rms_gain = (NORMALIZE_TARGET_RMS / integrated_rms)
-                    .clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
-                let peak_gain = if self.analyzed_peak > 0.0 {
-                    NORMALIZE_PEAK_CEILING / (self.analyzed_peak * total_static_gain.max(f64::MIN_POSITIVE))
-                } else {
-                    NORMALIZE_MAX_GAIN
-                };
-                self.target_gain = rms_gain
-                    .min(peak_gain)
-                    .clamp(NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
+            let had = self.analyzed_samples;
+            self.fold_block();
+            if self.analyzed_samples > had {
+                self.recompute_target(total_static_gain);
             }
-            self.block_sum_squares = 0.0;
-            self.block_peak = 0.0;
-            self.block_samples = 0;
         }
 
         // 非对称逐样本平滑：降快（防爆音）升慢（收敛不突兀）
@@ -429,6 +472,9 @@ pub struct LoudnessSource<S> {
     sample_counter: usize,
     normalize_enabled: bool,
     normalizer: IntegratedNormalizer,
+    /// 预热窗：起播先测后放，第一个可闻样本就是正确响度
+    warmup_queue: std::collections::VecDeque<f32>,
+    warmup_pending: usize,
 }
 
 impl<S> LoudnessSource<S>
@@ -445,6 +491,14 @@ where
         };
         let gain = mb_to_linear(gain_mb);
 
+        // 预热窗 200ms：解码远快于实时，起播只多花几毫秒；
+        // 未开均衡时窗为 0，路径完全不变
+        let warmup_pending = if normalize_enabled {
+            (f64::from(sample_rate) * f64::from(channels.max(1)) * NORMALIZE_WARMUP_SECONDS)
+                as usize
+        } else {
+            0
+        };
         Self {
             inner: source,
             params,
@@ -455,6 +509,8 @@ where
             sample_counter: 0,
             normalize_enabled,
             normalizer: IntegratedNormalizer::new(),
+            warmup_queue: std::collections::VecDeque::new(),
+            warmup_pending,
         }
     }
 
@@ -482,7 +538,28 @@ where
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        let sample = self.inner.next()?;
+        // 预热：拉满测量窗（或源提前结束），以测得响度落位初始增益。
+        // 没有它，响曲以 1.0 全响度开播、43ms 后被 0.25s 时间常数压下来，
+        // 即「开头特别响然后忽然压下去」。
+        if self.warmup_pending > 0 {
+            while self.warmup_pending > 0 {
+                match self.inner.next() {
+                    Some(sample) => {
+                        self.normalizer.observe(sample);
+                        self.warmup_queue.push_back(sample);
+                        self.warmup_pending -= 1;
+                    }
+                    None => break,
+                }
+            }
+            self.warmup_pending = 0;
+            self.normalizer.seed_from_observations(self.gain);
+        }
+
+        let sample = match self.warmup_queue.pop_front() {
+            Some(sample) => sample,
+            None => self.inner.next()?,
+        };
 
         self.sample_counter += 1;
         if self.sample_counter >= PARAM_CHECK_INTERVAL {
@@ -604,6 +681,60 @@ mod tests {
         // 且都朝目标方向移动：安静曲被抬、响曲被压
         assert!(quiet_out_rms > 0.05 * 1.5, "安静曲应被抬升");
         assert!(loud_out_rms < 0.4 * 0.7, "响曲应被压低");
+    }
+
+    /// 语义 4：响曲的第一个可闻样本就必须是压好的响度
+    ///
+    /// 冷启动缺陷的回归：current_gain 从 1.0 起步时，响曲开头以全响度
+    /// 播出，43ms 后第一块统计出来才被 0.25s 时间常数压下——
+    /// 「开头特别响然后忽然压下去」。预热窗先测后放，杜绝这个台阶。
+    #[test]
+    fn warmup_seeds_gain_before_the_first_audible_sample() {
+        struct SquareSource {
+            remaining: usize,
+            amplitude: f32,
+            flip: bool,
+        }
+        impl Iterator for SquareSource {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> {
+                if self.remaining == 0 {
+                    return None;
+                }
+                self.remaining -= 1;
+                self.flip = !self.flip;
+                Some(if self.flip { self.amplitude } else { -self.amplitude })
+            }
+        }
+        impl super::super::pcm::PcmSource for SquareSource {
+            fn channels(&self) -> u16 { 2 }
+            fn sample_rate(&self) -> u32 { 48_000 }
+            fn total_duration(&self) -> Option<std::time::Duration> { None }
+            fn try_seek(
+                &mut self,
+                _position: std::time::Duration,
+            ) -> Result<(), super::super::pcm::PcmSeekError> {
+                Ok(())
+            }
+        }
+
+        let params = Arc::new(Mutex::new(AudioEffectsParams {
+            loudness_gain_mb: 0,
+            eq_enabled: false,
+            eq_band_levels_mb: [0; 5],
+            normalize_volume: true,
+        }));
+        // -6dBFS 的响曲：目标增益约 0.25（-18dBFS / 0.5）
+        let mut source = super::LoudnessSource::new(
+            SquareSource { remaining: 96_000 * 2, amplitude: 0.5, flip: false },
+            params,
+        );
+
+        let first = source.next().expect("should produce audio").abs();
+        assert!(
+            first < 0.5 * 0.6,
+            "第一个样本应已被压好而不是全响度: {first}",
+        );
     }
 
     /// 语义 3：增益不得把峰值推过 -2 dBFS 削波
