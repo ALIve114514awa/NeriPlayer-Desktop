@@ -10,4 +10,5 @@ pub mod lyrics;
 pub mod security;
 pub mod settings;
 pub mod state;
+pub mod stats;
 pub mod sync;

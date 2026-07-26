@@ -512,6 +512,26 @@ pub async fn configure_github_sync(
     }))
 }
 
+/// 读取本地播放统计快照注入同步信封
+fn local_stats_payload(state: &State<'_, AppState>) -> manager::SyncStatsPayload {
+    let store = state.stats.lock();
+    let (stats, buckets, cleared_at) = store.sync_snapshot();
+    manager::SyncStatsPayload { stats, buckets, cleared_at }
+}
+
+/// 把合并后的统计写回本地，并只保留本机分片，避免下轮上传重复累加他机增量
+fn apply_merged_stats(app: &AppHandle, state: &State<'_, AppState>, merged: &SyncData) {
+    let device_id = manager::get_or_create_device_id_pub(app);
+    let mut store = state.stats.lock();
+    store.apply_merged(
+        &merged.playback_stats,
+        &merged.playback_stat_buckets,
+        merged.playback_stats_cleared_at,
+        &device_id,
+    );
+    crate::stats::save(&store);
+}
+
 /// 执行 GitHub 同步
 #[tauri::command]
 pub async fn sync_github(
@@ -529,12 +549,15 @@ pub async fn sync_github(
         &app,
         history_entries.as_deref(),
         history_deletions.as_deref(),
+        Some(local_stats_payload(&state)),
     );
-    let result = manager::sync_github(&state.http(), &mut config, &local_data).await?;
+    let outcome = manager::sync_github(&state.http(), &mut config, &local_data).await?;
+    apply_merged_stats(&app, &state, &outcome.merged);
     save_github_config(&app, &config);
     // 通知前端歌单数据可能已变更
     let _ = app.emit("playlists-changed", ());
-    Ok(result)
+    let _ = app.emit("playback-stats-changed", ());
+    Ok(outcome.result)
 }
 
 /// 断开 GitHub 同步
@@ -608,11 +631,14 @@ pub async fn sync_webdav(
         &app,
         history_entries.as_deref(),
         history_deletions.as_deref(),
+        Some(local_stats_payload(&state)),
     );
-    let result = manager::sync_webdav(&state.http(), &mut config, &local_data).await?;
+    let outcome = manager::sync_webdav(&state.http(), &mut config, &local_data).await?;
+    apply_merged_stats(&app, &state, &outcome.merged);
     save_webdav_config(&app, &config);
     let _ = app.emit("playlists-changed", ());
-    Ok(result)
+    let _ = app.emit("playback-stats-changed", ());
+    Ok(outcome.result)
 }
 
 /// 更新 GitHub 同步子设置（不影响 token/owner/repo）

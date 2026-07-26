@@ -38,12 +38,26 @@ pub struct SyncHistoryDeletion {
     pub deleted_at: i64,
 }
 
+/// 本地播放统计快照，由 stats 模块产出后注入同步信封
+#[derive(Debug, Clone, Default)]
+pub struct SyncStatsPayload {
+    pub stats: Vec<SyncTrackStat>,
+    pub buckets: Vec<SyncPlaybackStatBucket>,
+    pub cleared_at: i64,
+}
+
+/// 同步产物：调用方需要合并结果才能把统计回写本地
+pub struct SyncOutcome {
+    pub result: SyncResult,
+    pub merged: SyncData,
+}
+
 /// GitHub 同步（支持省流模式 backup.bin / 普通模式 backup.json）
 pub async fn sync_github(
     http: &reqwest::Client,
     config: &mut GitHubSyncConfig,
     local_data: &SyncData,
-) -> AppResult<SyncResult> {
+) -> AppResult<SyncOutcome> {
     let _sync_guard = acquire_sync_lock().await;
     let api = GitHubApiClient::new(http, &config.token);
     let data_saver = config.data_saver;
@@ -184,16 +198,20 @@ pub async fn sync_github(
         "Sync complete"
     };
 
-    Ok(with_history(SyncResult {
-        success: true,
-        message: message.into(),
-        playlists_added: playlists_added.max(0),
-        playlists_updated: 0,
-        playlists_deleted: 0,
-        songs_added: songs_added.max(0),
-        songs_removed: 0,
-        history: None,
-    }, &merged))
+    let result = with_history(
+        SyncResult {
+            success: true,
+            message: message.into(),
+            playlists_added: playlists_added.max(0),
+            playlists_updated: 0,
+            playlists_deleted: 0,
+            songs_added: songs_added.max(0),
+            songs_removed: 0,
+            history: None,
+        },
+        &merged,
+    );
+    Ok(SyncOutcome { result, merged })
 }
 
 #[derive(Debug, Clone)]
@@ -276,7 +294,7 @@ pub async fn sync_webdav(
     http: &reqwest::Client,
     config: &mut WebDavSyncConfig,
     local_data: &SyncData,
-) -> AppResult<SyncResult> {
+) -> AppResult<SyncOutcome> {
     let _sync_guard = acquire_sync_lock().await;
     let api = WebDavApiClient::new(http, &config.server_url, &config.username, &config.password, &config.base_path);
 
@@ -287,17 +305,23 @@ pub async fn sync_webdav(
     let (remote_content, remote_fingerprint) = match api.get_file_content().await? {
         Some((content, fp)) if !content.trim().is_empty() => (content, fp),
         _ => {
-            let content = serde_json::to_string_pretty(local_data)?;
+            // 首次上传同样要归一化, 否则空串 optional 字段会被写上云
+            let initial = local_data.normalized_for_sync();
+            let content = serde_json::to_string_pretty(&initial)?;
             let fp = api.update_file_content(&content).await?;
-            save_base_snapshot(local_data, "webdav");
-            save_recent_play_history(local_data);
+            save_base_snapshot(&initial, "webdav");
+            save_recent_play_history(&initial);
             config.last_remote_fingerprint = fp;
             config.last_sync_time = chrono::Utc::now().timestamp_millis();
-            return Ok(with_history(SyncResult {
-                success: true,
-                message: "Initial upload complete".into(),
-                ..Default::default()
-            }, local_data));
+            let result = with_history(
+                SyncResult {
+                    success: true,
+                    message: "Initial upload complete".into(),
+                    ..Default::default()
+                },
+                &initial,
+            );
+            return Ok(SyncOutcome { result, merged: initial });
         }
     };
 
@@ -315,11 +339,15 @@ pub async fn sync_webdav(
     if !remote_changed && !merge::has_data_changed(&remote_data, &merged) {
         config.last_remote_fingerprint = remote_fingerprint;
         config.last_sync_time = chrono::Utc::now().timestamp_millis();
-        return Ok(with_history(SyncResult {
-            success: true,
-            message: "Already up to date".into(),
-            ..Default::default()
-        }, &merged));
+        let result = with_history(
+            SyncResult {
+                success: true,
+                message: "Already up to date".into(),
+                ..Default::default()
+            },
+            &merged,
+        );
+        return Ok(SyncOutcome { result, merged });
     }
 
     let content = serde_json::to_string_pretty(&merged)?;
@@ -332,16 +360,20 @@ pub async fn sync_webdav(
     config.last_remote_fingerprint = fp;
     config.last_sync_time = chrono::Utc::now().timestamp_millis();
 
-    Ok(with_history(SyncResult {
-        success: true,
-        message: "Sync complete".into(),
-        playlists_added: playlists_added.max(0),
-        playlists_updated: 0,
-        playlists_deleted: 0,
-        songs_added: songs_added.max(0),
-        songs_removed: 0,
-        history: None,
-    }, &merged))
+    let result = with_history(
+        SyncResult {
+            success: true,
+            message: "Sync complete".into(),
+            playlists_added: playlists_added.max(0),
+            playlists_updated: 0,
+            playlists_deleted: 0,
+            songs_added: songs_added.max(0),
+            songs_removed: 0,
+            history: None,
+        },
+        &merged,
+    );
+    Ok(SyncOutcome { result, merged })
 }
 
 /// 构建本地同步数据（从 tauri-plugin-store 读取歌单等）
@@ -349,6 +381,7 @@ pub fn build_local_sync_data(
     app: &AppHandle,
     history_entries: Option<&[SyncHistoryEntry]>,
     history_deletions: Option<&[SyncHistoryDeletion]>,
+    stats: Option<SyncStatsPayload>,
 ) -> SyncData {
     // 从 store 读取本地歌单数据
     // 当前歌单系统使用文件存储，构建 SyncData
@@ -361,6 +394,7 @@ pub fn build_local_sync_data(
     let recent_play_deletions = history_deletions
         .map(|deletions| history_deletions_to_sync(deletions, &device_id))
         .unwrap_or_else(load_recent_play_deletions);
+    let stats = stats.unwrap_or_default();
 
     SyncData {
         version: "2.0".into(),
@@ -372,9 +406,9 @@ pub fn build_local_sync_data(
         recent_plays,
         sync_log: Vec::new(),
         recent_play_deletions,
-        playback_stats: Vec::new(),
-        playback_stats_cleared_at: 0,
-        playback_stat_buckets: Vec::new(),
+        playback_stats: stats.stats,
+        playback_stats_cleared_at: stats.cleared_at,
+        playback_stat_buckets: stats.buckets,
         playlist_song_deletions: load_local_playlist_song_deletions(),
     }
 }
@@ -562,6 +596,21 @@ fn playlists_path() -> std::path::PathBuf {
 
 pub fn tracks_to_sync_songs_pub(tracks: &[TrackInfo]) -> Vec<SyncSong> {
     tracks_to_sync_songs(tracks)
+}
+
+/// 播放统计身份键：与 Android SongItem.stableKey() 同源
+///
+/// 本地文件也要计入统计，所以不能像同步那样直接过滤掉 Local 源。
+pub fn playback_stats_identity_key_pub(track: &TrackInfo) -> String {
+    if track.source == TrackSource::Local {
+        let identity = SongIdentity {
+            id: numeric_id_or_zero(&track.id).to_string(),
+            album: track.album.clone(),
+            media_uri: track.id.clone(),
+        };
+        return identity.stable_key();
+    }
+    track_to_sync_song(track).identity().stable_key()
 }
 
 pub fn playlist_track_identity_key_pub(track: &TrackInfo) -> String {
@@ -1086,6 +1135,14 @@ mod tests {
         (format!("http://{}", address), handle)
     }
 
+    /// 同 github_api 测试：mock server 在回环地址，必须绕开系统代理
+    fn loopback_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("failed to build loopback test client")
+    }
+
     fn github_response(status: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1111,7 +1168,7 @@ mod tests {
         )])
         .await;
         let api = GitHubApiClient::new_with_api_base(
-            &reqwest::Client::new(),
+            &loopback_client(),
             "token",
             &base,
         );
@@ -1132,7 +1189,7 @@ mod tests {
         ])
         .await;
         let api = GitHubApiClient::new_with_api_base(
-            &reqwest::Client::new(),
+            &loopback_client(),
             "token",
             &base,
         );

@@ -35,6 +35,8 @@ pub struct AppState {
     pub download_tasks: Mutex<HashMap<String, DownloadTaskControl>>,
     /// YouTube 会话保鲜闸门(冷却 + 熔断), 对齐 Android 自动刷新
     pub youtube_refresh: Mutex<crate::api::youtube::refresh::YouTubeRefreshGate>,
+    /// 播放统计, 启动时从磁盘恢复
+    pub stats: Mutex<crate::stats::StatsStore>,
 }
 
 impl AppState {
@@ -60,6 +62,7 @@ impl AppState {
             lt_session: Mutex::new(LtSession::new()),
             download_tasks: Mutex::new(HashMap::new()),
             youtube_refresh: Mutex::new(crate::api::youtube::refresh::YouTubeRefreshGate::default()),
+            stats: Mutex::new(crate::stats::load()),
         }
     }
 
