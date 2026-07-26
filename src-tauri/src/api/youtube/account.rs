@@ -27,23 +27,23 @@ impl YouTubeAccountProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct YouTubeBootstrap {
-    api_key: String,
-    client_version: String,
-    visitor_data: String,
-    session_index: String,
-    user_session_id: String,
+pub(super) struct YouTubeBootstrap {
+    pub(super) api_key: String,
+    pub(super) client_version: String,
+    pub(super) visitor_data: String,
+    pub(super) session_index: String,
+    pub(super) user_session_id: String,
     logged_in: bool,
 }
 
 impl YouTubeBootstrap {
-    fn context(&self) -> Value {
+    pub(super) fn context(&self) -> Value {
         json!({
             "client": {
                 "clientName": "WEB_REMIX",
                 "clientVersion": self.client_version,
-                "hl": "zh-CN",
-                "gl": "JP",
+                "hl": super::innertube_locale().0,
+                "gl": super::innertube_locale().1,
                 "visitorData": self.visitor_data,
                 "platform": "DESKTOP",
                 "userAgent": USER_AGENT,
@@ -57,6 +57,66 @@ impl YouTubeBootstrap {
             },
             "user": { "lockedSafetyMode": false }
         })
+    }
+}
+
+/// bootstrap 缓存
+///
+/// 每次库请求都去抓一遍 music.youtube.com 的 HTML 太贵；但也不能永久缓存，
+/// clientVersion / visitorData 会过期。按账号（SAPISID）分键，切号自动失效。
+const BOOTSTRAP_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+struct CachedBootstrap {
+    account_key: String,
+    value: YouTubeBootstrap,
+    fetched_at: std::time::Instant,
+}
+
+static BOOTSTRAP_CACHE: std::sync::Mutex<Option<CachedBootstrap>> =
+    std::sync::Mutex::new(None);
+
+/// 取一份可用的 bootstrap，命中缓存则直接返回
+pub(super) async fn cached_bootstrap(
+    http: &FallbackHttp,
+    auth: &YouTubeAuth,
+) -> AppResult<YouTubeBootstrap> {
+    let account_key = auth.get_sapisid().unwrap_or_default().to_string();
+    if let Ok(guard) = BOOTSTRAP_CACHE.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.account_key == account_key && cached.fetched_at.elapsed() < BOOTSTRAP_TTL {
+                return Ok(cached.value.clone());
+            }
+        }
+    }
+
+    let cookie_values = select_cookie_values(&auth.cookies, MUSIC_HOST);
+    if cookie_values.is_empty() {
+        return Err(AppError::Api(
+            "YouTube login is incomplete, please sign in again".into(),
+        ));
+    }
+    let bootstrap = fetch_bootstrap(http, &build_cookie_header(&cookie_values)).await?;
+    log::info!(
+        target: "youtube",
+        "bootstrap ready: clientVersion={}, sessionIndex={}",
+        bootstrap.client_version,
+        bootstrap.session_index,
+    );
+
+    if let Ok(mut guard) = BOOTSTRAP_CACHE.lock() {
+        *guard = Some(CachedBootstrap {
+            account_key,
+            value: bootstrap.clone(),
+            fetched_at: std::time::Instant::now(),
+        });
+    }
+    Ok(bootstrap)
+}
+
+/// 登录态变化或请求被拒时丢弃缓存，下次重新抓取
+pub(super) fn invalidate_bootstrap_cache() {
+    if let Ok(mut guard) = BOOTSTRAP_CACHE.lock() {
+        *guard = None;
     }
 }
 
@@ -79,7 +139,7 @@ pub async fn get_account_profile(
         .ok_or_else(|| AppError::Api("YouTube account menu did not contain a profile".into()))
 }
 
-async fn fetch_bootstrap(
+pub(super) async fn fetch_bootstrap(
     http: &FallbackHttp,
     cookie_header: &str,
 ) -> AppResult<YouTubeBootstrap> {

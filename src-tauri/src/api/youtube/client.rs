@@ -188,14 +188,17 @@ impl YouTubeClient {
         map
     }
 
-    fn authorization_header(auth: &crate::auth::state::YouTubeAuth) -> AppResult<String> {
+    fn authorization_header(
+        auth: &crate::auth::state::YouTubeAuth,
+        user_session_id: &str,
+    ) -> AppResult<String> {
         let cookies = Self::cookie_map(auth);
         crate::auth::youtube_hash::build_youtube_authorization(
             cookies.get("SAPISID").map(String::as_str),
             cookies.get("__Secure-1PAPISID").map(String::as_str),
             cookies.get("__Secure-3PAPISID").map(String::as_str),
             "https://music.youtube.com",
-            "",
+            user_session_id,
         )
         .ok_or_else(|| AppError::Api("No SAPISID for YouTube auth".into()))
     }
@@ -229,7 +232,15 @@ impl YouTubeClient {
             "context": self.build_context(),
             "browseId": "FEmusic_liked_playlists"
         });
-        self.innertube_post_auth("browse", &body, auth).await
+        let data = self.innertube_post_auth("browse", &body, auth).await?;
+        // 诊断用：区分「请求没发出」「返回了但目录为空」「返回有内容但前端解析不出」
+        log::info!(
+            target: "youtube",
+            "library playlists response: shelves={}, has_contents={}",
+            count_browse_items(&data),
+            data.get("contents").is_some(),
+        );
+        Ok(data)
     }
 
     /// YouTube Music 歌单详情（需登录）
@@ -257,9 +268,21 @@ impl YouTubeClient {
             return Err(AppError::Api("YouTube not logged in".into()));
         }
         let cookie_header = Self::build_cookie_header(&auth.cookies);
-        let api_key = self.api_key.lock().clone();
-        let url = format!("{}/{}?prettyPrint=false&key={}", INNERTUBE_URL, endpoint, api_key);
-        let auth_header = Self::authorization_header(auth)?;
+
+        // 必须用 bootstrap 而不是硬编码常量：InnerTube 对过期的 clientVersion
+        // 往往返回 HTTP 200 + 空目录而不是报错，表现就是「登录了但没有云端歌单」。
+        // 同时它提供 visitorData / sessionIndex / userSessionId，Android 也是这么做的。
+        let bootstrap = super::account::cached_bootstrap(&self.http, auth).await?;
+        let url = format!(
+            "{}/{}?prettyPrint=false&key={}",
+            INNERTUBE_URL, endpoint, bootstrap.api_key
+        );
+        let auth_header = Self::authorization_header(auth, &bootstrap.user_session_id)?;
+
+        // 用 bootstrap 的 context 覆盖调用方拼的那份
+        let mut body = body.clone();
+        body["context"] = bootstrap.context();
+        let body = &body;
 
         let resp = self
             .http
@@ -272,8 +295,10 @@ impl YouTubeClient {
                     .header("X-Origin", "https://music.youtube.com")
                     .header("Referer", "https://music.youtube.com/")
                     .header("X-YouTube-Client-Name", "67")
+                    .header("X-YouTube-Client-Version", &bootstrap.client_version)
+                    .header("X-Goog-Visitor-Id", &bootstrap.visitor_data)
                     .header("Authorization", &auth_header)
-                    .header("X-Goog-AuthUser", "0")
+                    .header("X-Goog-AuthUser", &bootstrap.session_index)
                     .header("Cookie", &cookie_header)
                     .json(body)
             })
@@ -291,6 +316,7 @@ impl YouTubeClient {
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
+            super::account::invalidate_bootstrap_cache();
             let detail = innertube_error_detail(&body);
             log::warn!(
                 target: "youtube",
@@ -308,6 +334,8 @@ impl YouTubeClient {
             AppError::Api(format!("YouTube response is not valid JSON: {error}"))
         })?;
         if let Some(reason) = innertube_rejection_reason(&data) {
+            // 被拒往往意味着 bootstrap 过期，丢掉缓存让下次重新抓
+            super::account::invalidate_bootstrap_cache();
             log::warn!(target: "youtube", "innertube {} rejected: {}", endpoint, reason);
             return Err(AppError::Api(format!("YouTube request rejected: {reason}")));
         }
@@ -397,4 +425,31 @@ fn innertube_rejection_reason(data: &Value) -> Option<String> {
         return Some("YouTube session is signed out".into());
     }
     None
+}
+
+/// 粗略统计 browse 响应里的条目数，仅用于诊断
+fn count_browse_items(data: &Value) -> usize {
+    fn walk(value: &Value, count: &mut usize) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("musicTwoRowItemRenderer")
+                    || map.contains_key("musicResponsiveListItemRenderer")
+                {
+                    *count += 1;
+                }
+                for nested in map.values() {
+                    walk(nested, count);
+                }
+            }
+            Value::Array(items) => {
+                for nested in items {
+                    walk(nested, count);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut count = 0;
+    walk(data, &mut count);
+    count
 }
