@@ -2,6 +2,8 @@
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePlayerStore, displayAlbum } from '@/stores/player'
+import { usePlaybackStatsStore } from '@/stores/playbackStats'
+import { installGlobalShortcuts } from '@/modules/shortcuts/globalShortcuts'
 import { syncFrequencyDelayMs, useSyncStore } from '@/stores/sync'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
@@ -35,6 +37,9 @@ const likedSongs = useLikedSongsStore()
 const route = useRoute()
 const router = useRouter()
 const isNowPlayingOpen = ref(false)
+// 静音前的音量，取消静音时还原
+let volumeBeforeMute = 0.5
+let uninstallShortcuts: (() => void) | null = null
 const contentRef = ref<HTMLElement | null>(null)
 const miniPlayerRef = ref<InstanceType<typeof MiniPlayer> | null>(null)
 const nowPlayingRef = ref<InstanceType<typeof NowPlaying> | null>(null)
@@ -181,6 +186,8 @@ let unlistenCloseRequested: UnlistenFn | null = null
 
 function handleBeforeUnload() {
   player.flushPlayerState()
+  // 结算最后一段收听，否则关窗前听的时长会丢
+  void usePlaybackStatsStore().flushFinal()
 }
 
 function scheduleDebouncedSync() {
@@ -271,6 +278,51 @@ onMounted(async () => {
   }
 
   // Rust 配置是启动后的规范来源，本地影子只负责首屏快速显示
+  // 播放统计要在任何播放发生之前接上，否则首曲不计数
+  usePlaybackStatsStore().attach()
+  uninstallShortcuts = installGlobalShortcuts({
+    togglePlay: () => void player.togglePlayPause(),
+    next: () => void player.next(),
+    previous: () => void player.previous(),
+    seekBy: (deltaMs) => {
+      if (!player.hasPlaybackSession) return
+      const target = Math.max(0, Math.min(player.durationMs, player.positionMs + deltaMs))
+      void player.seekTo(target)
+    },
+    adjustVolume: (delta) => {
+      void player.setVolume(Math.max(0, Math.min(1, player.volume + delta)))
+    },
+    toggleMute: () => {
+      if (player.volume > 0) {
+        volumeBeforeMute = player.volume
+        void player.setVolume(0)
+      } else {
+        void player.setVolume(volumeBeforeMute || 0.5)
+      }
+    },
+    toggleNowPlaying: () => {
+      if (isNowPlayingOpen.value) void closeNowPlaying()
+      else if (player.hasPlaybackSession) openNowPlaying()
+    },
+    closeOverlay: () => {
+      if (!isNowPlayingOpen.value) return false
+      void closeNowPlaying()
+      return true
+    },
+    focusSearch: () => {
+      void router.push({ name: 'explore' }).then(() => {
+        requestAnimationFrame(() => {
+          const input = document.querySelector<HTMLInputElement>('[data-shortcut-search]')
+          input?.focus()
+          input?.select()
+        })
+      })
+    },
+    toggleShuffle: () => player.toggleShuffle(),
+    cycleRepeat: () => player.toggleRepeatMode(),
+    isOverlayOpen: () => document.querySelector('.dialog-overlay, .m3-dialog-scrim') !== null,
+  })
+
   await settingsStore.hydrate()
   applyTheme(settingsStore.darkMode, false)
   applyThemeColor(settingsStore.themeColor, undefined, false)
@@ -315,6 +367,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   player.flushPlayerState()
+  uninstallShortcuts?.()
+  uninstallShortcuts = null
   window.removeEventListener('beforeunload', handleBeforeUnload)
   window.removeEventListener('pagehide', handleBeforeUnload)
   resetFlipState()

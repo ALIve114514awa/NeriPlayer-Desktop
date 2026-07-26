@@ -111,7 +111,17 @@
     "remove_confirm_msg": "Remove \"{name}\" from this playlist?",
     "added_to_playlist": "Added to playlist",
     "downloads_empty_title": "No downloaded songs",
-    "downloads_empty_desc": "Download songs from the Now Playing more options menu"
+    "downloads_empty_desc": "Download songs from the Now Playing more options menu",
+    "local_category_playlists": "Playlists",
+    "local_category_artists": "Artists",
+    "local_artist_empty": "No local artists yet",
+    "local_artist_hint": "Imported local audio is grouped by track artist automatically",
+    "local_artist_search_hint": "Search local artists / tracks",
+    "local_artist_sort": "Sort local artists",
+    "local_artist_sort_name": "By name",
+    "local_artist_sort_song_count": "By track count",
+    "local_artist_sort_recent": "Recently added",
+    "local_artist_unknown": "Unknown artist"
   },
   "common": {
     "save": "Save",
@@ -326,6 +336,24 @@
     "clear_history": "Clear History",
     "clear_confirm_msg": "Are you sure you want to clear all play history? This cannot be undone.",
     "clear_confirm_btn": "Clear All"
+  },
+  "stats": {
+    "title": "Playback Stats",
+    "period_day": "Day",
+    "period_week": "Week",
+    "period_month": "Month",
+    "period_year": "Year",
+    "period_all": "All",
+    "play_count": "Plays",
+    "listen_time": "Listening time",
+    "track_count": "Tracks",
+    "most_played": "Most played",
+    "times": "{count} plays",
+    "unknown_track": "Unknown track",
+    "empty": "No playback history yet",
+    "clear": "Clear playback stats",
+    "clear_confirm_msg": "Clear all playback statistics? This cannot be undone and will sync to your other devices.",
+    "clear_confirm_btn": "Clear"
   },
   "settings": {
     "title": "Settings",
@@ -738,5 +766,24 @@
     "reset_identity_confirm_desc": "A new UUID will be generated. Your nickname will stay unchanged, but existing room connections will expire.",
     "identity_reset": "Identity reset",
     "reset_btn": "Reset"
+  },
+  "shortcuts": {
+    "title": "Keyboard shortcuts",
+    "desc": "Shortcuts stand down while a text field is focused",
+    "toggle_play": "Play / pause",
+    "next": "Next track",
+    "previous": "Previous track",
+    "seek_forward": "Forward 5s",
+    "seek_back": "Back 5s",
+    "seek_forward_large": "Forward 30s",
+    "seek_back_large": "Back 30s",
+    "volume_up": "Volume up",
+    "volume_down": "Volume down",
+    "mute": "Mute / unmute",
+    "now_playing": "Open / close now playing",
+    "search": "Go to search",
+    "shuffle": "Shuffle",
+    "repeat": "Repeat mode",
+    "close": "Dismiss overlay"
   }
 }

@@ -19,11 +19,13 @@ const router = createRouter({
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
     { path: '/downloads', name: 'downloads', component: () => import('./views/DownloadsView.vue') },
     { path: '/recent', name: 'recent', component: () => import('./views/RecentView.vue') },
+    { path: '/stats', name: 'playback-stats', component: () => import('./views/PlaybackStatsView.vue') },
     { path: '/playlist/netease/:id', name: 'netease-playlist', component: () => import('./views/NeteasePlaylistView.vue') },
     { path: '/album/netease/:id', name: 'netease-album', component: () => import('./views/NeteasePlaylistView.vue'), props: { isAlbum: true } },
     { path: '/playlist/bilibili/:mediaId', name: 'bili-playlist', component: () => import('./views/BiliPlaylistView.vue') },
     { path: '/playlist/youtube/:browseId', name: 'youtube-playlist', component: () => import('./views/YouTubePlaylistView.vue') },
     { path: '/playlist/local/:id', name: 'local-playlist', component: () => import('./views/LocalPlaylistView.vue') },
+    { path: '/library/local-artist/:name', name: 'local-artist', component: () => import('./views/LocalArtistView.vue') },
     { path: '/debug', name: 'debug', component: () => import('./views/DebugView.vue') },
   ],
 })

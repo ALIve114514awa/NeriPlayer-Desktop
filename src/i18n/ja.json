@@ -111,7 +111,17 @@
     "remove_confirm_msg": "「{name}」をプレイリストから削除しますか？",
     "added_to_playlist": "プレイリストに追加しました",
     "downloads_empty_title": "ダウンロードした曲はありません",
-    "downloads_empty_desc": "再生画面のその他オプションから曲をダウンロード"
+    "downloads_empty_desc": "再生画面のその他オプションから曲をダウンロード",
+    "local_category_playlists": "プレイリスト",
+    "local_category_artists": "アーティスト",
+    "local_artist_empty": "ローカルアーティストがありません",
+    "local_artist_hint": "ローカル音源を読み込むと、アーティストごとに自動で分類されます",
+    "local_artist_search_hint": "ローカルのアーティスト / 曲を検索",
+    "local_artist_sort": "アーティストの並び替え",
+    "local_artist_sort_name": "名前順",
+    "local_artist_sort_song_count": "曲数順",
+    "local_artist_sort_recent": "追加順",
+    "local_artist_unknown": "不明なアーティスト"
   },
   "common": {
     "save": "保存",
@@ -326,6 +336,24 @@
     "clear_history": "履歴をクリア",
     "clear_confirm_msg": "すべての再生履歴をクリアしますか？この操作は取り消せません。",
     "clear_confirm_btn": "クリア確認"
+  },
+  "stats": {
+    "title": "再生統計",
+    "period_day": "日",
+    "period_week": "週",
+    "period_month": "月",
+    "period_year": "年",
+    "period_all": "全体",
+    "play_count": "再生回数",
+    "listen_time": "累計時間",
+    "track_count": "曲数",
+    "most_played": "よく再生した曲",
+    "times": "{count} 回",
+    "unknown_track": "不明な曲",
+    "empty": "再生履歴がありません",
+    "clear": "再生統計を消去",
+    "clear_confirm_msg": "すべての再生統計を消去しますか？この操作は取り消せず、他の端末にも同期されます。",
+    "clear_confirm_btn": "消去する"
   },
   "settings": {
     "title": "設定",
@@ -738,5 +766,24 @@
     "reset_identity_confirm_desc": "新しい UUID を生成します。ニックネームは保持されますが、参加中のルーム接続は無効になります。",
     "identity_reset": "IDがリセットされました",
     "reset_btn": "リセット"
+  },
+  "shortcuts": {
+    "title": "キーボードショートカット",
+    "desc": "入力欄にフォーカスがある間は無効になります",
+    "toggle_play": "再生 / 一時停止",
+    "next": "次の曲",
+    "previous": "前の曲",
+    "seek_forward": "5秒進む",
+    "seek_back": "5秒戻る",
+    "seek_forward_large": "30秒進む",
+    "seek_back_large": "30秒戻る",
+    "volume_up": "音量を上げる",
+    "volume_down": "音量を下げる",
+    "mute": "ミュート切替",
+    "now_playing": "再生画面の開閉",
+    "search": "検索へ移動",
+    "shuffle": "シャッフル",
+    "repeat": "リピート",
+    "close": "オーバーレイを閉じる"
   }
 }

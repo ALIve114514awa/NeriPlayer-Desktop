@@ -254,6 +254,7 @@ onMounted(() => {
         v-model="searchQuery"
         type="text"
         :placeholder="t('explore.search_placeholder')"
+        data-shortcut-search
         @focus="isFocused = true"
         @blur="isFocused = false"
       />
@@ -525,6 +526,7 @@ onMounted(() => {
   font-weight: 500;
   color: var(--md-on-surface-variant);
   border-bottom: 2px solid transparent;
+  border-radius: var(--radius-md, 12px) var(--radius-md, 12px) 0 0;
   transition: color var(--duration-short), border-color var(--duration-short);
   cursor: pointer;
   user-select: none;

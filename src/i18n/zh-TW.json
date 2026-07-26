@@ -111,7 +111,17 @@
     "remove_confirm_msg": "確定要從歌單中移除「{name}」嗎？",
     "added_to_playlist": "已加入歌單",
     "downloads_empty_title": "還沒有下載的歌曲",
-    "downloads_empty_desc": "在播放頁點擊更多選項下載歌曲到本機"
+    "downloads_empty_desc": "在播放頁點擊更多選項下載歌曲到本機",
+    "local_category_playlists": "歌單",
+    "local_category_artists": "歌手",
+    "local_artist_empty": "暫無本機歌手",
+    "local_artist_hint": "匯入本機音訊後，會依歌曲演出者自動分類",
+    "local_artist_search_hint": "搜尋本機歌手 / 歌曲",
+    "local_artist_sort": "本機歌手排序",
+    "local_artist_sort_name": "依名稱排序",
+    "local_artist_sort_song_count": "依歌曲數量排序",
+    "local_artist_sort_recent": "依最近加入排序",
+    "local_artist_unknown": "未知歌手"
   },
   "common": {
     "save": "儲存",
@@ -325,6 +335,24 @@
     "no_history": "暫無播放記錄",
     "clear_history": "清空播放記錄",
     "clear_confirm_msg": "確定要清空所有播放記錄嗎？此操作無法復原。",
+    "clear_confirm_btn": "確定清空"
+  },
+  "stats": {
+    "title": "播放統計",
+    "period_day": "日",
+    "period_week": "週",
+    "period_month": "月",
+    "period_year": "年",
+    "period_all": "總",
+    "play_count": "播放次數",
+    "listen_time": "累計時長",
+    "track_count": "曲目數",
+    "most_played": "最常播放",
+    "times": "{count} 次",
+    "unknown_track": "未知曲目",
+    "empty": "還沒有播放記錄",
+    "clear": "清空播放統計",
+    "clear_confirm_msg": "確定要清空所有播放統計嗎？此操作無法復原，且會同步到其他裝置。",
     "clear_confirm_btn": "確定清空"
   },
   "settings": {
@@ -738,5 +766,24 @@
     "reset_identity_confirm_desc": "重置後會產生新的 UUID，目前暱稱不會被清除，已加入的房間連線也會失效。",
     "identity_reset": "身份已重置",
     "reset_btn": "重置"
+  },
+  "shortcuts": {
+    "title": "鍵盤快速鍵",
+    "desc": "輸入框取得焦點時快速鍵自動讓位",
+    "toggle_play": "播放 / 暫停",
+    "next": "下一首",
+    "previous": "上一首",
+    "seek_forward": "快轉 5 秒",
+    "seek_back": "倒轉 5 秒",
+    "seek_forward_large": "快轉 30 秒",
+    "seek_back_large": "倒轉 30 秒",
+    "volume_up": "音量 +",
+    "volume_down": "音量 -",
+    "mute": "靜音 / 取消靜音",
+    "now_playing": "展開 / 收合播放頁",
+    "search": "前往並聚焦搜尋",
+    "shuffle": "隨機播放",
+    "repeat": "循環模式",
+    "close": "關閉目前彈層"
   }
 }

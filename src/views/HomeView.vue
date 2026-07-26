@@ -52,6 +52,7 @@ const quickAccess = computed(() => [
   { title: t('home.favorites'), icon: 'favorite', color: 'var(--md-tertiary-container)', action: 'favorites' },
   { title: t('home.local_music'), icon: 'folder_open', color: 'var(--md-secondary-container)', action: 'local' },
   { title: t('home.downloads'), icon: 'download', color: 'var(--md-surface-container-highest)', action: 'downloads' },
+  { title: t('stats.title'), icon: 'bar_chart', color: 'var(--md-primary-container)', action: 'stats' },
 ])
 
 // 最近播放（真实历史记录）
@@ -155,6 +156,8 @@ async function handleQuickAction(action: string) {
     router.push({ name: 'library', query: { tab: 'favorites' } })
   } else if (action === 'downloads') {
     router.push({ name: 'downloads' })
+  } else if (action === 'stats') {
+    router.push({ name: 'playback-stats' })
   }
 }
 

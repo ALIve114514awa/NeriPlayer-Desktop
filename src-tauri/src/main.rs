@@ -5,7 +5,7 @@ use neri_player_desktop::audio::media_session::{MediaAction, MediaSessionControl
 use neri_player_desktop::auth;
 use neri_player_desktop::commands::{
     auth_cmd, download_cmd, image_cmd, library_cmd, listen_together_cmd, lyrics_cmd, player_cmd,
-    recommend_cmd, search_cmd, settings_cmd, storage_cmd, sync_cmd,
+    recommend_cmd, search_cmd, settings_cmd, stats_cmd, storage_cmd, sync_cmd,
 };
 use neri_player_desktop::state::AppState;
 use std::sync::mpsc;
@@ -100,11 +100,18 @@ fn main() {
                 let mut media_update_counter: u32 = 0;
                 // 缓存上次发送给 media session 的元数据 ID，避免重复设置
                 let mut last_media_track_id = String::new();
+                // 每 300 tick（约 60s）回收一次服务端轮换的 Cookie
+                let mut cookie_sync_counter: u32 = 0;
 
                 loop {
                     std::thread::sleep(Duration::from_millis(200));
 
                     let state = handle_ticker.state::<AppState>();
+
+                    cookie_sync_counter = cookie_sync_counter.wrapping_add(1);
+                    if cookie_sync_counter.is_multiple_of(300) {
+                        auth_cmd::persist_rotated_cookies(&handle_ticker, state.inner());
+                    }
 
                     // 处理媒体键事件
                     while let Ok(action) = media_action_rx.try_recv() {
@@ -263,6 +270,7 @@ fn main() {
             player_cmd::stop,
             player_cmd::set_speed,
             player_cmd::set_loudness_gain,
+            player_cmd::set_normalize_volume,
             player_cmd::set_equalizer,
             player_cmd::reset_audio_effects,
             player_cmd::pause_with_fade,
@@ -370,6 +378,13 @@ fn main() {
             listen_together_cmd::lt_disconnect_ws,
             listen_together_cmd::lt_send_event,
             listen_together_cmd::lt_send_ping,
+            stats_cmd::record_playback_session,
+            stats_cmd::record_playback_sessions,
+            stats_cmd::get_playback_stats,
+            stats_cmd::get_playback_stats_overview,
+            stats_cmd::clear_playback_stats,
+            stats_cmd::remove_playback_stats,
+            stats_cmd::playback_stats_identity_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
