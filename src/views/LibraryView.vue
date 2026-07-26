@@ -1085,9 +1085,9 @@ onUnmounted(() => {
       </TransitionGroup>
 
       <!-- 多选模式底部操作栏 -->
-      <Transition name="lib-fade">
+      <Transition name="lib-bar">
       <div v-if="isMultiSelectMode" class="multi-select-bar">
-        <span class="select-count">{{ t('common.selected_count', { count: selectedPlaylists.size }) }}</span>
+        <span class="select-count">{{ t('common.selected_playlist_count', { count: selectedPlaylists.size }) }}</span>
         <button class="multi-select-action danger" :disabled="selectedPlaylists.size === 0" @click="requestDeleteSelected">
           <span class="material-symbols-rounded" style="font-size: 18px">delete</span>
           <span>{{ t('common.delete_selected') }}</span>
@@ -1676,13 +1676,26 @@ onUnmounted(() => {
 .multi-select-bar {
   position: sticky;
   bottom: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 12px;
   margin-top: 8px;
   padding: 10px 12px;
   border-radius: var(--radius-md);
-  background: var(--md-surface-container-high);
+  /* 与歌单详情页选择工具条同一套毛玻璃配方，保持质感一致 */
+  background: color-mix(in srgb, var(--md-surface-container-high) 70%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  backdrop-filter: blur(24px) saturate(1.5);
+  border: 1px solid color-mix(in srgb, var(--md-outline-variant) 60%, transparent);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+
+/* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .multi-select-bar {
+    background: var(--md-surface-container-high);
+  }
 }
 
 .select-count {
@@ -2215,6 +2228,16 @@ onUnmounted(() => {
 .lib-fade-enter-from,
 .lib-fade-leave-to { opacity: 0; }
 
+// 多选底部操作栏：上滑淡入 / 下滑淡出
+.lib-bar-enter-active,
+.lib-bar-leave-active {
+  transition:
+    opacity 200ms var(--ease-standard),
+    transform 200ms var(--ease-standard);
+}
+.lib-bar-enter-from,
+.lib-bar-leave-to { opacity: 0; transform: translateY(12px); }
+
 // 小控件出现 / 消失：淡入 + 缩放（排序按钮）
 .lib-zoom-enter-active {
   transition:
@@ -2257,6 +2280,8 @@ onUnmounted(() => {
   .lib-collapse-enter-active .collapse-clip > *,
   .lib-fade-enter-active,
   .lib-fade-leave-active,
+  .lib-bar-enter-active,
+  .lib-bar-leave-active,
   .lib-zoom-enter-active,
   .lib-zoom-leave-active,
   .lib-list-enter-active,

@@ -137,6 +137,7 @@
     "delete": "刪除",
     "multi_select": "多選",
     "selected_count": "已選擇 {count} 首",
+    "selected_playlist_count": "已選擇 {count} 個歌單",
     "select_all": "全選",
     "invert_selection": "反選",
     "drag_to_reorder": "拖動排序",

@@ -137,6 +137,7 @@
     "delete": "Delete",
     "multi_select": "Multi-select",
     "selected_count": "{count} selected",
+    "selected_playlist_count": "{count} playlists selected",
     "select_all": "Select all",
     "invert_selection": "Invert selection",
     "drag_to_reorder": "Drag to reorder",

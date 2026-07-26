@@ -137,6 +137,7 @@
     "delete": "削除",
     "multi_select": "複数選択",
     "selected_count": "{count} 件を選択中",
+    "selected_playlist_count": "{count} 件のプレイリストを選択中",
     "select_all": "すべて選択",
     "invert_selection": "選択を反転",
     "drag_to_reorder": "ドラッグして並べ替え",

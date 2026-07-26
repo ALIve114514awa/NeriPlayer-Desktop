@@ -65,13 +65,33 @@ const { t } = useI18n()
 </template>
 
 <style scoped lang="scss">
-.selection-toolbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; margin-bottom: 12px; border-radius: 14px; background: var(--md-primary-container); color: var(--md-on-primary-container); }
-.selection-count { flex: 1; font-size: 13px; font-weight: 700; }
+.selection-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 14px;
+  /* 与歌单详情页选择工具条同一套毛玻璃配方，保持质感一致 */
+  background: color-mix(in srgb, var(--md-surface-container-high) 70%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  backdrop-filter: blur(24px) saturate(1.5);
+  border: 1px solid color-mix(in srgb, var(--md-outline-variant) 60%, transparent);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+  color: var(--md-on-surface);
+}
+/* Linux WebKitGTK 无 backdrop-filter 时给不透明底色，避免列表穿透 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .selection-toolbar {
+    background: var(--md-surface-container-high);
+  }
+}
+.selection-count { flex: 1; font-size: 13px; font-weight: 700; color: var(--md-primary); }
 .selection-actions { display: flex; align-items: center; gap: 4px; }
 .selection-btn { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
 .selection-btn:hover:not(:disabled) { background: color-mix(in srgb, currentColor 12%, transparent); }
 .selection-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .selection-btn.danger { color: var(--md-error); }
-.selection-btn.ghost { color: var(--md-on-primary-container); }
+.selection-btn.ghost { color: inherit; }
 .material-symbols-rounded { font-size: 19px; }
 </style>
