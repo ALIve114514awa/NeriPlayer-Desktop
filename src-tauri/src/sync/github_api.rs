@@ -227,6 +227,19 @@ impl GitHubApiClient {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect();
+
+        // Contents API 对超过 1MB 的文件只回 size, content 为空串且 encoding=none
+        // 此时必须改走 raw 媒体类型, 否则会被误判成"文件损坏"
+        if cleaned.is_empty() && size > 0 {
+            log::info!(
+                target: "sync",
+                "GitHub contents API omitted inline content (size={}), falling back to raw",
+                size,
+            );
+            let content = self.get_file_raw(owner, repo, path).await?;
+            return Ok(Some((content, sha)));
+        }
+
         let decoded = BASE64.decode(&cleaned).map_err(|error| {
             GitHubApiError::InvalidResponse(format!("failed to decode file content: {}", error))
         })?;
@@ -240,6 +253,42 @@ impl GitHubApiClient {
         })?;
 
         Ok(Some((content, sha)))
+    }
+
+    /// 以 raw 媒体类型读取文件正文, 绕开 Contents API 的 1MB 内联上限
+    async fn get_file_raw(&self, owner: &str, repo: &str, path: &str) -> GitHubResult<String> {
+        // 不能复用 request(): reqwest 的 header() 是追加语义,
+        // 追加第二个 Accept 会让 GitHub 仍按 JSON 返回
+        let response = self
+            .http
+            .get(self.endpoint(&format!("repos/{}/{}/contents/{}", owner, repo, path)))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/vnd.github.raw")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await?;
+        let status = response.status();
+
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(GitHubApiError::TokenExpired);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(GitHubApiError::NotFound(path.to_string()));
+        }
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(api_error(status, body, "get raw file", false));
+        }
+
+        let bytes = response.bytes().await?;
+        if bytes.len() as u64 > MAX_SYNC_FILE_BYTES {
+            return Err(GitHubApiError::InvalidResponse(
+                "remote backup file is too large".into(),
+            ));
+        }
+        String::from_utf8(bytes.to_vec()).map_err(|error| {
+            GitHubApiError::InvalidResponse(format!("file content is not UTF-8: {}", error))
+        })
     }
 
     /// 创建或更新文件，sha 为空时表示新建
@@ -408,6 +457,15 @@ mod tests {
         (format!("http://{}", address), request_rx, handle)
     }
 
+    /// 测试必须绕开系统代理：mock server 监听 127.0.0.1，
+    /// reqwest 默认会读取 macOS/Windows 的系统代理设置并把回环请求也发给代理
+    fn loopback_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("failed to build loopback test client")
+    }
+
     fn response(status: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -420,11 +478,59 @@ mod tests {
     #[tokio::test]
     async fn get_file_only_maps_not_found_to_none() {
         let (base, _, server) = mock_server(vec![response("404 Not Found", "{}")]).await;
-        let api = GitHubApiClient::new_with_api_base(&Client::new(), "token", &base);
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
 
         let result = api.get_file_content("owner", "repo", "backup.bin").await;
 
         assert!(matches!(result, Ok(None)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_file_falls_back_to_raw_when_contents_api_omits_inline_content() {
+        // Contents API 对 >1MB 的文件只回 size，content 为空串
+        let (base, mut requests, server) = mock_server(vec![
+            response(
+                "200 OK",
+                r#"{"size":2000000,"sha":"deadbeef","content":"","encoding":"none"}"#,
+            ),
+            response("200 OK", "RAW-BACKUP-PAYLOAD"),
+        ])
+        .await;
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
+
+        let result = api
+            .get_file_content("owner", "repo", "backup.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Some(("RAW-BACKUP-PAYLOAD".to_string(), "deadbeef".to_string()))
+        );
+        let _json_request = requests.recv().await.unwrap();
+        let raw_request = requests.recv().await.unwrap();
+        assert!(raw_request.contains("application/vnd.github.raw"));
+        // 追加第二个 Accept 会让 GitHub 仍按 JSON 返回，必须只带 raw 这一个
+        assert!(!raw_request.contains("application/vnd.github+json"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_file_keeps_inline_content_when_present() {
+        let (base, _, server) = mock_server(vec![response(
+            "200 OK",
+            r#"{"size":6,"sha":"abc123","content":"aW5saW5l","encoding":"base64"}"#,
+        )])
+        .await;
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
+
+        let result = api
+            .get_file_content("owner", "repo", "backup.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(("inline".to_string(), "abc123".to_string())));
         server.await.unwrap();
     }
 
@@ -435,7 +541,7 @@ mod tests {
             r#"{"message":"temporary failure"}"#,
         )])
         .await;
-        let api = GitHubApiClient::new_with_api_base(&Client::new(), "token", &base);
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
 
         let error = api
             .get_file_content("owner", "repo", "backup.bin")
@@ -453,7 +559,7 @@ mod tests {
             response("409 Conflict", r#"{"message":"sha does not match"}"#),
         ])
         .await;
-        let api = GitHubApiClient::new_with_api_base(&Client::new(), "token", &base);
+        let api = GitHubApiClient::new_with_api_base(&loopback_client(), "token", &base);
 
         let error = api
             .update_file_content("owner", "repo", "backup.bin", "content", "old-sha", "sync")
