@@ -277,6 +277,40 @@ pub struct LtEvent {
     pub finished_track_stable_key: Option<String>,
 }
 
+/// 服务端实际落地的事件（对齐 Android ListenTogetherAppliedEvent）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LtAppliedEvent {
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<LtRoomState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_position_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<LtCause>,
+}
+
+/// 控制命令的应答（对齐 Android ListenTogetherControlResponse）
+///
+/// 缺这个字段时，服务端拒绝控制（成员无权限、房间已关闭等）在桌面端
+/// 会被静默丢弃：本地乐观改动照旧生效，用户也收不到任何提示，
+/// 于是两端状态就此分叉。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LtControlResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<LtAppliedEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LtSocketEnvelope {
@@ -304,6 +338,9 @@ pub struct LtSocketEnvelope {
     pub t: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// 控制命令应答；serde 默认忽略未知字段，缺这一项会被静默丢弃
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<LtControlResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

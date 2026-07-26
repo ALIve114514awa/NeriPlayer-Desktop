@@ -772,7 +772,8 @@
     "reset_identity_confirm_title": "確認重置身份",
     "reset_identity_confirm_desc": "重置後會產生新的 UUID，目前暱稱不會被清除，已加入的房間連線也會失效。",
     "identity_reset": "身份已重置",
-    "reset_btn": "重置"
+    "reset_btn": "重置",
+    "control_rejected": "控制被伺服器拒絕"
   },
   "shortcuts": {
     "title": "鍵盤快速鍵",

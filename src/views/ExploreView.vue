@@ -131,6 +131,17 @@ async function loadYoutubeHomeFeedIfAvailable() {
   await recommend.fetchHomeFeed()
 }
 
+// 登录态是启动后异步拉回来的：只在挂载/切 tab 时判一次，
+// 若挂载时正停在 YouTube tab 且登录态尚未到位就会永远空着
+watch(
+  () => auth.youtube.loggedIn,
+  (loggedIn) => {
+    if (!loggedIn || activeTab.value !== 'youtube') return
+    void loadDiscoveryShelves('youtube')
+    void loadYoutubeHomeFeedIfAvailable()
+  },
+)
+
 async function loadQualityByTag(tagKey: string) {
   selectedTag.value = tagKey
   isLoadingPlaylists.value = true

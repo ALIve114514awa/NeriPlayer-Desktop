@@ -121,6 +121,18 @@ export interface ListenTogetherSocketEnvelope {
   nowMs?: number
   t?: number
   ok?: boolean
+  /// 控制命令应答：服务端拒绝时才有 error，缺它会让被拒绝的控制静默生效
+  result?: {
+    ok: boolean
+    error?: string
+    applied?: {
+      type: string
+      roomId?: string
+      version?: number
+      expectedPositionMs?: number
+      nowMs?: number
+    }
+  }
   message?: string
   roomId?: string
   version?: number

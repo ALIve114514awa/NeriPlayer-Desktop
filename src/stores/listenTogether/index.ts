@@ -322,10 +322,30 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         // 心跳回复，忽略
         break
       case 'event_applied':
-        // 事件确认，忽略
+        handleEventApplied(envelope)
         break
       default:
         log.debug('unknown message type:', envelope.type)
+    }
+  }
+
+  /// 控制命令应答
+  ///
+  /// 被拒绝（无权限、房间已关闭等）时必须回滚到服务端状态并告知用户，
+  /// 否则本地乐观改动会留下来，两端就此分叉。
+  function handleEventApplied(envelope: ListenTogetherSocketEnvelope) {
+    const result = envelope.result
+    if (!result || result.ok !== false) return
+
+    log.warn('control rejected by server:', result.error)
+    const t = (i18n.global as any).t
+    useToastStore().error(result.error || t('listen_together.control_rejected'))
+    // 以服务端状态为准重新对齐，不保留本地乐观改动
+    if (envelope.state) {
+      roomState.value = envelope.state
+      _lastAppliedRoomVersion = envelope.state.version || 0
+      roomSettings.value = envelope.state.settings || roomSettings.value
+      markSync('EVENT_REJECTED', envelope.state.updatedAt || Date.now())
     }
   }
 

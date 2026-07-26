@@ -772,7 +772,8 @@
     "reset_identity_confirm_title": "IDリセットの確認",
     "reset_identity_confirm_desc": "新しい UUID を生成します。ニックネームは保持されますが、参加中のルーム接続は無効になります。",
     "identity_reset": "IDがリセットされました",
-    "reset_btn": "リセット"
+    "reset_btn": "リセット",
+    "control_rejected": "サーバーが操作を拒否しました"
   },
   "shortcuts": {
     "title": "キーボードショートカット",

@@ -772,7 +772,8 @@
     "reset_identity_confirm_title": "Confirm identity reset",
     "reset_identity_confirm_desc": "A new UUID will be generated. Your nickname will stay unchanged, but existing room connections will expire.",
     "identity_reset": "Identity reset",
-    "reset_btn": "Reset"
+    "reset_btn": "Reset",
+    "control_rejected": "The server rejected this control"
   },
   "shortcuts": {
     "title": "Keyboard shortcuts",
