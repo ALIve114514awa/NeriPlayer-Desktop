@@ -55,9 +55,18 @@
   /* 迷你播放器高度：MiniPlayer 与内容区 padding 共用，改动只需一处 */
   --mini-player-height: 76px;
 
+  /* 顶栏高度：TitleBar / 内容区 / NowPlaying 顶部安全区共用
+     Windows/Linux 默认 36px；macOS 由 .platform-mac 提升为 52px（IDEA 风格） */
+  --titlebar-height: 36px;
+
   --font-family: 'MiSans', 'Inter', -apple-system, BlinkMacSystemFont,
     'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei UI', 'Noto Sans CJK SC', 'Noto Sans', system-ui, sans-serif;
+}
+
+/* macOS：更高的标题栏承载垂直居中的红绿灯（trafficLightPosition 20/20） */
+html.platform-mac {
+  --titlebar-height: 52px;
 }
 
 *, *::before, *::after {

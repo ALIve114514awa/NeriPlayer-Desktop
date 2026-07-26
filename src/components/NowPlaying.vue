@@ -2985,7 +2985,7 @@ const sliderActiveColor = computed(() => {
   z-index: 2;
   display: flex;
   align-items: center;
-  padding: 44px 24px 14px; /* 顶部 44px = 36px 顶栏 + 8px 间距 */
+  padding: calc(var(--titlebar-height, 36px) + 8px) 24px 14px; /* 顶栏高度 + 8px 间距 */
   gap: 12px;
   flex-shrink: 0;
   transition: transform 380ms cubic-bezier(0.22, 1, 0.36, 1), opacity 260ms ease;
@@ -3055,8 +3055,8 @@ const sliderActiveColor = computed(() => {
   transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 300ms ease;
 
   &.np-body--no-header {
-    /* 顶栏 36px + 呼吸空间，避免内容贴红绿灯/顶栏 */
-    padding-top: 52px;
+    /* 顶栏高度 + 16px 呼吸空间，避免内容贴红绿灯/顶栏 */
+    padding-top: calc(var(--titlebar-height, 36px) + 16px);
   }
 
   &.np-body--lyrics-mode {

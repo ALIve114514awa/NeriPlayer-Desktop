@@ -31,6 +31,13 @@ type CoverSnapshot = {
   src: string
 }
 
+// macOS 标题栏更高（52px，红绿灯垂直居中），根类驱动 --titlebar-height 分支；
+// 与 TitleBar.vue 相同的 navigator 平台判定，窗口在 mount 后才显示，不会闪
+const isMacPlatform = /Mac|iPhone|iPad/.test(
+  (navigator as any).userAgentData?.platform || navigator.platform || navigator.userAgent
+)
+if (isMacPlatform) document.documentElement.classList.add('platform-mac')
+
 const player = usePlayerStore()
 const settingsStore = useSettingsStore()
 const likedSongs = useLikedSongsStore()
@@ -496,7 +503,7 @@ onUnmounted(() => {
   overflow: hidden;
   position: relative;
   border-radius: var(--radius-lg);
-  padding-top: 36px; /* 让出顶栏高度（与 TitleBar / mac 红绿灯对齐） */
+  padding-top: var(--titlebar-height, 36px); /* 让出顶栏高度（与 TitleBar / mac 红绿灯对齐） */
   isolation: isolate;
 }
 

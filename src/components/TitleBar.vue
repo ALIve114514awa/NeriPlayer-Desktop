@@ -84,7 +84,7 @@ onUnmounted(() => {
     }"
     data-tauri-drag-region
   >
-    <!-- macOS 原生红绿灯安全区（约 78px），避免内容压住系统交通灯 -->
+    <!-- macOS 原生红绿灯安全区（92px，红绿灯 x=20 起），避免内容压住系统交通灯 -->
     <div v-if="isMac" class="tb-traffic-safe-area" data-tauri-drag-region></div>
 
     <div class="tb-left-slot">
@@ -170,8 +170,9 @@ onUnmounted(() => {
   top: 0;
   left: 0;
   right: 0;
-  /* 固定 36px：对齐 macOS 红绿灯垂直中心，开关 NP 不改高度避免位移 */
-  height: 36px;
+  /* 高度走全局变量：Windows/Linux 36px，macOS 52px（红绿灯垂直居中），
+     开关 NP 不改高度避免位移 */
+  height: var(--titlebar-height, 36px);
   display: flex;
   align-items: stretch;
   background: transparent;
@@ -183,7 +184,7 @@ onUnmounted(() => {
 
   &.tb-np-mode {
     /* 与普通模式同高，只做透明度交叉 */
-    height: 36px;
+    height: var(--titlebar-height, 36px);
     padding-top: 0;
   }
 }
@@ -305,7 +306,7 @@ onUnmounted(() => {
   position: relative;
   width: 100%;
   height: 100%;
-  min-height: 36px;
+  min-height: var(--titlebar-height, 36px);
 }
 
 .tb-left-stack > .tb-brand,
@@ -408,12 +409,12 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 1px;
-  /* 水平留白；高度锁在 36px 内与红绿灯对齐，不做垂直撑高 */
+  /* 水平留白；高度锁在顶栏高度内与红绿灯对齐，不做垂直撑高 */
   padding: 0 24px;
   box-sizing: border-box;
   width: min(56vw, 560px);
   max-width: calc(100% - 200px);
-  height: 36px;
+  height: var(--titlebar-height, 36px);
   pointer-events: auto;
   -webkit-app-region: drag;
   min-width: 180px;
@@ -477,9 +478,10 @@ onUnmounted(() => {
   pointer-events: auto;
 }
 
-/* macOS 原生红绿灯安全区：系统交通灯位于左上 ~12px 起、宽约 78px */
+/* macOS 原生红绿灯安全区：trafficLightPosition x=20，按钮组宽 ~52px，
+   右侧再留 ~20px 呼吸空间 -> 92px */
 .tb-traffic-safe-area {
-  width: 78px;
+  width: 92px;
   height: 100%;
   flex: 0 0 auto;
   -webkit-app-region: drag;
@@ -492,7 +494,23 @@ onUnmounted(() => {
 }
 
 .tb-mac.tb-np-mode .tb-traffic-safe-area {
-  height: 36px;
+  height: var(--titlebar-height, 36px);
+}
+
+/* mac：更高顶栏下放大播放信息两行字号，与红绿灯/菜单按钮同轴垂直居中 */
+.tb-mac .tb-np-center {
+  gap: 3px;
+}
+
+.tb-mac .tb-np-label {
+  font-size: 12px;
+  letter-spacing: 1px;
+  line-height: 1.25;
+}
+
+.tb-mac .tb-np-track {
+  font-size: 15px;
+  line-height: 1.35;
 }
 
 .tb-controls {
