@@ -1,7 +1,8 @@
 // Cookie 持久化：Release 使用系统钥匙串，Debug 使用随机路径明文文件
 // tauri-plugin-store 仅负责旧数据迁移
+use std::collections::HashMap;
 use std::sync::Arc;
-use reqwest::cookie::Jar;
+use reqwest::cookie::{CookieStore, Jar};
 use reqwest::Url;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
@@ -126,6 +127,73 @@ pub fn inject_cookies(jar: &Arc<Jar>, entries: &[CookieEntry]) {
     }
 }
 
+/// 从共享 Jar 回收服务端轮换后的 Cookie 值
+///
+/// 服务端会在响应的 Set-Cookie 中轮换会话令牌，reqwest 会把新值写进 Jar，
+/// 但 AuthState 只在登录时落盘。重启后 inject_all 会把登录当天的旧值重新写回
+/// Jar，对实现了令牌轮换 + 重放检测的服务端就等于提交了一个已作废的令牌，
+/// 整条会话链会被判为异常 —— 表现就是「另一台设备登录后这边掉登录」。
+///
+/// 返回是否发生了变更，调用方据此决定要不要重新落盘。
+pub fn sync_auth_from_jar(jar: &Arc<Jar>, auth: &mut AuthState) -> bool {
+    let mut cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut changed = false;
+    if let Some(netease) = auth.netease.as_mut() {
+        changed |= refresh_entries_from_jar(jar, &mut netease.cookies, &mut cache);
+    }
+    if let Some(bilibili) = auth.bilibili.as_mut() {
+        changed |= refresh_entries_from_jar(jar, &mut bilibili.cookies, &mut cache);
+    }
+    if let Some(youtube) = auth.youtube.as_mut() {
+        changed |= refresh_entries_from_jar(jar, &mut youtube.cookies, &mut cache);
+    }
+    changed
+}
+
+fn refresh_entries_from_jar(
+    jar: &Arc<Jar>,
+    entries: &mut [CookieEntry],
+    cache: &mut HashMap<String, HashMap<String, String>>,
+) -> bool {
+    let mut changed = false;
+    for entry in entries.iter_mut() {
+        let values = cache
+            .entry(entry.domain.clone())
+            .or_insert_with(|| read_jar_cookies(jar, &entry.domain));
+        let Some(current) = values.get(&entry.name) else {
+            continue;
+        };
+        if current.is_empty() || current == &entry.value {
+            continue;
+        }
+        entry.value = current.clone();
+        changed = true;
+    }
+    changed
+}
+
+fn read_jar_cookies(jar: &Arc<Jar>, domain: &str) -> HashMap<String, String> {
+    let Ok(url) = domain_to_url(domain).parse::<Url>() else {
+        return HashMap::new();
+    };
+    let Some(header) = jar.cookies(&url) else {
+        return HashMap::new();
+    };
+    let Ok(text) = header.to_str() else {
+        return HashMap::new();
+    };
+    text.split(';')
+        .filter_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 /// 登出时过期指定平台的 Cookie
 pub fn expire_platform_cookies(jar: &Arc<Jar>, auth: &AuthState, platform: &str) {
     let entries = match platform {
@@ -220,7 +288,8 @@ fn domain_to_url(domain: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_raw_cookie_text;
+    use super::*;
+    use crate::auth::state::NeteaseAuth;
 
     #[test]
     fn raw_cookie_parser_accepts_all_supported_separators() {
@@ -228,5 +297,47 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
 
         assert_eq!(names, ["first", "second", "third", "fourth"]);
+    }
+
+    #[test]
+    fn rotated_jar_cookies_are_written_back_into_auth_state() {
+        let jar = Arc::new(Jar::default());
+        let mut auth = AuthState {
+            netease: Some(NeteaseAuth {
+                cookies: vec![
+                    CookieEntry {
+                        name: "MUSIC_U".into(),
+                        value: "stale".into(),
+                        domain: "music.163.com".into(),
+                    },
+                    CookieEntry {
+                        name: "os".into(),
+                        value: "pc".into(),
+                        domain: "music.163.com".into(),
+                    },
+                ],
+                user_id: None,
+                nickname: None,
+                avatar_url: None,
+            }),
+            ..Default::default()
+        };
+        inject_cookies(&jar, &auth.netease.as_ref().unwrap().cookies);
+
+        // 模拟服务端轮换
+        jar.add_cookie_str(
+            "MUSIC_U=rotated; Domain=music.163.com; Path=/",
+            &"https://music.163.com".parse::<Url>().unwrap(),
+        );
+
+        assert!(sync_auth_from_jar(&jar, &mut auth));
+        let cookies = &auth.netease.as_ref().unwrap().cookies;
+        assert_eq!(
+            cookies.iter().find(|c| c.name == "MUSIC_U").unwrap().value,
+            "rotated"
+        );
+        assert_eq!(cookies.iter().find(|c| c.name == "os").unwrap().value, "pc");
+        // 无变化时不应报告变更，避免每次心跳都写钥匙串
+        assert!(!sync_auth_from_jar(&jar, &mut auth));
     }
 }

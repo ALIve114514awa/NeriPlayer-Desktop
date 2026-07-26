@@ -750,6 +750,7 @@ pub async fn clear_debug_cookie_storage(
             &app,
             &state.cookie_jar,
             &crate::auth::state::AuthState::default(),
+            None,
         )
         .await
     }
@@ -779,11 +780,14 @@ pub async fn logout(platform: String, app: AppHandle, state: State<'_, AppState>
     let remaining_auth = auth.clone();
     drop(auth);
 
-    // 在后台清除 WebView cookie
+    // 在后台清除该平台的 WebView cookie
     let app_clone = app.clone();
     let jar = state.cookie_jar.clone();
     tokio::task::spawn(async move {
-        if let Err(e) = clear_and_reinject_webview_cookies(&app_clone, &jar, &remaining_auth).await {
+        if let Err(e) =
+            clear_and_reinject_webview_cookies(&app_clone, &jar, &remaining_auth, Some(&platform))
+                .await
+        {
             log::warn!(target: "auth", "清除 WebView cookie 失败: {}", e);
         }
     });
@@ -791,13 +795,49 @@ pub async fn logout(platform: String, app: AppHandle, state: State<'_, AppState>
     Ok(())
 }
 
-/// 清除 WebView2 cookie 并重新注入剩余平台的 cookie
+/// 把共享 Jar 中被服务端轮换过的 Cookie 回写到持久层
+///
+/// 只在真的发生变更时落盘，避免心跳频繁写钥匙串。
+pub fn persist_rotated_cookies(app: &AppHandle, state: &AppState) {
+    let mut auth = state.auth.lock();
+    if cookies::sync_auth_from_jar(&state.cookie_jar, &mut auth) {
+        cookies::save_auth(app, &auth);
+        log::info!(target: "auth", "已回收服务端轮换的 Cookie 并落盘");
+    }
+}
+
+/// 各平台在 WebView cookie store 中占用的域
+fn platform_cookie_domains(platform: &str) -> &'static [&'static str] {
+    match platform {
+        "netease" => &["163.com"],
+        "bilibili" => &["bilibili.com", "bilivideo.com", "biliapi.net"],
+        "youtube" => &["youtube.com", "google.com", "googleapis.com", "ytimg.com"],
+        _ => &[],
+    }
+}
+
+fn cookie_domain_belongs_to(cookie_domain: &str, domains: &[&str]) -> bool {
+    let cookie_domain = cookie_domain.trim_start_matches('.').to_ascii_lowercase();
+    if cookie_domain.is_empty() {
+        return false;
+    }
+    domains.iter().any(|domain| {
+        cookie_domain == *domain || cookie_domain.ends_with(&format!(".{domain}"))
+    })
+}
+
+/// 清除指定平台的 WebView cookie 并重新注入剩余平台的 cookie
+///
+/// `platform` 为 None 时清空全部（仅 Debug 的清库入口使用）。
+/// 三个平台共用同一个 WebView cookie store，所以绝不能用
+/// `clear_all_browsing_data()` —— 登出一个平台会把另外两个的浏览器登录态一起抹掉。
 async fn clear_and_reinject_webview_cookies(
     app: &AppHandle,
     jar: &std::sync::Arc<reqwest::cookie::Jar>,
     remaining_auth: &crate::auth::state::AuthState,
+    platform: Option<&str>,
 ) -> AppResult<()> {
-    // 创建一个不可见的临时窗口来操作 WebView2 cookie
+    // 创建一个不可见的临时窗口来操作 WebView cookie
     let label = "cookie-cleaner";
     let window = WebviewWindowBuilder::new(
         app, label,
@@ -810,14 +850,39 @@ async fn clear_and_reinject_webview_cookies(
     // 短暂等待窗口初始化
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 清除所有浏览数据（含所有 cookie）
-    let _ = window.clear_all_browsing_data();
+    match platform {
+        None => {
+            let _ = window.clear_all_browsing_data();
+        }
+        Some(platform) => {
+            let domains = platform_cookie_domains(platform);
+            match window.cookies() {
+                Ok(all_cookies) => {
+                    for cookie in all_cookies {
+                        let domain = cookie.domain().unwrap_or_default().to_string();
+                        if !cookie_domain_belongs_to(&domain, domains) {
+                            continue;
+                        }
+                        if let Err(e) = window.delete_cookie(cookie) {
+                            log::warn!(target: "auth", "删除 WebView cookie 失败: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "auth",
+                        "无法枚举 WebView cookie，跳过按域清理: {}",
+                        e,
+                    );
+                }
+            }
+        }
+    }
 
     // 关闭临时窗口
     let _ = window.close();
 
     // 重新注入剩余已登录平台的 cookie 到 reqwest Jar
-    // （WebView cookie 已经清空，下次打开登录窗口时会是干净状态）
     cookies::inject_all(jar, remaining_auth);
 
     Ok(())

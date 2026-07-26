@@ -34,6 +34,19 @@ const PERSISTED_COOKIE_KEYS: &[&str] = &[
     "YSC",
 ];
 
+/// 带轮换语义的会话令牌：Google 每次签发新值都会作废旧值
+///
+/// 桌面与移动端若共享同一 SID 家族，两端各自收编轮换值就会互相让对方失效，
+/// 表现为「另一台设备登录后这边掉登录」。这里一旦本地已有值就不再收编，
+/// 保持登录时拿到的那一份，把轮换主导权让给用户的主力设备。
+const ROTATING_SESSION_COOKIE_KEYS: &[&str] = &["__Secure-1PSIDTS", "__Secure-3PSIDTS"];
+
+fn is_rotating_session_cookie(name: &str) -> bool {
+    ROTATING_SESSION_COOKIE_KEYS
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(name))
+}
+
 fn cookie_key_allowed(name: &str) -> bool {
     PERSISTED_COOKIE_KEYS
         .iter()
@@ -152,6 +165,14 @@ pub fn merge_youtube_auth_cookies(
         if entry.name.is_empty() || entry.value.is_empty() || !cookie_key_allowed(&entry.name) {
             continue;
         }
+        // 已持有轮换令牌时保留旧值，不参与与其它设备的轮换竞争
+        if is_rotating_session_cookie(&entry.name)
+            && previous
+                .get(&entry.name)
+                .is_some_and(|existing| !existing.value.is_empty())
+        {
+            continue;
+        }
         merged.insert(entry.name.clone(), entry.clone());
     }
 
@@ -231,5 +252,74 @@ mod tests {
             .cookies
             .iter()
             .any(|c| c.name == "SAPISID" && c.value == "sap-new"));
+    }
+
+    #[test]
+    fn rotating_session_tokens_are_not_adopted_once_present() {
+        let base = YouTubeAuth {
+            cookies: vec![
+                CookieEntry {
+                    name: "SID".into(),
+                    value: "sid".into(),
+                    domain: ".youtube.com".into(),
+                },
+                CookieEntry {
+                    name: "__Secure-3PSIDTS".into(),
+                    value: "sidts-login".into(),
+                    domain: ".google.com".into(),
+                },
+            ],
+            nickname: None,
+            avatar_url: None,
+        };
+        let observed = vec![
+            CookieEntry {
+                name: "__Secure-3PSIDTS".into(),
+                value: "sidts-rotated".into(),
+                domain: ".google.com".into(),
+            },
+            CookieEntry {
+                name: "SIDCC".into(),
+                value: "sidcc-new".into(),
+                domain: ".youtube.com".into(),
+            },
+        ];
+
+        let merged = merge_youtube_auth_cookies(&base, &observed);
+
+        assert!(merged
+            .cookies
+            .iter()
+            .any(|c| c.name == "__Secure-3PSIDTS" && c.value == "sidts-login"));
+        // 非轮换令牌照常收编
+        assert!(merged
+            .cookies
+            .iter()
+            .any(|c| c.name == "SIDCC" && c.value == "sidcc-new"));
+    }
+
+    #[test]
+    fn rotating_session_tokens_are_adopted_when_absent() {
+        let base = YouTubeAuth {
+            cookies: vec![CookieEntry {
+                name: "SID".into(),
+                value: "sid".into(),
+                domain: ".youtube.com".into(),
+            }],
+            nickname: None,
+            avatar_url: None,
+        };
+        let observed = vec![CookieEntry {
+            name: "__Secure-1PSIDTS".into(),
+            value: "sidts-first".into(),
+            domain: ".google.com".into(),
+        }];
+
+        let merged = merge_youtube_auth_cookies(&base, &observed);
+
+        assert!(merged
+            .cookies
+            .iter()
+            .any(|c| c.name == "__Secure-1PSIDTS" && c.value == "sidts-first"));
     }
 }
