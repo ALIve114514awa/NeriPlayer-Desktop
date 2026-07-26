@@ -90,17 +90,57 @@ pub fn deserialize(content: &str, is_binary: bool) -> AppResult<SyncData> {
     }
 }
 
+// Android 端 kotlinx.serialization 把「无默认值的属性」视为必填, 缺字段直接抛
+// MissingFieldException; 而 prost 遵循 proto3 语义, 标量等于默认值时不写入报文。
+// 两者叠加会让「桌面写出的合法报文对端解不开」, 因此编码前必须保证这些字段非零,
+// 无法保证的记录只能整条丢弃。详见 docs/SYNC-MODEL-CONTRACT.md §3.1
+const FALLBACK_DEVICE_ID: &str = "neriplayer-desktop";
+const FALLBACK_DEVICE_NAME: &str = "NeriPlayer Desktop";
+
+fn non_empty_or(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 日志条目的 timestamp / deviceId / action 在 Android 侧均为必填,
+/// 其中 action 的 CREATE_PLAYLIST 序数为 0, prost 会省略该 tag。
+/// syncLog 只是排障辅助数据, 丢弃安全, 优先保证对端能解码。
+fn log_entry_is_proto_safe(entry: &SyncLogEntry) -> bool {
+    entry.timestamp > 0
+        && !entry.device_id.trim().is_empty()
+        && sync_action_to_code(&entry.action) != 0
+}
+
 // Proto <-> SyncData 转换
 fn sync_data_to_proto(data: &SyncData) -> ProtoSyncData {
     ProtoSyncData {
-        version: data.version.clone(),
-        device_id: data.device_id.clone(),
-        device_name: data.device_name.clone(),
+        version: non_empty_or(&data.version, "2.0"),
+        device_id: non_empty_or(&data.device_id, FALLBACK_DEVICE_ID),
+        device_name: non_empty_or(&data.device_name, FALLBACK_DEVICE_NAME),
         last_modified: data.last_modified,
-        playlists: data.playlists.iter().map(sync_playlist_to_proto).collect(),
-        favorite_playlists: data.favorite_playlists.iter().map(fav_playlist_to_proto).collect(),
+        playlists: data
+            .playlists
+            .iter()
+            .filter(|playlist| sync_i64_from_string(&playlist.id) != 0)
+            .map(sync_playlist_to_proto)
+            .collect(),
+        favorite_playlists: data
+            .favorite_playlists
+            .iter()
+            .filter(|playlist| sync_i64_from_string(&playlist.id) != 0)
+            .map(fav_playlist_to_proto)
+            .collect(),
         recent_plays: data.recent_plays.iter().map(recent_play_to_proto).collect(),
-        sync_log: data.sync_log.iter().map(log_entry_to_proto).collect(),
+        sync_log: data
+            .sync_log
+            .iter()
+            .filter(|entry| log_entry_is_proto_safe(entry))
+            .map(log_entry_to_proto)
+            .collect(),
         recent_play_deletions: data.recent_play_deletions.iter().map(deletion_to_proto).collect(),
         playback_stats: data.playback_stats.iter().map(track_stat_to_proto).collect(),
         playback_stats_cleared_at: data.playback_stats_cleared_at,
@@ -846,6 +886,98 @@ mod compressed_contract_tests {
         assert!(decoded.playback_stats[0].cover_url.is_none());
         assert!(decoded.playback_stats[0].media_uri.is_none());
         assert!(decoded.playlist_song_deletions[0].media_uri.is_none());
+    }
+
+    #[test]
+    fn compressed_encode_drops_records_that_would_omit_android_required_fields() {
+        let data = SyncData {
+            version: String::new(),
+            device_id: "  ".into(),
+            device_name: String::new(),
+            playlists: vec![
+                SyncPlaylist {
+                    id: "not-a-number".into(),
+                    name: "Dropped".into(),
+                    songs: Vec::new(),
+                    created_at: 1,
+                    modified_at: 2,
+                    is_deleted: false,
+                    song_order_version: 1,
+                },
+                SyncPlaylist {
+                    id: "7".into(),
+                    name: "Kept".into(),
+                    songs: Vec::new(),
+                    created_at: 1,
+                    modified_at: 2,
+                    is_deleted: false,
+                    song_order_version: 1,
+                },
+            ],
+            favorite_playlists: vec![SyncFavoritePlaylist {
+                id: "0".into(),
+                name: "Dropped".into(),
+                cover_url: String::new(),
+                track_count: 0,
+                source: "netease".into(),
+                songs: Vec::new(),
+                added_time: 1,
+                modified_at: 1,
+                is_deleted: false,
+                sort_order: 1,
+                browse_id: None,
+                playlist_id: None,
+                subtitle: None,
+            }],
+            sync_log: vec![
+                // action 序数为 0, prost 会省略 tag 3 -> Android 必填校验失败
+                SyncLogEntry {
+                    timestamp: 10,
+                    device_id: "desktop".into(),
+                    action: "CREATE_PLAYLIST".into(),
+                    playlist_id: None,
+                    song_id: None,
+                    details: None,
+                },
+                SyncLogEntry {
+                    timestamp: 0,
+                    device_id: "desktop".into(),
+                    action: "ADD_SONG".into(),
+                    playlist_id: None,
+                    song_id: None,
+                    details: None,
+                },
+                SyncLogEntry {
+                    timestamp: 20,
+                    device_id: "  ".into(),
+                    action: "ADD_SONG".into(),
+                    playlist_id: None,
+                    song_id: None,
+                    details: None,
+                },
+                SyncLogEntry {
+                    timestamp: 30,
+                    device_id: "desktop".into(),
+                    action: "REMOVE_SONG".into(),
+                    playlist_id: None,
+                    song_id: None,
+                    details: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let encoded = serialize_compressed(&data).unwrap();
+        let decoded = deserialize_compressed(&encoded).unwrap();
+
+        assert_eq!(decoded.version, "2.0");
+        assert_eq!(decoded.device_id, "neriplayer-desktop");
+        assert_eq!(decoded.device_name, "NeriPlayer Desktop");
+        assert_eq!(decoded.playlists.len(), 1);
+        assert_eq!(decoded.playlists[0].id, "7");
+        assert!(decoded.favorite_playlists.is_empty());
+        assert_eq!(decoded.sync_log.len(), 1);
+        assert_eq!(decoded.sync_log[0].action, "REMOVE_SONG");
     }
 
     #[test]
