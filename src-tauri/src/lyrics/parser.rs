@@ -132,10 +132,14 @@ pub fn parse_lrc(content: &str) -> Vec<LyricLine> {
         }
     }
 
-    // 计算每行持续时间
+    // 先按开始时间稳定排序：在野 LRC 存在乱序时间轴，直接按行序差分会 u64 下溢
+    // （debug panic / release 得到天文数字时长）；同刻多行保持原文相对顺序
+    lines.sort_by_key(|line| line.start_ms);
+
+    // 计算每行持续时间；saturating_sub 兜底防御排序后仍可能出现的相等时间戳
     for i in 0..lines.len() {
         if i + 1 < lines.len() {
-            lines[i].duration_ms = lines[i + 1].start_ms - lines[i].start_ms;
+            lines[i].duration_ms = lines[i + 1].start_ms.saturating_sub(lines[i].start_ms);
         } else {
             lines[i].duration_ms = 5000;
         }
@@ -160,7 +164,32 @@ pub fn merge_translation(lines: &mut [LyricLine], translation_lrc: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_auto, parse_yrc};
+    use super::{parse_auto, parse_lrc, parse_yrc};
+
+    #[test]
+    fn parse_lrc_sorts_out_of_order_timestamps_without_underflow() {
+        // 乱序时间轴：第二行时间早于第一行，旧实现差分会 u64 下溢
+        let lines = parse_lrc("[00:10.00]later\n[00:05.00]earlier\n[00:12.00]last");
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["earlier", "later", "last"]
+        );
+        assert_eq!(lines[0].start_ms, 5000);
+        assert_eq!(lines[0].duration_ms, 5000);
+        assert_eq!(lines[1].duration_ms, 2000);
+        assert_eq!(lines[2].duration_ms, 5000);
+    }
+
+    #[test]
+    fn parse_lrc_equal_timestamps_do_not_underflow() {
+        let lines = parse_lrc("[00:05.00]a\n[00:05.00]b");
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].duration_ms, 0);
+        assert_eq!(lines[1].duration_ms, 5000);
+    }
 
     #[test]
     fn parse_yrc_normalizes_relative_word_times() {
