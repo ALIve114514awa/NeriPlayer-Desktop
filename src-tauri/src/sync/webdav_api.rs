@@ -19,6 +19,17 @@ pub struct WebDavApiClient {
 
 const SYNC_FILENAME: &str = "neriplayer-sync.json";
 
+/// 412 并发冲突的可识别错误文案前缀
+///
+/// AppError 不归本模块管（新增变体会波及全局 IPC 序列化），
+/// 用固定前缀 + 判别函数让 manager 能把 412 与其他失败区分开做重试。
+const PRECONDITION_CONFLICT_PREFIX: &str = "WebDAV precondition failed (412)";
+
+/// 判断错误是否为 If-Match 未命中导致的 412 并发冲突
+pub fn is_precondition_conflict(error: &crate::error::AppError) -> bool {
+    matches!(error, AppError::Api(message) if message.starts_with(PRECONDITION_CONFLICT_PREFIX))
+}
+
 impl WebDavApiClient {
     pub fn new(http: &Client, server_url: &str, username: &str, password: &str, base_path: &str) -> Self {
         Self {
@@ -64,9 +75,9 @@ impl WebDavApiClient {
         }
     }
 
-    /// 获取文件内容和指纹
+    /// 获取文件内容、指纹与 ETag（服务端未返回 ETag 时为 None）
     /// 不存在时返回 Ok(None)
-    pub async fn get_file_content(&self) -> AppResult<Option<(Vec<u8>, String)>> {
+    pub async fn get_file_content(&self) -> AppResult<Option<(Vec<u8>, String, Option<String>)>> {
         let url = self.remote_url();
         let resp = self.http.get(&url)
             .basic_auth(&self.username, Some(&self.password))
@@ -82,6 +93,15 @@ impl WebDavApiClient {
         if !resp.status().is_success() {
             return Err(AppError::Api(format!("WebDAV GET failed ({})", status)));
         }
+
+        // 捕获 ETag 供后续 PUT 带 If-Match，弱 ETag（W/ 前缀）不可用于写前提条件
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.starts_with("W/"))
+            .map(String::from);
 
         // 服务端声明的体积就已超限时直接拒收，不必先把整个响应读进内存
         if let Some(declared) = resp.content_length() {
@@ -102,14 +122,23 @@ impl WebDavApiClient {
             )));
         }
         let fingerprint = Self::sha256_fingerprint(&content);
-        Ok(Some((content, fingerprint)))
+        Ok(Some((content, fingerprint, etag)))
     }
 
     /// 上传文件内容，返回 SHA-256 指纹
     ///
     /// 省流模式以 octet-stream 传原始 GZIP 字节，与 Android 对齐；
     /// 对二进制正文声明 `application/json` 会让部分服务端做转码甚至拒收。
-    pub async fn update_file_content(&self, content: &[u8], data_saver: bool) -> AppResult<String> {
+    ///
+    /// `if_match` 为 GET 时捕获的 ETag：带上后 GET→PUT 窗口内他端的写入会让
+    /// 服务端返回 412 而不是被本次 PUT 静默覆盖（对齐 Android WebDavApiClient
+    /// 的 If-Match）；无 ETag 时退化为现状的无条件 PUT。
+    pub async fn update_file_content(
+        &self,
+        content: &[u8],
+        data_saver: bool,
+        if_match: Option<&str>,
+    ) -> AppResult<String> {
         let url = self.remote_url();
         // 省流传 GZIP 二进制，非省流传 JSON 文本；与 Android 的 mediaType 选择一致
         let media_type = if data_saver {
@@ -117,15 +146,25 @@ impl WebDavApiClient {
         } else {
             "application/json; charset=utf-8"
         };
-        let resp = self.http.put(&url)
+        let mut request = self.http.put(&url)
             .basic_auth(&self.username, Some(&self.password))
-            .header("Content-Type", media_type)
+            .header("Content-Type", media_type);
+        if let Some(etag) = if_match {
+            request = request.header(reqwest::header::IF_MATCH, etag);
+        }
+        let resp = request
             .body(content.to_vec())
             .send().await?;
 
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
             return Err(AppError::Api("WebDAV authentication failed".into()));
+        }
+        if status == 412 {
+            return Err(AppError::Api(format!(
+                "{}: remote file changed since last read",
+                PRECONDITION_CONFLICT_PREFIX
+            )));
         }
         // WebDAV PUT 成功通常返回 200/201/204
         if !resp.status().is_success() {

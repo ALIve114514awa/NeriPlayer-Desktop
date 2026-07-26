@@ -559,12 +559,16 @@ pub async fn sync_github(
         history_entries.as_deref(),
         history_deletions.as_deref(),
         Some(local_stats_payload(&state)),
-    );
+    )?;
     let outcome = manager::sync_github(&state.http(), &mut config, &local_data).await?;
     apply_merged_stats(&app, &state, &outcome.merged);
     save_github_config(&app, &config);
-    // 通知前端歌单数据可能已变更
-    let _ = app.emit("playlists-changed", ());
+    // 仅本地数据确有变化时通知前端：App.vue 监听该事件后会防抖触发自动同步，
+    // "Already up to date" 也无条件 emit 会形成 5s 自激同步环；
+    // 有变化时事件照发，手动同步后的 UI 刷新能力不受影响
+    if outcome.local_changed {
+        let _ = app.emit("playlists-changed", ());
+    }
     let _ = app.emit("playback-stats-changed", ());
     Ok(outcome.result)
 }
@@ -641,11 +645,14 @@ pub async fn sync_webdav(
         history_entries.as_deref(),
         history_deletions.as_deref(),
         Some(local_stats_payload(&state)),
-    );
+    )?;
     let outcome = manager::sync_webdav(&state.http(), &mut config, &local_data).await?;
     apply_merged_stats(&app, &state, &outcome.merged);
     save_webdav_config(&app, &config);
-    let _ = app.emit("playlists-changed", ());
+    // 与 sync_github 同理：无本地变化不 emit，消除自激同步环
+    if outcome.local_changed {
+        let _ = app.emit("playlists-changed", ());
+    }
     let _ = app.emit("playback-stats-changed", ());
     Ok(outcome.result)
 }
@@ -770,7 +777,7 @@ pub async fn export_playlists(app: AppHandle) -> AppResult<Value> {
         path.push("playlists.json");
         path
     };
-    let store = PlaylistStore::load(&playlists_path);
+    let store = PlaylistStore::load_strict(&playlists_path)?;
 
     // 转换为 SyncPlaylist 格式（Android 兼容）
     let sync_playlists: Vec<crate::sync::models::SyncPlaylist> = store.playlists.iter().map(|pl| {
@@ -875,7 +882,7 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
                     playlists: sync_playlists,
                     ..Default::default()
                 };
-                save_synced_playlists(&sync_data);
+                save_synced_playlists(&sync_data)?;
             } else if parsed.is_array() {
                 // 尝试 Desktop 格式
                 if let Ok(imported) = serde_json::from_value::<Vec<Playlist>>(parsed.clone()) {
@@ -886,7 +893,7 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
                         path.push("playlists.json");
                         path
                     };
-                    let mut store = PlaylistStore::load(&playlists_path);
+                    let mut store = PlaylistStore::load_strict(&playlists_path)?;
                     for pl in imported {
                         if !store.playlists.iter().any(|p| p.name == pl.name) {
                             store.playlists.push(pl);
@@ -902,7 +909,7 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
                         playlists: sync_playlists,
                         ..Default::default()
                     };
-                    save_synced_playlists(&sync_data);
+                    save_synced_playlists(&sync_data)?;
                 }
             } else {
                 return Err(AppError::Other("Unrecognized playlist format".into()));

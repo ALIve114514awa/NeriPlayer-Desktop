@@ -242,13 +242,12 @@ fn merge_single_playlist(
 ) -> SyncPlaylist {
     let local_changed = local.modified_at > last_sync_time;
     let remote_changed = remote.modified_at > last_sync_time;
+    // 仅远端单侧改名时取远端；双方都改（或都未改但名字不同）固定 local-wins，
+    // 对齐 Android GitHubSyncManager 的 PLAYLIST_RENAMED_BOTH_SIDES 裁决。
+    // 按 modified_at 较新者裁决会让快钟设备永远赢且双端结果不同，名字乒乓。
     let name = if local.name == remote.name {
         local.name.clone()
     } else if remote_changed && !local_changed {
-        remote.name.clone()
-    } else if local_changed && !remote_changed {
-        local.name.clone()
-    } else if remote.modified_at > local.modified_at {
         remote.name.clone()
     } else {
         local.name.clone()
@@ -292,7 +291,13 @@ fn order_merged_playlists(
     };
     let mut ordered_ids = Vec::new();
     let mut seen = HashSet::new();
+    // 与 Android orderMergedPlaylists 的 filterNot(isDeleted) 对齐：
+    // 已删歌单不参与来源顺序，统一由下方兜底循环按 key 序补在末尾，
+    // 否则双端排序结果不同会被误判为数据变更而回声上传
     for playlist in primary.iter().chain(secondary.iter()) {
+        if playlist.is_deleted {
+            continue;
+        }
         if merged.contains_key(&playlist.id) && seen.insert(playlist.id.clone()) {
             ordered_ids.push(playlist.id.clone());
         }
@@ -432,15 +437,51 @@ struct SongMergeEntry {
     aliases: Vec<SyncSong>,
 }
 
+/// add_if_absent 的候选召回键
+///
+/// songs_match 的每一层正匹配都必然与对方共享其中一种键
+/// （token 相交 / identity 相等或 identity_keys 相交 / channel 三元组相等 /
+/// 兜底层的相同 id），因此按键召回候选后再用 songs_match 精确复核，
+/// 结果与全量线性扫描完全一致，但把万曲合并从 O(n²) 降到近 O(n)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SongIndexKey {
+    Token(SyncCausalToken),
+    Identity(String),
+    Channel(String),
+    Id(String),
+}
+
+fn song_index_keys(song: &SyncSong) -> Vec<SongIndexKey> {
+    let mut keys: Vec<SongIndexKey> = song
+        .sync_membership_tokens
+        .iter()
+        .cloned()
+        .map(SongIndexKey::Token)
+        .collect();
+    keys.extend(song.identity_keys().into_iter().map(SongIndexKey::Identity));
+    if let Some(channel_key) = channel_audio_key(song) {
+        keys.push(SongIndexKey::Channel(channel_key));
+    }
+    if !song.id.is_empty() && song.id != "0" {
+        keys.push(SongIndexKey::Id(song.id.clone()));
+    }
+    keys
+}
+
 struct SongMergeAccumulator {
-    entries: Vec<SongMergeEntry>,
+    /// 槽位表：槽位号即插入序，被吸收的槽位置 None，输出按槽位号升序，
+    /// 与旧实现「Vec 移除元素、剩余保持相对顺序」的输出顺序一致
+    slots: Vec<Option<SongMergeEntry>>,
+    /// 别名键 -> 槽位号倒排索引；查询时过滤掉已被吸收（None）的槽位
+    index: HashMap<SongIndexKey, Vec<usize>>,
     resolve_payload_deterministically: bool,
 }
 
 impl SongMergeAccumulator {
     fn new(resolve_payload_deterministically: bool) -> Self {
         Self {
-            entries: Vec::new(),
+            slots: Vec::new(),
+            index: HashMap::new(),
             resolve_payload_deterministically,
         }
     }
@@ -449,10 +490,12 @@ impl SongMergeAccumulator {
         let normalized = song.normalized_for_sync();
         let matching_indices = self.matching_indices(&normalized);
         if matching_indices.is_empty() {
-            self.entries.push(SongMergeEntry {
+            let slot = self.slots.len();
+            self.index_alias_keys(slot, std::slice::from_ref(&normalized));
+            self.slots.push(Some(SongMergeEntry {
                 aliases: vec![normalized.clone()],
                 song: normalized,
-            });
+            }));
             return;
         }
         self.merge_matching_components(&matching_indices, normalized);
@@ -466,16 +509,35 @@ impl SongMergeAccumulator {
         }
     }
 
+    /// 把一组别名的召回键指向槽位；重复指向无害（查询时去重）
+    fn index_alias_keys(&mut self, slot: usize, aliases: &[SyncSong]) {
+        for alias in aliases {
+            for key in song_index_keys(alias) {
+                let ids = self.index.entry(key).or_default();
+                if !ids.contains(&slot) {
+                    ids.push(slot);
+                }
+            }
+        }
+    }
+
     fn matching_indices(&self, song: &SyncSong) -> Vec<usize> {
-        self.entries
+        let mut candidates: Vec<usize> = song_index_keys(song)
             .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                entry
-                    .aliases
-                    .iter()
-                    .any(|alias| songs_match(alias, song))
-                    .then_some(index)
+            .filter_map(|key| self.index.get(key))
+            .flatten()
+            .copied()
+            .filter(|slot| self.slots[*slot].is_some())
+            .collect();
+        // 升序即插入序，保证 primary 选取与旧实现（首个匹配位置）一致
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+            .into_iter()
+            .filter(|slot| {
+                self.slots[*slot]
+                    .as_ref()
+                    .is_some_and(|entry| entry.aliases.iter().any(|alias| songs_match(alias, song)))
             })
             .collect()
     }
@@ -484,10 +546,14 @@ impl SongMergeAccumulator {
         let primary_index = matching_indices[0];
         let mut payload_candidates: Vec<SyncSong> = matching_indices
             .iter()
-            .map(|index| self.entries[*index].song.clone())
+            .filter_map(|index| self.slots[*index].as_ref().map(|entry| entry.song.clone()))
             .collect();
         payload_candidates.push(other.clone());
 
+        let primary_song = self.slots[primary_index]
+            .as_ref()
+            .map(|entry| entry.song.clone())
+            .unwrap_or_else(|| other.clone());
         let selected = if self.resolve_payload_deterministically {
             payload_candidates
                 .iter()
@@ -497,9 +563,9 @@ impl SongMergeAccumulator {
                         .then_with(|| canonical_payload_key(left).cmp(&canonical_payload_key(right)))
                 })
                 .cloned()
-                .unwrap_or_else(|| self.entries[primary_index].song.clone())
+                .unwrap_or_else(|| primary_song.clone())
         } else {
-            self.entries[primary_index].song.clone()
+            primary_song
         };
         let mut resolved = resolve_selected_sync_payload(&selected, &payload_candidates);
         resolved.added_at = resolve_primary_added_at(selected.added_at, &payload_candidates);
@@ -511,11 +577,15 @@ impl SongMergeAccumulator {
                 .collect::<Vec<_>>(),
         );
 
-        let mut aliases = self.entries[primary_index].aliases.clone();
+        let mut aliases = self.slots[primary_index]
+            .as_ref()
+            .map(|entry| entry.aliases.clone())
+            .unwrap_or_default();
         for index in matching_indices.iter().copied().skip(1) {
-            for alias in &self.entries[index].aliases {
-                if !aliases.iter().any(|known| same_song_payload(known, alias)) {
-                    aliases.push(alias.clone());
+            let Some(absorbed) = self.slots[index].take() else { continue };
+            for alias in absorbed.aliases {
+                if !aliases.iter().any(|known| same_song_payload(known, &alias)) {
+                    aliases.push(alias);
                 }
             }
         }
@@ -526,17 +596,20 @@ impl SongMergeAccumulator {
             aliases.push(other);
         }
 
-        self.entries[primary_index] = SongMergeEntry {
+        // 被吸收槽位的别名键必须重指到主槽位，后续歌曲才能继续命中该合并分量
+        self.index_alias_keys(primary_index, &aliases);
+        self.slots[primary_index] = Some(SongMergeEntry {
             song: resolved,
             aliases,
-        };
-        for index in matching_indices.iter().copied().skip(1).rev() {
-            self.entries.remove(index);
-        }
+        });
     }
 
     fn into_songs(self) -> Vec<SyncSong> {
-        self.entries.into_iter().map(|entry| entry.song).collect()
+        self.slots
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.song)
+            .collect()
     }
 }
 
@@ -1144,11 +1217,17 @@ fn prune_playlist_song_deletions(
             if !deletion.removed_membership_tokens.is_empty() {
                 return true;
             }
+            // 仅当活跃歌带非空 membership token（identity 已由 causal token 接管、
+            // 确实是新版本重新添加）且 added_at 晚于删除时刻才裁 legacy 墓碑。
+            // legacy 迁移合成的 addedAt（无 token）不可据此判定重新添加，否则
+            // 误裁墓碑会让已删歌在所有端复活（对齐 Android SyncPlaylistDeletionPolicy P1-1）
             playlists.iter().all(|playlist| {
                 playlist.id != deletion.playlist_id
                     || playlist.is_deleted
                     || playlist.songs.iter().all(|song| {
-                        !deletion.matches_song(&playlist.id, song) || song.added_at <= deletion.deleted_at
+                        !deletion.matches_song(&playlist.id, song)
+                            || normalize_sync_causal_tokens(&song.sync_membership_tokens).is_empty()
+                            || song.added_at <= deletion.deleted_at
                     })
             })
         })
@@ -1284,6 +1363,21 @@ impl CounterSide<'_> {
 
 fn merge_counter_values(local: CounterSide<'_>, remote: CounterSide<'_>) -> MergedCounters {
     let shards = merge_counter_shards(local.shards, remote.shards);
+    // 分片为空时 base 显式归零（对齐 Android SyncPlaybackStatsMergePolicy.mergeCounters）：
+    // 此时把 total 折算进 base 只会让本端与 Android 的 counter_base 永远不同，
+    // has_data_changed 每轮都判「有变化」，双端互相"纠正"形成永不收敛的回声上传；
+    // 总量本身仍由下方的 max 兜底，归零不丢任何数据
+    if shards.is_empty() {
+        return MergedCounters {
+            total_listen_ms: local.total_listen_ms.max(remote.total_listen_ms).max(0),
+            play_count: local.play_count.max(remote.play_count).max(0),
+            first_played_at: min_positive(local.first_played_at, remote.first_played_at),
+            last_played_at: local.last_played_at.max(remote.last_played_at),
+            base_listen_ms: 0,
+            base_play_count: 0,
+            shards,
+        };
+    }
     let base_total = local
         .effective_base_listen_ms()
         .max(remote.effective_base_listen_ms());
@@ -2112,6 +2206,116 @@ mod tests {
         assert_eq!(trimmed.len(), MAX_PLAYBACK_STATS);
         assert!(trimmed.iter().all(|stat| stat.last_played_at >= 10));
         assert_eq!(trim_playback_stats(trimmed.clone()).len(), MAX_PLAYBACK_STATS);
+    }
+
+    /// Y2 回归：legacy 迁移合成的 addedAt（无 membership token）不得据此裁墓碑，
+    /// 否则已删歌会在所有端复活（对齐 Android SyncPlaylistDeletionPolicy P1-1）
+    #[test]
+    fn legacy_tombstone_survives_active_song_without_membership_tokens() {
+        let active = song("42", 300);
+        assert!(active.sync_membership_tokens.is_empty());
+        let deletion = SyncPlaylistSongDeletion {
+            playlist_id: "1".into(),
+            song_id: "42".into(),
+            album: "netease".into(),
+            deleted_at: 200,
+            device_id: "phone".into(),
+            ..Default::default()
+        };
+
+        let pruned = prune_playlist_song_deletions(&[deletion], &[playlist(vec![active])]);
+
+        assert_eq!(pruned.len(), 1, "无 token 的活跃歌不构成\"重新添加\"证据");
+    }
+
+    #[test]
+    fn legacy_tombstone_is_pruned_when_readded_song_carries_membership_token() {
+        let mut readded = song("42", 300);
+        readded.sync_membership_tokens = vec![SyncCausalToken {
+            device_id: "desktop".into(),
+            counter: 7,
+        }];
+        let deletion = SyncPlaylistSongDeletion {
+            playlist_id: "1".into(),
+            song_id: "42".into(),
+            album: "netease".into(),
+            deleted_at: 200,
+            device_id: "phone".into(),
+            ..Default::default()
+        };
+
+        let pruned = prune_playlist_song_deletions(&[deletion], &[playlist(vec![readded])]);
+
+        assert!(pruned.is_empty(), "带 token 且 added_at 更晚才算真正重新添加");
+    }
+
+    /// Y3 回归：合并后分片为空时 counter_base 必须归零（对齐 Android），
+    /// 否则 base=total 与对端的 0 每轮互相"纠正"，回声上传永不收敛
+    #[test]
+    fn counter_base_is_zeroed_when_merged_shards_are_empty() {
+        let local = SyncTrackStat {
+            identity_key: "k".into(),
+            total_listen_ms: 900,
+            play_count: 9,
+            last_played_at: 100,
+            ..Default::default()
+        };
+        let mut remote = local.clone();
+        remote.total_listen_ms = 700;
+        remote.play_count = 7;
+        remote.last_played_at = 90;
+
+        let merged = merge_playback_stats(&[local], &[remote], 0);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].total_listen_ms, 900);
+        assert_eq!(merged[0].play_count, 9);
+        assert_eq!(merged[0].counter_base_listen_ms, 0);
+        assert_eq!(merged[0].counter_base_play_count, 0);
+    }
+
+    /// Y6 回归：双方都改名固定 local-wins（对齐 Android），不再按 modified_at 裁决
+    #[test]
+    fn playlist_rename_conflict_prefers_local_when_both_sides_changed() {
+        let mut local = playlist(Vec::new());
+        local.name = "Local name".into();
+        local.modified_at = 300;
+        let mut remote = playlist(Vec::new());
+        remote.name = "Remote name".into();
+        // 远端时间戳更晚（快钟设备）也不能赢
+        remote.modified_at = 400;
+
+        let merged = three_way_merge(
+            &sync_data(vec![local]),
+            &sync_data(vec![remote]),
+            200,
+            &HashMap::new(),
+        );
+
+        assert_eq!(merged.playlists[0].name, "Local name");
+    }
+
+    /// Y7 回归：已删歌单不参与来源顺序，墓碑统一补在末尾（对齐 Android filterNot）
+    #[test]
+    fn deleted_playlists_are_appended_after_active_ones_in_merge_order() {
+        let mut tombstone = playlist(Vec::new());
+        tombstone.id = "2".into();
+        tombstone.is_deleted = true;
+        tombstone.modified_at = 300;
+        let active = playlist(Vec::new());
+        let local = sync_data(vec![tombstone.clone(), active.clone()]);
+        let remote = sync_data(vec![tombstone, active]);
+
+        let merged = three_way_merge(&local, &remote, 200, &HashMap::new());
+
+        assert_eq!(
+            merged
+                .playlists
+                .iter()
+                .map(|playlist| (playlist.id.as_str(), playlist.is_deleted))
+                .collect::<Vec<_>>(),
+            vec![("1", false), ("2", true)],
+        );
     }
 
     fn stat_bucket(day_start_at: i64, identity_key: &str) -> SyncPlaybackStatBucket {

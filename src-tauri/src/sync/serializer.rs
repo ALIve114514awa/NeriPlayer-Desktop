@@ -135,15 +135,40 @@ pub fn deserialize_compressed(compressed: &[u8]) -> AppResult<SyncData> {
     }
 }
 
+/// 上传体积护栏，与下载侧 `ensure_remote_content_size` 同一组上限
+///
+/// 下载有 8/12MB 护栏而上传没有时，超限备份会被成功推上云端，
+/// 之后所有设备（含本机）拉取一律失败——同步从此自锁。必须在
+/// 上传前用同一标准拒绝，并明确告知实际体积与上限。
+fn ensure_upload_content_size(content: &[u8], data_saver: bool) -> AppResult<()> {
+    let (max, kind) = if data_saver {
+        (MAX_COMPRESSED_BYTES, "compressed")
+    } else {
+        (MAX_JSON_BYTES, "JSON")
+    };
+    if content.len() > max {
+        return Err(AppError::Other(format!(
+            "sync backup is too large to upload: {} bytes ({} limit is {} bytes); \
+             remote data is left untouched",
+            content.len(),
+            kind,
+            max
+        )));
+    }
+    Ok(())
+}
+
 /// 根据 data_saver 标志选择序列化方式，产物一律是原始字节
 pub fn serialize(data: &SyncData, data_saver: bool) -> AppResult<Vec<u8>> {
-    if data_saver {
-        serialize_compressed(data)
+    let content = if data_saver {
+        serialize_compressed(data)?
     } else {
         serde_json::to_string_pretty(&data.normalized_for_sync())
             .map(String::into_bytes)
-            .map_err(|e| AppError::Other(format!("JSON serialize: {}", e)))
-    }
+            .map_err(|e| AppError::Other(format!("JSON serialize: {}", e)))?
+    };
+    ensure_upload_content_size(&content, data_saver)?;
+    Ok(content)
 }
 
 /// 按内容自动识别格式并反序列化（read-both）
@@ -896,6 +921,29 @@ mod compressed_contract_tests {
             deserialize(legacy.as_bytes()).unwrap().playlists[0].name,
             "跨端歌单",
         );
+    }
+
+    /// 上传前必须套用与下载相同的体积护栏
+    ///
+    /// 下载有护栏而上传没有时，超限备份会被推上云端，
+    /// 之后所有设备拉取一律失败，同步永久自锁。
+    #[test]
+    fn serialize_rejects_payloads_exceeding_download_guardrails() {
+        let mut data = sample_sync_data();
+        // 用一段远超 8MB 的不可压缩前歌词字段撑爆 JSON 上限
+        let huge = "字".repeat(4 * 1024 * 1024);
+        data.playlists[0].songs.push(SyncSong {
+            id: "42".into(),
+            name: "Huge".into(),
+            album: "netease".into(),
+            matched_lyric: Some(huge),
+            ..Default::default()
+        });
+
+        let error = serialize(&data, false).unwrap_err().to_string();
+
+        assert!(error.contains("too large to upload"), "unexpected error: {error}");
+        assert!(error.contains("8388608"), "error should carry the limit: {error}");
     }
 
     /// 带 BOM 与前导空白的 JSON 仍要认出来
