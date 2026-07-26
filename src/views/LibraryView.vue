@@ -7,7 +7,7 @@ import { useI18n } from 'vue-i18n'
 import { useLibraryStore } from '@/stores/library'
 import { normalizeTrack, usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useRecommendStore } from '@/stores/recommend'
-import { useAuthStore } from '@/stores/auth'
+import { AUTH_CHANGED_EVENT, useAuthStore } from '@/stores/auth'
 import { useDownloadStore } from '@/stores/download'
 import { useToastStore } from '@/stores/toast'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
@@ -276,6 +276,46 @@ const LIKED_NAMES = ['我喜欢的音乐', '我喜歡的音樂', 'お気に入�
 const LOCAL_NAMES = ['本地音乐', '本機音樂', 'ローカル音楽', 'Local Music']
 const ALL_PROTECTED = [...LIKED_NAMES, ...LOCAL_NAMES]
 
+// 每个 tab 的搜索（对齐 Android 各库页顶部的搜索栏）
+//
+// 按 tab 分别保存关键词，切回来时不会丢；本地页的歌手分类有自己的
+// 搜索框（要同时匹配歌手与其名下曲目），这里不重复接管。
+const tabQueries = ref<Record<number, string>>({})
+const tabQuery = computed({
+  get: () => tabQueries.value[activeTab.value] ?? '',
+  set: (value: string) => { tabQueries.value = { ...tabQueries.value, [activeTab.value]: value } },
+})
+
+function matchesQuery(query: string, ...fields: (string | number | undefined | null)[]): boolean {
+  const trimmed = query.trim().toLowerCase()
+  if (!trimmed) return true
+  return fields.some((field) => String(field ?? '').toLowerCase().includes(trimmed))
+}
+
+const showTabSearch = computed(() => {
+  if (activeTab.value === 0) return localCategory.value === 'playlists'
+  return activeTab.value !== 2
+})
+
+const filteredPlaylists = computed(() =>
+  playlists.value.filter((pl) => matchesQuery(tabQuery.value, displayName(pl))),
+)
+const filteredFavoritePlaylists = computed(() =>
+  favoritePlaylists.value.filter((fpl) => matchesQuery(tabQuery.value, fpl.name, fpl.source)),
+)
+const filteredNeteasePlaylists = computed(() =>
+  neteasePlaylists.value.filter((npl: any) => matchesQuery(tabQuery.value, npl.name)),
+)
+const filteredNeteaseAlbums = computed(() =>
+  recommend.userAlbums.filter((album: any) => matchesQuery(tabQuery.value, album.name, album.artist)),
+)
+const filteredBiliPlaylists = computed(() =>
+  biliPlaylists.value.filter((bpl: any) => matchesQuery(tabQuery.value, bpl.name)),
+)
+const filteredYoutubePlaylists = computed(() =>
+  youtubePlaylists.value.filter((ypl: any) => matchesQuery(tabQuery.value, ypl.name)),
+)
+
 // 本地库分类：歌单 / 歌手（对齐 Android LOCAL_CATEGORY_ARTIST）
 type LocalCategory = 'playlists' | 'artists'
 const localCategory = ref<LocalCategory>('playlists')
@@ -317,10 +357,12 @@ async function loadLocalArtistTracks(force = false) {
         }
       }),
     )
+    // Android 按曲目的 artist 字段聚合，不区分来源：网易云/B站/YouTube 的
+    // 曲目同样要归到对应歌手下，只过滤掉没有 id 的脏数据
     const seen = new Set<string>()
     localArtistTracks.value = collected
       .flat()
-      .filter((track) => track.source === 'local' && track.id && !seen.has(track.id) && seen.add(track.id))
+      .filter((track) => !!track.id && !seen.has(track.id) && seen.add(track.id))
   } catch (e) {
     log.error('Load local artist tracks failed:', e)
     localArtistTracks.value = []
@@ -747,6 +789,26 @@ onMounted(() => {
   }
 })
 
+/// 登录/登出后重新拉取该平台数据；重新登录看到旧的空列表是最常见的抱怨
+function handleAuthChanged(event: Event) {
+  const platform = (event as CustomEvent<{ platform?: string }>).detail?.platform
+  if (!platform) return
+  if (platform === 'netease' && auth.netease.loggedIn) {
+    recommend.fetchUserPlaylists('netease')
+    recommend.fetchUserAlbums()
+  }
+  if (platform === 'bilibili' && auth.bilibili.loggedIn) {
+    recommend.fetchUserPlaylists('bilibili')
+  }
+  if (platform === 'youtube' && auth.youtube.loggedIn) {
+    recommend.fetchUserPlaylists('youtube')
+  }
+  void loadFavorites()
+}
+
+onMounted(() => window.addEventListener(AUTH_CHANGED_EVENT, handleAuthChanged))
+onUnmounted(() => window.removeEventListener(AUTH_CHANGED_EVENT, handleAuthChanged))
+
 // 监听同步完成后的歌单变更事件
 let unlistenPlaylistsChanged: UnlistenFn | null = null
 onMounted(async () => {
@@ -798,6 +860,25 @@ onUnmounted(() => {
       >
         <span class="material-symbols-rounded" :class="{ filled: activeTab === i }" style="font-size: 18px">{{ tab.icon }}</span>
         <span>{{ tab.label }}</span>
+      </button>
+    </div>
+
+    <!-- 各 tab 的搜索栏 -->
+    <div v-if="showTabSearch" class="tab-search">
+      <span class="material-symbols-rounded" style="font-size: 18px">search</span>
+      <input
+        v-model="tabQuery"
+        type="search"
+        :placeholder="t('library.tab_search_hint')"
+        :aria-label="t('library.tab_search_hint')"
+      />
+      <button
+        v-if="tabQuery"
+        class="tab-search-clear"
+        :aria-label="t('common.clear')"
+        @click="tabQuery = ''"
+      >
+        <span class="material-symbols-rounded" style="font-size: 18px">close</span>
       </button>
     </div>
 
@@ -909,7 +990,7 @@ onUnmounted(() => {
 
       <!-- 歌单列表 -->
       <div
-        v-for="(pl, index) in playlists"
+        v-for="(pl, index) in filteredPlaylists"
         :key="pl.id"
         class="playlist-item"
         :class="{
@@ -982,7 +1063,7 @@ onUnmounted(() => {
     <div v-else-if="activeTab === 1" class="playlist-list">
       <template v-if="favoritePlaylists.length > 0">
         <div
-          v-for="fpl in favoritePlaylists"
+          v-for="fpl in filteredFavoritePlaylists"
           :key="'fav-' + fpl.id"
           class="playlist-item"
           role="button"
@@ -1119,7 +1200,7 @@ onUnmounted(() => {
       <template v-if="neteaseCategory === 'albums'">
         <div v-if="recommend.userAlbums.length > 0">
           <div
-            v-for="album in recommend.userAlbums"
+            v-for="album in filteredNeteaseAlbums"
             :key="album.id"
             class="playlist-item"
             @click="router.push({ name: 'netease-album', params: { id: album.id } })"
@@ -1152,7 +1233,7 @@ onUnmounted(() => {
       <template v-else>
       <template v-if="neteasePlaylists.length > 0">
         <div
-          v-for="npl in neteasePlaylists"
+          v-for="npl in filteredNeteasePlaylists"
           :key="'ne-' + npl.id"
           class="playlist-item"
           @click="router.push({ name: 'netease-playlist', params: { id: npl.id } })"
@@ -1193,7 +1274,7 @@ onUnmounted(() => {
           </div>
         </div>
         <div
-          v-for="bpl in biliPlaylists"
+          v-for="bpl in filteredBiliPlaylists"
           :key="'bili-' + bpl.id"
           class="playlist-item"
           @click="router.push({ name: 'bili-playlist', params: { mediaId: bpl.id } })"
@@ -1229,7 +1310,7 @@ onUnmounted(() => {
           </div>
         </div>
         <div
-          v-for="ypl in youtubePlaylists"
+          v-for="ypl in filteredYoutubePlaylists"
           :key="'yt-' + ypl.id"
           class="playlist-item"
           @click="router.push({ name: 'youtube-playlist', params: { browseId: ypl.id } })"
@@ -2021,5 +2102,46 @@ onUnmounted(() => {
 @media (prefers-reduced-motion: reduce) {
   .artist-cover,
   .artist-play { transition: none; }
+}
+
+/* 各 tab 搜索栏 */
+.tab-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 14px;
+  margin-bottom: 14px;
+  border-radius: var(--radius-full);
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+
+  input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--md-on-surface);
+
+    &::placeholder { color: var(--md-on-surface-variant); opacity: 0.7; }
+    &::-webkit-search-cancel-button { -webkit-appearance: none; }
+  }
+}
+
+.tab-search-clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  color: var(--md-on-surface-variant);
+  transition: background var(--duration-short);
+
+  &:hover { background: var(--md-surface-container-highest); }
 }
 </style>

@@ -2,8 +2,12 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useToastStore } from './toast'
+import { useRecommendStore } from './recommend'
 import i18n from '@/i18n'
 import { createLogger } from '@/utils/logger'
+
+/// 登录态变化事件：库页等已挂载页面据此重新拉取平台数据
+export const AUTH_CHANGED_EVENT = 'neri:auth-changed'
 
 const log = createLogger('auth')
 
@@ -97,6 +101,15 @@ export const useAuthStore = defineStore('auth', () => {
     return map[key] ?? key
   }
 
+  /// 登录态变化：作废该平台缓存并广播，让已挂载的页面立刻重拉
+  ///
+  /// 不广播的话，库页在 onMounted 时才判断是否需要拉数据，
+  /// 用户在设置页登录完切回去看到的仍然是空列表。
+  function notifyAuthChanged(platform: string) {
+    useRecommendStore().invalidatePlatform(platform)
+    window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT, { detail: { platform } }))
+  }
+
   /** 通用登录流程 */
   async function doLogin(
     key: string,
@@ -114,6 +127,7 @@ export const useAuthStore = defineStore('auth', () => {
         if (needsYoutubeProfileRefresh(mapped)) void refreshYoutubeProfile()
       }
       if (mapped.loggedIn) {
+        notifyAuthChanged(key)
         toast.success(t('settings.login_success', { platform: platformLabel(key) }))
       }
     } catch (e: any) {
@@ -154,6 +168,7 @@ export const useAuthStore = defineStore('auth', () => {
         case 'bilibili': bilibili.value = emptyAuth(); break
         case 'youtube': youtube.value = emptyAuth(); break
       }
+      notifyAuthChanged(platform)
       toast.success(t('settings.logout_success', { platform: platformLabel(platform) }))
     } catch (e) {
       log.error(`Logout ${platform} failed:`, e)
@@ -174,6 +189,7 @@ export const useAuthStore = defineStore('auth', () => {
         if (needsYoutubeProfileRefresh(mapped)) void refreshYoutubeProfile()
       }
       if (mapped.loggedIn) {
+        notifyAuthChanged(platform)
         toast.success(t('settings.login_success', { platform: platformLabel(platform) }))
       }
     } catch (e: any) {

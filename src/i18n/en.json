@@ -126,7 +126,8 @@
     "tab_netease_playlists_short": "Playlists",
     "tab_netease_albums_short": "Albums",
     "favorite_empty_songs": "No tracks synced for this favorite yet",
-    "playback_stats_entry": "Playback stats"
+    "playback_stats_entry": "Playback stats",
+    "tab_search_hint": "Search"
   },
   "common": {
     "save": "Save",
@@ -152,7 +153,8 @@
     "hour_short": "h",
     "minute_short": "min",
     "edit_value": "Edit value",
-    "invalid_range": "Enter a number between {min} and {max}"
+    "invalid_range": "Enter a number between {min} and {max}",
+    "clear": "Clear"
   },
   "download": {
     "download": "Download",

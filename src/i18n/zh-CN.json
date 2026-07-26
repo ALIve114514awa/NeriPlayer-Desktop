@@ -126,7 +126,8 @@
     "tab_netease_playlists_short": "歌单",
     "tab_netease_albums_short": "专辑",
     "favorite_empty_songs": "这个收藏还没有同步到曲目",
-    "playback_stats_entry": "播放统计"
+    "playback_stats_entry": "播放统计",
+    "tab_search_hint": "搜索"
   },
   "common": {
     "save": "保存",
@@ -152,7 +153,8 @@
     "hour_short": "小时",
     "minute_short": "分钟",
     "edit_value": "编辑数值",
-    "invalid_range": "请输入 {min} - {max} 之间的数字"
+    "invalid_range": "请输入 {min} - {max} 之间的数字",
+    "clear": "清除"
   },
   "download": {
     "download": "下载",

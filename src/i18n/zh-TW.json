@@ -126,7 +126,8 @@
     "tab_netease_playlists_short": "歌單",
     "tab_netease_albums_short": "專輯",
     "favorite_empty_songs": "這個收藏還沒有同步到曲目",
-    "playback_stats_entry": "播放統計"
+    "playback_stats_entry": "播放統計",
+    "tab_search_hint": "搜尋"
   },
   "common": {
     "save": "儲存",
@@ -152,7 +153,8 @@
     "hour_short": "小時",
     "minute_short": "分鐘",
     "edit_value": "編輯數值",
-    "invalid_range": "請輸入 {min} - {max} 之間的數字"
+    "invalid_range": "請輸入 {min} - {max} 之間的數字",
+    "clear": "清除"
   },
   "download": {
     "download": "下載",

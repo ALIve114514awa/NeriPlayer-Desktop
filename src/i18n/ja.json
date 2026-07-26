@@ -126,7 +126,8 @@
     "tab_netease_playlists_short": "プレイリスト",
     "tab_netease_albums_short": "アルバム",
     "favorite_empty_songs": "このお気に入りの曲はまだ同期されていません",
-    "playback_stats_entry": "再生統計"
+    "playback_stats_entry": "再生統計",
+    "tab_search_hint": "検索"
   },
   "common": {
     "save": "保存",
@@ -152,7 +153,8 @@
     "hour_short": "時間",
     "minute_short": "分",
     "edit_value": "数値を編集",
-    "invalid_range": "{min} - {max} の範囲で入力してください"
+    "invalid_range": "{min} - {max} の範囲で入力してください",
+    "clear": "クリア"
   },
   "download": {
     "download": "ダウンロード",

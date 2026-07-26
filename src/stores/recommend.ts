@@ -109,6 +109,20 @@ export const useRecommendStore = defineStore('recommend', () => {
     } catch { /* localStorage 已满则忽略 */ }
   }
 
+  /// 登录态变化后清掉该平台的缓存，下一次进入库页会重新拉取
+  ///
+  /// 不清的话 LibraryView 的 `!length` 判断会一直命中旧数据，
+  /// 重新登录后看到的还是登录前的空列表。
+  function invalidatePlatform(platform: string) {
+    const next = { ...userPlaylists.value }
+    delete next[platform]
+    userPlaylists.value = next
+    if (platform === 'netease') {
+      userAlbums.value = []
+      likedSongIds.value = new Set()
+    }
+  }
+
   function isCacheFresh(): boolean {
     try {
       const raw = localStorage.getItem(CACHE_KEY)
@@ -388,6 +402,7 @@ export const useRecommendStore = defineStore('recommend', () => {
     fetchHomeSearchRecommendations, clearHomeSearchRecommendations,
     fetchHomeFeed, fetchHighQualityPlaylists, fetchHighQualityTags,
     fetchLikedSongIds, toggleLikeSong, fetchAlbumDetail, fetchUserAlbums,
+    invalidatePlatform,
     fetchBiliFavoriteItems, validateAuth,
   }
 })
