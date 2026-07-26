@@ -244,7 +244,7 @@ async fn fetch_remote_snapshot(
     data_saver: bool,
 ) -> AppResult<Option<GitHubRemoteSnapshot>> {
     let alternative_file = serializer::get_filename(!data_saver);
-    let (content, sha, mut actual_file) = match api
+    let (content, sha, actual_file) = match api
         .get_file_content(&config.owner, &config.repo, preferred_file)
         .await
         .map_err(AppError::from)?
@@ -264,29 +264,11 @@ async fn fetch_remote_snapshot(
         return Err(AppError::Other("Remote backup file is empty".into()));
     }
 
-    let mut actual_sha = sha;
-    // 按内容识别格式，不看后缀：远端那份可能是对端旧版本写的
-    let data = match serializer::deserialize(&content) {
-        Ok(data) => data,
-        Err(primary_error) => {
-            let fallback_file = serializer::get_filename(!actual_file.ends_with(".bin"));
-            let fallback = api
-                .get_file_content(&config.owner, &config.repo, fallback_file)
-                .await
-                .map_err(AppError::from)?;
-            let Some((fallback_content, fallback_sha)) = fallback else {
-                return Err(primary_error);
-            };
-            if is_blank_payload(&fallback_content) {
-                return Err(primary_error);
-            }
-            let fallback_data =
-                serializer::deserialize(&fallback_content).map_err(|_| primary_error)?;
-            actual_file = fallback_file.to_string();
-            actual_sha = fallback_sha;
-            fallback_data
-        }
-    };
+    let actual_sha = sha;
+    // 按内容识别格式，不看后缀：远端那份可能是对端旧版本写的。
+    // 解析失败即安全失败（对齐 Android 56489bfb）：绝不回退到另一文件名
+    // 的陈旧快照参与合并上传——那会把陈旧数据合并回云端，即回流。
+    let data = serializer::deserialize(&content)?;
 
     Ok(Some(GitHubRemoteSnapshot {
         data,
@@ -943,7 +925,6 @@ pub fn save_synced_playlists(merged: &SyncData) {
     let mut max_id: i64 = existing_playlists.iter().map(|p| p.id).filter(|&id| id > 0).max().unwrap_or(0);
     let mut active_ids = HashSet::new();
     let mut deleted_ids = HashSet::new();
-    let now = chrono::Utc::now().timestamp_millis();
 
     for sp in &merged.playlists {
         if sp.is_deleted {
@@ -952,7 +933,7 @@ pub fn save_synced_playlists(merged: &SyncData) {
             }
             continue;
         }
-        let playlist = sp.normalized_for_display_order(now);
+        let playlist = sp.normalized_for_display_order();
 
         let mut local_id = resolve_system_id(&playlist.id, &playlist.name);
         if local_id == 0 {

@@ -199,10 +199,9 @@ fn merge_playlists(
         merged.insert(id.to_string(), result);
     }
 
-    let now = chrono::Utc::now().timestamp_millis();
     order_merged_playlists(&merged, local, remote, last_sync_time)
         .into_iter()
-        .map(|playlist| playlist.normalized_for_display_order(now))
+        .map(|playlist| playlist.normalized_for_display_order())
         .collect()
 }
 

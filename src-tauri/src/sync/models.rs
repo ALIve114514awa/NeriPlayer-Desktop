@@ -391,7 +391,7 @@ pub struct SyncPlaylist {
 }
 
 impl SyncPlaylist {
-    pub(crate) fn normalized_for_display_order(&self, now: i64) -> Self {
+    pub(crate) fn normalized_for_display_order(&self) -> Self {
         let mut normalized = self.clone();
         if self.is_deleted {
             normalized.songs.clear();
@@ -402,17 +402,20 @@ impl SyncPlaylist {
         normalized.songs = if self.song_order_version >= DISPLAY_ORDER_SONG_ORDER_VERSION {
             sorted_songs_by_added_at_for_display(&self.songs)
         } else {
-            migrate_legacy_songs_to_display_order(&self.songs, self.modified_at, now)
+            migrate_legacy_songs_to_display_order(&self.songs, self.modified_at)
         };
         normalized.song_order_version = DISPLAY_ORDER_SONG_ORDER_VERSION;
         normalized
     }
 }
 
+/// 锚点必须与设备墙钟无关（对齐 Android 56489bfb 的 P1-1 修复）：
+/// 只用歌单自身 modified_at（快照产生时刻）。用墙钟做锚点的话，被抬高
+/// 的 added_at 恒大于任何历史 deleted_at，identity 删除墓碑永久失效并被
+/// prune 裁剪——已删歌曲复活。
 fn migrate_legacy_songs_to_display_order(
     songs: &[SyncSong],
     playlist_modified_at: i64,
-    now: i64,
 ) -> Vec<SyncSong> {
     if songs.is_empty() {
         return Vec::new();
@@ -423,8 +426,8 @@ fn migrate_legacy_songs_to_display_order(
         .map(|song| song.added_at)
         .max()
         .unwrap_or(0)
-        .max(now)
-        .max(playlist_modified_at);
+        .max(playlist_modified_at)
+        .max(1);
 
     songs.iter()
         .rev()
@@ -1163,16 +1166,18 @@ mod legacy_json_tests {
             song_order_version: 0,
         };
 
-        let normalized = playlist.normalized_for_display_order(100);
+        let normalized = playlist.normalized_for_display_order();
 
         assert_eq!(normalized.song_order_version, DISPLAY_ORDER_SONG_ORDER_VERSION);
         assert_eq!(
             normalized.songs.iter().map(|song| song.id.as_str()).collect::<Vec<_>>(),
             vec!["3", "2", "1"]
         );
+        // 锚点是歌单自身 modified_at（20），与墙钟无关：
+        // 墙钟锚点会让抬高的 added_at 恒大于历史 deleted_at，删除墓碑失效
         assert_eq!(
             normalized.songs.iter().map(|song| song.added_at).collect::<Vec<_>>(),
-            vec![100, 99, 98]
+            vec![20, 19, 18]
         );
     }
 
@@ -1193,7 +1198,7 @@ mod legacy_json_tests {
             song_order_version: DISPLAY_ORDER_SONG_ORDER_VERSION,
         };
 
-        let normalized = playlist.normalized_for_display_order(100);
+        let normalized = playlist.normalized_for_display_order();
 
         assert_eq!(
             normalized.songs.iter().map(|song| song.id.as_str()).collect::<Vec<_>>(),
