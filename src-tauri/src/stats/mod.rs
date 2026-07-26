@@ -742,6 +742,22 @@ mod tests {
         );
     }
 
+    /// record 后立即按「日」查询必须可见，且保留窗口修剪不得动今天的数据
+    #[test]
+    fn record_is_immediately_visible_today_and_survives_prune() {
+        let mut store = StatsStore::default();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        store.record(&session("k", 15_000, 0), "desktop", now);
+        store.prune_retention(now);
+
+        let day = store.summarize(StatsPeriod::Day, now);
+        assert_eq!(day.track_count, 1);
+        assert_eq!(day.total_listen_ms, 15_000);
+        assert_eq!(store.buckets.len(), 1, "今天的日分桶不得被修剪");
+        assert_eq!(store.daily_shards.len(), 1, "今天的日分片不得被修剪");
+    }
+
     #[test]
     fn day_start_is_local_midnight() {
         let now = chrono::Utc::now().timestamp_millis();

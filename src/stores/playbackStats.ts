@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { usePlayerStore, type TrackInfo } from '@/stores/player'
+import { toBackendTrack } from '@/modules/lyrics/syncTrackPayload'
 import {
   PLAYBACK_STATS_PERIODIC_FLUSH_MS,
   PlaybackStatsTracker,
@@ -70,7 +71,10 @@ export const usePlaybackStatsStore = defineStore('playbackStats', () => {
     try {
       await invoke('record_playback_session', {
         session: {
-          track: snapshot.track.track,
+          // 后端 TrackInfo 是 snake_case 且 duration_ms/url 必填，
+          // 直接传前端 camelCase TrackInfo 会反序列化失败被静默吞掉，
+          // 必须走 toBackendTrack 转换（与 update_playlist_track 同一约定）
+          track: toBackendTrack(snapshot.track.track),
           listenedMs: snapshot.listenedMs,
           playCountIncrement: snapshot.playCountIncrement,
         },

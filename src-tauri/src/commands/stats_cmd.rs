@@ -129,3 +129,67 @@ pub async fn playback_stats_identity_key(
 ) -> AppResult<String> {
     Ok(manager::playback_stats_identity_key_pub(&track))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 入参契约：track 必须是 toBackendTrack 产出的 snake_case 结构
+    /// （TrackInfo 的 duration_ms/url 必填且无 camelCase 别名）
+    #[test]
+    fn session_input_accepts_to_backend_track_shape() {
+        let payload = serde_json::json!({
+            "track": {
+                "id": "netease:2161589xxx",
+                "title": "Song",
+                "artist": "Artist",
+                "album": "Album",
+                "duration_ms": 200_000,
+                "cover_url": "https://cover",
+                "url": "",
+                "source": "netease",
+                "added_at": 0,
+                "sync_payload": null,
+                "playlist_key": null,
+            },
+            "listenedMs": 15_000,
+            "playCountIncrement": 1,
+        });
+
+        let input: PlaybackSessionInput =
+            serde_json::from_value(payload).expect("snake_case track 必须可反序列化");
+        let session = to_session(&input);
+        assert!(!session.identity_key.trim().is_empty(), "身份键不得为空");
+        assert_eq!(session.listened_ms, 15_000);
+        assert_eq!(session.play_count_increment, 1);
+        assert_eq!(session.duration_ms, 200_000);
+    }
+
+    /// 回归：前端曾直接上送 camelCase TrackInfo，反序列化失败被前端
+    /// catch 静默吞掉，导致播放统计从未落盘（全 0）。此测试钉死该形状
+    /// 必须被拒绝——若未来给 TrackInfo 加别名放行，请同步删除本测试
+    #[test]
+    fn session_input_rejects_frontend_camelcase_track() {
+        let payload = serde_json::json!({
+            "track": {
+                "id": "netease:2161589xxx",
+                "title": "Song",
+                "artist": "Artist",
+                "album": "Album",
+                "durationMs": 200_000,
+                "coverUrl": "https://cover",
+                "audioUrl": "",
+                "source": "netease",
+            },
+            "listenedMs": 15_000,
+            "playCountIncrement": 1,
+        });
+
+        let error = serde_json::from_value::<PlaybackSessionInput>(payload)
+            .expect_err("camelCase track 形状必须被拒绝");
+        assert!(
+            error.to_string().contains("missing field"),
+            "失败原因应为缺字段, 实际: {error}"
+        );
+    }
+}
