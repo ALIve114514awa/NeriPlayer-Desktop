@@ -124,6 +124,13 @@ function onExpandAfterLeave(el: Element) {
   e.style.opacity = ''
 }
 
+// 分组切换 out-in 过渡：新面板插入布局后立即恢复滚动位置
+// 此时元素已占位但尚未淡入完成，不会产生可见的滚动跳动；
+// 若在旧面板离场期间恢复，scrollHeight 不足会导致 scrollTop 被截断
+function onPanelEnter() {
+  void restoreSettingsScrollPosition(activeSettingsSection.value)
+}
+
 const presetColors = THEME_COLORS.map(c => ({
   key: c.key,
   color: c.dark['--md-primary'],
@@ -475,7 +482,7 @@ function selectSettingsSection(id: SettingsSectionId) {
     visitedSettingsSections.value = new Set([...visitedSettingsSections.value, id])
   }
   persistSettingsUiState()
-  void restoreSettingsScrollPosition(id)
+  // 滚动位置恢复改由面板过渡的 onPanelEnter 钩子触发（等新面板插入布局后再恢复）
 }
 
 // 启动时检查登录状态
@@ -992,13 +999,18 @@ function confirmDataSaverChange() {
         </nav>
       </aside>
 
-      <main ref="settingsContentRef" class="settings-content">
+      <main class="settings-content">
         <header class="settings-content-header">
           <div>
             <h2>{{ activeSettingsItem?.label }}</h2>
             <p>{{ activeSettingsItem?.description }}</p>
           </div>
         </header>
+
+        <!-- 头部固定不滚动，仅面板区滚动；切换分组时以分组 id 为 key 做 out-in 交叉淡入 -->
+        <div ref="settingsContentRef" class="settings-content-scroll">
+        <Transition name="fade" mode="out-in" @enter="onPanelEnter">
+        <div :key="activeSettingsSection" class="settings-panels">
 
         <div v-show="activeSettingsSection === 'accounts'" class="settings-section-panel">
     <div class="section-label">
@@ -2190,6 +2202,10 @@ function confirmDataSaverChange() {
       <span class="material-symbols-rounded" style="font-size: 20px; opacity: 0.3">open_in_new</span>
     </div>
         </div>
+
+        </div>
+        </Transition>
+        </div>
       </main>
     </div>
 
@@ -2426,7 +2442,10 @@ function confirmDataSaverChange() {
   min-height: 0;
   box-sizing: border-box;
   overflow: hidden;
-  padding: 28px clamp(24px, 4vw, 64px) 0;
+  /* 顶部总留白（标题栏 + 本内边距）恒定 64px：
+     原 28px 是按 36px 标题栏调的，macOS 标题栏加高到 52px 后
+     继续写死会叠加出双重留白，这里随 --titlebar-height 自动收窄 */
+  padding: max(8px, calc(64px - var(--titlebar-height, 36px))) clamp(24px, 4vw, 64px) 0;
 }
 
 .settings-layout {
@@ -2441,23 +2460,30 @@ function confirmDataSaverChange() {
   margin: 0 auto;
 }
 
+/* 左列标题固定不滚动，仅分组列表滚动，与右列头部固定的结构对称，
+   两列顶部基线不再随各自滚动位置错位 */
 .settings-sidebar {
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   padding-top: 18px;
-  padding-right: 4px;
-
-  scrollbar-width: none;
-  &::-webkit-scrollbar { display: none; }
 }
 
 .settings-nav {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
 }
 
 .settings-nav-group {
@@ -2539,19 +2565,32 @@ function confirmDataSaverChange() {
   color: var(--md-on-primary-container);
 }
 
+/* 右列头部固定，滚动职责移交给 .settings-content-scroll */
 .settings-content {
   width: 100%;
   min-width: 0;
   min-height: 0;
   max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-top: 18px;
+}
+
+.settings-content-scroll {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
   padding-right: 4px;
-  padding-top: 18px;
 
   scrollbar-width: none;
   &::-webkit-scrollbar { display: none; }
+}
+
+.settings-panels {
+  min-width: 0;
 }
 
 :global(.content:has(.settings-view)) {
@@ -2597,11 +2636,9 @@ function confirmDataSaverChange() {
   line-height: 1.5;
 }
 
+/* 每个分组面板的首个标签统一顶到面板顶部，
+   任意分组激活时内容顶部基线一致，不再出现有的分组多 24px 空白 */
 .settings-section-panel > .section-label:first-child {
-  margin-top: 24px;
-}
-
-.settings-content > .settings-section-panel:first-of-type > .section-label:first-child {
   margin-top: 0;
 }
 
@@ -2609,7 +2646,10 @@ function confirmDataSaverChange() {
   font-size: 28px;
   font-weight: 700;
   letter-spacing: -0.5px;
-  margin: 0 0 20px;
+  /* 与右侧详情头部等高（h2 28px×1.2 + 8px 间距 + 描述 13px×1.5 ≈ 61px），
+     保证左右两列列表顶部基线对齐 */
+  min-height: 61px;
+  margin: 0 0 24px;
 }
 
 .section-label {
@@ -3515,6 +3555,8 @@ function confirmDataSaverChange() {
   .page-title {
     margin-bottom: 14px;
     font-size: 24px;
+    /* 窄屏为单列布局，无需与右侧头部等高 */
+    min-height: auto;
   }
 
   .settings-nav {
@@ -3541,9 +3583,15 @@ function confirmDataSaverChange() {
   .settings-content {
     max-width: none;
     min-height: 0;
+    display: block;
+    overflow: visible;
+    padding-top: 12px;
+  }
+
+  /* 窄屏下整页滚动，内部滚动容器退化为普通块 */
+  .settings-content-scroll {
     overflow: visible;
     padding-right: 0;
-    padding-top: 12px;
   }
 
   .settings-content-header {
