@@ -786,20 +786,52 @@ pub async fn export_playlists(app: AppHandle) -> AppResult<Value> {
     let json_data = serde_json::to_string_pretty(&backup_data)
         .map_err(|e| AppError::Other(format!("Serialize failed: {}", e)))?;
 
-    use tauri_plugin_dialog::DialogExt;
-    let path = app.dialog().file()
-        .set_file_name("neriplayer-playlists.json")
-        .add_filter("JSON", &["json"])
-        .blocking_save_file();
+    let Some(path) = pick_file_path(&app, Some("neriplayer-playlists.json".into())).await? else {
+        return Ok(dialog_cancelled());
+    };
+    std::fs::write(&path, &json_data)
+        .map_err(|e| AppError::Other(format!("Write failed: {}", e)))?;
+    Ok(serde_json::json!({ "success": true, "count": store.playlists.len() }))
+}
 
-    match path {
-        Some(p) => {
-            std::fs::write(p.as_path().unwrap(), &json_data)
-                .map_err(|e| AppError::Other(format!("Write failed: {}", e)))?;
-            Ok(serde_json::json!({ "success": true, "count": store.playlists.len() }))
+/// 弹出文件对话框，且不占住 async 运行时
+///
+/// `blocking_save_file` / `blocking_pick_file` 会一直阻塞到用户选完，
+/// 可能是几分钟。直接在 `#[tauri::command] async fn` 里调用等于霸占一个
+/// tokio worker，插件文档也明确警告这么用会死锁。挪到阻塞线程池里执行。
+///
+/// 返回的 `FilePath` 可能是 `Url`（`file://`、Android `content://`），
+/// `as_path()` 对它返回 `None`——之前那里直接 unwrap，用户从虚拟位置选文件
+/// 就会 panic。`into_path()` 能把 `file://` 正确还原成路径。
+async fn pick_file_path(
+    app: &AppHandle,
+    save_as: Option<String>,
+) -> AppResult<Option<std::path::PathBuf>> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let dialog = app.dialog().clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let builder = dialog.file().add_filter("JSON", &["json"]);
+        match save_as {
+            Some(name) => builder.set_file_name(name).blocking_save_file(),
+            None => builder.blocking_pick_file(),
         }
-        None => Ok(serde_json::json!({ "success": false, "reason": "cancelled" })),
-    }
+    })
+    .await
+    .map_err(|error| AppError::Other(format!("File dialog failed: {error}")))?;
+
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    picked
+        .into_path()
+        .map(Some)
+        .map_err(|error| AppError::Other(format!("Unsupported file location: {error}")))
+}
+
+/// 取消选择时统一的返回体，避免各处自己拼 JSON 拼歪
+fn dialog_cancelled() -> Value {
+    serde_json::json!({ "success": false, "reason": "cancelled" })
 }
 
 /// 导入播放列表 JSON（兼容 Android BackupData 和 Desktop 两种格式）
@@ -808,15 +840,11 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
     use crate::library::playlist::{PlaylistStore, Playlist};
     use crate::sync::models::{SyncPlaylist, SyncData};
     use crate::sync::manager::save_synced_playlists;
-    use tauri_plugin_dialog::DialogExt;
-
-    let path = app.dialog().file()
-        .add_filter("JSON", &["json"])
-        .blocking_pick_file();
-
-    match path {
-        Some(p) => {
-            let data = std::fs::read_to_string(p.as_path().unwrap())
+    let Some(path) = pick_file_path(&app, None).await? else {
+        return Ok(dialog_cancelled());
+    };
+    {
+            let data = std::fs::read_to_string(&path)
                 .map_err(|e| AppError::Other(format!("Read failed: {}", e)))?;
 
             let parsed: serde_json::Value = serde_json::from_str(&data)
@@ -873,8 +901,6 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
 
             let _ = app.emit("playlists-changed", ());
             Ok(serde_json::json!({ "success": true, "imported": count }))
-        }
-        None => Ok(serde_json::json!({ "success": false, "reason": "cancelled" })),
     }
 }
 
@@ -886,8 +912,6 @@ pub async fn export_config(
     settings: AppSettings,
     listen_together_user_uuid: String,
 ) -> AppResult<Value> {
-    use tauri_plugin_dialog::DialogExt;
-
     let auth = state.auth.lock().clone();
     let preferences = load_sync_preferences(&app);
     let mut github = load_github_config(&app);
@@ -920,16 +944,11 @@ pub async fn export_config(
         "neriplayer-desktop-config-{}.json",
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
-    let path = app
-        .dialog()
-        .file()
-        .set_file_name(file_name)
-        .add_filter("JSON", &["json"])
-        .blocking_save_file();
+    let path = pick_file_path(&app, Some(file_name)).await?;
 
     match path {
         Some(path) => {
-            std::fs::write(path.as_path().unwrap(), content)
+            std::fs::write(&path, content)
                 .map_err(|e| AppError::Other(format!("Write config failed: {}", e)))?;
             Ok(serde_json::json!({
                 "success": true,
@@ -944,17 +963,10 @@ pub async fn export_config(
 /// 导入 PC 配置文件并恢复设置、登录状态和同步配置
 #[tauri::command]
 pub async fn import_config(app: AppHandle, state: State<'_, AppState>) -> AppResult<Value> {
-    use tauri_plugin_dialog::DialogExt;
-
-    let path = app
-        .dialog()
-        .file()
-        .add_filter("JSON", &["json"])
-        .blocking_pick_file();
-    let Some(path) = path else {
-        return Ok(serde_json::json!({ "success": false, "reason": "cancelled" }));
+    let Some(file_path) = pick_file_path(&app, None).await? else {
+        return Ok(dialog_cancelled());
     };
-    let file_path = path.as_path().unwrap();
+    let file_path = file_path.as_path();
     let metadata = std::fs::metadata(file_path)
         .map_err(|e| AppError::Other(format!("Read config metadata failed: {}", e)))?;
     if metadata.len() > 2 * 1024 * 1024 {
