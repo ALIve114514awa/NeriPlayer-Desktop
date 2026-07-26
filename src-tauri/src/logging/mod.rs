@@ -9,11 +9,141 @@
 //! 落到 `<data_dir>/NeriPlayer/logs/`。受插件能力限制，文件 target 只能
 //! 在启动时构建，运行时切换开关需重启生效；日志级别则可运行时调整。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use log::LevelFilter;
+use serde::Serialize;
 use tauri::Runtime;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
+
+/// 应用内日志查看的内存环形缓冲
+///
+/// 与文件日志无关、无论开关始终收集：调试页要能看到「现在正在发生什么」，
+/// 而文件日志默认是关的。容量按条数封顶，单条消息截断，杜绝无界增长。
+const RECENT_LOG_CAP: usize = 1_500;
+const RECENT_LOG_MESSAGE_CAP: usize = 2_000;
+
+static RECENT_LOGS: Mutex<VecDeque<RecentLogEntry>> = Mutex::new(VecDeque::new());
+
+#[derive(Clone, Serialize)]
+pub struct RecentLogEntry {
+    pub timestamp_ms: i64,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+fn push_recent(record: &log::Record, message: &std::fmt::Arguments) {
+    let mut text = message.to_string();
+    if text.len() > RECENT_LOG_MESSAGE_CAP {
+        let mut cut = RECENT_LOG_MESSAGE_CAP;
+        // 不能在多字节字符中间截断
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    let entry = RecentLogEntry {
+        timestamp_ms: chrono::Local::now().timestamp_millis(),
+        level: record.level().to_string(),
+        target: record.target().to_string(),
+        message: text,
+    };
+    if let Ok(mut logs) = RECENT_LOGS.lock() {
+        if logs.len() >= RECENT_LOG_CAP {
+            logs.pop_front();
+        }
+        logs.push_back(entry);
+    }
+}
+
+/// 取最近日志（新→旧），可按最低级别过滤
+pub fn recent_logs(limit: usize, min_level: Option<log::Level>) -> Vec<RecentLogEntry> {
+    let Ok(logs) = RECENT_LOGS.lock() else {
+        return Vec::new();
+    };
+    logs.iter()
+        .rev()
+        .filter(|entry| match min_level {
+            Some(min) => log::Level::from_str_loose(&entry.level)
+                .map(|level| level <= min)
+                .unwrap_or(true),
+            None => true,
+        })
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+/// 宽松解析级别字符串（环形缓冲里存的是 Display 输出）
+trait LevelFromLoose {
+    fn from_str_loose(value: &str) -> Option<log::Level>;
+}
+impl LevelFromLoose for log::Level {
+    fn from_str_loose(value: &str) -> Option<log::Level> {
+        value.parse().ok()
+    }
+}
+
+/// 崩溃报告目录
+pub fn crash_dir() -> PathBuf {
+    log_dir().join("crashes")
+}
+
+/// 安装 panic 钩子：崩溃现场落盘（对齐 Android 的崩溃收集）
+///
+/// 报告含版本、系统、panic 位置、回溯与最近 80 条日志尾巴——
+/// 复现困难的崩溃全靠这份现场。写盘失败静默（崩溃路径不能再抛）。
+pub fn install_panic_hook(app_version: &'static str) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let tail = recent_logs(80, None)
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                format!(
+                    "{} [{}] [{}] {}",
+                    entry.timestamp_ms, entry.target, entry.level, entry.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("
+");
+        let report = format!(
+            "NeriPlayer Desktop crash report
+             version: {}
+             os: {} {}
+             time: {}
+             panic: {}
+
+             backtrace:
+{}
+
+             recent logs (oldest first):
+{}
+",
+            app_version,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            info,
+            backtrace,
+            tail,
+        );
+        let dir = crash_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let name = format!(
+            "crash-{}.txt",
+            chrono::Local::now().format("%Y%m%d-%H%M%S%.3f")
+        );
+        let _ = std::fs::write(dir.join(name), report);
+        default_hook(info);
+    }));
+}
 
 /// 日志文件所在目录：与项目其余数据一致，统一落到 `<data_dir>/NeriPlayer/logs`
 const LOG_SUBDIR: &str = "NeriPlayer";
@@ -113,6 +243,7 @@ fn format_record(
     message: &std::fmt::Arguments,
     record: &log::Record,
 ) {
+    push_recent(record, message);
     // 使用本地时区的墙钟时间，毫秒精度，便于与用户操作时间对齐
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     out.finish(format_args!(
@@ -142,6 +273,7 @@ fn format_record_colored(
     message: &std::fmt::Arguments,
     record: &log::Record,
 ) {
+    push_recent(record, message);
     const RESET: &str = "\x1b[0m";
     const DIM: &str = "\x1b[90m";
     const SCOPE: &str = "\x1b[36m";

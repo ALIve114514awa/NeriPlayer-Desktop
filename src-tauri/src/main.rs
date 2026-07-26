@@ -5,14 +5,15 @@ use neri_player_desktop::audio::media_session::{MediaAction, MediaSessionControl
 use neri_player_desktop::auth;
 use neri_player_desktop::commands::{
     auth_cmd, download_cmd, image_cmd, library_cmd, listen_together_cmd, lyrics_cmd, player_cmd,
-    recommend_cmd, search_cmd, settings_cmd, stats_cmd, storage_cmd, sync_cmd,
-};
+    recommend_cmd, search_cmd, settings_cmd, stats_cmd, storage_cmd, sync_cmd, debug_cmd,};
 use neri_player_desktop::state::AppState;
 use std::sync::mpsc;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
 fn main() {
+    // 崩溃收集必须最早安装：之后任何线程 panic 都会把现场落盘
+    neri_player_desktop::logging::install_panic_hook(env!("CARGO_PKG_VERSION"));
     // 强制 WebView2 (Chromium) 启用 GPU 硬件加速
     // 仅 Windows 生效：WEBVIEW2_* 对 macOS 的 WKWebView、Linux 的 WebKitGTK 均为 no-op
     #[cfg(target_os = "windows")]
@@ -315,6 +316,12 @@ fn main() {
             settings_cmd::set_bypass_proxy,
             settings_cmd::get_build_info,
             settings_cmd::probe_platform_connectivity,
+            debug_cmd::get_recent_logs,
+            debug_cmd::export_debug_report,
+            debug_cmd::reveal_in_file_manager,
+            debug_cmd::list_crash_reports,
+            debug_cmd::read_crash_report,
+            debug_cmd::clear_crash_reports,
             storage_cmd::get_storage_usage,
             storage_cmd::clear_storage_cache,
             auth_cmd::login_netease,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
@@ -169,7 +169,116 @@ onMounted(async () => {
     appDataDir.value = await invoke('get_app_data_dir')
   } catch { /* 忽略 */ }
   await loadDebugCookieStorageStatus()
+  await refreshLogs()
+  await refreshCrashes()
+  logsTimer = window.setInterval(() => {
+    if (!logsPaused.value) void refreshLogs()
+  }, 1500)
 })
+
+onUnmounted(() => {
+  if (logsTimer) window.clearInterval(logsTimer)
+})
+
+// ===== 运行日志 =====
+interface RecentLogEntry { timestamp_ms: number; level: string; target: string; message: string }
+const logs = ref<RecentLogEntry[]>([])
+const logsPaused = ref(false)
+const logLevelFilter = ref('')
+let logsTimer: number | null = null
+
+async function refreshLogs() {
+  try {
+    logs.value = await invoke<RecentLogEntry[]>('get_recent_logs', {
+      limit: 300,
+      minLevel: logLevelFilter.value || null,
+    })
+  } catch { /* 命令不可用时静默 */ }
+}
+
+function logTime(ms: number): string {
+  const date = new Date(ms)
+  const pad = (v: number, n = 2) => String(v).padStart(n, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`
+}
+
+function levelColor(level: string): string {
+  switch (level) {
+    case 'ERROR': return 'var(--md-error)'
+    case 'WARN': return '#ffa726'
+    case 'DEBUG': return 'var(--md-on-surface-variant)'
+    case 'TRACE': return 'var(--md-outline)'
+    default: return 'var(--md-primary)'
+  }
+}
+
+async function copyLogs() {
+  const text = [...logs.value].reverse()
+    .map(entry => `${logTime(entry.timestamp_ms)} [${entry.target}] [${entry.level}] ${entry.message}`)
+    .join('\n')
+  try {
+    const { writeText } = await import('@tauri-apps/plugin-clipboard-manager')
+    await writeText(text)
+    toast.success(t('settings.debug_logs_copied'))
+  } catch (e) {
+    log.error('copy logs failed:', e)
+  }
+}
+
+async function exportReport() {
+  try {
+    const path = await invoke<string>('export_debug_report')
+    toast.success(t('settings.debug_logs_exported'))
+    await invoke('reveal_in_file_manager', { path })
+  } catch (e) {
+    log.error('export report failed:', e)
+  }
+}
+
+async function openLogDir() {
+  try {
+    const dir = await invoke<string>('get_log_dir')
+    await invoke('reveal_in_file_manager', { path: dir })
+  } catch (e) {
+    log.error('open log dir failed:', e)
+  }
+}
+
+// ===== 崩溃报告 =====
+interface CrashReportInfo { file_name: string; size_bytes: number; modified_ms: number }
+const crashes = ref<CrashReportInfo[]>([])
+const expandedCrash = ref('')
+const crashContent = ref('')
+
+async function refreshCrashes() {
+  try {
+    crashes.value = await invoke<CrashReportInfo[]>('list_crash_reports')
+  } catch { /* 静默 */ }
+}
+
+async function toggleCrash(name: string) {
+  if (expandedCrash.value === name) {
+    expandedCrash.value = ''
+    return
+  }
+  try {
+    crashContent.value = await invoke<string>('read_crash_report', { fileName: name })
+    expandedCrash.value = name
+  } catch (e) {
+    log.error('read crash failed:', e)
+  }
+}
+
+async function clearCrashes() {
+  try {
+    await invoke('clear_crash_reports')
+    expandedCrash.value = ''
+    await refreshCrashes()
+    toast.success(t('settings.debug_crashes_cleared'))
+  } catch (e) {
+    log.error('clear crashes failed:', e)
+  }
+}
 </script>
 
 <template>
@@ -339,6 +448,81 @@ onMounted(async () => {
             <span class="state-label">{{ t('settings.debug_last_sync') }} (WebDAV)</span>
             <span class="state-value">{{ formatSyncTime(syncStore.webdav.lastSyncTime) }}</span>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 运行日志 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">terminal</span>
+      <span>{{ t('settings.debug_logs') }}</span>
+    </div>
+    <div class="setting-card debug-logs-card">
+      <div class="debug-logs-toolbar">
+        <select v-model="logLevelFilter" class="debug-logs-level" @change="refreshLogs">
+          <option value="">{{ t('settings.debug_level_all') }}</option>
+          <option value="error">ERROR</option>
+          <option value="warn">WARN</option>
+          <option value="info">INFO</option>
+          <option value="debug">DEBUG</option>
+        </select>
+        <div class="debug-logs-actions">
+          <button class="debug-log-btn" @click="logsPaused = !logsPaused">
+            <span class="material-symbols-rounded">{{ logsPaused ? 'play_arrow' : 'pause' }}</span>
+            {{ logsPaused ? t('settings.debug_logs_resume') : t('settings.debug_logs_pause') }}
+          </button>
+          <button class="debug-log-btn" @click="copyLogs">
+            <span class="material-symbols-rounded">content_copy</span>
+            {{ t('settings.debug_logs_copy') }}
+          </button>
+          <button class="debug-log-btn" @click="exportReport">
+            <span class="material-symbols-rounded">ios_share</span>
+            {{ t('settings.debug_logs_export') }}
+          </button>
+          <button class="debug-log-btn" @click="openLogDir">
+            <span class="material-symbols-rounded">folder_open</span>
+            {{ t('settings.debug_logs_open_dir') }}
+          </button>
+        </div>
+      </div>
+      <div v-if="logs.length === 0" class="debug-logs-empty">{{ t('settings.debug_logs_empty') }}</div>
+      <div v-else class="debug-logs-list">
+        <div v-for="(entry, index) in logs" :key="`${entry.timestamp_ms}-${index}`" class="debug-log-line">
+          <span class="debug-log-time">{{ logTime(entry.timestamp_ms) }}</span>
+          <span class="debug-log-level" :style="{ color: levelColor(entry.level) }">{{ entry.level }}</span>
+          <span class="debug-log-target">[{{ entry.target }}]</span>
+          <span class="debug-log-msg">{{ entry.message }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 崩溃报告 -->
+    <div class="section-label">
+      <span class="material-symbols-rounded" style="font-size: 18px">report</span>
+      <span>{{ t('settings.debug_crashes') }}</span>
+    </div>
+    <div class="setting-card">
+      <div class="setting-info" style="display: flex; align-items: center; gap: 12px">
+        <div style="flex: 1; min-width: 0">
+          <div class="setting-title">{{ t('settings.debug_crashes') }}</div>
+          <div class="setting-desc">{{ t('settings.debug_crashes_desc') }}</div>
+        </div>
+        <button v-if="crashes.length > 0" class="debug-log-btn debug-crash-clear" @click="clearCrashes">
+          <span class="material-symbols-rounded">delete</span>
+          {{ t('settings.debug_crashes_clear') }}
+        </button>
+      </div>
+      <div v-if="crashes.length === 0" class="debug-logs-empty">{{ t('settings.debug_crashes_empty') }}</div>
+      <div v-else class="debug-crash-list">
+        <div v-for="report in crashes" :key="report.file_name" class="debug-crash-item">
+          <button class="debug-crash-row" @click="toggleCrash(report.file_name)">
+            <span class="material-symbols-rounded" style="font-size: 18px">
+              {{ expandedCrash === report.file_name ? 'expand_less' : 'expand_more' }}
+            </span>
+            <span class="debug-crash-name">{{ report.file_name }}</span>
+            <span class="debug-crash-size">{{ (report.size_bytes / 1024).toFixed(1) }} KB</span>
+          </button>
+          <pre v-if="expandedCrash === report.file_name" class="debug-crash-body">{{ crashContent }}</pre>
         </div>
       </div>
     </div>
@@ -644,5 +828,109 @@ onMounted(async () => {
   &:active {
     transform: scale(0.97);
   }
+}
+
+.debug-logs-card { display: flex; flex-direction: column; gap: 10px; }
+
+.debug-logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.debug-logs-level {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 10px;
+  background: var(--md-surface-container);
+  color: var(--md-on-surface);
+  border: 1px solid var(--md-outline-variant);
+  font-size: 12px;
+}
+
+.debug-logs-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+
+.debug-log-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-full);
+  background: var(--md-surface-container);
+  color: var(--md-on-surface-variant);
+  font-size: 12px;
+  transition: background 150ms;
+
+  .material-symbols-rounded { font-size: 16px; }
+  &:hover { background: var(--md-surface-container-highest); color: var(--md-on-surface); }
+}
+
+.debug-crash-clear { color: var(--md-error); }
+
+.debug-logs-list {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column-reverse; /* 新日志在底部，滚动锚在最新 */
+  gap: 2px;
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--md-surface-container-lowest, var(--md-surface));
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.debug-log-line { display: flex; gap: 8px; align-items: baseline; }
+.debug-log-time { color: var(--md-outline); flex-shrink: 0; }
+.debug-log-level { width: 44px; flex-shrink: 0; font-weight: 700; }
+.debug-log-target { color: var(--md-on-surface-variant); flex-shrink: 0; }
+.debug-log-msg { word-break: break-all; white-space: pre-wrap; }
+
+.debug-logs-empty {
+  padding: 20px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--md-on-surface-variant);
+}
+
+.debug-crash-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+
+.debug-crash-item {
+  border-radius: 12px;
+  background: var(--md-surface-container);
+  overflow: hidden;
+}
+
+.debug-crash-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--md-on-surface);
+  font-size: 13px;
+  transition: background 150ms;
+
+  &:hover { background: var(--md-surface-container-high); }
+}
+
+.debug-crash-name { flex: 1; min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
+.debug-crash-size { color: var(--md-on-surface-variant); font-size: 12px; flex-shrink: 0; }
+
+.debug-crash-body {
+  margin: 0;
+  padding: 12px;
+  max-height: 280px;
+  overflow: auto;
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-top: 1px solid var(--md-outline-variant);
+  color: var(--md-on-surface-variant);
 }
 </style>

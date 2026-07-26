@@ -1,4 +1,5 @@
 import { createApp } from 'vue'
+import { createLogger } from '@/utils/logger'
 import { createPinia } from 'pinia'
 import { createRouter, createWebHistory } from 'vue-router'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -29,6 +30,16 @@ const router = createRouter({
     { path: '/library/favorite/:id', name: 'favorite-playlist', meta: { section: 'library' }, component: () => import('./views/FavoritePlaylistView.vue') },
     { path: '/debug', name: 'debug', meta: { section: 'debug' }, component: () => import('./views/DebugView.vue') },
   ],
+})
+
+// 未捕获异常与未处理 rejection 全部进统一日志（含后端环形缓冲），
+// 崩溃收集才有前端现场可看
+const crashLog = createLogger('frontend-crash')
+window.addEventListener('error', (event) => {
+  crashLog.error('uncaught error:', event.message, event.filename, `${event.lineno}:${event.colno}`)
+})
+window.addEventListener('unhandledrejection', (event) => {
+  crashLog.error('unhandled rejection:', event.reason instanceof Error ? `${event.reason.message}\n${event.reason.stack ?? ''}` : String(event.reason))
 })
 
 const app = createApp(App)

@@ -1,0 +1,160 @@
+// 调试台命令：应用内日志查看、诊断报告导出、崩溃报告管理
+// 能力对齐 Android 调试页（NPLogger 文件日志 + 崩溃收集 + 导出）
+
+use crate::error::{AppError, AppResult};
+use crate::logging;
+use serde::Serialize;
+
+/// 拉取最近日志（新→旧）
+#[tauri::command]
+pub fn get_recent_logs(limit: Option<usize>, min_level: Option<String>) -> Vec<logging::RecentLogEntry> {
+    let level = min_level
+        .as_deref()
+        .and_then(|value| value.parse::<log::Level>().ok());
+    logging::recent_logs(limit.unwrap_or(300).min(1_500), level)
+}
+
+/// 导出诊断报告：构建信息 + 系统 + 全部内存日志 + 崩溃文件清单
+///
+/// 落到日志目录并返回路径，前端用 opener 在文件管理器里定位。
+/// 不弹保存对话框：报告是给「出问题时一键收集发给开发者」用的，
+/// 路径固定可预期比多一步选择更重要。
+#[tauri::command]
+pub fn export_debug_report(app: tauri::AppHandle) -> AppResult<String> {
+    let package = app.package_info();
+    let logs = logging::recent_logs(1_500, None);
+    let mut body = String::with_capacity(64 * 1024);
+    body.push_str(&format!(
+        "NeriPlayer Desktop debug report\nversion: {}\nos: {} {}\ntime: {}\n\n",
+        package.version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+    ));
+    body.push_str("== crash reports ==\n");
+    for report in list_crash_reports().unwrap_or_default() {
+        body.push_str(&format!("{} ({} bytes)\n", report.file_name, report.size_bytes));
+    }
+    body.push_str("\n== recent logs (oldest first) ==\n");
+    for entry in logs.into_iter().rev() {
+        body.push_str(&format!(
+            "{} [{}] [{}] {}\n",
+            entry.timestamp_ms, entry.target, entry.level, entry.message
+        ));
+    }
+
+    let dir = logging::log_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| AppError::Other(format!("create log dir: {error}")))?;
+    let path = dir.join(format!(
+        "debug-report-{}.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    std::fs::write(&path, body)
+        .map_err(|error| AppError::Other(format!("write report: {error}")))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 在系统文件管理器中定位文件（macOS Finder / Windows 资源管理器 / Linux 文件管理器）
+#[tauri::command]
+pub fn reveal_in_file_manager(path: String) -> AppResult<()> {
+    tauri_plugin_opener::reveal_item_in_dir(std::path::PathBuf::from(path))
+        .map_err(|error| AppError::Other(format!("reveal failed: {error}")))
+}
+
+#[derive(Serialize)]
+pub struct CrashReportInfo {
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub modified_ms: i64,
+}
+
+/// 崩溃文件名白名单校验
+///
+/// 名字来自前端参数，读/删前必须证明它就是本目录下的崩溃报告：
+/// 固定前后缀、无路径分隔符，杜绝 ../ 穿越到日志目录之外。
+fn validated_crash_path(file_name: &str) -> AppResult<std::path::PathBuf> {
+    let valid = file_name.starts_with("crash-")
+        && file_name.ends_with(".txt")
+        && !file_name.contains(['/', '\\'])
+        && !file_name.contains("..");
+    if !valid {
+        return Err(AppError::Other(format!("invalid crash report name: {file_name}")));
+    }
+    Ok(logging::crash_dir().join(file_name))
+}
+
+/// 崩溃报告清单（新→旧）
+#[tauri::command]
+pub fn list_crash_reports() -> AppResult<Vec<CrashReportInfo>> {
+    let dir = logging::crash_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // 目录不存在 = 没崩溃过，不是错误
+        return Ok(Vec::new());
+    };
+    let mut reports: Vec<CrashReportInfo> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("crash-") || !name.ends_with(".txt") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            Some(CrashReportInfo {
+                file_name: name,
+                size_bytes: metadata.len(),
+                modified_ms,
+            })
+        })
+        .collect();
+    reports.sort_by_key(|report| std::cmp::Reverse(report.modified_ms));
+    Ok(reports)
+}
+
+/// 读取单份崩溃报告正文
+#[tauri::command]
+pub fn read_crash_report(file_name: String) -> AppResult<String> {
+    let path = validated_crash_path(&file_name)?;
+    std::fs::read_to_string(&path)
+        .map_err(|error| AppError::Other(format!("read crash report: {error}")))
+}
+
+/// 清空全部崩溃报告
+#[tauri::command]
+pub fn clear_crash_reports() -> AppResult<usize> {
+    let mut removed = 0usize;
+    for report in list_crash_reports()? {
+        let path = validated_crash_path(&report.file_name)?;
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 崩溃文件名来自前端，必须挡住路径穿越与任意文件读取
+    #[test]
+    fn crash_names_outside_the_whitelist_are_rejected() {
+        for bad in [
+            "../settings.json",
+            "crash-../../etc/passwd.txt",
+            "crash-a/b.txt",
+            "crash-a\\b.txt",
+            "notes.txt",
+            "crash-1.log",
+        ] {
+            assert!(validated_crash_path(bad).is_err(), "should reject {bad}");
+        }
+        assert!(validated_crash_path("crash-20260726-120000.txt").is_ok());
+    }
+}
