@@ -5,7 +5,7 @@ import { useRouter, useRoute } from 'vue-router'
 defineOptions({ name: 'LibraryView' })
 import { useI18n } from 'vue-i18n'
 import { useLibraryStore } from '@/stores/library'
-import { usePlayerStore, type TrackInfo } from '@/stores/player'
+import { normalizeTrack, usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useRecommendStore } from '@/stores/recommend'
 import { useAuthStore } from '@/stores/auth'
 import { useDownloadStore } from '@/stores/download'
@@ -22,6 +22,13 @@ import {
   type ContextMenuActionItem,
   type ContextMenuItem,
 } from '@/utils/contextMenu'
+import {
+  filterLocalArtists,
+  groupLocalArtists,
+  sortLocalArtists,
+  type LocalArtistSortMode,
+  type LocalArtistSummary,
+} from '@/modules/library/localArtists'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('library-view')
@@ -261,6 +268,62 @@ const LIKED_NAMES = ['我喜欢的音乐', '我喜歡的音樂', 'お気に入�
 const LOCAL_NAMES = ['本地音乐', '本機音樂', 'ローカル音楽', 'Local Music']
 const ALL_PROTECTED = [...LIKED_NAMES, ...LOCAL_NAMES]
 
+// 本地库分类：歌单 / 歌手（对齐 Android LOCAL_CATEGORY_ARTIST）
+type LocalCategory = 'playlists' | 'artists'
+const localCategory = ref<LocalCategory>('playlists')
+const localArtistSort = ref<LocalArtistSortMode>('name')
+const localArtistQuery = ref('')
+const localArtistTracks = ref<TrackInfo[]>([])
+const localArtistsLoading = ref(false)
+const showLocalArtistSort = ref(false)
+
+const localArtistSortModes: LocalArtistSortMode[] = ['name', 'song_count', 'recent']
+
+const localArtists = computed(() =>
+  sortLocalArtists(
+    filterLocalArtists(
+      groupLocalArtists(localArtistTracks.value, t('library.local_artist_unknown')),
+      localArtistQuery.value,
+    ),
+    localArtistSort.value,
+  ),
+)
+
+async function loadLocalArtistTracks(force = false) {
+  if (localArtistsLoading.value) return
+  if (localArtistTracks.value.length > 0 && !force) return
+  localArtistsLoading.value = true
+  try {
+    const localPlaylist = playlists.value.find((pl) => LOCAL_NAMES.includes(pl.name))
+    if (!localPlaylist) {
+      localArtistTracks.value = []
+      return
+    }
+    const raw = await invoke<any[]>('get_playlist_tracks', { id: localPlaylist.id })
+    localArtistTracks.value = (raw || []).map(normalizeTrack)
+  } catch (e) {
+    log.error('Load local artist tracks failed:', e)
+    localArtistTracks.value = []
+  } finally {
+    localArtistsLoading.value = false
+  }
+}
+
+function switchLocalCategory(category: LocalCategory) {
+  if (localCategory.value === category) return
+  localCategory.value = category
+  if (category === 'artists') void loadLocalArtistTracks()
+}
+
+function openLocalArtist(artist: LocalArtistSummary) {
+  router.push({ name: 'local-artist', params: { name: artist.name } })
+}
+
+function playLocalArtist(artist: LocalArtistSummary) {
+  if (!artist.tracks.length) return
+  player.playAll(artist.tracks)
+}
+
 async function ensureLocalPlaylistId(): Promise<number> {
   const raw = await invoke<PlaylistInfo[]>('list_playlists')
   const localPlaylist = raw.find((pl) => LOCAL_NAMES.includes(pl.name))
@@ -293,6 +356,7 @@ async function syncScannedTracksToLocalPlaylist(scannedTracks: TrackInfo[]) {
   }
 
   await loadPlaylists()
+  if (localCategory.value === 'artists') await loadLocalArtistTracks(true)
 }
 
 async function selectAndScanLocalMusic() {
@@ -705,6 +769,93 @@ onUnmounted(() => {
 
     <!-- Tab: 本地 -->
     <div v-if="activeTab === 0" class="playlist-list">
+      <!-- 歌单 / 歌手分类（对齐 Android 本地页分类切换） -->
+      <div class="local-category-bar">
+        <button
+          v-for="category in (['playlists', 'artists'] as const)"
+          :key="category"
+          class="local-category-chip"
+          :class="{ active: localCategory === category }"
+          @click="switchLocalCategory(category)"
+        >
+          <span class="material-symbols-rounded" style="font-size: 17px">
+            {{ category === 'playlists' ? 'queue_music' : 'account_circle' }}
+          </span>
+          <span>{{ category === 'playlists' ? t('library.local_category_playlists') : t('library.local_category_artists') }}</span>
+        </button>
+      </div>
+
+      <!-- 歌手视图 -->
+      <template v-if="localCategory === 'artists'">
+        <div class="artist-toolbar">
+          <div class="artist-search">
+            <span class="material-symbols-rounded" style="font-size: 18px">search</span>
+            <input
+              v-model="localArtistQuery"
+              type="search"
+              :placeholder="t('library.local_artist_search_hint')"
+              :aria-label="t('library.local_artist_search_hint')"
+            />
+          </div>
+          <button
+            class="artist-sort-btn"
+            :title="t('library.local_artist_sort')"
+            :aria-label="t('library.local_artist_sort')"
+            @click="showLocalArtistSort = !showLocalArtistSort"
+          >
+            <span class="material-symbols-rounded" style="font-size: 20px">sort</span>
+          </button>
+        </div>
+        <div v-if="showLocalArtistSort" class="artist-sort-options">
+          <button
+            v-for="mode in localArtistSortModes"
+            :key="mode"
+            class="artist-sort-option"
+            :class="{ active: localArtistSort === mode }"
+            @click="localArtistSort = mode; showLocalArtistSort = false"
+          >
+            {{ t(`library.local_artist_sort_${mode}`) }}
+          </button>
+        </div>
+
+        <div v-if="localArtistsLoading" class="empty-tab">
+          <span class="material-symbols-rounded spinning" style="font-size: 32px">progress_activity</span>
+        </div>
+        <div v-else-if="localArtists.length === 0" class="empty-tab">
+          <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">account_circle</span></div>
+          <p class="empty-title">{{ t('library.local_artist_empty') }}</p>
+          <p class="empty-desc">{{ t('library.local_artist_hint') }}</p>
+        </div>
+        <div v-else class="artist-grid">
+          <div
+            v-for="artist in localArtists"
+            :key="artist.key"
+            class="artist-card"
+            role="button"
+            tabindex="0"
+            @click="openLocalArtist(artist)"
+            @keydown.enter="openLocalArtist(artist)"
+            @keydown.space.prevent="openLocalArtist(artist)"
+          >
+            <div class="artist-cover">
+              <BilibiliCoverImage v-if="artist.coverUrl" :src="artist.coverUrl" loading="lazy" />
+              <span v-else class="material-symbols-rounded filled" style="font-size: 34px">account_circle</span>
+              <button
+                class="artist-play"
+                :title="t('player.play_all')"
+                :aria-label="t('player.play_all')"
+                @click.stop="playLocalArtist(artist)"
+              >
+                <span class="material-symbols-rounded filled" style="font-size: 20px">play_arrow</span>
+              </button>
+            </div>
+            <div class="artist-name">{{ artist.name }}</div>
+            <div class="artist-count">{{ t('player.track_count', { count: artist.tracks.length }) }}</div>
+          </div>
+        </div>
+      </template>
+
+      <template v-else>
       <div class="new-playlist-row" :class="{ disabled: library.isScanning }" @click="selectAndScanLocalMusic">
         <span class="material-symbols-rounded" :class="{ spinning: library.isScanning }" style="font-size: 20px">
           {{ library.isScanning ? 'progress_activity' : 'folder_open' }}
@@ -790,6 +941,7 @@ onUnmounted(() => {
         <p class="empty-title">{{ t('library.playlist_empty_title') }}</p>
         <p class="empty-desc">{{ t('library.playlist_empty_desc') }}</p>
       </div>
+      </template>
     </div>
 
     <!-- Tab: 收藏（同步的收藏歌单） -->
@@ -1640,5 +1792,178 @@ onUnmounted(() => {
   font-size: 14px;
   color: var(--md-on-surface-variant);
   line-height: 1.5;
+}
+
+// 本地库：歌单 / 歌手 分类
+.local-category-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.local-category-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-full);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--md-on-surface-variant);
+  border: 1px solid var(--md-outline-variant, rgba(255, 255, 255, 0.12));
+  transition:
+    background var(--duration-short) var(--easing-standard, ease),
+    color var(--duration-short) var(--easing-standard, ease),
+    border-color var(--duration-short) var(--easing-standard, ease);
+
+  &:hover { background: var(--md-surface-container-high); }
+
+  &.active {
+    background: var(--md-secondary-container);
+    color: var(--md-on-secondary-container);
+    border-color: transparent;
+  }
+}
+
+.artist-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.artist-search {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  height: 40px;
+  border-radius: var(--radius-full);
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+
+  input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 13px;
+    color: var(--md-on-surface);
+
+    &::placeholder { color: var(--md-on-surface-variant); opacity: 0.7; }
+    &::-webkit-search-cancel-button { -webkit-appearance: none; }
+  }
+}
+
+.artist-sort-btn {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-on-surface-variant);
+  transition: background var(--duration-short);
+
+  &:hover { background: var(--md-surface-container-high); }
+}
+
+.artist-sort-options {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.artist-sort-option {
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  color: var(--md-on-surface-variant);
+  background: var(--md-surface-container-high);
+  transition: background var(--duration-short), color var(--duration-short);
+
+  &:hover { background: var(--md-surface-container-highest); }
+  &.active { background: var(--md-secondary-container); color: var(--md-on-secondary-container); }
+}
+
+.artist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+  gap: 16px 14px;
+  padding-bottom: 12px;
+}
+
+.artist-card {
+  cursor: pointer;
+  min-width: 0;
+  border-radius: var(--radius-lg, 16px);
+  outline: none;
+
+  &:focus-visible { box-shadow: 0 0 0 2px var(--md-primary); }
+  &:hover .artist-play { opacity: 1; transform: translateY(0) scale(1); }
+  &:hover .artist-cover { transform: translateY(-2px); }
+}
+
+.artist-cover {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+  // 只动 transform，避免触发布局
+  transition: transform 200ms var(--easing-emphasized, cubic-bezier(0.2, 0, 0, 1));
+
+  :deep(img) { width: 100%; height: 100%; object-fit: cover; }
+}
+
+.artist-play {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  opacity: 0;
+  transform: translateY(6px) scale(0.9);
+  transition:
+    opacity 160ms var(--easing-standard, ease),
+    transform 200ms var(--easing-emphasized, cubic-bezier(0.2, 0, 0, 1));
+
+  &:focus-visible { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.artist-name {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artist-count {
+  font-size: 11px;
+  text-align: center;
+  color: var(--md-on-surface-variant);
+  opacity: 0.7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .artist-cover,
+  .artist-play { transition: none; }
 }
 </style>
