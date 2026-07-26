@@ -115,7 +115,8 @@
   display: flex;
   gap: 24px;
   margin-bottom: 24px;
-  align-items: flex-start;
+  /* 信息区通常比封面矮, 顶对齐会在按钮下方留出大片空白; 居中让留白均匀分布 */
+  align-items: center;
 }
 
 .hero-cover {
@@ -142,7 +143,6 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding-top: 4px;
 }
 
 .hero-title {
