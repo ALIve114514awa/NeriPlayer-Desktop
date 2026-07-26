@@ -1,11 +1,11 @@
 use reqwest::header::{CONTENT_RANGE, RANGE, REFERER, USER_AGENT};
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
@@ -25,6 +25,12 @@ const REMOTE_INITIAL_BLOCK_BYTES: u64 = 128 * 1024;
 /// 超长媒体首包加大，尽量一次拿齐 moov + 起始音频
 const REMOTE_LONG_INITIAL_BLOCK_BYTES: u64 = 512 * 1024;
 const REMOTE_FETCH_BLOCK_BYTES: u64 = 256 * 1024;
+/// 预取专用块：慢链路上每个请求的往返/慢启动开销占大头（实机 256KB 块耗时
+/// 600-4000ms），顺序预取用大块摊薄开销；需求读与 seek 仍用 256KB 保低延迟
+const REMOTE_PREFETCH_BLOCK_BYTES: u64 = 512 * 1024;
+/// 预取流水线并发数：单流有效吞吐可低于码率（实机 65-430KB/s < 356KB/s），
+/// 多条并发请求掩盖单请求延迟；受 prefetch_target 窗口约束不会过量拉取
+const REMOTE_PREFETCH_CONCURRENCY: usize = 3;
 const REMOTE_FRAGMENTED_SEEK_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 const REMOTE_DECODER_BUFFER_BYTES: usize = 128 * 1024;
 /// virtual-body 远程 demuxer 缓冲：需覆盖单段 moof+mdat 回跳
@@ -232,8 +238,12 @@ struct RemoteAudioInner {
     prefetch_window: PrefetchWindow,
     cache: Mutex<Vec<CachedSegment>>,
     disk_ranges: Mutex<Vec<CachedRange>>,
-    in_flight: Mutex<HashSet<u64>>,
+    /// 在途 range 请求注册表（key=起始物理偏移）：需求读与预取共享，
+    /// 同一块只允许一个请求在途，后来者等待并共享缓存结果
+    in_flight: Mutex<HashMap<u64, Arc<InflightFetch>>>,
     range_available: Condvar,
+    /// 需求读在网计数：预取 lane 看到非零时暂缓发起新请求（需求读优先）
+    demand_fetches: AtomicUsize,
     last_read_pos: Mutex<u64>,
     /// 保护尾部 moov/sidx：seek 重开 demuxer 时不可被 trim 掉
     protected_ranges: Mutex<Vec<CachedRange>>,
@@ -343,6 +353,37 @@ impl RemoteAudioInner {
 struct CachedSegment {
     start: u64,
     data: Vec<u8>,
+}
+
+/// 单个在途 range 请求的登记项。
+///
+/// 为什么需要它：此前需求读与预取互不知道对方在途——需求读 claim 失败只等
+/// 800ms 就强抢重发，同一 range 被拉两次，慢链路上带宽直接减半（实机日志
+/// 同 range 两个响应）。登记后后来者改为等待首个请求完成并共享缓存结果。
+struct InflightFetch {
+    /// 请求覆盖的物理区间尾（含端点）：判断任意偏移是否已被在途请求覆盖
+    end: u64,
+    /// 请求结束（成功数据已入缓存 / 失败 / 被代际作废）后置位，
+    /// 配合 range_available 唤醒共享等待方
+    done: AtomicBool,
+}
+
+/// 需求读在网计数守卫：用 Drop 保证错误路径也能归零计数
+struct DemandFetchGuard<'a> {
+    inner: &'a RemoteAudioInner,
+}
+
+impl<'a> DemandFetchGuard<'a> {
+    fn new(inner: &'a RemoteAudioInner) -> Self {
+        inner.demand_fetches.fetch_add(1, Ordering::AcqRel);
+        Self { inner }
+    }
+}
+
+impl Drop for DemandFetchGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.demand_fetches.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -542,8 +583,9 @@ impl RemoteAudioSource {
             prefetch_window,
             cache: Mutex::new(cache),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(protected_ranges),
             disk_cache,
@@ -815,6 +857,8 @@ impl RemoteAudioSource {
         let probe = if position_is_cached_range(&self.inner, target, probe_end) {
             None
         } else {
+            // seek 关键路径同样属于需求读：探测期间预取让路
+            let _demand_guard = DemandFetchGuard::new(&self.inner);
             match fetch_range_block(
                 &self.inner,
                 target,
@@ -1016,33 +1060,6 @@ impl RemoteAudioSource {
         if physical >= self.inner.total_len {
             return Ok(());
         }
-        if self.has_cached_physical(physical)
-            || disk_cached_len(&self.inner, physical, 1).is_some()
-        {
-            return Ok(());
-        }
-        if self.wait_for_prefetch(physical) {
-            return Ok(());
-        }
-
-        // 同 offset 被别人占着时优先等；超时仍无数据则抢占，避免 seek 死等旧预取
-        let mut claimed = claim_prefetch_start(&self.inner, physical);
-        if !claimed {
-            if self.wait_for_prefetch(physical) || self.has_cached_physical(physical) {
-                return Ok(());
-            }
-            force_release_prefetch_start(&self.inner, physical);
-            claimed = claim_prefetch_start(&self.inner, physical);
-            if !claimed {
-                if self.wait_for_prefetch(physical) || self.has_cached_physical(physical) {
-                    return Ok(());
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "remote range is already being fetched",
-                ));
-            }
-        }
 
         // 虚拟 body 生效时改用 seek 专用块，避免 8MB 拖垮跳转延迟
         let block = if self.inner.virtual_body_origin.load(Ordering::Acquire) > 0 {
@@ -1055,70 +1072,124 @@ impl RemoteAudioSource {
             .saturating_add(wanted)
             .saturating_sub(1)
             .min(self.inner.total_len.saturating_sub(1));
+
+        // 「查缓存 → 等在途共享 → claim 亲拉」最多三轮：
+        // 同一块已有请求在途时等待并共享其结果，绝不重复发起（重复只会把
+        // 带宽劈半，数据不会更早到达）；claim 竞态失败则下一轮转入等待
+        let mut claimed = None;
+        for _ in 0..3 {
+            self.ensure_read_current()?;
+            if self.has_cached_physical(physical)
+                || disk_cached_len(&self.inner, physical, 1).is_some()
+            {
+                return Ok(());
+            }
+            if self.wait_for_inflight(physical) {
+                return Ok(());
+            }
+            self.ensure_read_current()?;
+            if let Some(entry) = claim_prefetch_start(&self.inner, physical, end) {
+                claimed = Some(entry);
+                break;
+            }
+        }
+        let Some(entry) = claimed else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote range is already being fetched",
+            ));
+        };
+
+        // 需求读在网标记：预取 lane 看到后暂缓开新请求，带宽让给解码急需的数据
+        let demand_guard = DemandFetchGuard::new(&self.inner);
         let fetched = fetch_range_block(
             &self.inner,
             physical,
             end,
             self.read_cancellation.as_ref(),
         );
-        release_prefetch_start(&self.inner, physical);
-        let data = fetched?;
+        drop(demand_guard);
+        let data = match fetched {
+            Ok(data) => data,
+            Err(err) => {
+                release_prefetch_start(&self.inner, physical, &entry);
+                return Err(err);
+            }
+        };
 
         if data.is_empty() {
+            release_prefetch_start(&self.inner, physical, &entry);
             return Ok(());
         }
 
-        let mut cache = self
-            .inner
-            .cache
-            .lock()
-            .map_err(|_| io::Error::other("remote cache lock poisoned"))?;
-        if !cache_contains_position(&cache, physical) {
-            cache.push(CachedSegment {
-                start: physical,
-                data,
-            });
-            cache.sort_by_key(|segment| segment.start);
-            trim_cache(
-                &self.inner,
-                &mut cache,
-                cache_center(&self.inner, physical),
-            );
-        }
-        drop(cache);
+        // 先入缓存再发布 done：共享等待方醒来即可命中，不会空等一场
+        let insert_result = (|| -> io::Result<()> {
+            let mut cache = self
+                .inner
+                .cache
+                .lock()
+                .map_err(|_| io::Error::other("remote cache lock poisoned"))?;
+            if !cache_contains_position(&cache, physical) {
+                cache.push(CachedSegment {
+                    start: physical,
+                    data,
+                });
+                cache.sort_by_key(|segment| segment.start);
+                trim_cache(
+                    &self.inner,
+                    &mut cache,
+                    cache_center(&self.inner, physical),
+                );
+            }
+            Ok(())
+        })();
+        release_prefetch_start(&self.inner, physical, &entry);
+        insert_result?;
         replenish_prefetch_window(&self.inner, physical);
         Ok(())
     }
 
-    fn wait_for_prefetch(&self, start: u64) -> bool {
-        let started = Instant::now();
-        // seek 后需求读不应被 15s 旧预取拖死；短等即可
-        let wait_budget = Duration::from_millis(800);
-        let Ok(mut in_flight) = self.inner.in_flight.lock() else {
+    /// 等待覆盖 start 的在途请求完成并共享其缓存结果。
+    ///
+    /// 旧实现只等 800ms 就强抢重发同一 range，慢链路上必然双请求并发、
+    /// 带宽减半；这里改为等到发布方置 done。seek 换代时
+    /// invalidate_prefetch_epoch 会立刻置 done 解除等待，低延迟语义不变。
+    fn wait_for_inflight(&self, start: u64) -> bool {
+        let entry = {
+            let Ok(in_flight) = self.inner.in_flight.lock() else {
+                return false;
+            };
+            in_flight
+                .iter()
+                .find(|(entry_start, entry)| **entry_start <= start && start <= entry.end)
+                .map(|(_, entry)| Arc::clone(entry))
+        };
+        let Some(entry) = entry else {
             return false;
         };
-        while in_flight.contains(&start) && started.elapsed() < wait_budget {
+
+        let started = Instant::now();
+        // 防御上限：发布方的请求自带 15s 超时，正常路径必在此之前发布结果
+        let wait_budget = REMOTE_REQUEST_TIMEOUT + Duration::from_secs(5);
+        while !entry.done.load(Ordering::Acquire) && started.elapsed() < wait_budget {
             if self.read_cancelled() {
                 return false;
             }
-            in_flight = match self
+            let Ok(guard) = self.inner.in_flight.lock() else {
+                return false;
+            };
+            // 拿锁后复查，避免错过 done 置位与 notify 之间的竞态窗口
+            if entry.done.load(Ordering::Acquire) {
+                break;
+            }
+            match self
                 .inner
                 .range_available
-                .wait_timeout(in_flight, Duration::from_millis(40))
+                .wait_timeout(guard, Duration::from_millis(40))
             {
-                Ok((guard, _)) => guard,
-                Err(error) => error.into_inner().0,
-            };
-            drop(in_flight);
-            if self.has_cached_physical(start) || disk_cached_len(&self.inner, start, 1).is_some() {
-                return true;
+                Ok(_) | Err(_) => {}
             }
-            in_flight = match self.inner.in_flight.lock() {
-                Ok(guard) => guard,
-                Err(_) => return false,
-            };
         }
-        drop(in_flight);
 
         self.has_cached_physical(start) || disk_cached_len(&self.inner, start, 1).is_some()
     }
@@ -2912,89 +2983,150 @@ fn replenish_prefetch_window(inner: &Arc<RemoteAudioInner>, read_pos: u64) {
 }
 
 fn spawn_prefetch_sequence(inner: Arc<RemoteAudioInner>, plan: PrefetchPlan) {
-    let Some(first_start) = claim_prefetch_sequence_start(&inner, plan) else {
+    // 先占首块：既是 0 号 lane 的首个任务，也天然拒绝重复提交的整段预取
+    let Some((first_start, first_entry)) = claim_prefetch_sequence_start(&inner, plan) else {
         return;
     };
     let epoch = inner.prefetch_epoch.load(Ordering::Acquire);
-    tauri::async_runtime::spawn(async move {
-        let mut next_start = first_start;
-        while next_start < inner.total_len && next_start < plan.target_end {
-            if inner.playback_cancelled()
+    let limit = plan.target_end.min(inner.total_len);
+    // 共享游标：各 lane 从这里领取下一块起点，构成 2-3 路并发流水线，
+    // 掩盖单请求往返延迟（串行 256KB 块的有效吞吐在慢链路上低于码率）
+    let cursor = Arc::new(AtomicU64::new(
+        first_start.saturating_add(prefetch_block_len(first_start, limit)),
+    ));
+    let stop = Arc::new(AtomicBool::new(false));
+    for lane in 0..REMOTE_PREFETCH_CONCURRENCY {
+        let preclaimed = (lane == 0).then(|| (first_start, Arc::clone(&first_entry)));
+        let inner = Arc::clone(&inner);
+        let cursor = Arc::clone(&cursor);
+        let stop = Arc::clone(&stop);
+        tauri::async_runtime::spawn(async move {
+            prefetch_lane(inner, plan, epoch, cursor, stop, preclaimed).await;
+        });
+    }
+}
+
+/// 预取块长度：夹到窗口/文件边界
+fn prefetch_block_len(start: u64, limit: u64) -> u64 {
+    REMOTE_PREFETCH_BLOCK_BYTES.min(limit.saturating_sub(start))
+}
+
+/// 单条预取 lane：从共享游标领块 → 登记在途 → 拉取 → 入缓存 → 发布。
+/// 出错/短响应/换代即停整条流水线，空洞由下一轮 replenish 从
+/// contiguous_cached_end 重新规划补齐
+async fn prefetch_lane(
+    inner: Arc<RemoteAudioInner>,
+    plan: PrefetchPlan,
+    epoch: u64,
+    cursor: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    preclaimed: Option<(u64, Arc<InflightFetch>)>,
+) {
+    let limit = plan.target_end.min(inner.total_len);
+    let mut pending = preclaimed;
+    loop {
+        let lane_cancelled = || {
+            stop.load(Ordering::Acquire)
+                || inner.playback_cancelled()
                 || inner.prefetch_epoch.load(Ordering::Acquire) != epoch
-            {
-                release_prefetch_start(&inner, next_start);
+        };
+        let (start, entry) = match pending.take() {
+            Some(next) => next,
+            None => {
+                // 需求读优先：解码线程正亲自拉块时暂缓开新请求，
+                // 已在途的请求继续跑完，只是不再抢新带宽
+                while inner.demand_fetches.load(Ordering::Acquire) > 0 && !lane_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if lane_cancelled() {
+                    break;
+                }
+                let start = cursor.fetch_add(REMOTE_PREFETCH_BLOCK_BYTES, Ordering::AcqRel);
+                if start >= limit {
+                    break;
+                }
+                let end = start + prefetch_block_len(start, limit) - 1;
+                match claim_prefetch_start(&inner, start, end) {
+                    Some(entry) => (start, entry),
+                    // 已缓存或已被别人（需求读）拉着：跳过本块领下一块
+                    None => continue,
+                }
+            }
+        };
+        if lane_cancelled() {
+            release_prefetch_start(&inner, start, &entry);
+            break;
+        }
+        let end = start + prefetch_block_len(start, limit) - 1;
+        // seek 换代时立刻中止在途预取请求，不让旧位置继续吃带宽
+        let fetch = fetch_range_block_async(&inner, start, end, None);
+        tokio::pin!(fetch);
+        let result = tokio::select! {
+            result = &mut fetch => result,
+            () = wait_for_generation_change(&inner.prefetch_epoch, epoch) => Err(
+                io::Error::new(io::ErrorKind::Interrupted, "prefetch epoch invalidated"),
+            ),
+        };
+
+        let requested = end - start + 1;
+        match result {
+            Ok(data) if !data.is_empty() => {
+                let fetched_len = data.len() as u64;
+                // epoch 变了：丢弃本块，避免旧位置继续污染缓存中心
+                if inner.prefetch_epoch.load(Ordering::Acquire) == epoch {
+                    if let Ok(mut cache) = inner.cache.lock() {
+                        if !cache_contains_position(&cache, start) {
+                            cache.push(CachedSegment { start, data });
+                            cache.sort_by_key(|segment| segment.start);
+                            trim_cache(&inner, &mut cache, cache_center(&inner, start));
+                        }
+                    }
+                } else {
+                    stop.store(true, Ordering::Release);
+                }
+                release_prefetch_start(&inner, start, &entry);
+                // 短响应在块尾留下空洞：停流水线交给 replenish 补齐
+                if fetched_len < requested {
+                    stop.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            Ok(_) => {
+                release_prefetch_start(&inner, start, &entry);
+                stop.store(true, Ordering::Release);
                 break;
             }
-
-            let fetch_start = next_start;
-            let end = fetch_start
-                .saturating_add(REMOTE_FETCH_BLOCK_BYTES)
-                .saturating_sub(1)
-                .min(plan.target_end.saturating_sub(1))
-                .min(inner.total_len.saturating_sub(1));
-            let result = fetch_range_block_async(&inner, fetch_start, end, None).await;
-
-            let should_stop = match result {
-                Ok(data) if data.is_empty() => true,
-                Ok(data) => {
-                    // epoch 变了：丢弃本块，避免旧位置继续污染缓存中心
-                    if inner.prefetch_epoch.load(Ordering::Acquire) != epoch {
-                        true
-                    } else {
-                        let fetched_end = fetch_start.saturating_add(data.len() as u64);
-                        if let Ok(mut cache) = inner.cache.lock() {
-                            if !cache_contains_position(&cache, fetch_start) {
-                                cache.push(CachedSegment {
-                                    start: fetch_start,
-                                    data,
-                                });
-                                cache.sort_by_key(|segment| segment.start);
-                                trim_cache(
-                                    &inner,
-                                    &mut cache,
-                                    cache_center(&inner, fetch_start),
-                                );
-                            }
-                        }
-                        next_start = fetched_end.max(fetch_start.saturating_add(1));
-                        false
-                    }
-                }
-                Err(err) => {
+            Err(err) => {
+                release_prefetch_start(&inner, start, &entry);
+                if err.kind() != io::ErrorKind::Interrupted {
                     log::warn!(
                         target: "remote-audio",
                         "prefetch stopped at {}: {}",
-                        fetch_start, err
+                        start, err
                     );
-                    true
                 }
-            };
-            release_prefetch_start(&inner, fetch_start);
-            if should_stop {
-                break;
-            }
-            if next_start >= inner.total_len || next_start >= plan.target_end {
-                break;
-            }
-            if !claim_prefetch_start(&inner, next_start) {
+                stop.store(true, Ordering::Release);
                 break;
             }
         }
-        if next_start >= inner.total_len {
-            try_mark_disk_cache_ready(&inner);
-        }
-    });
+    }
+    // 走到文件尾时触发磁盘缓存收尾检查（内部校验覆盖完整性，幂等）
+    if cursor.load(Ordering::Acquire) >= inner.total_len {
+        try_mark_disk_cache_ready(&inner);
+    }
 }
 
 fn claim_prefetch_sequence_start(
     inner: &RemoteAudioInner,
     plan: PrefetchPlan,
-) -> Option<u64> {
-    let start = plan.start.min(inner.total_len);
-    if start >= inner.total_len || start >= plan.target_end {
+) -> Option<(u64, Arc<InflightFetch>)> {
+    let limit = plan.target_end.min(inner.total_len);
+    let start = plan.start;
+    if start >= limit {
         return None;
     }
-    claim_prefetch_start(inner, start).then_some(start)
+    let end = start + prefetch_block_len(start, limit) - 1;
+    claim_prefetch_start(inner, start, end).map(|entry| (start, entry))
 }
 
 fn contiguous_cached_end(inner: &RemoteAudioInner, pos: u64) -> u64 {
@@ -3472,41 +3604,62 @@ fn parse_sidx_body(
     })
 }
 
-fn claim_prefetch_start(inner: &RemoteAudioInner, start: u64) -> bool {
+/// 登记 [start, end] 的在途请求；起点已被在途请求覆盖或已被连续缓存覆盖时
+/// 返回 None（调用方应转入等待/命中缓存，而不是重复发起请求）
+fn claim_prefetch_start(
+    inner: &RemoteAudioInner,
+    start: u64,
+    end: u64,
+) -> Option<Arc<InflightFetch>> {
     if contiguous_cached_end(inner, start) > start {
-        return false;
+        return None;
     }
     let Ok(mut in_flight) = inner.in_flight.lock() else {
-        return false;
+        return None;
     };
-    in_flight.insert(start)
-}
-
-fn release_prefetch_start(inner: &RemoteAudioInner, start: u64) {
-    if let Ok(mut in_flight) = inner.in_flight.lock() {
-        in_flight.remove(&start);
-        drop(in_flight);
-        inner.range_available.notify_all();
+    // 只按「起点被覆盖」判重：部分尾部重叠的少量浪费可接受，
+    // 若按整段重叠判重，需求读会在等不到对应登记项时陷入空转
+    if in_flight
+        .iter()
+        .any(|(entry_start, entry)| *entry_start <= start && start <= entry.end)
+    {
+        return None;
     }
+    let entry = Arc::new(InflightFetch {
+        end,
+        done: AtomicBool::new(false),
+    });
+    in_flight.insert(start, Arc::clone(&entry));
+    Some(entry)
 }
 
-/// seek 时作废旧预取：抬 epoch + 清空 in_flight，让需求读立刻能 claim
+/// 发布在途请求结果：置 done 唤醒共享等待方，并摘除登记项。
+/// 摘除前校验仍是同一个 Arc——代际作废会清空注册表，同一起点可能已被
+/// 新请求重新占用，不能误删别人的登记
+fn release_prefetch_start(inner: &RemoteAudioInner, start: u64, entry: &Arc<InflightFetch>) {
+    entry.done.store(true, Ordering::Release);
+    if let Ok(mut in_flight) = inner.in_flight.lock() {
+        if in_flight
+            .get(&start)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            in_flight.remove(&start);
+        }
+    }
+    inner.range_available.notify_all();
+}
+
+/// seek 时作废旧预取：抬 epoch + 置 done 解除所有共享等待方 + 清空注册表，
+/// 让需求读立刻能 claim（seek 到未缓存位置保持低延迟）
 fn invalidate_prefetch_epoch(inner: &RemoteAudioInner) {
     inner.prefetch_epoch.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut in_flight) = inner.in_flight.lock() {
-        in_flight.clear();
-        drop(in_flight);
-        inner.range_available.notify_all();
-    }
-}
-
-fn force_release_prefetch_start(inner: &RemoteAudioInner, start: u64) {
-    if let Ok(mut in_flight) = inner.in_flight.lock() {
-        if in_flight.remove(&start) {
-            drop(in_flight);
-            inner.range_available.notify_all();
+        for entry in in_flight.values() {
+            entry.done.store(true, Ordering::Release);
         }
+        in_flight.clear();
     }
+    inner.range_available.notify_all();
 }
 
 fn protect_cached_range(inner: &RemoteAudioInner, start: u64, len: u64) {
@@ -3681,16 +3834,17 @@ mod tests {
         ranges_cover_source,
         release_prefetch_start, remember_validated_audio_cache, reuse_validated_audio_cache,
         seek_target_time, track_duration, CacheMarker, CachedRange, CachedSegment, HttpByteRange,
+        InflightFetch,
         PrefetchPlan, PrefetchWindow, RemoteAccessMode, RemoteAudioCache, RemoteAudioInner,
         RemoteSeekIndex, SeekIndexEntry,
         RemoteAudioSource, RemoteReadCancellation, SymphoniaAudioDecoder, ValidatedCacheFile,
         REMOTE_PREFETCH_FALLBACK_LOW_WATER_BYTES, REMOTE_PREFETCH_FALLBACK_TARGET_BYTES,
     };
     use reqwest::header::HeaderValue;
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::io::{Cursor, Read};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -3822,8 +3976,9 @@ mod tests {
             },
             cache: Mutex::new(Vec::new()),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
@@ -3840,18 +3995,26 @@ mod tests {
             target_end: 4,
         };
 
-        assert_eq!(claim_prefetch_sequence_start(&inner, plan), Some(0));
-        assert_eq!(claim_prefetch_sequence_start(&inner, plan), None);
+        let (start, entry) =
+            claim_prefetch_sequence_start(&inner, plan).expect("first sequence claim");
+        assert_eq!(start, 0);
+        assert!(claim_prefetch_sequence_start(&inner, plan).is_none());
         assert_eq!(inner.in_flight.lock().expect("in-flight lock").len(), 1);
 
-        release_prefetch_start(&inner, 0);
-        assert_eq!(claim_prefetch_sequence_start(&inner, plan), Some(0));
-        release_prefetch_start(&inner, 0);
+        release_prefetch_start(&inner, 0, &entry);
+        let (start, entry) =
+            claim_prefetch_sequence_start(&inner, plan).expect("reclaim after release");
+        assert_eq!(start, 0);
+        release_prefetch_start(&inner, 0, &entry);
     }
 
     #[test]
     fn demand_read_waits_for_matching_prefetch_instead_of_downloading_twice() {
         let playback_generation = Arc::new(AtomicU64::new(1));
+        let inflight_entry = Arc::new(InflightFetch {
+            end: 3,
+            done: AtomicBool::new(false),
+        });
         let inner = Arc::new(RemoteAudioInner {
             client: reqwest::Client::new(),
             url: "http://127.0.0.1:9/should-not-be-requested".into(),
@@ -3864,8 +4027,9 @@ mod tests {
             },
             cache: Mutex::new(Vec::new()),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::from([0])),
+            in_flight: Mutex::new(HashMap::from([(0, Arc::clone(&inflight_entry))])),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
@@ -3888,7 +4052,7 @@ mod tests {
                     start: 0,
                     data: vec![1, 2, 3, 4],
                 });
-            release_prefetch_start(&producer_inner, 0);
+            release_prefetch_start(&producer_inner, 0, &inflight_entry);
         });
         let mut source = RemoteAudioSource {
             inner,
@@ -3902,6 +4066,175 @@ mod tests {
 
         assert_eq!(bytes, [1, 2, 3, 4]);
         assert!(producer.join().is_ok());
+    }
+
+    /// 需求读落在在途区间中段（起点不同）也必须共享结果而非重复拉取
+    #[test]
+    fn demand_read_shares_inflight_range_covering_its_offset() {
+        let inflight_entry = Arc::new(InflightFetch {
+            end: 1023,
+            done: AtomicBool::new(false),
+        });
+        let inner = Arc::new(RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 1024,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashMap::from([(0, Arc::clone(&inflight_entry))])),
+            range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        });
+        let producer_inner = Arc::clone(&inner);
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            producer_inner
+                .cache
+                .lock()
+                .expect("cache lock")
+                .push(CachedSegment {
+                    start: 0,
+                    data: vec![7; 1024],
+                });
+            release_prefetch_start(&producer_inner, 0, &inflight_entry);
+        });
+        let mut source = RemoteAudioSource {
+            inner,
+            pos: 512,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+        let mut bytes = [0; 4];
+
+        source.read_exact(&mut bytes).expect("mid-range read");
+
+        assert_eq!(bytes, [7, 7, 7, 7]);
+        assert!(producer.join().is_ok());
+    }
+
+    /// 代际作废必须立刻解除共享等待方，不允许陪旧预取等满超时预算
+    #[test]
+    fn epoch_invalidation_releases_inflight_waiters_immediately() {
+        let inner = Arc::new(RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 4,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashMap::from([(
+                0,
+                Arc::new(InflightFetch {
+                    end: 3,
+                    done: AtomicBool::new(false),
+                }),
+            )])),
+            range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        });
+        let invalidator_inner = Arc::clone(&inner);
+        let invalidator = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            // seek 语义：数据入缓存后作废旧代，等待方应立即醒来并命中缓存
+            invalidator_inner
+                .cache
+                .lock()
+                .expect("cache lock")
+                .push(CachedSegment {
+                    start: 0,
+                    data: vec![5, 6, 7, 8],
+                });
+            super::invalidate_prefetch_epoch(&invalidator_inner);
+        });
+        let mut source = RemoteAudioSource {
+            inner,
+            pos: 0,
+            access_mode: RemoteAccessMode::StandardSeekable,
+            read_cancellation: None,
+        };
+        let mut bytes = [0; 4];
+        let started = std::time::Instant::now();
+
+        source.read_exact(&mut bytes).expect("read after invalidate");
+
+        assert_eq!(bytes, [5, 6, 7, 8]);
+        // 远小于 15s+5s 的防御预算，证明等待方是被 invalidate 主动唤醒的
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(invalidator.join().is_ok());
+    }
+
+    /// 起点被在途区间覆盖时不得再登记新请求（转入共享等待）
+    #[test]
+    fn claim_rejects_offset_covered_by_inflight_range() {
+        let inner = RemoteAudioInner {
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:9/should-not-be-requested".into(),
+            referer: "https://example.com".into(),
+            total_len: 1024,
+            header_end: AtomicU64::new(0),
+            prefetch_window: PrefetchWindow {
+                low_water_bytes: 1,
+                target_bytes: 1,
+            },
+            cache: Mutex::new(Vec::new()),
+            disk_ranges: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(HashMap::from([(
+                0,
+                Arc::new(InflightFetch {
+                    end: 255,
+                    done: AtomicBool::new(false),
+                }),
+            )])),
+            range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
+            last_read_pos: Mutex::new(0),
+            protected_ranges: Mutex::new(Vec::new()),
+            disk_cache: None,
+            cache_finalize_started: AtomicBool::new(false),
+            prefetch_epoch: AtomicU64::new(0),
+            demuxer_open_sequential: AtomicBool::new(false),
+            virtual_body_origin: AtomicU64::new(0),
+            seek_index: Mutex::new(None),
+            playback_generation: Arc::new(AtomicU64::new(1)),
+            expected_generation: 1,
+        };
+
+        // 中段偏移已被 [0, 255] 在途请求覆盖 → 拒绝重复登记
+        assert!(super::claim_prefetch_start(&inner, 128, 383).is_none());
+        // 在途区间之外可以正常登记
+        let entry = super::claim_prefetch_start(&inner, 256, 511).expect("claim beyond range");
+        super::release_prefetch_start(&inner, 256, &entry);
     }
 
     #[test]
@@ -3919,8 +4252,9 @@ mod tests {
             },
             cache: Mutex::new(Vec::new()),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
@@ -3962,8 +4296,9 @@ mod tests {
             },
             cache: Mutex::new(Vec::new()),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
@@ -4015,8 +4350,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4062,8 +4398,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4135,8 +4472,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4175,8 +4513,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4252,8 +4591,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4315,8 +4655,9 @@ mod tests {
                     },
                     cache: Mutex::new(Vec::new()),
                     disk_ranges: Mutex::new(Vec::new()),
-                    in_flight: Mutex::new(HashSet::new()),
+                    in_flight: Mutex::new(HashMap::new()),
                     range_available: Condvar::new(),
+                    demand_fetches: AtomicUsize::new(0),
                     last_read_pos: Mutex::new(0),
                     protected_ranges: Mutex::new(Vec::new()),
                     disk_cache: None,
@@ -4452,8 +4793,9 @@ mod tests {
                     CachedSegment { start: 25_212_301, data: mid },
                 ]),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4512,8 +4854,9 @@ mod tests {
                 },
                 cache: Mutex::new(vec![head_segment, body_segment]),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4564,8 +4907,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4663,8 +5007,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4709,8 +5054,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4784,8 +5130,9 @@ mod tests {
                 },
                 cache: Mutex::new(Vec::new()),
                 disk_ranges: Mutex::new(Vec::new()),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 range_available: Condvar::new(),
+                demand_fetches: AtomicUsize::new(0),
                 last_read_pos: Mutex::new(0),
                 protected_ranges: Mutex::new(Vec::new()),
                 disk_cache: None,
@@ -4874,8 +5221,24 @@ mod tests {
             },
             cache: Mutex::new(Vec::new()),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::from([0, 256])),
+            in_flight: Mutex::new(HashMap::from([
+                (
+                    0,
+                    Arc::new(InflightFetch {
+                        end: 255,
+                        done: AtomicBool::new(false),
+                    }),
+                ),
+                (
+                    256,
+                    Arc::new(InflightFetch {
+                        end: 511,
+                        done: AtomicBool::new(false),
+                    }),
+                ),
+            ])),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(Vec::new()),
             disk_cache: None,
@@ -4887,15 +5250,15 @@ mod tests {
             playback_generation: Arc::new(AtomicU64::new(1)),
             expected_generation: 1,
         });
-        assert!(!super::claim_prefetch_start(&inner, 0));
+        assert!(super::claim_prefetch_start(&inner, 0, 255).is_none());
         super::invalidate_prefetch_epoch(&inner);
         assert_eq!(
             inner.prefetch_epoch.load(std::sync::atomic::Ordering::Acquire),
             1
         );
         assert!(inner.in_flight.lock().expect("lock").is_empty());
-        assert!(super::claim_prefetch_start(&inner, 0));
-        super::release_prefetch_start(&inner, 0);
+        let entry = super::claim_prefetch_start(&inner, 0, 255).expect("reclaim after invalidate");
+        super::release_prefetch_start(&inner, 0, &entry);
     }
 
     #[test]
@@ -4920,8 +5283,9 @@ mod tests {
             },
             cache: Mutex::new(vec![near, protected]),
             disk_ranges: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             range_available: Condvar::new(),
+            demand_fetches: AtomicUsize::new(0),
             last_read_pos: Mutex::new(0),
             protected_ranges: Mutex::new(vec![CachedRange {
                 start: 900,

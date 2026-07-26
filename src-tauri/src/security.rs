@@ -119,12 +119,12 @@ mod encrypted_secret_storage {
         #[cfg(test)]
         {
             static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
-            return TEST_ROOT
+            TEST_ROOT
                 .get_or_init(|| {
                     std::env::temp_dir()
                         .join(format!("neri-secure-store-test-{}", std::process::id()))
                 })
-                .clone();
+                .clone()
         }
         #[cfg(not(test))]
         {
