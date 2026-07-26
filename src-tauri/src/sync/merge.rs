@@ -6,6 +6,12 @@ use super::models::*;
 const MAX_RECENT_PLAYS: usize = 500;
 const MAX_DELETIONS: usize = 500;
 const MAX_SYNC_LOG: usize = 100;
+// 统计裁剪上限, 与 docs/SYNC-MODEL-CONTRACT.md §4 一致
+// 无上限时 playbackStatBuckets 按「天 × 曲目」无限增长, 备份最终撑爆传输通道
+const MAX_PLAYBACK_STATS: usize = 2_000;
+const MAX_STAT_BUCKETS: usize = 8_000;
+const STAT_BUCKET_RETENTION_DAYS: i64 = 400;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
 pub fn three_way_merge(
     local: &SyncData,
@@ -39,6 +45,19 @@ pub fn three_way_merge(
         .max(remote.playback_stats_cleared_at)
         .max(0);
 
+    let stat_buckets = merge_stat_buckets(
+        &local.playback_stat_buckets,
+        &remote.playback_stat_buckets,
+        playback_stats_cleared_at,
+    );
+    let playback_stats = merge_playback_stats(
+        &local.playback_stats,
+        &remote.playback_stats,
+        playback_stats_cleared_at,
+    );
+    // 先用未裁剪的全量分桶抬升聚合值, 再裁剪, 保证「总 >= 年」永远成立
+    let playback_stats = lift_stats_to_bucket_totals(&playback_stats, &stat_buckets);
+
     SyncData {
         version: "2.0".into(),
         device_id: local.device_id.clone(),
@@ -49,19 +68,91 @@ pub fn three_way_merge(
         recent_plays: recent,
         sync_log: merge_sync_log(&local.sync_log, &remote.sync_log),
         recent_play_deletions: recent_deletions,
-        playback_stats: merge_playback_stats(
-            &local.playback_stats,
-            &remote.playback_stats,
-            playback_stats_cleared_at,
-        ),
+        playback_stats: trim_playback_stats(playback_stats),
         playback_stats_cleared_at,
-        playback_stat_buckets: merge_stat_buckets(
-            &local.playback_stat_buckets,
-            &remote.playback_stat_buckets,
-            playback_stats_cleared_at,
-        ),
+        playback_stat_buckets: trim_stat_buckets(stat_buckets),
         playlist_song_deletions: playlist_deletions,
     }
+}
+
+/// 聚合统计不得小于同曲目日分桶之和
+///
+/// Android 的「总」读聚合值, 「日/周/月/年」读日分桶求和; 两者用了不同的合并代数
+/// (聚合取 max, 分桶按天取 max 后再求和), 于是会出现「年 > 总」。
+/// 这里只做单调抬升: 结果只增不减, 因此与对端的 max 合并天然收敛, 不会产生回声。
+fn lift_stats_to_bucket_totals(
+    stats: &[SyncTrackStat],
+    buckets: &[SyncPlaybackStatBucket],
+) -> Vec<SyncTrackStat> {
+    if buckets.is_empty() {
+        return stats.to_vec();
+    }
+    let mut totals: HashMap<&str, (i64, i64)> = HashMap::new();
+    for bucket in buckets {
+        let entry = totals.entry(bucket.identity_key.as_str()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(bucket.total_listen_ms.max(0));
+        entry.1 = entry.1.saturating_add(i64::from(bucket.play_count.max(0)));
+    }
+
+    stats
+        .iter()
+        .map(|stat| {
+            let Some((listen_ms, play_count)) = totals.get(stat.identity_key.as_str()) else {
+                return stat.clone();
+            };
+            let mut lifted = stat.clone();
+            lifted.total_listen_ms = lifted.total_listen_ms.max(*listen_ms);
+            lifted.play_count = lifted
+                .play_count
+                .max(i32::try_from(*play_count).unwrap_or(i32::MAX));
+            lifted
+        })
+        .collect()
+}
+
+/// 聚合统计裁剪: 保留最近播放的条目, 排序稳定以保证幂等
+fn trim_playback_stats(mut stats: Vec<SyncTrackStat>) -> Vec<SyncTrackStat> {
+    if stats.len() <= MAX_PLAYBACK_STATS {
+        return stats;
+    }
+    stats.sort_by(|left, right| {
+        right
+            .last_played_at
+            .cmp(&left.last_played_at)
+            .then_with(|| left.identity_key.cmp(&right.identity_key))
+    });
+    stats.truncate(MAX_PLAYBACK_STATS);
+    stats
+}
+
+/// 日分桶裁剪: 保留窗口锚定在数据集内最新的一天(而非墙钟), 保证双端结果一致且幂等
+fn trim_stat_buckets(buckets: Vec<SyncPlaybackStatBucket>) -> Vec<SyncPlaybackStatBucket> {
+    let newest_day = buckets
+        .iter()
+        .map(|bucket| bucket.day_start_at)
+        .max()
+        .unwrap_or(0);
+    let mut kept: Vec<SyncPlaybackStatBucket> = if newest_day > 0 {
+        let cutoff = newest_day.saturating_sub(STAT_BUCKET_RETENTION_DAYS * MILLIS_PER_DAY);
+        buckets
+            .into_iter()
+            .filter(|bucket| bucket.day_start_at >= cutoff)
+            .collect()
+    } else {
+        buckets
+    };
+
+    if kept.len() > MAX_STAT_BUCKETS {
+        kept.sort_by(|left, right| {
+            right
+                .day_start_at
+                .cmp(&left.day_start_at)
+                .then_with(|| right.play_count.cmp(&left.play_count))
+                .then_with(|| left.identity_key.cmp(&right.identity_key))
+        });
+        kept.truncate(MAX_STAT_BUCKETS);
+    }
+    kept
 }
 
 fn merge_playlists(
@@ -1297,49 +1388,103 @@ fn merge_stat_buckets(
     grouped.into_values().collect()
 }
 
+/// 按稳定键排序后逐条比较
+///
+/// 直接 zip 比较会把「仅顺序不同」误判为有变更, 触发无意义上传;
+/// 对端合并后顺序又可能变回去, 形成永不收敛的回声。
+fn pairs_by_key<'a, T, K, F>(left: &'a [T], right: &'a [T], key: F) -> Option<Vec<(&'a T, &'a T)>>
+where
+    K: Ord,
+    F: Fn(&T) -> K,
+{
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut left: Vec<&T> = left.iter().collect();
+    let mut right: Vec<&T> = right.iter().collect();
+    left.sort_by_key(|item| key(item));
+    right.sort_by_key(|item| key(item));
+    Some(left.into_iter().zip(right).collect())
+}
+
 pub fn has_data_changed(remote: &SyncData, merged: &SyncData) -> bool {
     let remote = remote.normalized_for_sync();
     let merged = merged.normalized_for_sync();
-    if remote.playlists.len() != merged.playlists.len() {
-        return true;
+    match pairs_by_key(&remote.playlists, &merged.playlists, |playlist| {
+        playlist.id.clone()
+    }) {
+        Some(pairs) => {
+            if pairs.iter().any(|(left, right)| !same_playlist(left, right)) {
+                return true;
+            }
+        }
+        None => return true,
     }
-    if remote.playlists.iter().zip(&merged.playlists).any(|(left, right)| !same_playlist(left, right)) {
-        return true;
+    match pairs_by_key(
+        &remote.favorite_playlists,
+        &merged.favorite_playlists,
+        SyncFavoritePlaylist::group_key,
+    ) {
+        Some(pairs) => {
+            if pairs.iter().any(|(left, right)| !same_favorite(left, right)) {
+                return true;
+            }
+        }
+        None => return true,
     }
-    if remote.favorite_playlists.len() != merged.favorite_playlists.len()
-        || remote.favorite_playlists.iter().zip(&merged.favorite_playlists).any(|(left, right)| !same_favorite(left, right))
-    {
-        return true;
+    match pairs_by_key(&remote.recent_plays, &merged.recent_plays, |play| {
+        (play.song.identity().stable_key(), play.played_at)
+    }) {
+        Some(pairs) => {
+            if pairs.iter().any(|(left, right)| {
+                left.song_id != right.song_id
+                    || left.played_at != right.played_at
+                    || left.device_id != right.device_id
+                    || !same_song(&left.song, &right.song)
+            }) {
+                return true;
+            }
+        }
+        None => return true,
     }
-    if remote.recent_plays.len() != merged.recent_plays.len()
-        || remote.recent_plays.iter().zip(&merged.recent_plays).any(|(left, right)| {
-            left.song_id != right.song_id
-                || left.played_at != right.played_at
-                || left.device_id != right.device_id
-                || !same_song(&left.song, &right.song)
-        })
-    {
-        return true;
+    match pairs_by_key(
+        &remote.recent_play_deletions,
+        &merged.recent_play_deletions,
+        |deletion| deletion.identity().stable_key(),
+    ) {
+        Some(pairs) => {
+            if pairs.iter().any(|(left, right)| {
+                left.identity() != right.identity()
+                    || left.deleted_at != right.deleted_at
+                    || left.device_id != right.device_id
+            }) {
+                return true;
+            }
+        }
+        None => return true,
     }
-    if remote.recent_play_deletions.len() != merged.recent_play_deletions.len()
-        || remote.recent_play_deletions.iter().zip(&merged.recent_play_deletions).any(|(left, right)| {
-            left.identity() != right.identity()
-                || left.deleted_at != right.deleted_at
-                || left.device_id != right.device_id
-        })
-    {
-        return true;
-    }
-    if remote.playlist_song_deletions.len() != merged.playlist_song_deletions.len()
-        || remote.playlist_song_deletions.iter().zip(&merged.playlist_song_deletions).any(|(left, right)| {
-            left.identity() != right.identity()
-                || left.deleted_at != right.deleted_at
-                || left.device_id != right.device_id
-                || normalize_sync_causal_tokens(&left.removed_membership_tokens)
-                    != normalize_sync_causal_tokens(&right.removed_membership_tokens)
-        })
-    {
-        return true;
+    match pairs_by_key(
+        &remote.playlist_song_deletions,
+        &merged.playlist_song_deletions,
+        |deletion| {
+            (
+                deletion.identity(),
+                deletion.removed_membership_tokens.is_empty(),
+            )
+        },
+    ) {
+        Some(pairs) => {
+            if pairs.iter().any(|(left, right)| {
+                left.identity() != right.identity()
+                    || left.deleted_at != right.deleted_at
+                    || left.device_id != right.device_id
+                    || normalize_sync_causal_tokens(&left.removed_membership_tokens)
+                        != normalize_sync_causal_tokens(&right.removed_membership_tokens)
+            }) {
+                return true;
+            }
+        }
+        None => return true,
     }
     if remote.playback_stats_cleared_at != merged.playback_stats_cleared_at
         || !same_stats(&remote.playback_stats, &merged.playback_stats)
@@ -1861,6 +2006,102 @@ mod tests {
         // 内容字段变化仍应检测
         merged.favorite_playlists[0].sort_order = 4;
         assert!(has_data_changed(&remote, &merged));
+    }
+
+    #[test]
+    fn playlist_reordering_alone_is_not_a_data_change() {
+        let first = playlist(vec![song("1", 10)]);
+        let second = SyncPlaylist { id: "2".into(), ..playlist(vec![song("2", 20)]) };
+        let remote = sync_data(vec![first.clone(), second.clone()]);
+        let reordered = sync_data(vec![second, first]);
+
+        assert!(!has_data_changed(&remote, &reordered));
+    }
+
+    #[test]
+    fn aggregate_stats_never_fall_below_daily_bucket_totals() {
+        let stat = SyncTrackStat {
+            identity_key: "k".into(),
+            total_listen_ms: 900,
+            play_count: 876,
+            last_played_at: 100,
+            ..Default::default()
+        };
+        let buckets = vec![
+            SyncPlaybackStatBucket {
+                day_start_at: 0,
+                identity_key: "k".into(),
+                total_listen_ms: 600,
+                play_count: 500,
+                last_played_at: 50,
+                ..Default::default()
+            },
+            SyncPlaybackStatBucket {
+                day_start_at: MILLIS_PER_DAY,
+                identity_key: "k".into(),
+                total_listen_ms: 700,
+                play_count: 381,
+                last_played_at: 100,
+                ..Default::default()
+            },
+        ];
+
+        let lifted = lift_stats_to_bucket_totals(&[stat], &buckets);
+
+        assert_eq!(lifted[0].play_count, 881);
+        assert_eq!(lifted[0].total_listen_ms, 1_300);
+        // 单调抬升必须幂等, 否则与对端的 max 合并会来回震荡
+        let again = lift_stats_to_bucket_totals(&lifted, &buckets);
+        assert_eq!(again[0].play_count, 881);
+        assert_eq!(again[0].total_listen_ms, 1_300);
+    }
+
+    #[test]
+    fn stat_bucket_trim_drops_out_of_window_days_and_is_idempotent() {
+        let newest = 1_000 * MILLIS_PER_DAY;
+        let buckets = vec![
+            stat_bucket(newest, "recent"),
+            stat_bucket(newest - STAT_BUCKET_RETENTION_DAYS * MILLIS_PER_DAY, "edge"),
+            stat_bucket(
+                newest - (STAT_BUCKET_RETENTION_DAYS + 1) * MILLIS_PER_DAY,
+                "stale",
+            ),
+        ];
+
+        let trimmed = trim_stat_buckets(buckets);
+        let keys: Vec<&str> = trimmed.iter().map(|b| b.identity_key.as_str()).collect();
+
+        assert!(keys.contains(&"recent"));
+        assert!(keys.contains(&"edge"));
+        assert!(!keys.contains(&"stale"));
+        assert_eq!(trim_stat_buckets(trimmed.clone()).len(), trimmed.len());
+    }
+
+    #[test]
+    fn playback_stats_trim_keeps_most_recent_entries() {
+        let stats: Vec<SyncTrackStat> = (0..(MAX_PLAYBACK_STATS + 10))
+            .map(|index| SyncTrackStat {
+                identity_key: format!("k{index:05}"),
+                last_played_at: index as i64,
+                ..Default::default()
+            })
+            .collect();
+
+        let trimmed = trim_playback_stats(stats);
+
+        assert_eq!(trimmed.len(), MAX_PLAYBACK_STATS);
+        assert!(trimmed.iter().all(|stat| stat.last_played_at >= 10));
+        assert_eq!(trim_playback_stats(trimmed.clone()).len(), MAX_PLAYBACK_STATS);
+    }
+
+    fn stat_bucket(day_start_at: i64, identity_key: &str) -> SyncPlaybackStatBucket {
+        SyncPlaybackStatBucket {
+            day_start_at,
+            identity_key: identity_key.into(),
+            play_count: 1,
+            last_played_at: day_start_at,
+            ..Default::default()
+        }
     }
 
     fn sync_data(playlists: Vec<SyncPlaylist>) -> SyncData {
