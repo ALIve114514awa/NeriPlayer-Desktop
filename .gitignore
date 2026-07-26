@@ -45,3 +45,7 @@ docs-private/
 
 # TypeScript incremental build info
 *.tsbuildinfo
+
+# 内部审查/对齐文档只留本地，不入库
+.report/
+docs/
