@@ -230,12 +230,16 @@ async fn search_youtube(_query: &str, state: &State<'_, AppState>) -> AppResult<
                             .and_then(|t| t["url"].as_str())
                             .map(upgrade_youtube_thumbnail_url);
 
+                        // 多路径解析时长(fixedColumns/flexColumns runs/lengthText)，失败回退 0
+                        let duration_ms =
+                            crate::api::youtube::duration::extract_track_duration_ms(renderer);
+
                         results.push(SearchResult {
                             id: format!("youtube:{}", vid),
                             title,
                             artist,
                             album: String::new(),
-                            duration_ms: 0, // InnerTube 不直接返回时长
+                            duration_ms,
                             source: "youtube".into(),
                             cover_url: thumbnail,
                             synced_lyrics: None,
