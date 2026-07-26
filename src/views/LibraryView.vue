@@ -31,6 +31,7 @@ import {
   type LocalArtistSummary,
 } from '@/modules/library/localArtists'
 import { createLogger } from '@/utils/logger'
+import { usePointerListReorder } from '@/composables/usePointerListReorder'
 
 const log = createLogger('library-view')
 
@@ -84,15 +85,20 @@ const playlists = ref<PlaylistInfo[]>([])
 const isMultiSelectMode = ref(false)
 const selectedPlaylists = ref<Set<number>>(new Set())
 
-function enterMultiSelect() {
+function enterMultiSelect(pl?: PlaylistInfo) {
   isMultiSelectMode.value = true
   selectedPlaylists.value.clear()
+  if (pl && !isProtectedPlaylist(pl)) selectedPlaylists.value.add(pl.id)
 }
 function exitMultiSelect() {
+  cancelPlaylistDrag()
   isMultiSelectMode.value = false
   selectedPlaylists.value.clear()
 }
 function togglePlaylistSelection(id: number) {
+  // 受保护歌单（我喜欢的音乐/本地文件）不允许进入选择集，防止被批量删除
+  const pl = playlists.value.find(p => p.id === id)
+  if (pl && isProtectedPlaylist(pl)) return
   const set = selectedPlaylists.value
   if (set.has(id)) set.delete(id)
   else set.add(id)
@@ -113,35 +119,52 @@ function invertSelection() {
   log.info('invert selection ->', selectedPlaylists.value.size, 'selected')
 }
 
-// 拖拽排序
-const dragIndex = ref<number | null>(null)
-const dragOverIndex = ref<number | null>(null)
+// 拖拽排序：与歌单详情页歌曲拖拽同一套指针交互（composable 抽取自 LocalPlaylistView）
+const playlistListRef = ref<HTMLElement | null>(null)
 
-function onDragStart(e: DragEvent, index: number) {
-  dragIndex.value = index
-  // 让拖拽 ghost 显示整行而非仅手柄，贴近 Android 抬起整行的手感
-  const handle = e.currentTarget as HTMLElement | null
-  const row = handle?.closest('.playlist-item') as HTMLElement | null
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move'
-    if (row) e.dataTransfer.setDragImage(row, 24, row.offsetHeight / 2)
-  }
+function playlistDragKey(pl: PlaylistInfo): string {
+  return String(pl.id)
 }
-function onDragOver(e: DragEvent, index: number) {
-  e.preventDefault()
-  dragOverIndex.value = index
-}
-function onDragEnd() {
-  if (dragIndex.value !== null && dragOverIndex.value !== null && dragIndex.value !== dragOverIndex.value) {
+
+const {
+  dragKey: plDragKey,
+  dragOverKey: plDragOverKey,
+  dragInsertPosition: plDragInsertPosition,
+  dragLandingKey: plDragLandingKey,
+  dragUnderGlassKeys: plDragUnderGlassKeys,
+  dragGlassActive: plDragGlassActive,
+  dropIndicatorVisible: plDropIndicatorVisible,
+  dropIndicatorY: plDropIndicatorY,
+  dropIndicatorSnap: plDropIndicatorSnap,
+  dragItemStyle: plDragItemStyle,
+  startDrag: startPlaylistDrag,
+  cancelDrag: cancelPlaylistDrag,
+} = usePointerListReorder({
+  listRef: playlistListRef,
+  itemSelector: '.playlist-item',
+  canDrag: () => isMultiSelectMode.value,
+  // 「我喜欢的音乐」「本地文件」等系统歌单固定首尾，不参与落点
+  isValidTargetKey: (key) => {
+    const pl = playlists.value.find(p => playlistDragKey(p) === key)
+    return !!pl && !isProtectedPlaylist(pl)
+  },
+  onReorder: (fromKey, toKey, position) => {
     const arr = [...playlists.value]
-    const [moved] = arr.splice(dragIndex.value, 1)
-    arr.splice(dragOverIndex.value, 0, moved)
+    const fromIndex = arr.findIndex(p => playlistDragKey(p) === fromKey)
+    let toIndex = arr.findIndex(p => playlistDragKey(p) === toKey)
+    if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return
+
+    const [moved] = arr.splice(fromIndex, 1)
+    if (toIndex > fromIndex) toIndex -= 1
+    const insertIndex = position === 'after' ? toIndex + 1 : toIndex
+    arr.splice(insertIndex, 0, moved)
+
+    if (arr.map(playlistDragKey).join('\n') === playlists.value.map(playlistDragKey).join('\n')) return
     playlists.value = arr
+    // 持久化链路保持不变：仅写 localStorage 的自定义顺序
     savePlaylistOrder(arr)
-  }
-  dragIndex.value = null
-  dragOverIndex.value = null
-}
+  },
+})
 
 function savePlaylistOrder(ordered: PlaylistInfo[]) {
   const orderIds = ordered.map(p => p.id)
@@ -456,6 +479,16 @@ function openContextMenu(e: MouseEvent, pl: PlaylistInfo) {
   contextMenu.value = { show: true, x, y: rect.top, playlist: pl }
 }
 
+// 行上右键：菜单在光标处弹出（复用 ContextMenu 的边缘翻转与重定位）
+function openPlaylistContextMenu(e: MouseEvent, pl: PlaylistInfo) {
+  if (isMultiSelectMode.value) {
+    togglePlaylistSelection(pl.id)
+    return
+  }
+  if (isProtectedPlaylist(pl)) return
+  contextMenu.value = { show: true, x: e.clientX, y: e.clientY, playlist: pl }
+}
+
 function closeContextMenu() {
   contextMenu.value.show = false
 }
@@ -499,6 +532,7 @@ function requestRename(pl: PlaylistInfo) {
 const playlistMenuItems = computed<ContextMenuItem[]>(() => {
   const playlist = contextMenu.value.playlist
   return [
+    createContextMenuItem(t('common.multi_select'), { id: 'select', icon: 'checklist' }),
     createContextMenuItem(t('library.rename_playlist'), { id: 'rename', icon: 'edit' }),
     createContextMenuItem(t('library.delete_playlist'), {
       id: 'delete',
@@ -514,6 +548,10 @@ function handlePlaylistMenuClick(item: ContextMenuActionItem) {
   if (!playlist) return
 
   switch (item.id) {
+    case 'select':
+      closeContextMenu()
+      enterMultiSelect(playlist)
+      break
     case 'rename':
       requestRename(playlist)
       break
@@ -544,7 +582,11 @@ function requestDeleteSelected() {
 }
 
 async function confirmDeleteSelected() {
-  const ids = [...selectedPlaylists.value]
+  // 兜底再过滤一次受保护歌单：即使选择集被其它路径污染也绝不删除系统歌单
+  const ids = [...selectedPlaylists.value].filter((id) => {
+    const pl = playlists.value.find(p => p.id === id)
+    return !pl || !isProtectedPlaylist(pl)
+  })
   try {
     for (const id of ids) {
       await invoke('delete_playlist', { id })
@@ -855,7 +897,7 @@ onUnmounted(() => {
         >
           <span class="material-symbols-rounded">bar_chart</span>
         </button>
-        <button v-if="activeTab === 0 && !isMultiSelectMode" class="header-action" @click="enterMultiSelect" :title="t('common.multi_select')">
+        <button v-if="activeTab === 0 && !isMultiSelectMode" class="header-action" @click="enterMultiSelect()" :title="t('common.multi_select')">
           <span class="material-symbols-rounded">checklist</span>
         </button>
         <button v-if="isMultiSelectMode" class="header-action" @click="selectAll" :title="t('common.select_all')">
@@ -1027,21 +1069,35 @@ onUnmounted(() => {
       <div class="list-divider" />
       <p v-if="library.scanError" class="scan-error">{{ t('library.scan_failed') }}</p>
 
-      <!-- 歌单列表：进入 / 移除 / 拖拽重排都走 TransitionGroup，
-           行数有限（几十条），FLIP move 开销可控 -->
-      <TransitionGroup tag="div" name="lib-list" class="lib-list">
+      <!-- 歌单列表：进入 / 移除走 TransitionGroup；拖拽重排与歌单详情页
+           歌曲拖拽同一套指针交互（让路位移 + 单实例落点指示线 + 拖影） -->
+      <div ref="playlistListRef" class="lib-list">
       <div
-        v-for="(pl, index) in filteredPlaylists"
+        class="drop-indicator"
+        :class="{ visible: plDropIndicatorVisible, snap: plDropIndicatorSnap }"
+        :style="{ transform: `translate3d(0, ${plDropIndicatorY}px, 0)` }"
+        aria-hidden="true"
+      />
+      <!-- 拖拽中切到无动画 name，释放后行归位走 FLIP move，避免与指针跟随打架 -->
+      <TransitionGroup :name="plDragKey ? 'lib-static' : 'lib-list'">
+      <div
+        v-for="pl in filteredPlaylists"
         :key="pl.id"
         class="playlist-item"
         :class="{
-          'drag-over': dragOverIndex === index,
-          dragging: dragIndex === index,
           selected: selectedPlaylists.has(pl.id),
+          dragging: plDragKey === playlistDragKey(pl),
+          'glass-active': plDragGlassActive && plDragKey === playlistDragKey(pl),
+          landing: plDragLandingKey === playlistDragKey(pl),
+          'drag-under-glass': plDragUnderGlassKeys.has(playlistDragKey(pl)),
+          'drag-under-glass-active': plDragGlassActive && plDragUnderGlassKeys.has(playlistDragKey(pl)),
+          'drag-over-before': plDragOverKey === playlistDragKey(pl) && plDragInsertPosition === 'before',
+          'drag-over-after': plDragOverKey === playlistDragKey(pl) && plDragInsertPosition === 'after',
         }"
-        @dragover="onDragOver($event, index)"
+        :data-drag-key="playlistDragKey(pl)"
+        :style="plDragItemStyle(playlistDragKey(pl))"
         @click="isMultiSelectMode ? togglePlaylistSelection(pl.id) : router.push({ name: 'local-playlist', params: { id: pl.id } })"
-        @contextmenu.prevent.stop="openContextMenu($event, pl)"
+        @contextmenu.prevent.stop="openPlaylistContextMenu($event, pl)"
       >
         <!-- 多选模式下显示复选框 -->
         <div v-if="isMultiSelectMode" class="pl-checkbox" @click.stop="togglePlaylistSelection(pl.id)">
@@ -1071,10 +1127,8 @@ onUnmounted(() => {
           v-if="isMultiSelectMode && !isProtectedPlaylist(pl)"
           class="pl-drag-handle material-symbols-rounded"
           style="font-size: 22px"
-          draggable="true"
           :title="t('common.drag_to_reorder')"
-          @dragstart.stop="onDragStart($event, index)"
-          @dragend.stop="onDragEnd()"
+          @pointerdown.stop="startPlaylistDrag($event, playlistDragKey(pl))"
           @click.stop
         >drag_handle</span>
         <!-- 受保护歌单不显示三点菜单 -->
@@ -1083,14 +1137,26 @@ onUnmounted(() => {
         </button>
       </div>
       </TransitionGroup>
+      </div>
 
       <!-- 多选模式底部操作栏 -->
       <Transition name="lib-bar">
       <div v-if="isMultiSelectMode" class="multi-select-bar">
         <span class="select-count">{{ t('common.selected_playlist_count', { count: selectedPlaylists.size }) }}</span>
-        <button class="multi-select-action danger" :disabled="selectedPlaylists.size === 0" @click="requestDeleteSelected">
+        <button class="multi-select-action neutral" @click="selectAll">
+          <span class="material-symbols-rounded" style="font-size: 18px">select_all</span>
+          <span>{{ t('common.select_all') }}</span>
+        </button>
+        <button class="multi-select-action neutral" @click="invertSelection">
+          <span class="material-symbols-rounded" style="font-size: 18px">flip</span>
+          <span>{{ t('common.invert_selection') }}</span>
+        </button>
+        <button class="multi-select-action danger push-right" :disabled="selectedPlaylists.size === 0" @click="requestDeleteSelected">
           <span class="material-symbols-rounded" style="font-size: 18px">delete</span>
           <span>{{ t('common.delete_selected') }}</span>
+        </button>
+        <button class="multi-select-action ghost" @click="exitMultiSelect">
+          <span>{{ t('common.cancel') }}</span>
         </button>
       </div>
       </Transition>
@@ -1627,19 +1693,157 @@ onUnmounted(() => {
 }
 
 .playlist-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 14px;
   padding: 10px 12px;
   border-radius: var(--radius-md);
   cursor: pointer;
-  transition: background var(--duration-short), box-shadow var(--duration-short), opacity var(--duration-short);
+  transform: translate3d(0, 0, 0);
+  filter: blur(0) saturate(1);
+  isolation: isolate;
+  transition:
+    filter 240ms cubic-bezier(0.2, 0, 0, 1),
+    transform 180ms cubic-bezier(0.2, 0, 0, 1),
+    background 180ms cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 180ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 220ms cubic-bezier(0.2, 0, 0, 1);
+  will-change: transform;
 
   &:hover { background: var(--md-surface-container); }
 
   &.selected { background: color-mix(in srgb, var(--md-primary) 12%, transparent); }
-  &.dragging { opacity: 0.4; }
-  &.drag-over { box-shadow: inset 0 2px 0 0 var(--md-primary); }
+}
+
+.playlist-item > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* 拖影毛玻璃层：常态透明，抬起后淡入（与歌单详情页歌曲拖拽同款） */
+.playlist-item::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: color-mix(in srgb, var(--md-surface-container-highest) 36%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(0) saturate(1);
+  -webkit-backdrop-filter: blur(0) saturate(1);
+  transition:
+    opacity 180ms cubic-bezier(0.2, 0, 0, 1),
+    background 180ms cubic-bezier(0.2, 0, 0, 1),
+    backdrop-filter 180ms cubic-bezier(0.2, 0, 0, 1),
+    -webkit-backdrop-filter 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* 拖拽中的行：跟随指针平移并浮起 */
+.playlist-item.dragging {
+  z-index: 6;
+  opacity: 0.96;
+  transform: translate3d(0, var(--drag-offset, 0px), 0) scale(1.012);
+  background: color-mix(in srgb, var(--md-surface-container-highest) 18%, transparent);
+  box-shadow:
+    0 18px 38px rgba(0, 0, 0, 0.18),
+    0 4px 10px color-mix(in srgb, var(--md-primary) 10%, transparent);
+  transition:
+    background 180ms cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 180ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.playlist-item.dragging.glass-active::before {
+  opacity: 1;
+  background: color-mix(in srgb, var(--md-surface-container-highest) 34%, transparent);
+  backdrop-filter: blur(28px) saturate(1.42);
+  -webkit-backdrop-filter: blur(28px) saturate(1.42);
+}
+
+.playlist-item.drag-under-glass {
+  filter: blur(0) saturate(1);
+  opacity: 1;
+  will-change: filter, opacity;
+}
+
+.playlist-item.drag-under-glass-active {
+  filter: blur(2.8px) saturate(0.82);
+  opacity: 0.72;
+}
+
+.playlist-item.landing {
+  animation: pl-glass-shadow-release 320ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.playlist-item.landing::before {
+  animation: pl-glass-release 320ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* 目标行 ±5px 让路位移，靠基础 transform 过渡回弹 */
+.playlist-item.drag-over-before {
+  transform: translate3d(0, 5px, 0);
+}
+
+.playlist-item.drag-over-after {
+  transform: translate3d(0, -5px, 0);
+}
+
+/* 单实例落点指示线：换目标时整体平移而非逐行显隐，杜绝闪烁 */
+.drop-indicator {
+  position: absolute;
+  top: 0;
+  left: 12px;
+  right: 12px;
+  z-index: 2;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--md-primary) 88%, white);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--md-primary) 12%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 170ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 120ms ease-out;
+
+  &.visible {
+    opacity: 1;
+  }
+
+  /* 隐藏转显示的首帧直接落位，只保留淡入 */
+  &.snap {
+    transition: opacity 120ms ease-out;
+  }
+}
+
+@keyframes pl-glass-release {
+  0% {
+    opacity: 1;
+    background: color-mix(in srgb, var(--md-surface-container-highest) 34%, transparent);
+    backdrop-filter: blur(28px) saturate(1.42);
+    -webkit-backdrop-filter: blur(28px) saturate(1.42);
+  }
+  100% {
+    opacity: 0;
+    background: color-mix(in srgb, var(--md-surface-container-highest) 16%, transparent);
+    backdrop-filter: blur(0) saturate(1);
+    -webkit-backdrop-filter: blur(0) saturate(1);
+  }
+}
+
+@keyframes pl-glass-shadow-release {
+  0% {
+    box-shadow:
+      0 18px 38px rgba(0, 0, 0, 0.18),
+      0 4px 10px color-mix(in srgb, var(--md-primary) 10%, transparent);
+  }
+  100% {
+    box-shadow: none;
+  }
 }
 
 /* 多选：复选框 */
@@ -1708,14 +1912,30 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-left: auto;
   padding: 8px 16px;
   border: 0;
   border-radius: var(--radius-full);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: background var(--duration-short), opacity var(--duration-short);
+  transition: background var(--duration-short), color var(--duration-short), opacity var(--duration-short);
+
+  /* 删除按钮起把后续动作推到右侧 */
+  &.push-right { margin-left: auto; }
+
+  &.neutral {
+    background: var(--md-surface-container-highest);
+    color: var(--md-on-surface-variant);
+
+    &:hover:not(:disabled) { background: var(--md-secondary-container); color: var(--md-on-secondary-container); }
+  }
+
+  &.ghost {
+    background: transparent;
+    color: var(--md-on-surface-variant);
+
+    &:hover:not(:disabled) { background: var(--md-surface-container-highest); }
+  }
 
   &.danger {
     background: color-mix(in srgb, var(--md-error) 14%, transparent);
@@ -2274,6 +2494,10 @@ onUnmounted(() => {
 .lib-list-leave-to { opacity: 0; }
 .lib-list-move { transition: transform var(--duration-medium) var(--ease-standard); }
 
+// 拖拽释放后行归位的 FLIP move 过渡（拖拽中切到 lib-static 无动画 name，
+// 避免 move 位移与指针跟随打架），参数对齐歌单详情页歌曲拖拽
+.playlist-item.lib-list-move { transition: transform 300ms cubic-bezier(0.2, 0, 0, 1); }
+
 @media (prefers-reduced-motion: reduce) {
   .lib-collapse-enter-active,
   .lib-collapse-leave-active,
@@ -2286,6 +2510,7 @@ onUnmounted(() => {
   .lib-zoom-leave-active,
   .lib-list-enter-active,
   .lib-list-leave-active,
-  .lib-list-move { transition: none; }
+  .lib-list-move,
+  .playlist-item.lib-list-move { transition: none; }
 }
 </style>
