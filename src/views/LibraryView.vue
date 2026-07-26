@@ -50,14 +50,22 @@ const tabs = computed(() => [
   { label: t('library.tab_local'), icon: 'folder_open', key: 'local' },
   { label: t('library.tab_favorites'), icon: 'favorite', key: 'favorites' },
   { label: t('library.tab_downloads'), icon: 'download', key: 'downloads' },
-  { label: t('library.tab_netease_playlists'), icon: 'queue_music', key: 'netease_playlists' },
+  // 网易云歌单与专辑合成一个板块，内部再分类（对齐 Android
+  // LibraryTab.NETEASEALBUM.asVisibleLibraryTab() == NETEASE）
+  { label: t('library.tab_netease'), icon: 'queue_music', key: 'netease' },
   { label: t('library.bilibili_favorites'), icon: 'video_library', key: 'bilibili_favorites' },
   { label: 'YouTube Music', icon: 'subscriptions', key: 'youtube_playlists' },
-  { label: t('library.tab_netease_albums'), icon: 'album', key: 'netease_albums' },
 ])
-// 根据路由 query 参数设置初始标签
-const tabKeyToIndex: Record<string, number> = { local: 0, favorites: 1, downloads: 2, netease_playlists: 3, bilibili_favorites: 4, youtube_playlists: 5, netease_albums: 6 }
+// 根据路由 query 参数设置初始标签；旧的 netease_albums / netease_playlists 仍可用
+const tabKeyToIndex: Record<string, number> = {
+  local: 0, favorites: 1, downloads: 2,
+  netease: 3, netease_playlists: 3, netease_albums: 3,
+  bilibili_favorites: 4, youtube_playlists: 5,
+}
+type NeteaseCategory = 'playlists' | 'albums'
+const neteaseCategory = ref<NeteaseCategory>('playlists')
 const initialTab = typeof route.query.tab === 'string' ? (tabKeyToIndex[route.query.tab] ?? 0) : 0
+if (route.query.tab === 'netease_albums') neteaseCategory.value = 'albums'
 const activeTab = ref(initialTab)
 
 // 监听路由 query 变化（同页面内导航）
@@ -294,13 +302,25 @@ async function loadLocalArtistTracks(force = false) {
   if (localArtistTracks.value.length > 0 && !force) return
   localArtistsLoading.value = true
   try {
-    const localPlaylist = playlists.value.find((pl) => LOCAL_NAMES.includes(pl.name))
-    if (!localPlaylist) {
-      localArtistTracks.value = []
-      return
-    }
-    const raw = await invoke<any[]>('get_playlist_tracks', { id: localPlaylist.id })
-    localArtistTracks.value = (raw || []).map(normalizeTrack)
+    // Android 从所有歌单里的本地曲目聚合歌手，只看「本地音乐」会漏掉
+    // 用户手动整理到其它歌单的那些本地文件
+    const lists = playlists.value.length
+      ? playlists.value
+      : await invoke<PlaylistInfo[]>('list_playlists')
+    const collected = await Promise.all(
+      lists.map(async (pl) => {
+        try {
+          const raw = await invoke<any[]>('get_playlist_tracks', { id: pl.id })
+          return (raw || []).map(normalizeTrack)
+        } catch {
+          return [] as TrackInfo[]
+        }
+      }),
+    )
+    const seen = new Set<string>()
+    localArtistTracks.value = collected
+      .flat()
+      .filter((track) => track.source === 'local' && track.id && !seen.has(track.id) && seen.add(track.id))
   } catch (e) {
     log.error('Load local artist tracks failed:', e)
     localArtistTracks.value = []
@@ -516,6 +536,11 @@ interface FavoritePlaylist {
   songs: any[]; addedTime: number; modifiedAt: number; isDeleted: boolean;
 }
 const favoritePlaylists = ref<FavoritePlaylist[]>([])
+
+/// 收藏项的曲目随同步数据落地，直接打开本地详情，不依赖平台接口
+function openFavorite(fpl: FavoritePlaylist) {
+  router.push({ name: 'favorite-playlist', params: { id: fpl.id } })
+}
 
 async function loadFavorites() {
   try {
@@ -739,6 +764,15 @@ onUnmounted(() => {
     <header class="lib-header">
       <h1 class="page-title">{{ t('library.title') }}</h1>
       <div class="header-actions">
+        <button
+          v-if="!isMultiSelectMode"
+          class="header-action"
+          :title="t('stats.title')"
+          :aria-label="t('stats.title')"
+          @click="router.push({ name: 'playback-stats' })"
+        >
+          <span class="material-symbols-rounded">bar_chart</span>
+        </button>
         <button v-if="activeTab === 0 && !isMultiSelectMode" class="header-action" @click="enterMultiSelect" :title="t('common.multi_select')">
           <span class="material-symbols-rounded">checklist</span>
         </button>
@@ -951,6 +985,10 @@ onUnmounted(() => {
           v-for="fpl in favoritePlaylists"
           :key="'fav-' + fpl.id"
           class="playlist-item"
+          role="button"
+          tabindex="0"
+          @click="openFavorite(fpl)"
+          @keydown.enter="openFavorite(fpl)"
         >
           <div class="pl-icon has-cover" v-if="fpl.coverUrl && !isLibraryCoverFailed('favorite', fpl.id, fpl.coverUrl)">
             <img
@@ -1062,6 +1100,56 @@ onUnmounted(() => {
 
     <!-- Tab: 网易云-歌单 -->
     <div v-else-if="activeTab === 3" class="playlist-list">
+      <!-- 歌单 / 专辑 分类（对齐 Android 网易云板块内部分类） -->
+      <div class="local-category-bar">
+        <button
+          v-for="category in (['playlists', 'albums'] as const)"
+          :key="category"
+          class="local-category-chip"
+          :class="{ active: neteaseCategory === category }"
+          @click="neteaseCategory = category"
+        >
+          <span class="material-symbols-rounded" style="font-size: 17px">
+            {{ category === 'playlists' ? 'queue_music' : 'album' }}
+          </span>
+          <span>{{ category === 'playlists' ? t('library.tab_netease_playlists_short') : t('library.tab_netease_albums_short') }}</span>
+        </button>
+      </div>
+
+      <template v-if="neteaseCategory === 'albums'">
+        <div v-if="recommend.userAlbums.length > 0">
+          <div
+            v-for="album in recommend.userAlbums"
+            :key="album.id"
+            class="playlist-item"
+            @click="router.push({ name: 'netease-album', params: { id: album.id } })"
+          >
+            <div class="pl-icon" :class="{ 'has-cover': album.coverUrl && !isLibraryCoverFailed('netease-album', album.id, album.coverUrl) }">
+              <img
+                v-if="album.coverUrl && !isLibraryCoverFailed('netease-album', album.id, album.coverUrl)"
+                :src="toDisplayableLibraryCoverUrl(album.coverUrl)"
+                class="pl-cover-img"
+                loading="lazy"
+                referrerpolicy="no-referrer"
+                @error="markLibraryCoverFailed('netease-album', album.id, album.coverUrl)"
+              />
+              <span v-else class="material-symbols-rounded filled" style="font-size: 22px">album</span>
+            </div>
+            <div class="pl-info">
+              <div class="pl-name">{{ album.name }}</div>
+              <div class="pl-count">{{ album.artist }} · {{ t('player.track_count', { count: album.trackCount }) }}</div>
+            </div>
+            <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
+          </div>
+        </div>
+        <div v-else class="empty-tab">
+          <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">album</span></div>
+          <p class="empty-title">{{ t('library.empty_title', { type: t('library.albums') }) }}</p>
+          <p class="empty-desc">{{ t('library.empty_desc') }}</p>
+        </div>
+      </template>
+
+      <template v-else>
       <template v-if="neteasePlaylists.length > 0">
         <div
           v-for="npl in neteasePlaylists"
@@ -1091,6 +1179,7 @@ onUnmounted(() => {
         <p class="empty-title">{{ t('explore.no_playlists') }}</p>
         <p class="empty-desc">{{ t('explore.login_for_playlists') }}</p>
       </div>
+      </template>
     </div>
 
     <!-- Tab: Bili 收藏夹 -->
@@ -1170,39 +1259,6 @@ onUnmounted(() => {
     </div>
 
     <!-- Tab: 网易云-专辑 -->
-    <div v-else-if="activeTab === 6" class="playlist-list">
-      <div v-if="recommend.userAlbums.length > 0">
-        <div
-          v-for="album in recommend.userAlbums"
-          :key="album.id"
-          class="playlist-item"
-          @click="router.push({ name: 'netease-album', params: { id: album.id } })"
-        >
-          <div class="pl-icon" :class="{ 'has-cover': album.coverUrl && !isLibraryCoverFailed('netease-album', album.id, album.coverUrl) }">
-            <img
-              v-if="album.coverUrl && !isLibraryCoverFailed('netease-album', album.id, album.coverUrl)"
-              :src="toDisplayableLibraryCoverUrl(album.coverUrl)"
-              class="pl-cover-img"
-              loading="lazy"
-              referrerpolicy="no-referrer"
-              @error="markLibraryCoverFailed('netease-album', album.id, album.coverUrl)"
-            />
-            <span v-else class="material-symbols-rounded filled" style="font-size: 22px">album</span>
-          </div>
-          <div class="pl-info">
-            <div class="pl-name">{{ album.name }}</div>
-            <div class="pl-count">{{ album.artist }} · {{ t('player.track_count', { count: album.trackCount }) }}</div>
-          </div>
-          <span class="material-symbols-rounded" style="font-size: 18px; opacity: 0.3">chevron_right</span>
-        </div>
-      </div>
-      <div v-else class="empty-tab">
-        <div class="empty-circle"><span class="material-symbols-rounded" style="font-size: 40px">album</span></div>
-        <p class="empty-title">{{ t('library.empty_title', { type: t('library.albums') }) }}</p>
-        <p class="empty-desc">{{ t('library.empty_desc') }}</p>
-      </div>
-    </div>
-
     <ContextMenu
       :open="dlContextMenu.show"
       :x="dlContextMenu.x"

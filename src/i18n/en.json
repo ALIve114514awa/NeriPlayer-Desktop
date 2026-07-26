@@ -121,7 +121,12 @@
     "local_artist_sort_name": "By name",
     "local_artist_sort_song_count": "By track count",
     "local_artist_sort_recent": "Recently added",
-    "local_artist_unknown": "Unknown artist"
+    "local_artist_unknown": "Unknown artist",
+    "tab_netease": "NetEase",
+    "tab_netease_playlists_short": "Playlists",
+    "tab_netease_albums_short": "Albums",
+    "favorite_empty_songs": "No tracks synced for this favorite yet",
+    "playback_stats_entry": "Playback stats"
   },
   "common": {
     "save": "Save",

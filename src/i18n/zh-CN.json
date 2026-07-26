@@ -121,7 +121,12 @@
     "local_artist_sort_name": "按名称排序",
     "local_artist_sort_song_count": "按歌曲数量排序",
     "local_artist_sort_recent": "按最近添加排序",
-    "local_artist_unknown": "未知歌手"
+    "local_artist_unknown": "未知歌手",
+    "tab_netease": "网易云",
+    "tab_netease_playlists_short": "歌单",
+    "tab_netease_albums_short": "专辑",
+    "favorite_empty_songs": "这个收藏还没有同步到曲目",
+    "playback_stats_entry": "播放统计"
   },
   "common": {
     "save": "保存",

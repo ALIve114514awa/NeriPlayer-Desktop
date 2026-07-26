@@ -121,7 +121,12 @@
     "local_artist_sort_name": "名前順",
     "local_artist_sort_song_count": "曲数順",
     "local_artist_sort_recent": "追加順",
-    "local_artist_unknown": "不明なアーティスト"
+    "local_artist_unknown": "不明なアーティスト",
+    "tab_netease": "NetEase",
+    "tab_netease_playlists_short": "プレイリスト",
+    "tab_netease_albums_short": "アルバム",
+    "favorite_empty_songs": "このお気に入りの曲はまだ同期されていません",
+    "playback_stats_entry": "再生統計"
   },
   "common": {
     "save": "保存",

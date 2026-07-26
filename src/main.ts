@@ -26,6 +26,7 @@ const router = createRouter({
     { path: '/playlist/youtube/:browseId', name: 'youtube-playlist', component: () => import('./views/YouTubePlaylistView.vue') },
     { path: '/playlist/local/:id', name: 'local-playlist', component: () => import('./views/LocalPlaylistView.vue') },
     { path: '/library/local-artist/:name', name: 'local-artist', component: () => import('./views/LocalArtistView.vue') },
+    { path: '/library/favorite/:id', name: 'favorite-playlist', component: () => import('./views/FavoritePlaylistView.vue') },
     { path: '/debug', name: 'debug', component: () => import('./views/DebugView.vue') },
   ],
 })

@@ -121,7 +121,12 @@
     "local_artist_sort_name": "依名稱排序",
     "local_artist_sort_song_count": "依歌曲數量排序",
     "local_artist_sort_recent": "依最近加入排序",
-    "local_artist_unknown": "未知歌手"
+    "local_artist_unknown": "未知歌手",
+    "tab_netease": "網易雲",
+    "tab_netease_playlists_short": "歌單",
+    "tab_netease_albums_short": "專輯",
+    "favorite_empty_songs": "這個收藏還沒有同步到曲目",
+    "playback_stats_entry": "播放統計"
   },
   "common": {
     "save": "儲存",
