@@ -1,4 +1,5 @@
 use crate::listen_together::protocol::*;
+use crate::listen_together::session::LtSessionUpdate;
 use crate::listen_together::ws_client::LtWsClient;
 use crate::state::AppState;
 use tauri::{AppHandle, State};
@@ -36,12 +37,16 @@ pub async fn lt_create_room(
 
     if room_resp.ok {
         let mut session = state.lt_session.lock();
-        session.base_url = Some(base_url);
-        session.room_id = room_resp.room_id.clone();
-        session.token = room_resp.token.clone();
-        session.ws_url = room_resp.ws_url.clone();
-        session.user_uuid = user_uuid;
-        session.nickname = nickname;
+        session.update_room(LtSessionUpdate {
+            base_url,
+            room_id: room_resp.room_id.clone(),
+            user_uuid,
+            nickname,
+            token: room_resp.token.clone(),
+            ws_url: room_resp.ws_url.clone(),
+            member_secret: room_resp.member_secret.clone(),
+            join_secret: room_resp.join_secret.clone(),
+        });
     }
 
     Ok(room_resp)
@@ -53,6 +58,8 @@ pub async fn lt_join_room(
     room_id: String,
     user_uuid: String,
     nickname: String,
+    member_secret: Option<String>,
+    join_secret: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<LtRoomResponse, String> {
     let http = state.transport("listen-together");
@@ -62,14 +69,26 @@ pub async fn lt_join_room(
         room_id
     );
 
+    let credentials = state
+        .lt_session
+        .lock()
+        .credentials_for_join(&base_url, &room_id, &user_uuid);
     let body = LtJoinRoomRequest {
         user_uuid: user_uuid.clone(),
         nickname: nickname.clone(),
+        member_secret: member_secret.or(credentials.member_secret.clone()),
+        join_secret: join_secret.or(credentials.join_secret.clone()),
     };
 
     let resp = http
         // 加入请求同样可能产生服务端成员记录，避免请求体已发出后重复提交
-        .send_once(|client| client.post(&url).json(&body))
+        .send_once(|client| {
+            let request = client.post(&url).json(&body);
+            match credentials.token.as_deref() {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            }
+        })
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
@@ -80,12 +99,16 @@ pub async fn lt_join_room(
 
     if room_resp.ok {
         let mut session = state.lt_session.lock();
-        session.base_url = Some(base_url);
-        session.room_id = Some(room_id);
-        session.token = room_resp.token.clone();
-        session.ws_url = room_resp.ws_url.clone();
-        session.user_uuid = user_uuid;
-        session.nickname = nickname;
+        session.update_room(LtSessionUpdate {
+            base_url,
+            room_id: room_resp.room_id.clone().or(Some(room_id)),
+            user_uuid,
+            nickname,
+            token: room_resp.token.clone(),
+            ws_url: room_resp.ws_url.clone(),
+            member_secret: room_resp.member_secret.clone(),
+            join_secret: room_resp.join_secret.clone(),
+        });
     }
 
     Ok(room_resp)
@@ -98,7 +121,10 @@ pub async fn lt_get_room_state(
     state: State<'_, AppState>,
 ) -> Result<LtStateResponse, String> {
     let http = state.transport("listen-together");
-    let token = state.lt_session.lock().token.clone().unwrap_or_default();
+    let token = state
+        .lt_session
+        .lock()
+        .token_for_room_state(&base_url, &room_id);
     let url = format!(
         "{}/api/rooms/{}/state",
         base_url.trim_end_matches('/'),
@@ -107,9 +133,11 @@ pub async fn lt_get_room_state(
 
     let resp = http
         .send(|client| {
-            client
-                .get(&url)
-                .header("Authorization", format!("Bearer {token}"))
+            let request = client.get(&url);
+            match token.as_deref() {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            }
         })
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;

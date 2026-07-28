@@ -174,6 +174,8 @@ export interface ListenTogetherRoomResponse {
   userId?: string
   nickname?: string
   role?: string
+  memberSecret?: string
+  joinSecret?: string
   autoPauseOnJoin?: boolean
   token?: string
   state?: ListenTogetherRoomState
@@ -251,4 +253,37 @@ export function normalizeLtRoomId(value: string): string {
 /** 返回 true 表示房间号合法 */
 export function isValidLtRoomId(roomId: string): boolean {
   return ROOM_ID_REGEX.test(normalizeLtRoomId(roomId))
+}
+
+export function normalizeLtHttpBaseUrl(value: string | null | undefined): string | null {
+  const candidate = value?.trim().replace(/\/+$/, '')
+  if (!candidate) return null
+  try {
+    const parsed = new URL(candidate)
+    const protocol = parsed.protocol.toLowerCase()
+    if ((protocol !== 'http:' && protocol !== 'https:') || !parsed.host || parsed.search || parsed.hash) {
+      return null
+    }
+    const path = parsed.pathname.replace(/\/+$/, '')
+    return `${protocol}//${parsed.host}${path === '/' ? '' : path}`
+  } catch {
+    return null
+  }
+}
+
+export function normalizeLtInviteBaseUrl(value: string | null | undefined): string | null {
+  const normalized = normalizeLtHttpBaseUrl(value)
+  return normalized?.startsWith('https://') ? normalized : null
+}
+
+export function normalizeLtJoinSecret(value: string | null | undefined): string | undefined {
+  const normalized = value?.trim()
+  return normalized && normalized.length <= 256 ? normalized : undefined
+}
+
+export function resolveLtJoinSecret(
+  value: string | null | undefined,
+  fallback: string | null | undefined = undefined,
+): string | undefined {
+  return normalizeLtJoinSecret(value) ?? normalizeLtJoinSecret(fallback)
 }

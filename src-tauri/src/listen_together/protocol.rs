@@ -193,6 +193,10 @@ pub struct LtCreateRoomRequest {
 pub struct LtJoinRoomRequest {
     pub user_uuid: String,
     pub nickname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +213,10 @@ pub struct LtRoomResponse {
     pub nickname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_secret: Option<String>,
     #[serde(default)]
     pub auto_pause_on_join: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -375,4 +383,33 @@ pub struct LtSocketEnvelope {
     pub client_sequence: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_sequence: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn room_join_credentials_use_the_android_wire_contract() {
+        let request = LtJoinRoomRequest {
+            user_uuid: "user-1".into(),
+            nickname: "Neri".into(),
+            member_secret: Some("member-secret".into()),
+            join_secret: Some("join-secret".into()),
+        };
+
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["memberSecret"], "member-secret");
+        assert_eq!(encoded["joinSecret"], "join-secret");
+
+        let response: LtRoomResponse = serde_json::from_value(json!({
+            "ok": true,
+            "memberSecret": "member-secret",
+            "joinSecret": "join-secret"
+        }))
+        .unwrap();
+        assert_eq!(response.member_secret.as_deref(), Some("member-secret"));
+        assert_eq!(response.join_secret.as_deref(), Some("join-secret"));
+    }
 }

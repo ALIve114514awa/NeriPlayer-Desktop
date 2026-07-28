@@ -21,6 +21,7 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 const joinRoomId = ref('')
+const pendingInvite = ref<{ roomId: string; joinSecret?: string } | null>(null)
 const nowTick = ref(Date.now())
 let nowTimer: ReturnType<typeof setInterval> | null = null
 const CONTROLLER_GRACE_PERIOD_MS = 10 * 60 * 1000
@@ -121,7 +122,11 @@ function handleCreate() {
 
 function handleJoin() {
   if (!joinRoomId.value.trim()) return
-  lt.joinRoom(joinRoomId.value.trim())
+  const normalizedRoomId = joinRoomId.value.trim().toUpperCase()
+  const joinSecret = pendingInvite.value?.roomId === normalizedRoomId
+    ? pendingInvite.value.joinSecret
+    : undefined
+  lt.joinRoom(joinRoomId.value.trim(), joinSecret)
 }
 
 function handleLeave() {
@@ -131,6 +136,7 @@ function handleLeave() {
 // 剪贴板检测
 async function checkClipboard() {
   const invite = await lt.checkClipboardInvite()
+  pendingInvite.value = invite
   if (invite) {
     joinRoomId.value = invite.roomId
     if (invite.baseUrl) {

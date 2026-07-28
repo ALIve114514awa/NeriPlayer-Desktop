@@ -19,8 +19,18 @@ import type {
   ListenTogetherSocketEnvelope,
   ListenTogetherEvent,
   ListenTogetherInitialSnapshot,
+  ListenTogetherRoomResponse,
 } from './protocol'
-import { desktopRepeatToWire, isValidLtNickname, normalizeLtRoomId, isValidLtRoomId } from './protocol'
+import {
+  desktopRepeatToWire,
+  isValidLtNickname,
+  normalizeLtHttpBaseUrl,
+  normalizeLtInviteBaseUrl,
+  normalizeLtJoinSecret,
+  normalizeLtRoomId,
+  resolveLtJoinSecret,
+  isValidLtRoomId,
+} from './protocol'
 import { trackInfoToLtTrack, ltTrackToTrackInfo, toShareableQueueSnapshot } from './mapper'
 import { createLogger } from '@/utils/logger'
 
@@ -129,6 +139,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
   let _serverClockOffsetMs = 0
   let _lastRequestedLinkStableKey: string | null = null
   let _lastRequestedLinkAt = 0
+  let _joinSecret: string | null = null
 
   // 计算属性
   const isConnected = computed(() => connectionState.value === 'connected')
@@ -173,7 +184,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         shuffleEnabled: !!player.shuffleEnabled,
       }
 
-      const resp = await invoke<any>('lt_create_room', {
+      const resp = await invoke<ListenTogetherRoomResponse>('lt_create_room', {
         baseUrl: baseUrl.value,
         userUuid: userUuid.value,
         nickname: nickname.value,
@@ -184,7 +195,12 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         throw new Error(resp.error || 'Create room failed')
       }
 
-      roomId.value = resp.roomId
+      const createdRoomId = resp.roomId
+      if (!createdRoomId) {
+        throw new Error('Create room response did not include a room ID')
+      }
+      roomId.value = createdRoomId
+      updateJoinSecret(resp.joinSecret)
       role.value = (resp.role as LtRole) || 'controller'
       if (resp.state) {
         roomState.value = resp.state
@@ -193,7 +209,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       }
 
       // 连接 WebSocket
-      const wsUrl = resp.wsUrl || buildWsUrl(baseUrl.value, resp.roomId, resp.token)
+      const wsUrl = resolveWsUrl(resp, createdRoomId)
       await connectWs(wsUrl)
 
       startHeartbeat()
@@ -208,7 +224,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
   }
 
   /** 加入房间 */
-  async function joinRoom(targetRoomId: string) {
+  async function joinRoom(targetRoomId: string, joinSecret?: string) {
     const player = usePlayerStore()
     const toast = useToastStore()
     const t = (i18n.global as any).t
@@ -225,11 +241,12 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       }
       connectionState.value = 'connecting'
 
-      const resp = await invoke<any>('lt_join_room', {
+      const resp = await invoke<ListenTogetherRoomResponse>('lt_join_room', {
         baseUrl: baseUrl.value,
         roomId: normalizedRoomId,
         userUuid: userUuid.value,
         nickname: nickname.value,
+        joinSecret: normalizeLtJoinSecret(joinSecret),
       })
 
       if (!resp.ok) {
@@ -237,6 +254,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       }
 
       roomId.value = normalizedRoomId
+      updateJoinSecret(resp.joinSecret, joinSecret)
       role.value = (resp.role as LtRole) || 'listener'
       if (resp.state) {
         roomState.value = resp.state
@@ -247,7 +265,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         applyRoomStateToPlayer(resp.state, 'join')
       }
 
-      const wsUrl = resp.wsUrl || buildWsUrl(baseUrl.value, normalizedRoomId, resp.token)
+      const wsUrl = resolveWsUrl(resp, normalizedRoomId)
       await connectWs(wsUrl)
 
       startListenerPing()
@@ -280,6 +298,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
     } catch {}
 
     roomId.value = null
+    _joinSecret = null
     role.value = null
     roomState.value = null
     _lastAppliedRoomVersion = 0
@@ -1263,7 +1282,7 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
         if (!isController.value && _reconnectAttempt >= RECONNECT_DELAYS.length && roomId.value) {
           const targetRoomId = roomId.value
           try {
-            const resp = await invoke<any>('lt_join_room', {
+            const resp = await invoke<ListenTogetherRoomResponse>('lt_join_room', {
               baseUrl: baseUrl.value,
               roomId: targetRoomId,
               userUuid: userUuid.value,
@@ -1271,7 +1290,8 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
             })
             if (resp.ok) {
               _reconnectAttempt = 0
-              const newWsUrl = resp.wsUrl || buildWsUrl(baseUrl.value, targetRoomId, resp.token)
+              updateJoinSecret(resp.joinSecret, _joinSecret)
+              const newWsUrl = resolveWsUrl(resp, targetRoomId)
               await connectWs(newWsUrl)
               startListenerPing()
               if (resp.state) {
@@ -1303,7 +1323,15 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
 
   // 邀请链接
   function getInviteLink(): string {
-    return `neriplayer://listen-together/join?roomId=${roomId.value}&baseUrl=${encodeURIComponent(baseUrl.value)}`
+    const params = new URLSearchParams({ roomId: roomId.value || '' })
+    const inviter = nickname.value.trim()
+    if (isValidLtNickname(inviter)) params.set('inviter', inviter)
+    const normalizedBaseUrl = normalizeLtHttpBaseUrl(baseUrl.value)
+    if (normalizedBaseUrl && normalizedBaseUrl !== DEFAULT_BASE_URL) {
+      params.set('baseUrl', normalizedBaseUrl)
+    }
+    if (_joinSecret) params.set('secret', _joinSecret)
+    return `neriplayer://listen-together/join?${params.toString()}`
   }
 
   async function copyInviteLink() {
@@ -1317,7 +1345,11 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
   }
 
   /** 检测剪贴板中的邀请链接 */
-  async function checkClipboardInvite(): Promise<{ roomId: string; baseUrl?: string } | null> {
+  async function checkClipboardInvite(): Promise<{
+    roomId: string
+    baseUrl?: string
+    joinSecret?: string
+  } | null> {
     try {
       const text = await readText()
       if (!text) return null
@@ -1331,18 +1363,42 @@ export const useListenTogetherStore = defineStore('listenTogether', () => {
       if (!rawRoomId) return null
       const roomId = normalizeLtRoomId(rawRoomId)
       if (!isValidLtRoomId(roomId)) return null
-      const rawBaseUrl = params.get('baseUrl')
+      const baseUrl = normalizeLtInviteBaseUrl(params.get('baseUrl'))
+      const joinSecret = normalizeLtJoinSecret(params.get('secret'))
       return {
         roomId,
-        baseUrl: rawBaseUrl ? rawBaseUrl.trim() : undefined,
+        baseUrl: baseUrl || undefined,
+        joinSecret,
       }
     } catch {}
     return null
   }
 
   // 工具函数
+  function updateJoinSecret(
+    value: string | null | undefined,
+    fallback?: string | null,
+  ) {
+    _joinSecret = resolveLtJoinSecret(value, fallback) || null
+  }
+
+  function resolveWsUrl(response: ListenTogetherRoomResponse, fallbackRoomId: string): string {
+    const wsUrl = response.wsUrl?.trim()
+    if (wsUrl && !isInternalRoomWsUrl(wsUrl)) return wsUrl
+    const token = response.token?.trim()
+    if (!token) throw new Error('Listen Together response did not include a WebSocket token')
+    return buildWsUrl(baseUrl.value, fallbackRoomId, token)
+  }
+
+  function isInternalRoomWsUrl(value: string): boolean {
+    const normalized = value.toLowerCase()
+    return normalized.includes('://room.internal/')
+      || normalized.includes('://room.internal?')
+      || normalized.includes('://room.internal:')
+  }
+
   function buildWsUrl(base: string, roomId: string, token: string): string {
-    const normalized = base.replace(/\/$/, '')
+    const normalized = normalizeLtHttpBaseUrl(base) || base.replace(/\/$/, '')
     const httpUrl = `${normalized}/api/rooms/${roomId}/ws?token=${encodeURIComponent(token)}`
     return httpUrl.replace(/^http/, 'ws')
   }

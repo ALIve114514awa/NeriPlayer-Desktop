@@ -35,6 +35,19 @@ async function loadMapperModule() {
   return import(moduleUrl)
 }
 
+async function loadProtocolModule() {
+  const protocolPath = path.join(root, 'src/stores/listenTogether/protocol.ts')
+  const protocolSource = await readFile(protocolPath, 'utf8')
+  const compiled = ts.transpileModule(protocolSource, {
+    compilerOptions: {
+      module: ts.ModuleKind.ES2022,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`
+  return import(moduleUrl)
+}
+
 const {
   buildStableKey,
   trackInfoToLtTrack,
@@ -42,6 +55,26 @@ const {
   toShareableQueueSnapshot,
   isTrustedInboundStreamUrl,
 } = await loadMapperModule()
+
+const {
+  normalizeLtHttpBaseUrl,
+  normalizeLtInviteBaseUrl,
+  normalizeLtJoinSecret,
+  resolveLtJoinSecret,
+} = await loadProtocolModule()
+
+assert.equal(
+  normalizeLtHttpBaseUrl(' https://listen.example/room/ '),
+  'https://listen.example/room',
+)
+assert.equal(normalizeLtInviteBaseUrl('https://listen.example/room/'), 'https://listen.example/room')
+assert.equal(normalizeLtInviteBaseUrl('http://listen.example'), null)
+assert.equal(normalizeLtInviteBaseUrl('https://listen.example?token=secret'), null)
+assert.equal(normalizeLtInviteBaseUrl('javascript:alert(1)'), null)
+assert.equal(normalizeLtJoinSecret(' invite-secret '), 'invite-secret')
+assert.equal(normalizeLtJoinSecret('x'.repeat(257)), undefined)
+assert.equal(resolveLtJoinSecret(undefined, 'invite-secret'), 'invite-secret')
+assert.equal(resolveLtJoinSecret('response-secret', 'invite-secret'), 'response-secret')
 
 // buildStableKey: 对齐 Android buildStableTrackKey
 assert.equal(buildStableKey('netease', '123'), 'netease:123')
