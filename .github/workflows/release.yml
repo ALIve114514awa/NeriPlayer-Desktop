@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch, tag, or commit SHA to release
+        required: true
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -22,10 +29,19 @@ jobs:
       build_git_sha: ${{ steps.build_metadata.outputs.build_git_sha }}
       build_uuid: ${{ steps.build_metadata.outputs.build_uuid }}
       build_version: ${{ steps.build_metadata.outputs.build_version }}
+      is_tag_release: ${{ steps.build_metadata.outputs.is_tag_release }}
+      previous_tag: ${{ steps.build_metadata.outputs.previous_tag }}
+      release_tag: ${{ steps.build_metadata.outputs.release_tag }}
+      release_title: ${{ steps.build_metadata.outputs.release_title }}
+      target_sha: ${{ steps.build_metadata.outputs.target_sha }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Generate shared build metadata
         id: build_metadata
@@ -33,10 +49,25 @@ jobs:
         run: |
           set -euo pipefail
           build_epoch="$(date +%s)"
-          build_git_sha="$(git rev-parse HEAD)"
+          target_sha="$(git rev-parse HEAD)"
+          build_git_sha="$target_sha"
           build_timestamp="$(TZ=Asia/Taipei date --date="@$build_epoch" +%m%d%H%M)"
           build_version="${build_git_sha:0:7}.${build_timestamp}"
           build_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            release_tag="NeriPlayer-${build_git_sha:0:7}.${build_timestamp}"
+            release_title="$release_tag"
+            is_tag_release=false
+            previous_tag_pattern='refs/tags/NeriPlayer-*'
+          else
+            release_tag="${{ github.ref_name }}"
+            release_title="NeriPlayer ${release_tag#v}"
+            is_tag_release=true
+            previous_tag_pattern='refs/tags/v*'
+          fi
+          previous_tag="$(git for-each-ref --merged "$target_sha" --sort=-creatordate \
+            --format='%(refname:short)' "$previous_tag_pattern" \
+            | grep -Fvx "$release_tag" | head -n 1 || true)"
           [[ "$build_version" =~ ^[0-9a-f]{7}\.[0-9]{8}$ ]]
           [[ "$build_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
 
@@ -45,6 +76,11 @@ jobs:
             echo "build_git_sha=$build_git_sha"
             echo "build_uuid=$build_uuid"
             echo "build_version=$build_version"
+            echo "is_tag_release=$is_tag_release"
+            echo "previous_tag=$previous_tag"
+            echo "release_tag=$release_tag"
+            echo "release_title=$release_title"
+            echo "target_sha=$target_sha"
           } >> "$GITHUB_OUTPUT"
 
           echo "Build version: $build_version"
@@ -55,6 +91,8 @@ jobs:
             echo "- Build UUID: \`$build_uuid\`"
             echo "- Build version: \`$build_version\`"
             echo "- Git SHA: \`$build_git_sha\`"
+            echo "- Release tag: \`$release_tag\`"
+            echo "- Previous release tag: \`${previous_tag:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build metadata artifact
@@ -67,6 +105,9 @@ jobs:
             echo "build_version=${{ steps.build_metadata.outputs.build_version }}"
             echo "build_git_sha=${{ steps.build_metadata.outputs.build_git_sha }}"
             echo "build_epoch=${{ steps.build_metadata.outputs.build_epoch }}"
+            echo "release_tag=${{ steps.build_metadata.outputs.release_tag }}"
+            echo "target_sha=${{ steps.build_metadata.outputs.target_sha }}"
+            echo "previous_tag=${{ steps.build_metadata.outputs.previous_tag }}"
             echo "github_sha=${{ github.sha }}"
             echo "github_ref=${{ github.ref }}"
             echo "github_run_id=${{ github.run_id }}"
@@ -76,7 +117,7 @@ jobs:
       - name: Persist build metadata artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: NeriPlayer-build-metadata-${{ github.ref_name }}
+          name: NeriPlayer-build-metadata-${{ steps.build_metadata.outputs.release_tag }}
           path: artifacts/build-metadata.txt
           if-no-files-found: error
           retention-days: 30
@@ -89,7 +130,8 @@ jobs:
 
       - name: Check version consistency
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.build_metadata.outputs.release_tag }}
+          REQUIRE_SEMVER_TAG: ${{ steps.build_metadata.outputs.is_tag_release }}
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs'
@@ -105,7 +147,7 @@ jobs:
           const expectedTag = `v${packageJson.version}`
 
           const errors = []
-          if (process.env.RELEASE_TAG !== expectedTag) {
+          if (process.env.REQUIRE_SEMVER_TAG === 'true' && process.env.RELEASE_TAG !== expectedTag) {
             errors.push(`tag ${process.env.RELEASE_TAG} must equal ${expectedTag}`)
           }
           if (cargoVersion !== packageJson.version) {
@@ -166,6 +208,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.validate.outputs.target_sha }}
+          fetch-depth: 0
           submodules: recursive
 
       - name: Install Linux dependencies
@@ -345,7 +389,7 @@ jobs:
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: NeriPlayer-${{ matrix.artifact_name }}-${{ github.ref_name }}
+          name: NeriPlayer-${{ matrix.artifact_name }}-${{ needs.validate.outputs.release_tag }}
           path: artifacts/${{ matrix.artifact_name }}/
           if-no-files-found: error
           retention-days: 7
@@ -353,17 +397,23 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
+      - name: Checkout release target
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.target_sha }}
+          fetch-depth: 0
+
       - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: NeriPlayer-*-${{ github.ref_name }}
+          pattern: NeriPlayer-*-${{ needs.validate.outputs.release_tag }}
           path: release-assets
           merge-multiple: true
 
@@ -406,25 +456,91 @@ jobs:
           cp macOS-install.txt release-assets/macOS-install.txt
           (cd release-assets && sha256sum * > SHA256SUMS.txt)
 
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ needs.validate.outputs.previous_tag }}
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+          BUILD_UUID: ${{ needs.validate.outputs.build_uuid }}
+          BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api_args=(
+            --method POST
+            "repos/${REPO}/releases/generate-notes"
+            -f "tag_name=${RELEASE_TAG}"
+            -f "target_commitish=${TARGET_SHA}"
+          )
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            api_args+=(-f "previous_tag_name=${PREVIOUS_TAG}")
+          fi
+          gh api "${api_args[@]}" --jq '.body' > generated-release-notes.md
+
+          cat macOS-install.txt > release-notes.md
+          {
+            echo
+            echo
+            echo "## Build metadata"
+            echo
+            echo "- Build UUID: \`${BUILD_UUID}\`"
+            echo "- Build version: \`${BUILD_VERSION}\`"
+            echo "- Target commit: \`${TARGET_SHA}\`"
+            echo
+            echo "## Commits"
+            if [[ -n "$PREVIOUS_TAG" ]]; then
+              git log --first-parent --pretty='- %h %s' "${PREVIOUS_TAG}..${TARGET_SHA}"
+            else
+              git log --first-parent --pretty='- %h %s' "$TARGET_SHA"
+            fi
+          } >> release-notes.md
+
+          if [[ -s generated-release-notes.md ]]; then
+            {
+              echo
+              echo
+              echo "## Changes"
+              cat generated-release-notes.md
+            } >> release-notes.md
+          fi
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          IS_TAG_RELEASE: ${{ needs.validate.outputs.is_tag_release }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          RELEASE_TITLE: ${{ needs.validate.outputs.release_title }}
+          TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes-file release-notes.md
             exit 0
           fi
 
           prerelease=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then
+          latest=()
+          if [[ "$IS_TAG_RELEASE" == "true" && "$RELEASE_TAG" == *-* ]]; then
             prerelease+=(--prerelease)
+          else
+            latest+=(--latest)
           fi
 
-          gh release create "$RELEASE_TAG" release-assets/* \
-            --verify-tag \
-            --title "NeriPlayer ${RELEASE_TAG#v}" \
-            --notes "$(cat macOS-install.txt)" \
-            --generate-notes \
-            "${prerelease[@]}"
+          create_args=(
+            gh release create "$RELEASE_TAG" release-assets/*
+            --title "$RELEASE_TITLE"
+            --notes-file release-notes.md
+          )
+          if [[ "$IS_TAG_RELEASE" == "true" ]]; then
+            create_args+=(--verify-tag)
+          else
+            create_args+=(--target "$TARGET_SHA")
+          fi
+          create_args+=("${prerelease[@]}" "${latest[@]}")
+          "${create_args[@]}"
