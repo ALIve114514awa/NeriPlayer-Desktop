@@ -90,6 +90,7 @@
     "scan_local_music": "扫描本地音乐目录",
     "scanning": "正在扫描本地音乐...",
     "scan_success": "扫描完成，共导入 {count} 首",
+    "scan_partial": "扫描完成：导入 {count} 首，{failed} 首失败",
     "scan_failed": "扫描本地音乐失败",
     "playlist_name_placeholder": "输入播放列表名称",
     "liked_songs": "我喜欢的音乐",
@@ -176,6 +177,7 @@
     "cancelled_count": "已请求取消 {count} 个下载任务",
     "already_exists": "该歌曲已下载",
     "missing_cleaned": "已清理 {count} 条失效下载记录",
+    "integrity_mismatch": "检测到 {count} 个下载文件大小与清单不一致，请重新下载",
     "redownload": "重新下载",
     "redownload_desc": "删除本地文件并重新下载",
     "download_desc": "保存歌曲到本地",
@@ -208,7 +210,8 @@
     "empty_title": "暂无下载",
     "empty_desc": "在播放页的更多菜单里保存歌曲到本地",
     "delete_confirm_msg": "确定要删除「{name}」吗？此操作不可撤销。",
-    "not_downloaded": "未下载"
+    "not_downloaded": "未下载",
+    "dir_fallback": "所选下载目录不可用，已保存到默认位置"
   },
   "player": {
     "not_playing": "未在播放",
@@ -226,6 +229,8 @@
     "video_count": "{count} 个视频",
     "loading": "加载中...",
     "load_failed": "加载失败",
+    "too_many_failures": "连续播放失败过多，已停止",
+    "like_cloud_sync_failed": "已在本地收藏，但云端同步失败",
     "retry": "重试",
     "empty_playlist": "歌单为空",
     "queue": "播放队列",
@@ -473,6 +478,7 @@
     "audio_quality_desc": "展开以配置音质选项",
     "quality": "音质",
     "netease_quality": "网易云音质",
+    "qq_quality": "QQ 音乐音质",
     "youtube_quality": "YouTube 音质",
     "bili_quality": "哔哩哔哩音质",
     "q_standard": "标准",
@@ -508,6 +514,7 @@
     "logs_title": "日志",
     "log_to_file": "写入日志文件",
     "log_to_file_desc": "将运行日志保存到本地文件，便于反馈问题",
+    "log_to_file_restart_hint": "日志文件开关将在重启应用后生效",
     "log_level": "日志级别",
     "log_level_desc": "控制记录的详细程度",
     "log_level_off": "关闭",
@@ -835,7 +842,10 @@
     "reset_identity_confirm_desc": "重置后会生成新的 UUID，当前昵称不会被清除，已加入的房间连接也会失效。",
     "identity_reset": "身份已重置",
     "reset_btn": "重置",
-    "control_rejected": "控制被服务端拒绝"
+    "control_rejected": "控制被服务端拒绝",
+    "control_not_sent": "控制未能发送（连接已断开）",
+    "invalid_room_id": "房间号无效（6 位字母数字）",
+    "invalid_nickname": "昵称只能包含字母、数字与汉字（最多 24 个字符）"
   },
   "shortcuts": {
     "title": "键盘快捷键",

@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePlayerStore, type TrackInfo } from '@/stores/player'
 import { useDownloadStore } from '@/stores/download'
+import { useDelayedFlag } from '@/composables/useDelayedFlag'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import AddToPlaylistDialog from '@/components/AddToPlaylistDialog.vue'
@@ -32,6 +33,8 @@ const downloadStore = useDownloadStore()
 const { t } = useI18n()
 
 const isLoading = ref(true)
+// 慢加载才显示 spinner，避免快速加载时一闪而过（UI-016）
+const isLoadingSlow = useDelayedFlag(isLoading)
 const error = ref<string | null>(null)
 const playlistName = ref('')
 const subtitle = ref('')
@@ -335,8 +338,10 @@ onMounted(() => {
     </header>
 
     <div v-if="isLoading" class="state-center">
-      <span class="material-symbols-rounded spinning">progress_activity</span>
-      <p>{{ t('player.loading') }}</p>
+      <template v-if="isLoadingSlow">
+        <span class="material-symbols-rounded spinning">progress_activity</span>
+        <p>{{ t('player.loading') }}</p>
+      </template>
     </div>
 
     <div v-else-if="error" class="state-center">

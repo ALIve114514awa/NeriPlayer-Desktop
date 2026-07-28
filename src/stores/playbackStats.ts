@@ -95,38 +95,43 @@ export const usePlaybackStatsStore = defineStore('playbackStats', () => {
     }
   }
 
+  // 保存所有 watch stop 句柄与 listen unlisten，detach 时全部解除，
+  // 避免 attach/detach 循环重复注册监听器并双计统计（MK-05）
+  const watchStops: Array<() => void> = []
+  const unlistens: Array<() => void> = []
+
   /// 接入播放器状态，全局只需调用一次
   function attach() {
     if (attached) return
     attached = true
     const player = usePlayerStore()
 
-    watch(
+    watchStops.push(watch(
       () => (player.currentTrack ? `${player.currentTrack.source}:${player.currentTrack.id}` : null),
       () => void submit(tracker.onTrackChanged(toTracked(player.currentTrack))),
       { immediate: true },
-    )
+    ))
 
-    watch(
+    watchStops.push(watch(
       () => player.isPlaying,
       (playing) => void submit(tracker.onPlayingChanged(playing)),
       { immediate: true },
-    )
+    ))
 
     // 位置回绕 = 单曲循环走完一轮，Android 同款判定
-    watch(
+    watchStops.push(watch(
       () => player.positionMs,
       (position) => void submit(tracker.onProgress(position)),
-    )
+    ))
 
-    watch(
+    watchStops.push(watch(
       () => player.lastSeekCommand.seq,
       () => tracker.onManualSeek(player.positionMs),
-    )
+    ))
 
     void listen('player:track-ended', () => {
       void submit(tracker.onTrackEnded())
-    })
+    }).then(un => { if (attached) unlistens.push(un); else un() })
 
     // 周期落盘：崩溃或强杀最多只丢一个窗口的收听时长
     flushTimer = setInterval(() => {
@@ -136,6 +141,7 @@ export const usePlaybackStatsStore = defineStore('playbackStats', () => {
     }, PLAYBACK_STATS_PERIODIC_FLUSH_MS)
 
     void listen('playback-stats-changed', () => void refresh())
+      .then(un => { if (attached) unlistens.push(un); else un() })
   }
 
   function detach() {
@@ -143,6 +149,8 @@ export const usePlaybackStatsStore = defineStore('playbackStats', () => {
       clearInterval(flushTimer)
       flushTimer = null
     }
+    watchStops.splice(0).forEach(stop => stop())
+    unlistens.splice(0).forEach(un => un())
     attached = false
   }
 

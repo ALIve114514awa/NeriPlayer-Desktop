@@ -23,6 +23,17 @@ export default defineConfig({
   optimizeDeps: {
     entries: ['index.html'],
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('/node_modules/')) return 'vendor'
+          if (id.includes('/vendor/applemusic-like-lyrics/')) return 'lyrics-core'
+          return undefined
+        },
+      },
+    },
+  },
   server: {
     port: 1420,
     strictPort: true,

@@ -11,21 +11,24 @@ export const useLibraryStore = defineStore('library', () => {
   const tracks = ref<TrackInfo[]>([])
   const isScanning = ref(false)
   const scanError = ref<string | null>(null)
+  const scanSkipped = ref<{ path: string; reason: string }[]>([])
   const lastScanDir = ref<string | null>(null)
 
   async function scanDirectory(dir: string) {
     isScanning.value = true
     scanError.value = null
+    scanSkipped.value = []
 
     try {
       const settings = useSettingsStore()
-      const results = await invoke<any[]>('scan_music_directory', {
+      const results = await invoke<{ tracks: any[]; skipped: { path: string; reason: string }[] }>('scan_music_directory', {
         dir,
         nameTemplate: settings.downloadNameTemplate || null,
       })
+      scanSkipped.value = results.skipped || []
 
       // 后端返回的字段名是 snake_case，映射到前端 camelCase
-      tracks.value = results.map(t => ({
+      tracks.value = (results.tracks || []).map(t => ({
         id: t.id,
         title: t.title,
         artist: t.artist,
@@ -59,7 +62,7 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   return {
-    tracks, isScanning, scanError, lastScanDir,
+    tracks, isScanning, scanError, scanSkipped, lastScanDir,
     scanDirectory, restoreLastScan,
   }
 })

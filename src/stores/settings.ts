@@ -292,7 +292,7 @@ function normalizeSnapshot(input: unknown): AppSettings {
   result.lyricBlurAmount = clamp(result.lyricBlurAmount, 0, 8)
   result.cloudMusicOffset = clamp(result.cloudMusicOffset, -30000, 30000)
   result.qqMusicOffset = clamp(result.qqMusicOffset, -30000, 30000)
-  result.coverBlurAmount = clamp(result.coverBlurAmount, 0, 100)
+  result.coverBlurAmount = clamp(result.coverBlurAmount, 0, 500)
   result.coverBlurDarken = clamp(result.coverBlurDarken, 0, 1)
   result.backgroundImageBlur = clamp(result.backgroundImageBlur, 0, 100)
   result.backgroundImageAlpha = clamp(result.backgroundImageAlpha, 0, 1)

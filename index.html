@@ -4,21 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NeriPlayer</title>
-    <script>
-      // 在任何 CSS/JS 加载前，立即从 localStorage 读取主题模式并设置背景色
-      // 这是消除闪黑/闪白的关键 — 必须内联在 <head> 最前面
-      (function() {
-        var mode = localStorage.getItem('theme-mode') || 'system';
-        var isDark = mode === 'dark' || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        // 浅色背景 rgb(252,248,253) = .light-theme --md-surface
-        // 深色背景 rgb(20,18,24) = :root --md-surface
-        var bg = isDark ? 'rgb(20,18,24)' : 'rgb(252,248,253)';
-        var fg = isDark ? 'rgb(230,225,229)' : 'rgb(28,27,31)';
-        document.documentElement.style.background = bg;
-        document.documentElement.style.color = fg;
-        document.documentElement.className = isDark ? 'dark-theme' : 'light-theme';
-      })();
-    </script>
+    <script src="/theme-init.js"></script>
     <style>
       /* 本地字体 — 零网络依赖 */
       @font-face {

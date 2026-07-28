@@ -30,6 +30,7 @@ pub struct DownloadedTrack {
 pub struct DownloadManifestValidation {
     pub tracks: Vec<DownloadedTrack>,
     pub removed_count: usize,
+    pub integrity_mismatch_count: usize,
 }
 
 /// 流式下载的空闲超时：超过该时长收不到任何数据视为连接假死。
@@ -89,32 +90,65 @@ fn sanitize_filename(s: &str) -> String {
 }
 
 /// 根据模板渲染下载文件名（不含扩展名）
-/// 支持占位符：{title}, {artist}, {album}, {source}
+/// 支持占位符：{title}, {artist}, {album}, {source}, {id}, {audioId}, {subAudioId}（%%写法同）
 fn render_download_filename(
     title: &str,
     artist: &str,
     album: &str,
     source: &str,
+    track_id: &str,
     template: Option<&str>,
 ) -> String {
     let tpl = template
         .filter(|t| !t.is_empty())
         .unwrap_or(DEFAULT_DOWNLOAD_NAME_TEMPLATE);
+    // audioId = 去平台前缀的 id；subAudioId = bilibili album 中的 cid（"Bilibili|<cid>"）
+    let audio_id = track_id.split_once(':').map(|(_, r)| r).unwrap_or(track_id);
+    let sub_audio_id = album
+        .strip_prefix("Bilibili|")
+        .map(|s| s.split('|').next().unwrap_or(s))
+        .unwrap_or("");
     let rendered = tpl
         .replace("{title}", title)
         .replace("{artist}", artist)
         .replace("{album}", album)
         .replace("{source}", source)
+        .replace("{id}", audio_id)
+        .replace("{audioId}", audio_id)
+        .replace("{subAudioId}", sub_audio_id)
         .replace("%title%", title)
         .replace("%artist%", artist)
         .replace("%album%", album)
-        .replace("%source%", source);
+        .replace("%source%", source)
+        .replace("%id%", audio_id)
+        .replace("%audioId%", audio_id)
+        .replace("%subAudioId%", sub_audio_id);
+    // 折叠占位符替换为空后残留的多余分隔符与空括号（SC-5）
+    let rendered = collapse_empty_name_separators(&rendered);
     let sanitized = sanitize_filename(&rendered);
     if sanitized.is_empty() {
         sanitize_filename(title)
     } else {
         sanitized
     }
+}
+
+/// 清理占位符替换后残留的空括号、连续分隔符与首尾分隔符
+fn collapse_empty_name_separators(s: &str) -> String {
+    let mut out = s.to_string();
+    // 移除空的 []/() 及其内部空白
+    for _ in 0..3 {
+        out = out.replace("[]", "").replace("()", "");
+        out = out
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    // 折叠连续 " - " 分隔符并去首尾分隔符/空白
+    while out.contains("-  -") || out.contains("- -") {
+        out = out.replace("-  -", "-").replace("- -", "-");
+    }
+    out.trim().trim_matches(|c| c == '-' || c == ' ').trim().to_string()
 }
 fn ext_from_content_type(content_type: &str) -> &str {
     if content_type.contains("mp4") || content_type.contains("m4a") || content_type.contains("aac")
@@ -215,7 +249,6 @@ async fn write_download_sidecars(
     duration_ms: u64,
     cover_url: Option<&str>,
 ) -> AppResult<()> {
-    let base_path = file_path.with_extension("");
     let mut written_files: Vec<PathBuf> = Vec::new();
 
     // 歌词 sidecar
@@ -235,14 +268,18 @@ async fn write_download_sidecars(
         .unwrap_or_default();
 
     if let Some(lrc_text) = build_lrc_text(&lyrics) {
-        let lrc_path = base_path.with_extension("lrc");
-        std::fs::write(&lrc_path, lrc_text)?;
+        let lrc_path = download_sidecar_path(file_path, "lrc")
+            .ok_or_else(|| AppError::Other("下载文件名无效，无法写入歌词".into()))?;
+        // 原子写：sidecar 是 load_local_sidecar_lyrics 的最高优先级本地源，
+        // 半截写入会被读回成损坏歌词（LY-6）
+        crate::fsutil::atomic_write(&lrc_path, lrc_text.as_bytes())?;
         written_files.push(lrc_path);
     }
 
     if let Some(tlrc_text) = build_translation_lrc_text(&lyrics) {
-        let tlrc_path = base_path.with_extension("tlrc");
-        std::fs::write(&tlrc_path, tlrc_text)?;
+        let tlrc_path = download_sidecar_path(file_path, "tlrc")
+            .ok_or_else(|| AppError::Other("下载文件名无效，无法写入翻译歌词".into()))?;
+        crate::fsutil::atomic_write(&tlrc_path, tlrc_text.as_bytes())?;
         written_files.push(tlrc_path);
     }
 
@@ -271,8 +308,12 @@ async fn write_download_sidecars(
                         if let Ok(bytes) = resp.bytes().await {
                             if !bytes.is_empty() {
                                 let ext = ext_from_image_content_type(&content_type);
-                                let cover_path = base_path.with_extension(ext);
-                                std::fs::write(&cover_path, &bytes)?;
+                                let cover_path = download_sidecar_path(file_path, ext)
+                                    .ok_or_else(|| {
+                                        AppError::Other("下载文件名无效，无法写入封面".into())
+                                    })?;
+                                // 原子写封面 sidecar（DL-4）
+                                crate::fsutil::atomic_write(&cover_path, &bytes)?;
                                 written_files.push(cover_path);
                             }
                         }
@@ -299,7 +340,12 @@ fn downloads_dir(app: &AppHandle, custom_dir: Option<&str>) -> AppResult<PathBuf
                 if std::fs::create_dir_all(&p).is_ok() {
                     return Ok(p);
                 }
-                // 创建失败，fallback 到默认
+                // 创建失败(U盘拔出/权限变更): 静默回退默认目录会让用户以为文件落在
+                // 所选目录、实际散落 AppData。回退前告知前端（DL-11）
+                let _ = app.emit(
+                    "download-dir-fallback",
+                    serde_json::json!({ "requestedDir": cd }),
+                );
             } else {
                 return Ok(p);
             }
@@ -356,6 +402,12 @@ pub async fn get_default_download_dir(app: AppHandle) -> AppResult<String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+/// 下载并发信号量（进程级，上限 8，对齐 Android DownloadParallelism）
+fn download_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(8))
+}
+
 /// manifest.json 路径（始终存储在默认下载目录，与自定义目录无关）
 fn manifest_path(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = default_downloads_dir(app)?;
@@ -365,6 +417,69 @@ fn manifest_path(app: &AppHandle) -> AppResult<PathBuf> {
     Ok(dir.join("manifest.json"))
 }
 
+fn download_sidecar_path(audio_path: &std::path::Path, suffix: &str) -> Option<PathBuf> {
+    let file_name = audio_path.file_name()?;
+    let mut sidecar_name = file_name.to_os_string();
+    sidecar_name.push(format!(".{suffix}"));
+    Some(audio_path.with_file_name(sidecar_name))
+}
+
+fn reserve_path_for(audio_path: &std::path::Path) -> Option<PathBuf> {
+    download_sidecar_path(audio_path, "reserve")
+}
+
+fn path_exists_including_broken_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn has_download_size_mismatch(expected: u64, actual: u64) -> bool {
+    expected > 0 && expected != actual
+}
+
+fn reserve_download_path(
+    dir: &std::path::Path,
+    base_name: &str,
+    ext: &str,
+) -> AppResult<(PathBuf, PathBuf)> {
+    let mut file_path = dir.join(format!("{base_name}.{ext}"));
+    let mut collision_suffix = 2_u32;
+    loop {
+        if path_exists_including_broken_symlink(&file_path) {
+            file_path = dir.join(format!("{base_name} ({collision_suffix}).{ext}"));
+            collision_suffix += 1;
+            if collision_suffix > 1_000 {
+                return Err(AppError::Other("Too many filename collisions".into()));
+            }
+            continue;
+        }
+        let Some(candidate_reserve) = reserve_path_for(&file_path) else {
+            return Err(AppError::Other("无法为下载文件创建保留标记".into()));
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate_reserve)
+        {
+            Ok(marker) => {
+                if let Err(error) = marker.sync_all() {
+                    drop(marker);
+                    let _ = std::fs::remove_file(&candidate_reserve);
+                    return Err(AppError::Io(error));
+                }
+                return Ok((file_path, candidate_reserve));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                file_path = dir.join(format!("{base_name} ({collision_suffix}).{ext}"));
+                collision_suffix += 1;
+                if collision_suffix > 1_000 {
+                    return Err(AppError::Other("Too many filename collisions".into()));
+                }
+            }
+            Err(e) => return Err(AppError::Io(e)),
+        }
+    }
+}
+
 /// 读取 manifest
 fn read_manifest(app: &AppHandle) -> AppResult<Vec<DownloadedTrack>> {
     let path = manifest_path(app)?;
@@ -372,8 +487,16 @@ fn read_manifest(app: &AppHandle) -> AppResult<Vec<DownloadedTrack>> {
         return Ok(vec![]);
     }
     let data = std::fs::read_to_string(&path)?;
-    let tracks: Vec<DownloadedTrack> = serde_json::from_str(&data).unwrap_or_default();
-    Ok(tracks)
+    match serde_json::from_str::<Vec<DownloadedTrack>>(&data) {
+        Ok(tracks) => Ok(tracks),
+        Err(e) => {
+            // manifest 解析失败不能静默当空表：后续任一次 write_manifest 会用空表覆盖，
+            // 全部历史下载记录永久丢失。隔离损坏文件后返回错误，保留磁盘上的原始现场（DL-6）
+            log::error!(target: "download", "manifest 解析失败, 已隔离: {e}");
+            let _ = crate::fsutil::quarantine_corrupt_file(&path);
+            Err(AppError::Other(format!("下载清单损坏，已隔离原文件: {e}")))
+        }
+    }
 }
 
 /// 写入 manifest（原子写：半截 manifest 会让全部下载记录判损坏丢失）
@@ -384,29 +507,73 @@ fn write_manifest(app: &AppHandle, tracks: &[DownloadedTrack]) -> AppResult<()> 
     Ok(())
 }
 
-fn candidate_download_sidecars(audio_path: &std::path::Path) -> Vec<PathBuf> {
-    let Some(parent) = audio_path.parent() else {
-        return Vec::new();
-    };
-    let Some(stem) = audio_path.file_stem().and_then(|s| s.to_str()) else {
-        return Vec::new();
-    };
+fn manifest_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!(target: "download", "manifest lock was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 
-    [
-        "lrc",
-        "tlrc",
-        "txt",
-        "translated.lrc",
-        "translation.lrc",
-        "jpg",
-        "jpeg",
-        "png",
-        "webp",
-        "gif",
-    ]
-    .into_iter()
-    .map(|suffix| parent.join(format!("{}.{}", stem, suffix)))
-    .collect()
+const DOWNLOAD_SIDECAR_SUFFIXES: [&str; 10] = [
+    "lrc",
+    "tlrc",
+    "txt",
+    "translated.lrc",
+    "translation.lrc",
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+];
+
+fn has_ambiguous_legacy_sidecar(audio_path: &std::path::Path) -> bool {
+    let Some(parent) = audio_path.parent() else {
+        return false;
+    };
+    let Some(stem) = audio_path.file_stem() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path != audio_path
+            && path.is_file()
+            && path.file_stem() == Some(stem)
+            && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+                let lower = ext.to_ascii_lowercase();
+                !DOWNLOAD_SIDECAR_SUFFIXES.iter().any(|suffix| *suffix == lower)
+            })
+    })
+}
+
+fn candidate_download_sidecars(audio_path: &std::path::Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(DOWNLOAD_SIDECAR_SUFFIXES.len() * 2);
+    for suffix in DOWNLOAD_SIDECAR_SUFFIXES {
+        if let Some(path) = download_sidecar_path(audio_path, suffix) {
+            candidates.push(path);
+        }
+    }
+
+    // 旧版本按 stem 写 sidecar。只有目录中不存在同 stem 的其它文件时才删除，
+    // 否则删除一个扩展名可能误删另一个下载仍在使用的旧 sidecar
+    if !has_ambiguous_legacy_sidecar(audio_path) {
+        if let (Some(parent), Some(stem)) = (
+            audio_path.parent(),
+            audio_path.file_stem().and_then(|s| s.to_str()),
+        ) {
+            for suffix in DOWNLOAD_SIDECAR_SUFFIXES {
+                candidates.push(parent.join(format!("{stem}.{suffix}")));
+            }
+        }
+    }
+    candidates
 }
 
 fn remove_download_artifacts(file_path: &str) {
@@ -420,12 +587,30 @@ fn remove_download_artifacts(file_path: &str) {
     let _ = std::fs::remove_file(audio_path);
 }
 
-/// 清扫遗留的 `*.part` 半截下载文件
+/// 清扫遗留的下载标记和半截下载文件
 ///
-/// 只清理最后修改超过 1 小时的：下载中的 .part 由任务自身负责删除，
-/// 且流有 30s 空闲超时——停滞任务会在分钟级内自行失败并清掉自己的
-/// .part；能活过 1 小时的必然是崩溃/断电遗留
-fn sweep_stale_part_files(dirs: impl IntoIterator<Item = PathBuf>) -> usize {
+/// 只清理最后修改超过 1 小时的：活动下载的 .part 和 .reserve 由任务自身负责删除，
+/// 且流有 30s 空闲超时，能活过 1 小时的标记通常是崩溃或断电遗留
+fn marker_is_stale(path: &std::path::Path, stale_after: Duration) -> bool {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age >= stale_after)
+}
+
+fn reserve_has_fresh_part(reserve_path: &std::path::Path, stale_after: Duration) -> bool {
+    let Some(file_name) = reserve_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(audio_name) = file_name.strip_suffix(".reserve") else {
+        return false;
+    };
+    let part_path = reserve_path.with_file_name(format!("{audio_name}.part"));
+    part_path.is_file() && !marker_is_stale(&part_path, stale_after)
+}
+
+fn sweep_stale_download_markers(dirs: impl IntoIterator<Item = PathBuf>) -> usize {
     const STALE_AFTER: Duration = Duration::from_secs(3_600);
     let mut removed = 0_usize;
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -438,16 +623,19 @@ fn sweep_stale_part_files(dirs: impl IntoIterator<Item = PathBuf>) -> usize {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("part") || !path.is_file() {
+            let is_marker = matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("part" | "reserve")
+            );
+            if !is_marker || !path.is_file() {
                 continue;
             }
-            let stale = entry
-                .metadata()
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|time| time.elapsed().ok())
-                .is_some_and(|age| age >= STALE_AFTER);
-            if stale && std::fs::remove_file(&path).is_ok() {
+            let stale = marker_is_stale(&path, STALE_AFTER);
+            // reservation 只在任务启动时写入，长下载中自身会超过阈值。
+            // 只要同名 part 仍在持续写入，就不能把 reservation 当成崩溃残留删掉
+            let active_reservation = path.extension().and_then(|ext| ext.to_str()) == Some("reserve")
+                && reserve_has_fresh_part(&path, STALE_AFTER);
+            if stale && !active_reservation && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
         }
@@ -456,9 +644,10 @@ fn sweep_stale_part_files(dirs: impl IntoIterator<Item = PathBuf>) -> usize {
 }
 
 fn validate_manifest_files(app: &AppHandle) -> AppResult<DownloadManifestValidation> {
+    let _manifest_guard = manifest_lock();
     let manifest = read_manifest(app)?;
 
-    // 顺带清扫崩溃/断电遗留的 .part：默认下载目录 + manifest 涉及的自定义目录
+    // 顺带清扫崩溃或断电遗留的下载标记：默认下载目录加 manifest 涉及的自定义目录
     let mut sweep_dirs: Vec<PathBuf> = manifest
         .iter()
         .filter_map(|track| {
@@ -470,23 +659,30 @@ fn validate_manifest_files(app: &AppHandle) -> AppResult<DownloadManifestValidat
     if let Ok(default_dir) = default_downloads_dir(app) {
         sweep_dirs.push(default_dir);
     }
-    let swept = sweep_stale_part_files(sweep_dirs);
+    let swept = sweep_stale_download_markers(sweep_dirs);
     if swept > 0 {
-        log::info!(target: "download", "swept {} stale .part files", swept);
+        log::info!(target: "download", "swept {} stale download markers", swept);
     }
 
     let mut valid = Vec::with_capacity(manifest.len());
     let mut removed_count = 0_usize;
+    let mut integrity_mismatch_count = 0_usize;
     let mut changed = false;
 
-    for mut track in manifest {
+    for track in manifest {
         let path = std::path::Path::new(&track.file_path);
         if path.is_file() {
             if let Ok(meta) = std::fs::metadata(path) {
                 let actual_size = meta.len();
-                if actual_size > 0 && actual_size != track.file_size {
-                    track.file_size = actual_size;
-                    changed = true;
+                // 大小不一致是检测截断/外部篡改的唯一信号, 不再静默自愈改写 manifest
+                // （会销毁完整性证据, DL-2）; 仅告警, 保留清单记录的期望大小
+                if has_download_size_mismatch(track.file_size, actual_size) {
+                    integrity_mismatch_count += 1;
+                    log::warn!(
+                        target: "download",
+                        "下载文件大小与清单不一致(疑似截断/篡改): path={}, manifest={}, actual={}",
+                        track.file_path, track.file_size, actual_size
+                    );
                 }
             }
             valid.push(track);
@@ -505,6 +701,7 @@ fn validate_manifest_files(app: &AppHandle) -> AppResult<DownloadManifestValidat
     Ok(DownloadManifestValidation {
         tracks: valid,
         removed_count,
+        integrity_mismatch_count,
     })
 }
 
@@ -553,8 +750,14 @@ async fn perform_download(
     download_dir: Option<String>,
     name_template: Option<String>,
 ) -> AppResult<DownloadedTrack> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(AppError::Other("Download cancelled".into()));
+    }
     // 检查是否已下载
-    let existing = read_manifest(&app)?;
+    let existing = {
+        let _manifest_guard = manifest_lock();
+        read_manifest(&app)?
+    };
     if existing.iter().any(|t| t.id == track_id) {
         emit_download_progress(&app, &track_id, "already_exists", None, None, None, None);
         return Err(AppError::Other("Track already downloaded".into()));
@@ -586,6 +789,10 @@ async fn perform_download(
         .send()
         .await?;
 
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(AppError::Other("Download cancelled".into()));
+    }
+
     if !resp.status().is_success() {
         return Err(AppError::Api(format!("HTTP {}", resp.status())));
     }
@@ -602,21 +809,20 @@ async fn perform_download(
 
     // 构造文件名：使用模板
     let base_name =
-        render_download_filename(&title, &artist, &album, &source, name_template.as_deref());
+        render_download_filename(&title, &artist, &album, &source, &track_id, name_template.as_deref());
 
     let dir = downloads_dir(&app, download_dir.as_deref())?;
-    // 同名碰撞：本曲目已下载会在函数入口提前返回，走到这里时目标文件若已
-    // 存在则必属于其它曲目（或历史遗留）——直接覆盖会互删数据、manifest
-    // 双记录指向同一文件。追加 " (2)"/" (3)" 后缀避让
-    let mut file_path = dir.join(format!("{}.{}", base_name, ext));
-    let mut collision_suffix = 2_u32;
-    while file_path.exists() {
-        file_path = dir.join(format!("{} ({}).{}", base_name, collision_suffix, ext));
-        collision_suffix += 1;
-        if collision_suffix > 1_000 {
-            return Err(AppError::Other("Too many filename collisions".into()));
-        }
+    // 每次下载开始顺带清扫目标目录的崩溃遗留 .part 和 .reserve: validate 的 sweep
+    // 集合拿不到前端配置的自定义目录, 自定义目录首次下载即崩溃会残留标记（DL-9）
+    let swept = sweep_stale_download_markers(std::iter::once(dir.clone()));
+    if swept > 0 {
+        log::info!(target: "download", "swept {} stale download markers in target dir", swept);
     }
+    // 同名碰撞：本曲目已下载会在函数入口提前返回，走到这里时目标文件若已
+    // 存在则必属于其它曲目或历史遗留。用独立 .reserve 文件做原子保留，
+    // 避免两个渲染名相同的并发任务选到同一最终名后互相覆盖或争用同一 .part
+    // .reserve 不会成为 rename 目标，兼容 Windows 对目标已存在的限制
+    let (file_path, reserve_path) = reserve_download_path(&dir, &base_name, ext)?;
     // 先写 `<final>.part` 临时文件，完整收尾后才 rename 为最终名：
     // 失败/取消/崩溃只会留下可识别清扫的 .part，不会产生半截"成品"文件
     let part_path = {
@@ -627,7 +833,13 @@ async fn perform_download(
         name.push(".part");
         file_path.with_file_name(name)
     };
-    let mut file = tokio::fs::File::create(&part_path).await?;
+    let mut file = match tokio::fs::File::create(&part_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&reserve_path).await;
+            return Err(AppError::Io(error));
+        }
+    };
 
     let mut stream = resp.bytes_stream();
     emit_download_progress(
@@ -691,6 +903,16 @@ async fn perform_download(
         if file_size == 0 {
             return Err(AppError::Audio("Empty audio data received".into()));
         }
+        // Content-Length 已知且实际字节数不足 => 截断流（HTTP/2 半关、代理提前 EOF、
+        // CDN 改写 CL 等）。删 .part 报错, 不 rename 成品, 对齐 Android isTransferSizeComplete
+        // （DL-1）。音频直链不启用压缩, 正常情况 file_size 应等于 total
+        if let Some(total) = total_bytes {
+            if total > 0 && file_size != total {
+                return Err(AppError::Audio(format!(
+                    "下载文件不完整: 期望 {total} 字节, 实际 {file_size} 字节"
+                )));
+            }
+        }
         Ok(file_size)
     }
     .await;
@@ -701,12 +923,31 @@ async fn perform_download(
         Ok(size) => size,
         Err(error) => {
             let _ = tokio::fs::remove_file(&part_path).await;
+            let _ = tokio::fs::remove_file(&reserve_path).await;
             return Err(error);
         }
     };
+    if cancel_flag.load(Ordering::Relaxed) {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        let _ = tokio::fs::remove_file(&reserve_path).await;
+        return Err(AppError::Other("Download cancelled".into()));
+    }
+    if path_exists_including_broken_symlink(&file_path) {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        let _ = tokio::fs::remove_file(&reserve_path).await;
+        return Err(AppError::Other("下载文件名在传输期间发生冲突".into()));
+    }
+    // 目标文件尚未存在，rename 只提交完整的 .part，不覆盖其它曲目的成品
     if let Err(error) = tokio::fs::rename(&part_path, &file_path).await {
         let _ = tokio::fs::remove_file(&part_path).await;
+        let _ = tokio::fs::remove_file(&reserve_path).await;
         return Err(AppError::Io(error));
+    }
+    let _ = tokio::fs::remove_file(&reserve_path).await;
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        remove_download_artifacts(&file_path.to_string_lossy());
+        return Err(AppError::Other("Download cancelled".into()));
     }
 
     // 下载 sidecar（歌词/翻译歌词/封面），失败不影响主音频
@@ -728,6 +969,11 @@ async fn perform_download(
         );
     }
 
+    if cancel_flag.load(Ordering::Relaxed) {
+        remove_download_artifacts(&file_path.to_string_lossy());
+        return Err(AppError::Other("Download cancelled".into()));
+    }
+
     // 构造记录
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -747,8 +993,17 @@ async fn perform_download(
         downloaded_at: now,
     };
 
+    let _manifest_guard = manifest_lock();
     let mut manifest = read_manifest(&app)?;
+    if cancel_flag.load(Ordering::Relaxed) {
+        remove_download_artifacts(&file_path.to_string_lossy());
+        return Err(AppError::Other("Download cancelled".into()));
+    }
     manifest.push(track.clone());
+    if cancel_flag.load(Ordering::Relaxed) {
+        remove_download_artifacts(&file_path.to_string_lossy());
+        return Err(AppError::Other("Download cancelled".into()));
+    }
     write_manifest(&app, &manifest)?;
 
     emit_download_progress(
@@ -799,6 +1054,9 @@ pub async fn download_track(
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let task_cancel_flag = cancel_flag.clone();
     let handle = tokio::spawn(async move {
+        // 全局并发上限（对齐 Android MAX_DOWNLOAD_PARALLELISM=8）：批量下载时其余任务
+        // 在此排队，避免数百并发流打崩带宽 / 触发平台风控（DL-8）
+        let _permit = download_semaphore().acquire().await;
         let result = perform_download(
             app_handle.clone(),
             client,
@@ -875,6 +1133,7 @@ pub async fn validate_downloads(app: AppHandle) -> AppResult<DownloadManifestVal
 /// 删除已下载的曲目（文件 + manifest 记录）
 #[tauri::command]
 pub async fn delete_download(app: AppHandle, track_id: String) -> AppResult<()> {
+    let _manifest_guard = manifest_lock();
     let mut manifest = read_manifest(&app)?;
 
     // 查找并移除
@@ -1005,29 +1264,105 @@ mod tests {
         assert!(out.is_char_boundary(out.len()));
     }
 
-    /// 超 1 小时的 .part 会被清扫，新鲜 .part 与正常文件保留
+    /// 超 1 小时的下载标记会被清扫，新鲜标记与正常文件保留
     #[test]
-    fn stale_part_files_are_swept_but_fresh_ones_kept() {
+    fn stale_download_markers_are_swept_but_fresh_ones_kept() {
         let dir = std::env::temp_dir().join(format!("neri-part-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stale = dir.join("old.mp3.part");
+        let stale_reserve = dir.join("old.flac.reserve");
         let fresh = dir.join("new.mp3.part");
+        let fresh_reserve = dir.join("new.flac.reserve");
+        let active_reserve = dir.join("active.m4a.reserve");
+        let active_part = dir.join("active.m4a.part");
         let audio = dir.join("keep.mp3");
         std::fs::write(&stale, b"x").unwrap();
+        std::fs::write(&stale_reserve, b"").unwrap();
         std::fs::write(&fresh, b"x").unwrap();
+        std::fs::write(&fresh_reserve, b"").unwrap();
+        std::fs::write(&active_reserve, b"").unwrap();
+        std::fs::write(&active_part, b"x").unwrap();
         std::fs::write(&audio, b"x").unwrap();
         // 把 stale 的 mtime 拨回 2 小时前
         let old_time = std::time::SystemTime::now() - Duration::from_secs(7_200);
         let file = std::fs::OpenOptions::new().write(true).open(&stale).unwrap();
         file.set_modified(old_time).unwrap();
         drop(file);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_reserve)
+            .unwrap();
+        file.set_modified(old_time).unwrap();
+        drop(file);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale_reserve)
+            .unwrap();
+        file.set_modified(old_time).unwrap();
+        drop(file);
 
-        let removed = sweep_stale_part_files([dir.clone()]);
+        let removed = sweep_stale_download_markers([dir.clone()]);
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         assert!(!stale.exists());
+        assert!(!stale_reserve.exists());
         assert!(fresh.exists());
+        assert!(fresh_reserve.exists());
+        assert!(active_reserve.exists());
+        assert!(active_part.exists());
         assert!(audio.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecars_are_scoped_to_full_audio_name_when_stems_collide() {
+        let dir = std::env::temp_dir().join(format!("neri-sidecar-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let m4a = dir.join("Song.m4a");
+        let flac = dir.join("Song.flac");
+        std::fs::write(&m4a, b"audio").unwrap();
+        std::fs::write(&flac, b"audio").unwrap();
+
+        let m4a_sidecars = candidate_download_sidecars(&m4a);
+        assert!(m4a_sidecars.contains(&dir.join("Song.m4a.lrc")));
+        assert!(m4a_sidecars.contains(&dir.join("Song.m4a.jpg")));
+        assert!(!m4a_sidecars.contains(&dir.join("Song.lrc")));
+        assert!(!m4a_sidecars.contains(&dir.join("Song.flac.lrc")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserve_download_path_is_atomic_and_collision_safe() {
+        let dir = std::env::temp_dir().join(format!("neri-reserve-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (first, first_reserve) = reserve_download_path(&dir, "Song", "m4a").unwrap();
+        let (second, second_reserve) = reserve_download_path(&dir, "Song", "m4a").unwrap();
+        assert_eq!(first, dir.join("Song.m4a"));
+        assert_eq!(first_reserve, dir.join("Song.m4a.reserve"));
+        assert_eq!(second, dir.join("Song (2).m4a"));
+        assert_eq!(second_reserve, dir.join("Song (2).m4a.reserve"));
+        assert!(first_reserve.is_file());
+        assert!(second_reserve.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("missing-target", dir.join("Song (3).m4a")).unwrap();
+            let (third, _) = reserve_download_path(&dir, "Song", "m4a").unwrap();
+            assert_eq!(third, dir.join("Song (4).m4a"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_size_mismatch_requires_a_known_expected_size() {
+        assert!(!has_download_size_mismatch(0, 0));
+        assert!(!has_download_size_mismatch(0, 12));
+        assert!(!has_download_size_mismatch(12, 12));
+        assert!(has_download_size_mismatch(12, 11));
+        assert!(has_download_size_mismatch(12, 0));
     }
 }

@@ -4,6 +4,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { TrackInfo } from '@/stores/player'
 import { useRecommendStore } from '@/stores/recommend'
+import { useToastStore } from '@/stores/toast'
+import i18n from '@/i18n'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('liked-songs')
@@ -135,7 +137,24 @@ export const useLikedSongsStore = defineStore('likedSongs', () => {
         setTrackLiked(track.id, false)
       }
       if (neteaseSongId !== null) {
-        useRecommendStore().toggleLikeSong(neteaseSongId, shouldLike).catch(() => {})
+        // 网易云端红心上报失败（会话失效/业务码非 200）不能静默：本地已收藏但云端未同步，
+        // 两端红心会无提示地漂移，明确提示用户（CL-2）
+        useRecommendStore()
+          .toggleLikeSong(neteaseSongId, shouldLike)
+          .then((ok) => {
+            if (!ok) {
+              useToastStore().show(
+                (i18n.global as any).t('player.like_cloud_sync_failed'),
+                'info',
+              )
+            }
+          })
+          .catch(() => {
+            useToastStore().show(
+              (i18n.global as any).t('player.like_cloud_sync_failed'),
+              'info',
+            )
+          })
       }
       return true
     } catch (e) {

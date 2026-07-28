@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 
 const props = withDefaults(defineProps<{
   progress: number
@@ -31,6 +31,7 @@ let phase = 0
 let currentAmp = 0
 let animFrame = 0
 let lastTime = 0
+let looping = false
 
 let pathActive: SVGPathElement | null = null
 let pathInactive: SVGPathElement | null = null
@@ -77,6 +78,20 @@ function animate(timestamp: number) {
     thumbDiv.style.width = thumbDiv.style.height = isDragging.value ? '12px' : '8px'
   }
 
+  // 空闲停表：波幅已归零且目标为 0（暂停/静止）时不再逐帧重建两条 SVG path，
+  // 省 CPU/电；进度或播放态变化时由 watch 重启（MK-03）
+  if (currentAmp === 0 && targetAmp === 0) {
+    looping = false
+    lastTime = 0
+    return
+  }
+  animFrame = requestAnimationFrame(animate)
+}
+
+function startLoop() {
+  if (looping) return
+  looping = true
+  lastTime = 0
   animFrame = requestAnimationFrame(animate)
 }
 
@@ -85,8 +100,13 @@ onMounted(() => {
   pathInactive = svg.querySelector('.wave-inactive')
   pathActive = svg.querySelector('.wave-active')
   thumbDiv = containerRef.value!.querySelector('.thumb') as HTMLDivElement
-  animFrame = requestAnimationFrame(animate)
+  startLoop()
 })
+
+// 播放态/拖拽/进度变化时重启渲染循环（停表后需要更新一帧位置或恢复波动）
+watch(() => props.isPlaying, startLoop)
+watch(isDragging, startLoop)
+watch(currentProgress, startLoop)
 onUnmounted(() => {
   cancelAnimationFrame(animFrame)
   // 拖拽中被重建（切歌时按 key 重建）时兜底复位；pointer capture 随元素销毁自动释放

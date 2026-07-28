@@ -46,6 +46,7 @@ export function isEditableTarget(target: EventTarget | null): boolean {
   if (tag === 'TEXTAREA' || tag === 'SELECT') return true
   if (tag !== 'INPUT') return false
   const type = (target as HTMLInputElement).type
-  // 这些 input 自己不消费方向键/空格，可以放行给全局快捷键
-  return !['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color'].includes(type)
+  // range 原生依赖方向键调值，必须视为可输入目标，否则全局方向键快捷键会劫持所有
+  // 滑条（设置页音量/淡入淡出/模糊等 12+ 个滑条无法键盘调节，UI-003）
+  return !['checkbox', 'radio', 'button', 'submit', 'reset', 'color'].includes(type)
 }

@@ -90,6 +90,7 @@
     "scan_local_music": "ローカル音楽フォルダをスキャン",
     "scanning": "ローカル音楽をスキャン中...",
     "scan_success": "スキャン完了、{count} 曲を取り込みました",
+    "scan_partial": "スキャン完了：{count} 曲取り込み、{failed} 曲失敗",
     "scan_failed": "ローカル音楽のスキャンに失敗しました",
     "playlist_name_placeholder": "プレイリスト名を入力",
     "liked_songs": "お気に入りの曲",
@@ -176,6 +177,7 @@
     "cancelled_count": "{count} 件のダウンロードキャンセルを要求しました",
     "already_exists": "この曲はすでにダウンロード済みです",
     "missing_cleaned": "無効なダウンロード記録を {count} 件クリーンアップしました",
+    "integrity_mismatch": "ダウンロードファイル {count} 件のサイズが記録と一致しません。再ダウンロードしてください",
     "redownload": "再ダウンロード",
     "redownload_desc": "ローカルファイルを削除して再ダウンロード",
     "download_desc": "曲をローカルに保存",
@@ -208,7 +210,8 @@
     "empty_title": "ダウンロードはまだありません",
     "empty_desc": "再生ページのその他メニューから曲をローカルに保存できます",
     "delete_confirm_msg": "「{name}」を削除しますか？この操作は元に戻せません。",
-    "not_downloaded": "未ダウンロード"
+    "not_downloaded": "未ダウンロード",
+    "dir_fallback": "選択したダウンロードフォルダが利用できないため、既定の場所に保存しました"
   },
   "player": {
     "not_playing": "再生停止中",
@@ -226,6 +229,8 @@
     "video_count": "{count} 本の動画",
     "loading": "読み込み中...",
     "load_failed": "読み込みに失敗",
+    "too_many_failures": "再生の失敗が続いたため停止しました",
+    "like_cloud_sync_failed": "ローカルでお気に入り登録しましたが、クラウド同期に失敗しました",
     "retry": "再試行",
     "empty_playlist": "プレイリストが空です",
     "queue": "再生キュー",
@@ -473,6 +478,7 @@
     "audio_quality_desc": "展開して音質を設定",
     "quality": "音質",
     "netease_quality": "網易雲音質",
+    "qq_quality": "QQ ミュージック音質",
     "youtube_quality": "YouTube 音質",
     "bili_quality": "ビリビリ音質",
     "q_standard": "標準",
@@ -508,6 +514,7 @@
     "logs_title": "ログ",
     "log_to_file": "ログをファイルに書き込む",
     "log_to_file_desc": "問題報告に役立つよう、実行ログをローカルファイルに保存します",
+    "log_to_file_restart_hint": "ログファイル設定はアプリの再起動後に有効になります",
     "log_level": "ログレベル",
     "log_level_desc": "記録する詳細度を制御します",
     "log_level_off": "オフ",
@@ -835,7 +842,10 @@
     "reset_identity_confirm_desc": "新しい UUID を生成します。ニックネームは保持されますが、参加中のルーム接続は無効になります。",
     "identity_reset": "IDがリセットされました",
     "reset_btn": "リセット",
-    "control_rejected": "サーバーが操作を拒否しました"
+    "control_rejected": "サーバーが操作を拒否しました",
+    "control_not_sent": "操作を送信できませんでした（接続が切断されました）",
+    "invalid_room_id": "ルームコードが無効です（6 文字の英数字）",
+    "invalid_nickname": "ニックネームは英数字と漢字のみ使用できます（最大 24 文字）"
   },
   "shortcuts": {
     "title": "キーボードショートカット",

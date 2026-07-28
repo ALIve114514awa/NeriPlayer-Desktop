@@ -241,6 +241,15 @@ function inferTrackSource(track: TrackInfo) {
   return 'local'
 }
 
+// 扫描时封面路径经 convertFileSrc 转成 asset URL, 直接落盘会把 webview 专用 URL 写进
+// playlists.json, 协议格式变更/数据迁移后封面失效（SC-12）。持久化前反解回原始路径
+function assetUrlToLocalPath(value?: string | null): string {
+  if (!value) return ''
+  const m = value.match(/^(?:asset:\/\/localhost\/|https?:\/\/asset\.localhost\/)(.+)$/i)
+  if (!m) return value
+  try { return decodeURIComponent(m[1]) } catch { return value }
+}
+
 function toBackendTrack(track: TrackInfo) {
   return {
     id: track.id,
@@ -250,7 +259,7 @@ function toBackendTrack(track: TrackInfo) {
     duration_ms: track.durationMs || 0,
     source: inferTrackSource(track),
     url: track.audioUrl || '',
-    cover_url: track.coverUrl || null,
+    cover_url: assetUrlToLocalPath(track.coverUrl) || null,
     added_at: Math.max(0, Math.round(track.addedAt || 0)),
     sync_payload: track.syncPayload ?? null,
     playlist_key: track.playlistKey ?? null,
@@ -440,25 +449,38 @@ async function ensureLocalPlaylistId(): Promise<number> {
   return created.id
 }
 
-async function syncScannedTracksToLocalPlaylist(scannedTracks: TrackInfo[]) {
+async function syncScannedTracksToLocalPlaylist(
+  scannedTracks: TrackInfo[],
+  allowRemovals = true,
+) {
   const localPlaylistId = await ensureLocalPlaylistId()
 
   const existingTracks = await invoke<any[]>('get_playlist_tracks', { id: localPlaylistId })
-  const existingIds = (existingTracks || [])
-    .map((track: any) => String(track?.id || ''))
-    .filter(Boolean)
+  const existingIds = new Set(
+    (existingTracks || [])
+      .map((track: any) => String(track?.id || ''))
+      .filter(Boolean),
+  )
+  const scannedIds = new Set(scannedTracks.map(t => t.id).filter(Boolean))
 
-  if (existingIds.length > 0) {
+  // 差量同步（SC-8）: 只移除本次扫描已消失的曲目, 只新增未入库的曲目; 仍存在的
+  // 曲目保持 added_at 与自定义顺序不变, 避免每次重扫排序归零、本地删除墓碑 token
+  // 无界累积（旧逻辑 remove-all/add-all 会重置 added_at 并给每首歌新增墓碑 token）
+  const removedIds = allowRemovals
+    ? [...existingIds].filter(id => !scannedIds.has(id))
+    : []
+  if (removedIds.length > 0) {
     await invoke('remove_tracks_from_playlist', {
       playlistId: localPlaylistId,
-      trackIds: existingIds,
+      trackIds: removedIds,
     })
   }
 
-  if (scannedTracks.length > 0) {
+  const newTracks = scannedTracks.filter(t => t.id && !existingIds.has(t.id))
+  if (newTracks.length > 0) {
     await invoke('add_tracks_to_playlist', {
       playlistId: localPlaylistId,
-      tracks: scannedTracks.map(toBackendTrack),
+      tracks: newTracks.map(toBackendTrack),
     })
   }
 
@@ -481,8 +503,14 @@ async function selectAndScanLocalMusic() {
       return
     }
 
-    await syncScannedTracksToLocalPlaylist(library.tracks)
-    toast.success(t('library.scan_success', { count: library.tracks.length }))
+    // 部分扫描失败时无法区分“文件已删除”和“目录暂时不可读”，只新增成功项，
+    // 保留旧曲目直到下一次完整扫描（SC-1）
+    await syncScannedTracksToLocalPlaylist(library.tracks, library.scanSkipped.length === 0)
+    if (library.scanSkipped.length > 0) {
+      toast.show(t('library.scan_partial', { count: library.tracks.length, failed: library.scanSkipped.length }), 'info')
+    } else {
+      toast.success(t('library.scan_success', { count: library.tracks.length }))
+    }
   } catch (e) {
     log.error('Scan local music failed:', e)
     toast.error(t('library.scan_failed'))

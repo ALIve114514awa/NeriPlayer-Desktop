@@ -146,13 +146,6 @@ function searchResultToTrack(s: HomeRecommendationSong): TrackInfo {
   }
 }
 
-function formatDuration(ms: number): string {
-  const totalSeconds = Math.floor(Math.max(0, ms) / 1000)
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`
-}
-
 async function handleQuickAction(action: string) {
   if (action === 'local') {
     router.push({ name: 'library', query: { tab: 'local' } })

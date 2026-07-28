@@ -90,6 +90,7 @@
     "scan_local_music": "掃描本機音樂資料夾",
     "scanning": "正在掃描本機音樂...",
     "scan_success": "掃描完成，共匯入 {count} 首",
+    "scan_partial": "掃描完成：匯入 {count} 首，{failed} 首失敗",
     "scan_failed": "掃描本機音樂失敗",
     "playlist_name_placeholder": "輸入播放清單名稱",
     "liked_songs": "我喜歡的音樂",
@@ -176,6 +177,7 @@
     "cancelled_count": "已請求取消 {count} 個下載任務",
     "already_exists": "該歌曲已下載",
     "missing_cleaned": "已清理 {count} 條失效下載記錄",
+    "integrity_mismatch": "偵測到 {count} 個下載檔案大小與清單不一致，請重新下載",
     "redownload": "重新下載",
     "redownload_desc": "刪除本地檔案並重新下載",
     "download_desc": "儲存歌曲到本地",
@@ -208,7 +210,8 @@
     "empty_title": "暫無下載",
     "empty_desc": "在播放頁的更多選單裡將歌曲儲存到本地",
     "delete_confirm_msg": "確定要刪除「{name}」嗎？此操作無法復原。",
-    "not_downloaded": "未下載"
+    "not_downloaded": "未下載",
+    "dir_fallback": "所選下載目錄不可用，已儲存到預設位置"
   },
   "player": {
     "not_playing": "未在播放",
@@ -226,6 +229,8 @@
     "video_count": "{count} 個影片",
     "loading": "載入中...",
     "load_failed": "載入失敗",
+    "too_many_failures": "連續播放失敗過多，已停止",
+    "like_cloud_sync_failed": "已在本機收藏，但雲端同步失敗",
     "retry": "重試",
     "empty_playlist": "歌單為空",
     "queue": "播放佇列",
@@ -473,6 +478,7 @@
     "audio_quality_desc": "展開以設定音質選項",
     "quality": "音質",
     "netease_quality": "網易雲音質",
+    "qq_quality": "QQ 音樂音質",
     "youtube_quality": "YouTube 音質",
     "bili_quality": "嗶哩嗶哩音質",
     "q_standard": "標準",
@@ -508,6 +514,7 @@
     "logs_title": "日誌",
     "log_to_file": "寫入日誌檔案",
     "log_to_file_desc": "將執行日誌儲存到本機檔案，方便回報問題",
+    "log_to_file_restart_hint": "日誌檔案開關將在重啟應用後生效",
     "log_level": "日誌等級",
     "log_level_desc": "控制記錄的詳細程度",
     "log_level_off": "關閉",
@@ -835,7 +842,10 @@
     "reset_identity_confirm_desc": "重置後會產生新的 UUID，目前暱稱不會被清除，已加入的房間連線也會失效。",
     "identity_reset": "身份已重置",
     "reset_btn": "重置",
-    "control_rejected": "控制被伺服器拒絕"
+    "control_rejected": "控制被伺服器拒絕",
+    "control_not_sent": "控制未能傳送（連線已中斷）",
+    "invalid_room_id": "房間號無效（6 位字母數字）",
+    "invalid_nickname": "暱稱只能包含字母、數字與漢字（最多 24 個字元）"
   },
   "shortcuts": {
     "title": "鍵盤快速鍵",

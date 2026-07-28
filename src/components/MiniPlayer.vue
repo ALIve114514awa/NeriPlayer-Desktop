@@ -273,30 +273,32 @@ defineExpose({
           <button class="mp-tool-btn" :class="{ active: showVolumeSlider }" @click="showVolumeSlider = !showVolumeSlider">
             <span class="material-symbols-rounded">{{ volumeIcon }}</span>
           </button>
-          <div v-if="showVolumeSlider" class="mp-volume-popover">
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.01"
-              :value="player.volume"
-              class="mp-volume-slider"
-              @input="player.setVolume(parseFloat(($event.target as HTMLInputElement).value))"
-            />
-            <EditableRangeValue
-              :model-value="player.volume"
-              class="mp-volume-label"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :input-scale="100"
-              :input-width="32"
-              :display-value="`${volumePercent}%`"
-              input-suffix="%"
-              :aria-label="t('player.volume')"
-              @update:model-value="player.setVolume($event)"
-            />
-          </div>
+          <Transition name="mp-popover">
+            <div v-if="showVolumeSlider" class="mp-volume-popover">
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                :value="player.volume"
+                class="mp-volume-slider"
+                @input="player.setVolume(parseFloat(($event.target as HTMLInputElement).value))"
+              />
+              <EditableRangeValue
+                :model-value="player.volume"
+                class="mp-volume-label"
+                :min="0"
+                :max="1"
+                :step="0.01"
+                :input-scale="100"
+                :input-width="32"
+                :display-value="`${volumePercent}%`"
+                input-suffix="%"
+                :aria-label="t('player.volume')"
+                @update:model-value="player.setVolume($event)"
+              />
+            </div>
+          </Transition>
         </div>
         <button
           class="mp-tool-btn"
@@ -626,6 +628,18 @@ defineExpose({
   display: flex;
   flex-direction: column;
   align-items: center;
+}
+
+/* 音量弹层进出场过渡（保留 translateX(-50%) 居中，只叠加纵向位移与缩放） */
+.mp-popover-enter-from,
+.mp-popover-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(8px) scale(0.96);
+}
+
+.mp-popover-enter-active,
+.mp-popover-leave-active {
+  transition: opacity 140ms var(--ease-decelerate), transform 140ms var(--ease-decelerate);
 }
 
 .mp-volume-slider {

@@ -90,6 +90,7 @@
     "scan_local_music": "Scan local music folder",
     "scanning": "Scanning local music...",
     "scan_success": "Scan complete, imported {count} tracks",
+    "scan_partial": "Scan done: {count} imported, {failed} failed",
     "scan_failed": "Failed to scan local music",
     "playlist_name_placeholder": "Enter playlist name",
     "liked_songs": "Liked Songs",
@@ -176,6 +177,7 @@
     "cancelled_count": "Requested cancellation for {count} download task(s)",
     "already_exists": "This track is already downloaded",
     "missing_cleaned": "Cleaned {count} missing download record(s)",
+    "integrity_mismatch": "{count} downloaded file(s) differ from the manifest size; redownload them",
     "redownload": "Redownload",
     "redownload_desc": "Delete the local file and download again",
     "download_desc": "Save this track locally",
@@ -208,7 +210,8 @@
     "empty_title": "No downloads yet",
     "empty_desc": "Save tracks locally from the more menu on the playback page",
     "delete_confirm_msg": "Delete \"{name}\"? This cannot be undone.",
-    "not_downloaded": "Not downloaded"
+    "not_downloaded": "Not downloaded",
+    "dir_fallback": "Selected download folder unavailable, saved to default location"
   },
   "player": {
     "not_playing": "Not Playing",
@@ -226,6 +229,8 @@
     "video_count": "{count} videos",
     "loading": "Loading...",
     "load_failed": "Failed to load",
+    "too_many_failures": "Too many playback failures, stopped",
+    "like_cloud_sync_failed": "Liked locally, but cloud sync failed",
     "retry": "Retry",
     "empty_playlist": "Empty playlist",
     "queue": "Queue",
@@ -433,7 +438,7 @@
     "lyric_font_size": "Lyrics Font Size",
     "playback": "Playback Settings",
     "nav_playback_desc": "Expand to configure playback behavior",
-    "crossfade": "Gapless Playback",
+    "crossfade": "Crossfade",
     "crossfade_desc": "Fade between tracks",
     "normalize": "Volume Normalization",
     "normalize_desc": "Auto-adjust volume across tracks",
@@ -473,6 +478,7 @@
     "audio_quality_desc": "Expand to configure audio quality",
     "quality": "Audio Quality",
     "netease_quality": "Netease Quality",
+    "qq_quality": "QQ Music Quality",
     "youtube_quality": "YouTube Quality",
     "bili_quality": "Bilibili Quality",
     "q_standard": "Standard",
@@ -508,6 +514,7 @@
     "logs_title": "Logs",
     "log_to_file": "Write logs to file",
     "log_to_file_desc": "Save runtime logs to a local file to help report issues",
+    "log_to_file_restart_hint": "Log file setting takes effect after restarting the app",
     "log_level": "Log level",
     "log_level_desc": "Control how much detail is recorded",
     "log_level_off": "Off",
@@ -835,7 +842,10 @@
     "reset_identity_confirm_desc": "A new UUID will be generated. Your nickname will stay unchanged, but existing room connections will expire.",
     "identity_reset": "Identity reset",
     "reset_btn": "Reset",
-    "control_rejected": "The server rejected this control"
+    "control_rejected": "The server rejected this control",
+    "control_not_sent": "The control could not be sent (connection lost)",
+    "invalid_room_id": "Invalid room code (6 characters, letters and digits)",
+    "invalid_nickname": "Nickname may only contain letters, digits, and Chinese characters (max 24)"
   },
   "shortcuts": {
     "title": "Keyboard shortcuts",

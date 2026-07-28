@@ -30,7 +30,10 @@ const totalDurationMs = computed(() =>
 function formatTotal(ms: number): string {
   const minutes = Math.floor(Math.max(0, ms) / 60_000)
   const hours = Math.floor(minutes / 60)
-  return hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`
+  // 使用本地化时长单位（对齐 LocalPlaylistView），避免中日文界面显示 '3h 12m'
+  return hours > 0
+    ? `${hours}${t('common.hour_short')} ${minutes % 60}${t('common.minute_short')}`
+    : `${minutes}${t('common.minute_short')}`
 }
 
 async function load() {

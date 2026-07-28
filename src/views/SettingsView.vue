@@ -4,7 +4,7 @@ import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { SUPPORTED_LOCALES, setLocaleWithTransition } from '@/i18n'
-import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
@@ -55,7 +55,7 @@ const {
   cloudMusicOffset, qqMusicOffset,
   advancedLyrics, dynamicBackground, dynamicColor, audioReactive,
   coverBlurBg, coverBlurAmount, coverBlurDarken,
-  neteaseQuality, youtubeQuality, biliQuality,
+  neteaseQuality, qqMusicQuality, youtubeQuality, biliQuality,
   bypassProxy, internationalizationEnabled,
   backgroundImageUri, backgroundImageBlur, backgroundImageAlpha,
   devModeEnabled, logToFile, logLevel,
@@ -83,7 +83,9 @@ const logLevelOptions = computed<Array<{ value: string; label: string }>>(() => 
 async function openLogDir() {
   try {
     const dir = await invoke<string>('get_log_dir')
-    await revealItemInDir(dir)
+    // 走后端 reveal_in_file_manager，避免依赖 opener:allow-reveal-item-in-dir 权限
+    // （capability 只授了 opener:allow-open-url，revealItemInDir 会被 ACL 拒绝）
+    await invoke('reveal_in_file_manager', { path: dir })
   } catch (error) {
     log.error('failed to open log dir:', error)
     toast.error(t('settings.open_log_dir_failed'))
@@ -141,6 +143,21 @@ const activeColorKey = ref(selectedColor.value || getSavedThemeColor())
 watch(selectedColor, value => {
   activeColorKey.value = value
 })
+
+// 动态背景与封面模糊互斥（对齐 Android effectiveDynamicBackgroundEnabled = dynamic && !coverBlur）:
+// 启用一方即关闭另一方，避免 coverBlurBg 残留导致动态背景开关看似失效
+watch(dynamicBackground, on => {
+  if (on && coverBlurBg.value) coverBlurBg.value = false
+})
+watch(coverBlurBg, on => {
+  if (on && dynamicBackground.value) dynamicBackground.value = false
+})
+
+// 文件日志开关仅在下次启动生效（受插件限制）：用户切换时提示需重启。
+// 用 @change 而非 watch，避免启动 hydrate 时误触发提示
+function onLogToFileChange() {
+  toast.show(t('settings.log_to_file_restart_hint'), 'info')
+}
 
 // 头像地址可能短暂失效，记录具体失败地址，换地址后仍允许重新加载
 const failedAvatarUrls = ref<Record<string, string | null>>({})
@@ -223,6 +240,12 @@ const neteaseQualityOptions = computed(() => [
   { value: 'jymaster', label: t('settings.q_master') },
 ])
 
+const qqQualityOptions = computed(() => [
+  { value: 'standard', label: t('settings.q_standard') },
+  { value: 'high', label: t('settings.q_high') },
+  { value: 'lossless', label: t('settings.q_lossless') },
+])
+
 const youtubeQualityOptions = computed(() => [
   { value: 'low', label: t('settings.q_low') },
   { value: 'medium', label: t('settings.q_medium') },
@@ -239,17 +262,19 @@ const biliQualityOptions = computed(() => [
   { value: 'dolby', label: t('settings.q_dolby') },
 ])
 
-type OnlineQualitySource = 'netease' | 'youtube' | 'bilibili'
+type OnlineQualitySource = 'netease' | 'qq' | 'youtube' | 'bilibili'
 const qualitySwitching = ref(false)
 
 function qualityForSource(source: OnlineQualitySource): string {
   if (source === 'netease') return neteaseQuality.value
+  if (source === 'qq') return qqMusicQuality.value
   if (source === 'youtube') return youtubeQuality.value
   return biliQuality.value
 }
 
 function setQualityForSource(source: OnlineQualitySource, value: string) {
   if (source === 'netease') neteaseQuality.value = value
+  else if (source === 'qq') qqMusicQuality.value = value
   else if (source === 'youtube') youtubeQuality.value = value
   else biliQuality.value = value
 }
@@ -1362,7 +1387,9 @@ function confirmDataSaverChange() {
         <label class="m3-switch"><input type="checkbox" v-model="fadeIn" /><span class="track"><span class="thumb"><span v-if="fadeIn" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
       </div>
 
-      <template v-if="fadeIn">
+      <!-- crossfade（无缝切换）在 crossfadeNext 关闭时复用淡入/淡出时长做 overlap，
+           因此 crossfade 开启时也须展示这两个滑杆，否则时长被隐藏且固定为默认（ST-08） -->
+      <template v-if="fadeIn || crossfade">
         <div class="setting-card sub-card">
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.fade_in_duration') }}</div>
@@ -1757,7 +1784,7 @@ function confirmDataSaverChange() {
         <label class="m3-switch"><input type="checkbox" v-model="audioReactive" /><span class="track"><span class="thumb"><span v-if="audioReactive" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
       </div>
 
-      <div v-if="!dynamicBackground" class="setting-card">
+      <div class="setting-card">
         <div class="setting-icon-wrap"><span class="material-symbols-rounded">blur_circular</span></div>
         <div class="setting-info">
           <div class="setting-title">{{ t('settings.cover_blur') }}</div>
@@ -1766,7 +1793,7 @@ function confirmDataSaverChange() {
         <label class="m3-switch"><input type="checkbox" v-model="coverBlurBg" /><span class="track"><span class="thumb"><span v-if="coverBlurBg" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
       </div>
 
-      <template v-if="!dynamicBackground && coverBlurBg">
+      <template v-if="coverBlurBg">
         <div class="setting-card sub-card">
           <div class="setting-info">
             <div class="setting-title">{{ t('settings.blur_amount') }}</div>
@@ -1818,6 +1845,16 @@ function confirmDataSaverChange() {
           <div class="setting-title">{{ t('settings.netease_quality') }}</div>
           <div class="chip-wrap">
             <button v-for="o in neteaseQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: neteaseQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('netease', o.value)">{{ o.label }}</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting-card quality-card">
+        <div class="setting-icon-wrap"><span class="material-symbols-rounded">library_music</span></div>
+        <div class="setting-info">
+          <div class="setting-title">{{ t('settings.qq_quality') }}</div>
+          <div class="chip-wrap">
+            <button v-for="o in qqQualityOptions" :key="o.value" class="m3-chip sm" :class="{ active: qqMusicQuality === o.value }" :disabled="qualitySwitching" @click="handleQualityChange('qq', o.value)">{{ o.label }}</button>
           </div>
         </div>
       </div>
@@ -1919,7 +1956,7 @@ function confirmDataSaverChange() {
           <div class="setting-title">{{ t('settings.log_to_file') }}</div>
           <div class="setting-desc">{{ t('settings.log_to_file_desc') }}</div>
         </div>
-        <label class="m3-switch"><input type="checkbox" v-model="logToFile" /><span class="track"><span class="thumb"><span v-if="logToFile" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
+        <label class="m3-switch"><input type="checkbox" v-model="logToFile" @change="onLogToFileChange" /><span class="track"><span class="thumb"><span v-if="logToFile" class="material-symbols-rounded" style="font-size: 14px">check</span></span></span></label>
       </div>
 
       <div class="setting-card">

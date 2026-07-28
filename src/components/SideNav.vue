@@ -35,7 +35,12 @@ const activeSection = computed(() => (route.meta.section as string) ?? route.nam
         :key="item.path"
         class="nav-item"
         :class="{ active: activeSection === item.section }"
+        role="link"
+        tabindex="0"
+        :aria-current="activeSection === item.section ? 'page' : undefined"
         @click="router.push(item.path)"
+        @keydown.enter="router.push(item.path)"
+        @keydown.space.prevent="router.push(item.path)"
       >
         <div class="nav-pill">
           <span class="material-symbols-rounded" :class="{ filled: activeSection === item.section }">

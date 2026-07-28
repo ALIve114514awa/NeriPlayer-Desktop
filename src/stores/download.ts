@@ -7,6 +7,10 @@ import { useSettingsStore } from './settings'
 import { useToastStore } from './toast'
 import i18n from '@/i18n'
 import { createLogger } from '@/utils/logger'
+import {
+  consumeResolvingCancellation,
+  markResolvingTasksCancelled,
+} from '@/modules/download/downloadCancellation'
 
 const log = createLogger('download')
 
@@ -27,6 +31,8 @@ interface DownloadValidationResult {
   tracks: any[]
   removed_count?: number
   removedCount?: number
+  integrity_mismatch_count?: number
+  integrityMismatchCount?: number
 }
 
 export interface ActiveDownloadTask {
@@ -46,14 +52,38 @@ export const useDownloadStore = defineStore('download', () => {
   const downloading = ref<Map<string, ActiveDownloadTask>>(new Map())
   const activeDownloads = computed(() => Array.from(downloading.value.values()))
 
+  // resolving 阶段的请求 token 集合，后端尚无任务时先在前端取消（DL-7）
+  const resolvingCancelled = new Set<string>()
+  let resolvingTokenSequence = 0
+  const resolvingRequestTokens = new Map<string, string>()
+
   let eventsInitialized = false
+  let eventsGeneration = 0
   const terminalCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  let unlistenProgress: (() => void) | null = null
+  let unlistenDirFallback: (() => void) | null = null
 
   function initEvents() {
     if (eventsInitialized) return
     eventsInitialized = true
+    const generation = ++eventsGeneration
 
-    listen<{ trackId: string; status: string; fileSize?: number; message?: string; downloadedBytes?: number; totalBytes?: number }>(
+    // 保存 UnlistenFn 并在 HMR dispose 时反注册, 避免 dev 下模块热重载重复挂监听
+    // 导致重复 toast / 重复 loadDownloads（DL-13）
+    if (import.meta.hot) {
+      import.meta.hot.dispose(() => {
+        if (eventsGeneration !== generation) return
+        eventsInitialized = false
+        eventsGeneration += 1
+        unlistenProgress?.()
+        unlistenDirFallback?.()
+        unlistenProgress = null
+        unlistenDirFallback = null
+      })
+    }
+
+    const progressListening = listen<{ trackId: string; status: string; fileSize?: number; message?: string; downloadedBytes?: number; totalBytes?: number }>(
       'download-progress',
       (e) => {
         const { trackId, status, message, downloadedBytes, totalBytes } = e.payload
@@ -105,6 +135,30 @@ export const useDownloadStore = defineStore('download', () => {
         }
       },
     )
+    void progressListening
+      .then((un) => {
+        if (eventsGeneration === generation && eventsInitialized) {
+          unlistenProgress = un
+        } else {
+          un()
+        }
+      })
+      .catch((error) => log.error('Register download progress listener failed:', error))
+
+    // 自定义下载目录不可用回退默认目录时提示用户（DL-11），避免以为文件落在所选目录
+    const fallbackListening = listen<{ requestedDir: string }>('download-dir-fallback', () => {
+      const toast = useToastStore()
+      toast.show((i18n.global as any).t('download.dir_fallback'), 'info')
+    })
+    void fallbackListening
+      .then((un) => {
+        if (eventsGeneration === generation && eventsInitialized) {
+          unlistenDirFallback = un
+        } else {
+          un()
+        }
+      })
+      .catch((error) => log.error('Register download fallback listener failed:', error))
   }
 
   function clearTerminalCleanup(trackId: string) {
@@ -184,6 +238,16 @@ export const useDownloadStore = defineStore('download', () => {
         const toast = useToastStore()
         toast.show((i18n.global as any).t('download.missing_cleaned', { count: removedCount }), 'info')
       }
+      const mismatchCount = result.integrity_mismatch_count
+        ?? result.integrityMismatchCount
+        ?? 0
+      if (mismatchCount > 0) {
+        const toast = useToastStore()
+        toast.show(
+          (i18n.global as any).t('download.integrity_mismatch', { count: mismatchCount }),
+          'info',
+        )
+      }
     } catch (e) {
       log.error('Load downloads failed:', e)
     }
@@ -215,6 +279,8 @@ export const useDownloadStore = defineStore('download', () => {
           ? 'youtube'
           : 'local'
 
+    const requestToken = `${track.id}:${++resolvingTokenSequence}`
+    resolvingRequestTokens.set(track.id, requestToken)
     downloading.value = new Map(downloading.value.set(track.id, {
       trackId: track.id,
       title: track.title,
@@ -266,6 +332,20 @@ export const useDownloadStore = defineStore('download', () => {
       } else {
         // 本地文件无需下载
         toast.error((i18n.global as any).t('player.not_available'))
+        if (resolvingRequestTokens.get(track.id) === requestToken) {
+          resolvingRequestTokens.delete(track.id)
+        }
+        resolvingCancelled.delete(requestToken)
+        downloading.value.delete(track.id)
+        downloading.value = new Map(downloading.value)
+        return
+      }
+
+      // 解析期间被取消则不再启动后端下载（DL-7）
+      if (consumeResolvingCancellation(resolvingCancelled, requestToken)) {
+        if (resolvingRequestTokens.get(track.id) === requestToken) {
+          resolvingRequestTokens.delete(track.id)
+        }
         downloading.value.delete(track.id)
         downloading.value = new Map(downloading.value)
         return
@@ -284,10 +364,27 @@ export const useDownloadStore = defineStore('download', () => {
         downloadDir: useSettingsStore().downloadDir || null,
         nameTemplate: useSettingsStore().downloadNameTemplate || null,
       })
+
+      // 取消可能与启动命令并发发生，命令返回后再消费一次 token，
+      // 确保后端任务已注册后仍能收到取消请求
+      if (consumeResolvingCancellation(resolvingCancelled, requestToken)) {
+        try {
+          await invoke('cancel_download', { trackId: track.id })
+        } catch (cancelError) {
+          log.error('Cancel download after launch failed:', cancelError)
+        }
+      }
+      if (resolvingRequestTokens.get(track.id) === requestToken) {
+        resolvingRequestTokens.delete(track.id)
+      }
     } catch (e: any) {
       log.error('Download failed:', e)
       downloading.value.delete(track.id)
       downloading.value = new Map(downloading.value)
+      if (resolvingRequestTokens.get(track.id) === requestToken) {
+        resolvingRequestTokens.delete(track.id)
+      }
+      resolvingCancelled.delete(requestToken)
       const msg = typeof e === 'string' ? e : e?.message || String(e)
       const lowerMsg = msg.toLowerCase()
       if (!msg.includes('already downloaded') && !lowerMsg.includes('cancelled') && !lowerMsg.includes('canceled')) {
@@ -331,6 +428,7 @@ export const useDownloadStore = defineStore('download', () => {
 
   async function cancelDownload(trackId: string) {
     const current = downloading.value.get(trackId)
+    const resolvingToken = resolvingRequestTokens.get(trackId)
     if (current?.status === 'cancelling') return true
 
     try {
@@ -339,6 +437,17 @@ export const useDownloadStore = defineStore('download', () => {
       }
       const cancelled = await invoke<boolean>('cancel_download', { trackId })
       if (cancelled) {
+        return true
+      }
+      // 后端查无任务：任务仍处于 resolving 阶段（URL 解析中）。标记取消，
+      // 待解析完成时跳过后端下载，而不是误报取消失败（DL-7）
+      if (
+        current?.status === 'resolving'
+        && resolvingToken
+        && resolvingRequestTokens.get(trackId) === resolvingToken
+      ) {
+        resolvingCancelled.add(resolvingToken)
+        setTaskTerminalStatus(trackId, 'cancelled')
         return true
       }
       if (current) {
@@ -355,25 +464,51 @@ export const useDownloadStore = defineStore('download', () => {
 
   async function cancelAllDownloads() {
     const toast = useToastStore()
+    const visibleActiveCount = Array.from(downloading.value.values())
+      .filter(task => task.status === 'resolving' || task.status === 'downloading')
+      .length
+    const resolvingIds = markResolvingTasksCancelled(
+      downloading.value.values(),
+      resolvingCancelled,
+      trackId => resolvingRequestTokens.get(trackId),
+    )
     try {
       const cancelled = await invoke<number>('cancel_all_downloads')
+      for (const { trackId, token } of resolvingIds) {
+        if (
+          resolvingRequestTokens.get(trackId) === token
+          && downloading.value.get(trackId)?.status === 'resolving'
+        ) {
+          setTaskTerminalStatus(trackId, 'cancelled')
+        }
+      }
       if (cancelled > 0) {
         const next = new Map(downloading.value)
         for (const [trackId, task] of next.entries()) {
-          if (task.status === 'resolving' || task.status === 'downloading') {
+          if (task.status === 'downloading') {
             next.set(trackId, { ...task, status: 'cancelling' })
           }
         }
         downloading.value = next
       }
+      // 后端任务可能在快照和 cancel_all_downloads 之间注册，按可见任务数去重计数
+      const totalCancelled = Math.max(cancelled, visibleActiveCount)
       toast.show(
-        cancelled > 0
-          ? (i18n.global as any).t('download.cancelled_count', { count: cancelled })
+        totalCancelled > 0
+          ? (i18n.global as any).t('download.cancelled_count', { count: totalCancelled })
           : (i18n.global as any).t('settings.no_active_downloads'),
         'info',
       )
     } catch (e) {
       log.error('Cancel downloads failed:', e)
+      for (const { trackId, token } of resolvingIds) {
+        if (
+          resolvingRequestTokens.get(trackId) === token
+          && downloading.value.get(trackId)?.status === 'resolving'
+        ) {
+          setTaskTerminalStatus(trackId, 'cancelled')
+        }
+      }
       toast.error((i18n.global as any).t('download.cancel_failed'))
     }
   }

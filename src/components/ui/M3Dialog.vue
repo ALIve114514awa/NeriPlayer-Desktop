@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+
+const openDialogStack: symbol[] = []
 
 const { t } = useI18n()
 
@@ -30,6 +32,17 @@ const emit = defineEmits<{
 }>()
 
 const overlayRef = ref<HTMLDivElement>()
+const dialogToken = Symbol('m3-dialog')
+
+function removeFromOpenDialogStack() {
+  const index = openDialogStack.lastIndexOf(dialogToken)
+  if (index >= 0) openDialogStack.splice(index, 1)
+}
+
+function addToOpenDialogStack() {
+  removeFromOpenDialogStack()
+  openDialogStack.push(dialogToken)
+}
 
 function close() {
   emit('update:open', false)
@@ -44,6 +57,33 @@ function confirm() {
 function onOverlayClick(e: MouseEvent) {
   if (e.target === overlayRef.value) close()
 }
+
+function handleKeydown(event: KeyboardEvent) {
+  if (
+    !props.open
+    || event.key !== 'Escape'
+    || event.defaultPrevented
+    || openDialogStack[openDialogStack.length - 1] !== dialogToken
+  ) return
+  // 捕获阶段先阻止页面快捷键，再只关闭最后打开的对话框
+  event.preventDefault()
+  close()
+}
+
+watch(
+  () => props.open,
+  (open) => {
+    if (open) addToOpenDialogStack()
+    else removeFromOpenDialogStack()
+  },
+  { immediate: true },
+)
+
+onMounted(() => document.addEventListener('keydown', handleKeydown, true))
+onUnmounted(() => {
+  document.removeEventListener('keydown', handleKeydown, true)
+  removeFromOpenDialogStack()
+})
 </script>
 
 <template>

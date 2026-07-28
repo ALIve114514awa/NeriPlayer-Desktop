@@ -3,17 +3,36 @@ use crate::error::AppResult;
 use crate::state::TrackInfo;
 use crate::state::TrackSource;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "ogg", "wav", "m4a", "aac", "opus", "wma", "webm", "eac3",
 ];
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+// 含 gif：下载封面 sidecar 可能按 content-type 落成 .gif（ext_from_image_content_type），
+// 否则重扫时封面索引不认 gif 导致封面丢失（SC-10）
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 const COVER_NAMES: &[&str] = &["cover", "folder", "front", "albumart", "album"];
 // 大小写无关匹配的封面子目录名
 const COVER_DIR_NAMES: &[&str] = &["covers", "cover", "artwork", "scans"];
+const MAX_SCAN_DEPTH: usize = 32;
+const MAX_SCAN_ENTRIES: usize = 100_000;
+const MAX_SCAN_TRACKS: usize = 20_000;
+
+fn cover_name_priority(name: &str) -> usize {
+    COVER_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(COVER_NAMES.len())
+}
+
+fn cover_dir_priority(name: &str) -> usize {
+    COVER_DIR_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(COVER_DIR_NAMES.len())
+}
 
 #[derive(Debug, Clone, Default)]
 struct ParsedFileNameMetadata {
@@ -23,15 +42,94 @@ struct ParsedFileNameMetadata {
     source: Option<String>,
 }
 
+/// 扫描结果：成功曲目 + 解析失败的文件（供前端展示失败计数，SC-9）
+#[derive(Debug, serde::Serialize)]
+pub struct ScanResult {
+    pub tracks: Vec<TrackInfo>,
+    pub skipped: Vec<ScanSkipped>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ScanSkipped {
+    pub path: String,
+    pub reason: String,
+}
+
 /// 扫描目录下的所有音频文件，读取元数据
-pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<Vec<TrackInfo>> {
+pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<ScanResult> {
     let mut tracks = Vec::new();
+    let mut skipped: Vec<ScanSkipped> = Vec::new();
     // 扫描会话级封面索引缓存：同目录的封面查找只列举一次目录
     let mut cover_cache = CoverLookupCache::default();
 
-    for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_file() { continue; }
+    // 根目录不可读时必须返回 Err，而不是静默返回空列表（SC-1）：
+    // macOS TCC 拒绝、网络卷断开、EPERM 等会让 WalkDir 首个 entry 为 Err 被吞掉，
+    // 上层据此把"本地音乐"歌单全量清空并落盘，用户无从区分"目录空"与"读取失败"
+    let root = std::fs::canonicalize(Path::new(dir)).map_err(|e| {
+        crate::error::AppError::Other(format!("扫描目录不可访问: {dir}: {e}"))
+    })?;
+    if !root.is_dir() {
+        return Err(crate::error::AppError::Other(format!(
+            "扫描目录不可访问: {dir}"
+        )));
+    }
+    std::fs::read_dir(&root).map_err(|e| {
+        crate::error::AppError::Other(format!("扫描目录读取失败: {dir}: {e}"))
+    })?;
+
+    // 默认不跟随符号链接，避免扫描逃逸到根目录或网络挂载点。
+    // 规范化路径同时用于去重，防止别名路径重复导入同一个文件（SC-2/SC-13）
+    let mut seen_files = HashSet::new();
+    let mut visited_entries = 0usize;
+    for entry_result in WalkDir::new(&root)
+        .follow_links(false)
+        .max_depth(MAX_SCAN_DEPTH)
+        .into_iter()
+    {
+        visited_entries = visited_entries.saturating_add(1);
+        if visited_entries > MAX_SCAN_ENTRIES {
+            skipped.push(ScanSkipped {
+                path: root.display().to_string(),
+                reason: format!("扫描条目超过上限 {}", MAX_SCAN_ENTRIES),
+            });
+            break;
+        }
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                skipped.push(ScanSkipped {
+                    path: error
+                        .path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| dir.to_string()),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = match std::fs::canonicalize(entry.path()) {
+            Ok(path) if path.starts_with(&root) => path,
+            Ok(path) => {
+                skipped.push(ScanSkipped {
+                    path: entry.path().display().to_string(),
+                    reason: format!("跳过扫描根目录外的链接目标: {}", path.display()),
+                });
+                continue;
+            }
+            Err(error) => {
+                skipped.push(ScanSkipped {
+                    path: entry.path().display().to_string(),
+                    reason: format!("无法规范化文件路径: {error}"),
+                });
+                continue;
+            }
+        };
+        if !seen_files.insert(path.clone()) {
+            continue;
+        }
 
         let ext = path.extension()
             .and_then(|e| e.to_str())
@@ -40,13 +138,28 @@ pub fn scan_directory(dir: &str, name_template: Option<&str>) -> AppResult<Vec<T
 
         if !AUDIO_EXTENSIONS.contains(&ext.as_str()) { continue; }
 
-        match read_track_info(path, name_template, &mut cover_cache) {
+        if tracks.len() >= MAX_SCAN_TRACKS {
+            skipped.push(ScanSkipped {
+                path: path.display().to_string(),
+                reason: format!("扫描曲目超过上限 {}", MAX_SCAN_TRACKS),
+            });
+            break;
+        }
+
+        match read_track_info(&path, name_template, &mut cover_cache) {
             Ok(track) => tracks.push(track),
-            Err(e) => log::warn!(target: "scanner", "Skip {}: {}", path.display(), e),
+            Err(e) => {
+                // 解析失败不再仅后端 warn 静默丢弃, 回传给前端展示失败计数（SC-9）
+                log::warn!(target: "scanner", "Skip {}: {}", path.display(), e);
+                skipped.push(ScanSkipped {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
 
-    Ok(tracks)
+    Ok(ScanResult { tracks, skipped })
 }
 
 fn read_track_info(
@@ -134,8 +247,7 @@ struct CoverLookupCache {
 }
 
 struct DirCoverIndex {
-    /// (小写去扩展名文件名, 完整路径)，保持 read_dir 原始顺序，
-    /// 维持旧实现「首个命中」的选取行为
+    /// (小写去扩展名文件名, 完整路径)，按候选名优先级和路径稳定排序
     images: Vec<(String, PathBuf)>,
     /// 首个大小写无关命中的封面子目录（Covers/cover/artwork/scans）
     cover_subdir: Option<PathBuf>,
@@ -185,7 +297,18 @@ fn build_dir_cover_index(dir: &Path) -> DirCoverIndex {
                     .map(|s| s.to_lowercase())
                     .unwrap_or_default();
                 if COVER_DIR_NAMES.contains(&name.as_str()) {
-                    cover_subdir = Some(path);
+                    let replace = cover_subdir.as_ref().is_none_or(|current| {
+                        let current_name = current
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .map(|value| value.to_lowercase())
+                            .unwrap_or_default();
+                        (cover_dir_priority(&name), path.clone())
+                            < (cover_dir_priority(&current_name), current.clone())
+                    });
+                    if replace {
+                        cover_subdir = Some(path);
+                    }
                 }
             }
             continue;
@@ -208,6 +331,14 @@ fn build_dir_cover_index(dir: &Path) -> DirCoverIndex {
             .unwrap_or_default();
         images.push((stem, path));
     }
+    // 常见封面名按 cover/folder/front 等既定优先级选择，再以路径打破同名平局；
+    // 不依赖文件系统 read_dir 顺序，保证跨平台扫描结果一致（SC-11）
+    images.sort_by(|a, b| {
+        cover_name_priority(&a.0)
+            .cmp(&cover_name_priority(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
     DirCoverIndex {
         images,
         cover_subdir,
@@ -216,7 +347,13 @@ fn build_dir_cover_index(dir: &Path) -> DirCoverIndex {
 
 fn find_nearby_cover(audio_path: &Path, cache: &mut CoverLookupCache) -> Option<PathBuf> {
     let dir = audio_path.parent()?;
+    let audio_name = audio_path.file_name()?.to_str()?.to_lowercase();
     let stem = audio_path.file_stem()?.to_str()?.to_lowercase();
+
+    // 下载器新写入的 sidecar 使用完整音频名，例如 Song.m4a.jpg
+    if let Some(cover) = cache.find_image(dir, |name| name == audio_name) {
+        return Some(cover);
+    }
 
     // 同目录下与音频同名的图片（大小写无关）
     if let Some(cover) = cache.find_image(dir, |name| name == stem) {
@@ -225,6 +362,9 @@ fn find_nearby_cover(audio_path: &Path, cache: &mut CoverLookupCache) -> Option<
 
     // 大小写无关的封面子目录下与音频同名的图片
     if let Some(sub) = cache.cover_subdir(dir) {
+        if let Some(cover) = cache.find_image(&sub, |name| name == audio_name) {
+            return Some(cover);
+        }
         if let Some(cover) = cache.find_image(&sub, |name| name == stem) {
             return Some(cover);
         }
@@ -266,10 +406,13 @@ fn candidate_templates(active_template: Option<&str>) -> Vec<String> {
     if let Some(tpl) = active_template.map(str::trim).filter(|s| !s.is_empty()) {
         templates.push(tpl.to_string());
     }
+    // 三段式（DEFAULT）必须排在两段式（LEGACY）之前，对齐 Android candidateManagedDownloadFileNameTemplates
+    // 的 active → DEFAULT → LEGACY 顺序：否则 "netease - Halsey - Without Me" 会先被
+    // "{artist} - {title}" 的非贪婪正则命中，误解析成 artist=netease（SC-6）
     for tpl in [
-        "{artist} - {title}",
         "{source} - {artist} - {title}",
         "%source% - %artist% - %title%",
+        "{artist} - {title}",
         "%artist% - %title%",
     ] {
         if !templates.iter().any(|existing| existing == tpl) {
@@ -400,7 +543,7 @@ fn normalize_metadata_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_nearby_cover, CoverLookupCache};
+    use super::{find_nearby_cover, scan_directory, CoverLookupCache};
     use std::path::PathBuf;
 
     fn temp_scan_dir(tag: &str) -> PathBuf {
@@ -454,5 +597,65 @@ mod tests {
             Some(sub.join("track.webp"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cover_lookup_prefers_audio_scoped_download_sidecar() {
+        let dir = temp_scan_dir("scoped-sidecar");
+        let audio = dir.join("Song.m4a");
+        let scoped = dir.join("Song.m4a.jpg");
+        let legacy = dir.join("Song.jpg");
+        std::fs::write(&audio, b"audio").expect("write audio");
+        std::fs::write(&scoped, b"scoped").expect("write image");
+        std::fs::write(&legacy, b"legacy").expect("write image");
+
+        let mut cache = CoverLookupCache::default();
+        assert_eq!(find_nearby_cover(&audio, &mut cache), Some(scoped));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cover_lookup_uses_declared_common_name_priority() {
+        let dir = temp_scan_dir("cover-priority");
+        let audio = dir.join("track.mp3");
+        std::fs::write(&audio, b"audio").expect("write audio");
+        std::fs::write(dir.join("folder.jpg"), b"folder").expect("write folder cover");
+        std::fs::write(dir.join("cover.png"), b"cover").expect("write cover");
+
+        let mut cache = CoverLookupCache::default();
+        assert_eq!(find_nearby_cover(&audio, &mut cache), Some(dir.join("cover.png")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_directory_rejects_missing_root_instead_of_returning_empty_success() {
+        let path = std::env::temp_dir().join(format!(
+            "neri-scanner-missing-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        assert!(scan_directory(path.to_str().unwrap(), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_does_not_follow_audio_symlinks_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_scan_dir("symlink-root");
+        let outside = temp_scan_dir("symlink-outside");
+        let target = outside.join("outside.wav");
+        std::fs::write(&target, b"not an audio file").expect("write target");
+        symlink(&target, root.join("linked.wav")).expect("create symlink");
+
+        let result = scan_directory(root.to_str().unwrap(), None).expect("scan root");
+        assert!(result.tracks.is_empty());
+        assert!(result.skipped.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

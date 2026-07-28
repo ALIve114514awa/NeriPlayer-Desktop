@@ -787,6 +787,9 @@ const playlistCover = computed(() => {
 })
 
 let unlistenPlaylistsChanged: UnlistenFn | null = null
+// 组件已卸载标志：若在 await listen() resolve 前就卸载（路由切换，本视图不在 keep-alive
+// 列表），onUnmounted 会先拿到 null；据此在 listen resolve 后立即解绑，防监听器滞留（MK-04）
+let disposed = false
 let playlistRefreshTimer: ReturnType<typeof setTimeout> | null = null
 
 function schedulePlaylistRefresh() {
@@ -803,15 +806,21 @@ onMounted(async () => {
   downloadStore.initEvents()
   downloadStore.loadDownloads()
   try {
-    unlistenPlaylistsChanged = await listen('playlists-changed', () => {
+    const unlisten = await listen('playlists-changed', () => {
       schedulePlaylistRefresh()
     })
+    if (disposed) {
+      unlisten()
+    } else {
+      unlistenPlaylistsChanged = unlisten
+    }
   } catch (e) {
     log.error('listen playlists-changed failed:', e)
   }
 })
 
 onUnmounted(() => {
+  disposed = true
   cleanupTrackDrag()
   clearDragLandingState()
   if (playlistRefreshTimer) {

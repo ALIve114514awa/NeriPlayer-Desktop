@@ -279,7 +279,7 @@ const probeGroups: Array<{ platform: string; label: string; actions: ProbeAction
   {
     platform: 'youtube', label: 'YouTube',
     actions: [
-      { id: 'account', label: '账号信息', run: () => invoke('get_user_account', { platform: 'youtube' }) },
+      { id: 'account', label: '账号信息', run: () => invoke('refresh_youtube_profile') },
       { id: 'library', label: '云端歌单', run: () => invoke('get_user_playlists', { platform: 'youtube' }) },
       { id: 'player', label: '播放解析 dQw4w9WgXcQ', run: () => invoke('get_youtube_audio_url', { videoId: 'dQw4w9WgXcQ' }) },
       { id: 'search', label: '搜索「kano」', run: () => invoke('search', { query: 'kano', platform: 'youtube' }) },

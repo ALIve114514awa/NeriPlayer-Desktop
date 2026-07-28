@@ -259,13 +259,28 @@ function scheduleHistorySync() {
   }, delay)
 }
 
+// 滚动位置保持（UI-009）：.content 是各路由共享的滚动容器，keep-alive 只缓存组件状态、
+// 不保存该容器的 scrollTop。这里在离开时按 route.name 记录、进入时恢复：
+// keep-alive 页（home/explore/library）恢复原滚动，其余页归零，避免"新页从上一页偏移量开始"
+const KEEP_ALIVE_ROUTE_NAMES = ['home', 'explore', 'library']
+const _scrollPositions = new Map<string, number>()
+let _prevRouteName = route.name as string | undefined
 watch(() => route.fullPath, async () => {
-  if (route.name !== 'downloads') return
+  // flush:'pre'——此刻 DOM 尚未切换，contentRef.scrollTop 仍是离开页的真实滚动量
+  if (_prevRouteName && contentRef.value) {
+    _scrollPositions.set(_prevRouteName, contentRef.value.scrollTop)
+  }
+  const entering = route.name as string | undefined
+  _prevRouteName = entering
   await nextTick()
   requestAnimationFrame(() => {
-    contentRef.value?.scrollTo({ top: 0, left: 0 })
+    if (!contentRef.value) return
+    const restore = entering && KEEP_ALIVE_ROUTE_NAMES.includes(entering)
+      ? _scrollPositions.get(entering) ?? 0
+      : 0
+    contentRef.value.scrollTo({ top: restore, left: 0 })
   })
-}, { flush: 'post' })
+}, { flush: 'pre' })
 
 // 动态取色：跟随封面主题色。解析当前深浅色，供令牌生成使用
 function resolveDynamicIsDark(): boolean {
@@ -349,7 +364,11 @@ onMounted(async () => {
     },
     toggleShuffle: () => player.toggleShuffle(),
     cycleRepeat: () => player.toggleRepeatMode(),
-    isOverlayOpen: () => document.querySelector('.dialog-overlay, .m3-dialog-scrim') !== null,
+    // 覆盖所有实际存在的弹层根类；旧选择器 .dialog-overlay/.m3-dialog-scrim 均不存在，
+    // 导致弹层打开时全局播放快捷键仍生效（UI-002）
+    isOverlayOpen: () => document.querySelector(
+      '.m3-dialog-overlay, .atp-overlay, .lt-overlay, .queue-overlay, .notif-overlay, .debug-dialog-overlay',
+    ) !== null,
   })
 
   await settingsStore.hydrate()

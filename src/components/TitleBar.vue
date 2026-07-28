@@ -330,7 +330,6 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   padding: 0 10px;
-  -webkit-app-region: drag;
   width: 100%;
   box-sizing: border-box;
 }
@@ -358,7 +357,6 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   padding: 0 8px;
-  -webkit-app-region: no-drag;
 }
 
 .tb-np-btn {
@@ -416,7 +414,6 @@ onUnmounted(() => {
   max-width: calc(100% - 200px);
   height: var(--titlebar-height, 36px);
   pointer-events: auto;
-  -webkit-app-region: drag;
   min-width: 180px;
 }
 
@@ -429,6 +426,8 @@ onUnmounted(() => {
   letter-spacing: 1.2px;
   line-height: 1.2;
   padding: 0 8px;
+  /* 事件冒给带 data-tauri-drag-region 的 .tb-np-center，否则中心信息区不可拖拽窗口（UI-010） */
+  pointer-events: none;
 }
 
 .tb-np-track {
@@ -445,6 +444,7 @@ onUnmounted(() => {
   text-align: center;
   padding: 0 8px;
   box-sizing: border-box;
+  pointer-events: none;
 }
 
 
@@ -474,7 +474,6 @@ onUnmounted(() => {
 /* 公共 */
 .tb-drag {
   flex: 1;
-  -webkit-app-region: drag;
   pointer-events: auto;
 }
 
@@ -484,7 +483,6 @@ onUnmounted(() => {
   width: 92px;
   height: 100%;
   flex: 0 0 auto;
-  -webkit-app-region: drag;
   pointer-events: auto;
 }
 
@@ -516,7 +514,6 @@ onUnmounted(() => {
 .tb-controls {
   display: flex;
   align-items: stretch;
-  -webkit-app-region: no-drag;
 }
 
 .tb-ctrl {

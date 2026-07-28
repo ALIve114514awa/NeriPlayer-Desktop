@@ -1,22 +1,16 @@
 <script setup lang="ts">
 import { useToastStore } from '@/stores/toast'
 import type { ToastMessage } from '@/stores/toast'
-import { ref } from 'vue'
 import { createLogger } from '@/utils/logger'
 
 const log = createLogger('app-toast')
 
 const toast = useToastStore()
 
-// 追踪正在退出动画的 ID
-const leaving = ref<Set<number>>(new Set())
-
+// 退场动画交给 TransitionGroup 统一接管：手动点击与自动到期（store splice）
+// 都会走 leave 过渡，不再有"自动消失无动画/上方条目瞬移"的问题（UI-008）
 function onDismiss(id: number) {
-  leaving.value.add(id)
-  setTimeout(() => {
-    leaving.value.delete(id)
-    toast.dismiss(id)
-  }, 200)
+  toast.dismiss(id)
 }
 
 function onAction(msg: ToastMessage) {
@@ -30,12 +24,12 @@ function onAction(msg: ToastMessage) {
 
 <template>
   <Teleport to="body">
-    <div class="toast-container" v-if="toast.messages.length > 0">
+    <TransitionGroup tag="div" name="toast" class="toast-container">
       <div
         v-for="msg in toast.messages"
         :key="msg.id"
         class="toast-item"
-        :class="[msg.type, { 'toast-leaving': leaving.has(msg.id) }]"
+        :class="msg.type"
         @click="onDismiss(msg.id)"
       >
         <span class="material-symbols-rounded toast-icon">
@@ -51,7 +45,7 @@ function onAction(msg: ToastMessage) {
           {{ msg.action.label }}
         </button>
       </div>
-    </div>
+    </TransitionGroup>
   </Teleport>
 </template>
 
@@ -81,15 +75,27 @@ function onAction(msg: ToastMessage) {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
   pointer-events: auto;
   cursor: pointer;
-  animation: toast-in 250ms cubic-bezier(0.2, 0, 0, 1) forwards;
   min-width: 200px;
   max-width: min(460px, calc(100vw - 32px));
   user-select: none;
   backdrop-filter: blur(18px);
 }
 
-.toast-item.toast-leaving {
-  animation: toast-out 200ms cubic-bezier(0.2, 0, 0, 1) forwards;
+/* TransitionGroup 进出场与列表重排过渡（进/退场统一，含自动到期） */
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateY(16px) scale(0.95);
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 250ms cubic-bezier(0.2, 0, 0, 1),
+    transform 250ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.toast-move {
+  transition: transform 250ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .toast-icon {
@@ -97,16 +103,18 @@ function onAction(msg: ToastMessage) {
   flex-shrink: 0;
 }
 
+/* toast 底色是 inverse-surface（随主题翻转），图标向 inverse-on-surface 混色以保证
+   两个主题下都有足够对比度（UI-014），不再用固定浅色调 */
 .toast-item.success .toast-icon {
-  color: #7CDB8A;
+  color: color-mix(in srgb, #2E7D32 55%, var(--md-inverse-on-surface, #F4EFF4));
 }
 
 .toast-item.error .toast-icon {
-  color: #FFB4AB;
+  color: color-mix(in srgb, #C62828 55%, var(--md-inverse-on-surface, #F4EFF4));
 }
 
 .toast-item.info .toast-icon {
-  color: var(--md-primary, #D0BCFF);
+  color: var(--md-inverse-primary, var(--md-primary, #D0BCFF));
 }
 
 .toast-text {
@@ -146,27 +154,5 @@ function onAction(msg: ToastMessage) {
 
 .toast-action:active {
   transform: translateY(0) scale(0.98);
-}
-
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(16px) scale(0.95);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes toast-out {
-  from {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-  to {
-    opacity: 0;
-    transform: translateY(16px) scale(0.95);
-  }
 }
 </style>
