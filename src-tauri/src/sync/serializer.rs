@@ -481,6 +481,7 @@ fn legacy_proto_to_sync_song(p: &LegacyProtoSyncSong) -> SyncSong {
         playlist_context_id: None,
         sync_membership_tokens: Vec::new(),
         sync_metadata_version: LEGACY_SYNC_METADATA_VERSION,
+        legacy_added_at: None,
     }
 }
 
@@ -567,6 +568,7 @@ fn sync_song_to_proto(s: &SyncSong) -> ProtoSyncSong {
         playlist_context_id: option_text_to_proto(s.playlist_context_id.as_deref()),
         sync_membership_tokens: s.sync_membership_tokens.iter().map(causal_token_to_proto).collect(),
         sync_metadata_version: s.sync_metadata_version,
+        legacy_added_at: s.legacy_added_at,
     }
 }
 
@@ -600,6 +602,7 @@ fn proto_to_sync_song(p: &ProtoSyncSong) -> SyncSong {
         playlist_context_id: p.playlist_context_id.clone(),
         sync_membership_tokens: p.sync_membership_tokens.iter().map(proto_to_causal_token).collect(),
         sync_metadata_version: p.sync_metadata_version,
+        legacy_added_at: p.legacy_added_at,
     }
 }
 
@@ -1032,6 +1035,7 @@ mod compressed_contract_tests {
             original_lyric: Some("original".into()),
             original_translated_lyric: Some("original translated".into()),
             sync_metadata_version: CURRENT_SYNC_METADATA_VERSION,
+            legacy_added_at: Some(1_234),
             ..Default::default()
         };
         let data = SyncData {
@@ -1075,6 +1079,7 @@ mod compressed_contract_tests {
             decoded_song.sync_metadata_version,
             CURRENT_SYNC_METADATA_VERSION
         );
+        assert_eq!(decoded_song.legacy_added_at, Some(1_234));
         assert_eq!(decoded.sync_log[0].action, "REMOVE_SONG");
     }
 

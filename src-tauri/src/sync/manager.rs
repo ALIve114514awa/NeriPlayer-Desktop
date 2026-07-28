@@ -780,6 +780,7 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
         sync_membership_tokens: Vec::new(),
         // 无历史载荷时仍用 LEGACY, 让 merge fill-missing 可补齐云端歌词
         sync_metadata_version: LEGACY_SYNC_METADATA_VERSION,
+        legacy_added_at: None,
     }
 }
 

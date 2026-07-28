@@ -108,6 +108,8 @@ pub struct ProtoSyncSong {
     pub sync_membership_tokens: Vec<ProtoSyncCausalToken>,
     #[prost(int32, tag = "28")]
     pub sync_metadata_version: i32,
+    #[prost(int64, optional, tag = "29")]
+    pub legacy_added_at: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

@@ -435,6 +435,7 @@ fn migrate_legacy_songs_to_display_order(
         .map(|(index, song)| {
             let mut normalized = song.clone();
             normalized.added_at = (newest_added_at - index as i64).max(1);
+            normalized.legacy_added_at = normalized.legacy_added_at.or(Some(song.added_at));
             normalized
         })
         .collect()
@@ -542,6 +543,8 @@ pub struct SyncSong {
     pub sync_membership_tokens: Vec<SyncCausalToken>,
     #[serde(default)]
     pub sync_metadata_version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_added_at: Option<i64>,
 }
 
 impl SyncSong {
@@ -1087,6 +1090,7 @@ mod legacy_json_tests {
         let song = SyncSong {
             id: "yt-video".into(),
             album_id: "123".into(),
+            legacy_added_at: Some(456),
             matched_lyric: Some("matched".into()),
             matched_translated_lyric: Some("translated".into()),
             matched_lyric_source: Some("NETEASE".into()),
@@ -1107,6 +1111,7 @@ mod legacy_json_tests {
         assert_eq!(value["originalTranslatedLyric"], "original translated");
         assert_eq!(value["userLyricOffsetMs"], 0);
         assert_eq!(value["syncMetadataVersion"], LEGACY_SYNC_METADATA_VERSION);
+        assert_eq!(value["legacyAddedAt"], 456);
         assert!(value.get("lyric").is_none());
         assert!(value.get("coverUrl").is_none());
 
@@ -1119,7 +1124,8 @@ mod legacy_json_tests {
             "translatedLyric": "legacy translated",
             "lyricSource": "QQ_MUSIC",
             "lyricSongId": 56,
-            "userLyricOffsetMs": null
+            "userLyricOffsetMs": null,
+            "legacyAddedAt": 78
         })).unwrap();
         assert_eq!(decoded.id, "12");
         assert_eq!(decoded.album_id, "34");
@@ -1131,6 +1137,7 @@ mod legacy_json_tests {
         assert_eq!(decoded.matched_song_id.as_deref(), Some("56"));
         assert_eq!(decoded.user_lyric_offset_ms, 0);
         assert_eq!(decoded.sync_metadata_version, LEGACY_SYNC_METADATA_VERSION);
+        assert_eq!(decoded.legacy_added_at, Some(78));
     }
 
     #[test]
@@ -1178,6 +1185,14 @@ mod legacy_json_tests {
         assert_eq!(
             normalized.songs.iter().map(|song| song.added_at).collect::<Vec<_>>(),
             vec![20, 19, 18]
+        );
+        assert_eq!(
+            normalized
+                .songs
+                .iter()
+                .map(|song| song.legacy_added_at)
+                .collect::<Vec<_>>(),
+            vec![Some(3), Some(2), Some(1)]
         );
     }
 

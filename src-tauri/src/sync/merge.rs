@@ -930,7 +930,7 @@ fn apply_playlist_song_deletions(
                     .iter()
                     .max_by(|left, right| deletion_cmp(left, right));
                 return match latest {
-                    Some(deletion) if song.added_at <= deletion.deleted_at => None,
+                    Some(deletion) if effective_added_at(song) <= deletion.deleted_at => None,
                     _ => Some(song.clone()),
                 };
             }
@@ -947,6 +947,15 @@ fn apply_playlist_song_deletions(
             }
         })
         .collect()
+}
+
+fn effective_added_at(song: &SyncSong) -> i64 {
+    let timestamp = song.legacy_added_at.unwrap_or(song.added_at);
+    if timestamp > 0 {
+        timestamp
+    } else {
+        i64::MIN
+    }
 }
 
 fn merge_favorite_playlists(
@@ -1227,7 +1236,7 @@ fn prune_playlist_song_deletions(
                     || playlist.songs.iter().all(|song| {
                         !deletion.matches_song(&playlist.id, song)
                             || normalize_sync_causal_tokens(&song.sync_membership_tokens).is_empty()
-                            || song.added_at <= deletion.deleted_at
+                            || effective_added_at(song) <= deletion.deleted_at
                     })
             })
         })
@@ -1891,6 +1900,24 @@ mod tests {
         local.playlist_song_deletions = vec![deletion];
         let merged = three_way_merge(&local, &SyncData::default(), 0, &HashMap::new());
         assert!(merged.playlists[0].songs.is_empty());
+    }
+
+    #[test]
+    fn legacy_added_at_prevents_display_order_migration_from_reviving_deleted_song() {
+        let mut target = song("42", 900);
+        target.legacy_added_at = Some(100);
+        let deletion = SyncPlaylistSongDeletion {
+            playlist_id: "1".into(),
+            song_id: target.id.clone(),
+            album: target.album.clone(),
+            deleted_at: 200,
+            device_id: "android".into(),
+            ..Default::default()
+        };
+
+        let remaining = apply_playlist_song_deletions("1", &[target], &[deletion]);
+
+        assert!(remaining.is_empty());
     }
 
     #[test]
