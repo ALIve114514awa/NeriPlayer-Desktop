@@ -21,7 +21,9 @@ pub async fn lt_create_room(
     };
 
     let resp = http
-        .send(|client| client.post(&url).json(&body))
+        // 建房是非幂等写操作：读超时后重发可能创建两个房间，只有连接尚未建立
+        // 时才允许换代理重试
+        .send_once(|client| client.post(&url).json(&body))
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
@@ -66,7 +68,8 @@ pub async fn lt_join_room(
     };
 
     let resp = http
-        .send(|client| client.post(&url).json(&body))
+        // 加入请求同样可能产生服务端成员记录，避免请求体已发出后重复提交
+        .send_once(|client| client.post(&url).json(&body))
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
@@ -94,7 +97,7 @@ pub async fn lt_get_room_state(
     room_id: String,
     state: State<'_, AppState>,
 ) -> Result<LtStateResponse, String> {
-    let http = state.http();
+    let http = state.transport("listen-together");
     let token = state.lt_session.lock().token.clone().unwrap_or_default();
     let url = format!(
         "{}/api/rooms/{}/state",
@@ -103,15 +106,17 @@ pub async fn lt_get_room_state(
     );
 
     let resp = http
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
+        .send(|client| {
+            client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+        })
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
-    resp.json::<LtStateResponse>()
+    crate::api::transport::parse_json_response(resp, "listen-together room state")
         .await
-        .map_err(|e| format!("Parse error: {e}"))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -163,12 +168,12 @@ pub async fn lt_send_event(event: LtEvent, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-pub async fn lt_send_ping(state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn lt_send_ping(t: Option<i64>, state: State<'_, AppState>) -> Result<bool, String> {
     let ws_arc = state.lt_session.lock().ws_client.clone();
     let ws = ws_arc.lock().await;
     match ws.as_ref() {
         Some(client) => {
-            client.send_ping()?;
+            client.send_ping(t)?;
             Ok(true)
         }
         None => Ok(false),

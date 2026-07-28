@@ -40,6 +40,7 @@ const {
   trackInfoToLtTrack,
   ltTrackToTrackInfo,
   toShareableQueueSnapshot,
+  isTrustedInboundStreamUrl,
 } = await loadMapperModule()
 
 // buildStableKey: 对齐 Android buildStableTrackKey
@@ -51,6 +52,13 @@ assert.equal(
   buildStableKey('youtubeMusic', 'vid', undefined, 'PL123'),
   'youtubeMusic:vid:PL123',
 )
+
+// 入站直链必须同时满足协议和来源 CDN 白名单
+assert.equal(isTrustedInboundStreamUrl('https://m801.music.126.net/song.mp3', 'netease'), true)
+assert.equal(isTrustedInboundStreamUrl('https://example.test/song.mp3', 'netease'), false)
+assert.equal(isTrustedInboundStreamUrl('file:///tmp/song.mp3', 'netease'), false)
+assert.equal(isTrustedInboundStreamUrl('https://rr1.googlevideo.com/videoplayback?id=1', 'youtubeMusic'), true)
+assert.equal(isTrustedInboundStreamUrl('https://rr1.googlevideo.com/videoplayback?id=1', 'qqMusic'), false)
 
 // netease 往返
 {
@@ -166,6 +174,38 @@ assert.equal(
     ['netease:1', 'netease:2'],
   )
   assert.equal(resolvedIndex, 1)
+}
+
+// QQ Music 没有 Android 频道，不能进入跨端共享队列；当前曲被过滤时不回退首项
+{
+  const { queue, resolvedIndex } = toShareableQueueSnapshot([
+    {
+      id: 'qq:mid', title: 'QQ', artist: 'Artist', album: '', durationMs: 1,
+      coverUrl: '', audioUrl: '',
+    },
+    {
+      id: 'netease:ok', title: 'Netease', artist: 'Artist', album: '', durationMs: 1,
+      coverUrl: '', audioUrl: '',
+    },
+  ], 0)
+  assert.deepEqual(queue.map(t => t.stableKey), ['netease:ok'])
+  assert.equal(resolvedIndex, -1)
+}
+
+// 本地当前曲被排除时同样没有有效共享索引
+{
+  const { queue, resolvedIndex } = toShareableQueueSnapshot([
+    {
+      id: 'netease:ok', title: 'Netease', artist: 'Artist', album: '', durationMs: 1,
+      coverUrl: '', audioUrl: '',
+    },
+    {
+      id: 'local:private', title: 'Local', artist: 'Artist', album: '', durationMs: 1,
+      coverUrl: '', audioUrl: '/tmp/private.mp3',
+    },
+  ], 1)
+  assert.deepEqual(queue.map(t => t.stableKey), ['netease:ok'])
+  assert.equal(resolvedIndex, -1)
 }
 
 console.log('test-listen-together-mapper: ok')

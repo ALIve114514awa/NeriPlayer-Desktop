@@ -7,6 +7,9 @@ import { LtChannels, type ListenTogetherTrack } from './protocol'
 
 type PayloadRecord = Record<string, unknown>
 
+// 可分享队列上限（对齐 Android LISTEN_TOGETHER_MAX_SHAREABLE_QUEUE_SIZE）
+const MAX_SHAREABLE_QUEUE_SIZE = 2000
+
 function readPayloadString(
   payload: PayloadRecord | null | undefined,
   ...keys: string[]
@@ -46,6 +49,67 @@ function buildYouTubeMediaUri(audioId: string, playlistContextId?: string): stri
   const base = `ytmusic://video/${encodeURIComponent(audioId)}`
   if (!playlistContextId) return base
   return `${base}?playlistId=${encodeURIComponent(playlistContextId)}`
+}
+
+/**
+ * 出站 mediaUri 清洗：剔除会泄漏本地文件系统路径的值
+ * 绝对路径（/、C:\、file://、asset://、convertFileSrc 产物）一律丢弃，
+ * 只放行平台自定义 scheme（ytmusic:// 等）与 http(s)
+ */
+function sanitizeOutboundMediaUri(mediaUri?: string): string | undefined {
+  if (!mediaUri) return undefined
+  const v = mediaUri.trim()
+  if (!v) return undefined
+  const lower = v.toLowerCase()
+  if (
+    v.startsWith('/')
+    || /^[a-z]:[\\/]/i.test(v)
+    || lower.startsWith('file:')
+    || lower.startsWith('asset:')
+    || lower.startsWith('http://asset.localhost')
+    || lower.startsWith('https://asset.localhost')
+    || lower.includes('tauri.localhost')
+  ) {
+    return undefined
+  }
+  return v
+}
+
+// 入站 streamUrl 白名单：除 http(s) 外还要匹配曲目来源的 CDN 域名，
+// 否则任意房间成员都能把第三方 URL 伪装成音频直链投递到播放器
+export function isTrustedInboundStreamUrl(url?: string, channelId?: string): boolean {
+  if (!url) return false
+  const v = url.trim()
+  if (!v) return false
+  let parsed: URL
+  try {
+    parsed = new URL(v)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+  const host = parsed.hostname.toLowerCase()
+  if (!host) return false
+  switch (channelId) {
+    case LtChannels.NETEASE:
+      return host === 'music.126.net' || host.endsWith('.music.126.net')
+    case LtChannels.BILIBILI:
+      return host === 'bilivideo.com'
+        || host.endsWith('.bilivideo.com')
+        || host === 'bilivideo.cn'
+        || host.endsWith('.bilivideo.cn')
+        || host === 'hdslb.com'
+        || host.endsWith('.hdslb.com')
+    case LtChannels.YOUTUBE_MUSIC:
+      return host === 'googlevideo.com'
+        || host.endsWith('.googlevideo.com')
+        || host === 'youtube.com'
+        || host.endsWith('.youtube.com')
+        || host === 'youtube-nocookie.com'
+        || host.endsWith('.youtube-nocookie.com')
+    default:
+      return false
+  }
 }
 
 /**
@@ -108,15 +172,17 @@ export function trackInfoToLtTrack(
   } else if (track.id.startsWith('local:') || payloadChannel === LtChannels.LOCAL) {
     channelId = LtChannels.LOCAL
     audioId = payloadAudioId || track.id.replace(/^local:/i, '') || track.id
-    mediaUri = payloadMediaUri || track.audioUrl || undefined
+    // 本地曲目不得把绝对文件路径 / asset URL 泄漏进房间事件（暴露用户文件系统路径）;
+    // 仅保留非文件系统的 mediaUri, 本地曲目对端本就无法直接播放, audioId 已足够标识
+    mediaUri = sanitizeOutboundMediaUri(payloadMediaUri)
   } else {
     channelId = LtChannels.LOCAL
     audioId = payloadAudioId || track.id
-    mediaUri = payloadMediaUri || track.audioUrl || undefined
+    mediaUri = sanitizeOutboundMediaUri(payloadMediaUri)
   }
 
   if (!mediaUri && payloadMediaUri) {
-    mediaUri = payloadMediaUri
+    mediaUri = sanitizeOutboundMediaUri(payloadMediaUri)
   }
 
   const stableKey = buildStableKey(channelId, audioId, subAudioId, playlistContextId)
@@ -128,7 +194,9 @@ export function trackInfoToLtTrack(
     subAudioId,
     playlistContextId,
     mediaUri,
-    streamUrl,
+    streamUrl: isTrustedInboundStreamUrl(streamUrl, channelId)
+      ? streamUrl?.trim()
+      : undefined,
     name: track.title,
     artist: track.artist,
     album: track.album || undefined,
@@ -184,6 +252,12 @@ export function ltTrackToTrackInfo(lt: ListenTogetherTrack): TrackInfo {
   if (playlistContextId) syncPayload.playlistContextId = playlistContextId
   if (mediaUri) syncPayload.mediaUri = mediaUri
 
+  // 入站 streamUrl 必须过白名单再用作 audioUrl，未通过则回落到本地解析（audioUrl 置空）;
+  // mediaUri 仅作身份/回落，不作为可信直链
+  const trustedStreamUrl = isTrustedInboundStreamUrl(lt.streamUrl, lt.channelId)
+    ? lt.streamUrl
+    : undefined
+
   return {
     id,
     title: lt.name,
@@ -191,8 +265,8 @@ export function ltTrackToTrackInfo(lt: ListenTogetherTrack): TrackInfo {
     album,
     durationMs: lt.durationMs,
     coverUrl: lt.coverUrl || '',
-    // 播放优先可信 streamUrl; mediaUri 仅作身份/回落
-    audioUrl: lt.streamUrl || mediaUri || '',
+    // 播放优先可信 streamUrl; 不可信则留空由播放层自行按平台重新解析
+    audioUrl: trustedStreamUrl || '',
     source,
     syncPayload,
   }
@@ -235,7 +309,8 @@ export function toShareableQueueSnapshot(
   includeLocal: boolean = false,
 ): { queue: ListenTogetherTrack[]; resolvedIndex: number } {
   const result: ListenTogetherTrack[] = []
-  let resolvedIndex = 0
+  // 当前曲被 QQ/local 过滤时没有合法共享索引，绝不能回退到首项
+  let resolvedIndex = -1
   const currentTrack = queue[currentIndex]
   const currentStableKey = currentTrack
     ? trackInfoToLtTrack(currentTrack).stableKey
@@ -248,7 +323,12 @@ export function toShareableQueueSnapshot(
       track,
       isCurrentTrack && shareAudioLinks ? currentStreamUrl : undefined,
     )
-    if (!includeLocal && ltTrack.channelId === LtChannels.LOCAL) {
+    // QQ Music 没有 Android 对应频道，不能让 Android 把它改写成 netease
+    // 后再参与 currentIndex/stableKey 仲裁；跨端房间统一排除这类曲目
+    if (
+      ltTrack.channelId === LtChannels.QQ_MUSIC
+      || (!includeLocal && ltTrack.channelId === LtChannels.LOCAL)
+    ) {
       continue
     }
     result.push(ltTrack)
@@ -258,6 +338,15 @@ export function toShareableQueueSnapshot(
   if (currentStableKey) {
     const idx = result.findIndex(t => t.stableKey === currentStableKey)
     if (idx >= 0) resolvedIndex = idx
+  }
+
+  // 队列上限：以当前曲为中心截窗（对齐 Android boundedAroundStableKey），
+  // 避免超大歌单每次心跳全量序列化上传
+  if (result.length > MAX_SHAREABLE_QUEUE_SIZE) {
+    const half = Math.floor(MAX_SHAREABLE_QUEUE_SIZE / 2)
+    const end = Math.min(result.length, Math.max(resolvedIndex - half, 0) + MAX_SHAREABLE_QUEUE_SIZE)
+    const start = Math.max(0, end - MAX_SHAREABLE_QUEUE_SIZE)
+    return { queue: result.slice(start, end), resolvedIndex: resolvedIndex - start }
   }
 
   return { queue: result, resolvedIndex }

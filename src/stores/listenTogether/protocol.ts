@@ -5,7 +5,7 @@
 
 export const LtChannels = {
   NETEASE: 'netease',
-  // 桌面扩展频道: Android 协议未声明, 服务端透传即可
+  // 保留用于桌面本地映射，但跨端共享队列会排除该频道
   QQ_MUSIC: 'qqMusic',
   BILIBILI: 'bilibili',
   YOUTUBE_MUSIC: 'youtubeMusic',
@@ -122,6 +122,8 @@ export interface ListenTogetherSocketEnvelope {
   t?: number
   ok?: boolean
   /// 控制命令应答：服务端拒绝时才有 error，缺它会让被拒绝的控制静默生效
+  /// applied.state/causedBy 对齐 Android ListenTogetherAppliedEvent：
+  /// 自己发起的 REQUEST_* 被仲裁通过后要据此把权威状态应用到本地播放器
   result?: {
     ok: boolean
     error?: string
@@ -129,8 +131,10 @@ export interface ListenTogetherSocketEnvelope {
       type: string
       roomId?: string
       version?: number
+      state?: ListenTogetherRoomState
       expectedPositionMs?: number
       nowMs?: number
+      causedBy?: ListenTogetherCause
     }
   }
   message?: string
@@ -210,4 +214,41 @@ export function wireRepeatToDesktop(mode: number | null | undefined): 'off' | 'o
   if (mode === LtRepeatMode.ALL) return 'all'
   if (mode === LtRepeatMode.OFF) return 'off'
   return null
+}
+
+// 昵称/房间号校验（对齐 Android ListenTogetherNicknameValidation / RoomIdValidation）
+// Android 昵称白名单仅数字/大小写字母/汉字, 长度 1..24, 不含连字符
+export const LT_NICKNAME_MAX_LENGTH = 24
+const ROOM_ID_REGEX = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/
+
+function isAllowedNicknameChar(cp: number): boolean {
+  if (cp >= 0x30 && cp <= 0x39) return true // 0-9
+  if (cp >= 0x41 && cp <= 0x5a) return true // A-Z
+  if (cp >= 0x61 && cp <= 0x7a) return true // a-z
+  // CJK 统一表意文字（含扩展 A/B 常见区段），近似 Android HAN script 判定
+  if (cp >= 0x4e00 && cp <= 0x9fff) return true
+  if (cp >= 0x3400 && cp <= 0x4dbf) return true
+  if (cp >= 0x20000 && cp <= 0x2a6df) return true
+  return false
+}
+
+/** 返回 true 表示昵称合法（对齐 Android，避免云同步到 Android 端被 sanitize 丢弃） */
+export function isValidLtNickname(nickname: string): boolean {
+  const normalized = nickname.trim()
+  if (normalized.length < 1 || normalized.length > LT_NICKNAME_MAX_LENGTH) return false
+  for (const ch of normalized) {
+    const cp = ch.codePointAt(0)
+    if (cp === undefined || !isAllowedNicknameChar(cp)) return false
+  }
+  return true
+}
+
+/** roomId 归一化：去空白并大写（对齐 Android normalizeListenTogetherRoomId） */
+export function normalizeLtRoomId(value: string): string {
+  return value.trim().toUpperCase()
+}
+
+/** 返回 true 表示房间号合法 */
+export function isValidLtRoomId(roomId: string): boolean {
+  return ROOM_ID_REGEX.test(normalizeLtRoomId(roomId))
 }
