@@ -183,7 +183,7 @@ impl AppSettings {
         self.lyric_blur_amount = clamp_f32(self.lyric_blur_amount, 0.0, 8.0, 1.5);
         self.cloud_music_offset = self.cloud_music_offset.clamp(-30_000, 30_000);
         self.qq_music_offset = self.qq_music_offset.clamp(-30_000, 30_000);
-        self.cover_blur_amount = clamp_f32(self.cover_blur_amount, 0.0, 100.0, 1.5);
+        self.cover_blur_amount = clamp_f32(self.cover_blur_amount, 0.0, 500.0, 1.5);
         self.cover_blur_darken = clamp_f32(self.cover_blur_darken, 0.0, 1.0, 0.2);
         self.background_image_blur = clamp_f32(self.background_image_blur, 0.0, 100.0, 20.0);
         self.background_image_alpha = clamp_f32(self.background_image_alpha, 0.0, 1.0, 0.3);

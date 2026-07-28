@@ -111,6 +111,7 @@ const YOUTUBE_QUALITY_OPTIONS = ['low', 'medium', 'high', 'very_high']
   .map(key => ({ key, label: key }))
 
 const RESOLUTION_TTL_MS = 90_000
+const MAX_RESOLUTION_CACHE_ENTRIES = 256
 
 export function getPlaybackSourceKind(track: TrackInfo): PlaybackSourceKind | null {
   const idPrefix = track.id.split(':', 1)[0]?.toLowerCase()
@@ -207,6 +208,9 @@ export function playbackCacheReadCandidates(
   track: TrackInfo,
   settings: PlaybackSourceSettings,
 ): PlaybackCacheReadCandidate[] {
+  // 直链通常来自一起听权威流或临时签名地址，实际音质不受本机设置
+  // 控制；禁止读取稳定音质键，避免把其他来源写入的缓存误当成本次直链
+  if (isDirectStreamUrl(track.audioUrl)) return []
   const adapter = getPlaybackSourceAdapter(track)
   if (!adapter) return []
   const configuredQuality = adapter.qualityKey(settings).trim().toLowerCase()
@@ -240,6 +244,7 @@ export class PlaybackUrlResolver {
     settings: PlaybackSourceSettings,
     options: PlaybackResolveOptions = {},
   ): Promise<PlaybackResolution> {
+    this.pruneExpiredCache()
     const adapter = getPlaybackSourceAdapter(track)
     if (!adapter) {
       return {
@@ -257,10 +262,13 @@ export class PlaybackUrlResolver {
     const cacheKey = playbackPrefetchCacheId(track, resolvedSettings)
 
     if (!options.forceRefresh && isDirectStreamUrl(track.audioUrl)) {
+      const directUrl = track.audioUrl.trim()
       return createSuccess(track, adapter.kind, resolvedSettings, {
-        url: track.audioUrl.trim(),
+        url: directUrl,
         qualityKey: adapter.qualityKey(resolvedSettings),
-        cacheKey,
+        // 直链/一起听 streamUrl 的实际音质未知，不进入本地持久缓存
+        cacheKey: `${cacheKey}|direct`,
+        isPreview: true,
         audioInfo: createAudioInfo(
           adapter.kind,
           adapter.qualityKey(resolvedSettings),
@@ -290,6 +298,10 @@ export class PlaybackUrlResolver {
       .catch(error => classifyPlaybackError(error))
       .then(result => {
         if (result.type === 'success') {
+          if (!this.cache.has(cacheKey) && this.cache.size >= MAX_RESOLUTION_CACHE_ENTRIES) {
+            const oldest = this.cache.keys().next().value
+            if (oldest !== undefined) this.cache.delete(oldest)
+          }
           this.cache.set(cacheKey, {
             result,
             expiresAt: Date.now() + RESOLUTION_TTL_MS,
@@ -303,6 +315,12 @@ export class PlaybackUrlResolver {
 
     this.inFlight.set(cacheKey, pending)
     return pending
+  }
+
+  private pruneExpiredCache(now = Date.now()): void {
+    for (const [key, entry] of this.cache) {
+      if (entry.expiresAt <= now) this.cache.delete(key)
+    }
   }
 
   invalidate(track: TrackInfo, settings: PlaybackSourceSettings): void {
@@ -335,13 +353,14 @@ export async function resolvePlaybackSource(
 export function playbackCacheWriteOptions(
   resolved: ResolvedPlaybackSource,
   candidateIndex: number,
-  candidateUrl = resolved.url,
 ): PlaybackCacheWriteOptions {
   if (resolved.isPreview) return {}
   const primaryCacheKey = resolved.cacheKeyOverride || resolved.cacheKey
   if (candidateIndex !== 0) {
     return {
-      cacheKey: `${primaryCacheKey}|candidate:${candidateIndex}|${candidateUrl}`,
+      // 候选 URL 往往含短时签名，不能把完整 URL 写进键，否则每次刷新
+      // 都会生成永不复用的磁盘缓存文件（SR-08）
+      cacheKey: `${primaryCacheKey}|candidate:${candidateIndex}`,
     }
   }
   return {

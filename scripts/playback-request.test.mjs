@@ -110,6 +110,16 @@ assert.match(
   /const compactState = persistedPlayerState\(true\)[\s\S]*localStorage\.setItem\(PLAYER_STATE_KEY, JSON\.stringify\(compactState\)\)/,
   'an oversized queue must fall back to a compact current-track state',
 )
+assert.match(
+  playerStoreSource,
+  /const refreshed = await resolvePlaybackUrl\(\s*track,\s*true,\s*\)/,
+  'a failed playback retry must refresh the URL without silently changing quality',
+)
+assert.doesNotMatch(
+  playerStoreSource,
+  /const refreshed = await resolvePlaybackUrl\(\s*track,\s*true,\s*getPlaybackSourceKind\(track\) === 'youtube'/,
+  'a failed YouTube retry must preserve the user-selected quality',
+)
 
 const appSource = await readFile(new URL('../src/App.vue', import.meta.url), 'utf8')
 assert.match(
@@ -119,7 +129,7 @@ assert.match(
 )
 assert.match(
   appSource,
-  /getCurrentWindow\(\)\.onCloseRequested\(handleBeforeUnload\)/,
+  /getCurrentWindow\(\)\.onCloseRequested\(handleCloseRequested\)/,
   'the app must flush player state for a native Tauri window close',
 )
 assert.match(

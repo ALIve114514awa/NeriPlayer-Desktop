@@ -20,7 +20,8 @@ export class PlaybackPrefetchManager {
   readonly demandArbiter = new PlaybackDemandArbiter()
 
   private readonly entries = new Map<string, PrefetchEntry>()
-  private readonly jobs = new Map<string, Promise<void>>()
+  // 使用令牌而不是仅保存 Promise，清除后已在途的解析结果不能重新写回缓存
+  private readonly jobs = new Map<string, symbol>()
   private readonly ttlMs: number
   private readonly maxEntries: number
   private currentDemandKey: string | null = null
@@ -46,17 +47,19 @@ export class PlaybackPrefetchManager {
     if (this.hasFresh(cacheKey)) return
     if (this.jobs.has(cacheKey)) return
 
-    const job = resolver.resolve(track, settings).then((resolution) => {
+    const token = Symbol(cacheKey)
+    this.jobs.set(cacheKey, token)
+    void resolver.resolve(track, settings).then((resolution) => {
       if (resolution.type !== 'success') return
       if (this.demandArbiter.shouldYieldPrefetch(cacheKey)) return
+      // clearForTrack/clear 可能在解析完成前删除了令牌，此时丢弃旧结果
+      if (this.jobs.get(cacheKey) !== token) return
       this.put(cacheKey, resolution)
     }).catch(() => {
       // 预热失败不影响当前播放
     }).finally(() => {
-      if (this.jobs.get(cacheKey) === job) this.jobs.delete(cacheKey)
+      if (this.jobs.get(cacheKey) === token) this.jobs.delete(cacheKey)
     })
-
-    this.jobs.set(cacheKey, job)
   }
 
   prefetchWindow(

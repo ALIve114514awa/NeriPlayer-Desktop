@@ -1385,7 +1385,9 @@ impl Read for RemoteAudioSource {
                             read = self.read_disk_cached_at(physical, &mut out[total_read..window]);
                         }
                     }
-                    Err(_err) if total_read > 0 => return Ok(total_read),
+                    Err(err) if total_read > 0 && can_return_partial_read(&err) => {
+                        return Ok(total_read)
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -2941,8 +2943,14 @@ async fn fetch_range_block_async(
             .headers()
             .get(CONTENT_RANGE)
             .and_then(parse_content_range);
-        let bytes = response.bytes().await?;
-        Ok::<_, reqwest::Error>((status, content_range, bytes.to_vec()))
+        // 只有 206 的响应体才会进入缓存。对 200/4xx 直接丢弃 response，
+        // 避免 Range 被网关忽略时把整首音频读进内存后再报错（SR-04）
+        let bytes = if status == StatusCode::PARTIAL_CONTENT {
+            response.bytes().await?.to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok::<_, reqwest::Error>((status, content_range, bytes))
     };
     tokio::pin!(request);
     let result = tokio::select! {
@@ -3039,7 +3047,13 @@ async fn fetch_range_block_async(
     }
 
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        return Ok(Vec::new());
+        // 远端内容长度发生变化时，空 Vec 会被 Read 当作 EOF，导致无声截断
+        // 并错误推进到下一首。把永久范围错误交给上层的 URL 刷新/恢复路径
+        // 处理，不能把它伪装成正常结束（SR-03）
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote range no longer satisfiable: 416",
+        ));
     }
 
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -3190,6 +3204,10 @@ fn is_transient_fetch_error(err: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
     )
+}
+
+fn can_return_partial_read(err: &io::Error) -> bool {
+    is_transient_fetch_error(err) || err.kind() == io::ErrorKind::UnexpectedEof
 }
 
 /// reqwest 错误分类：超时（含 body 读取被 per-request 超时打断的
@@ -4193,6 +4211,7 @@ mod tests {
     use super::{
         adaptive_block_bytes, cache_duration_is_suspicious, ewma_bps_after_failure,
         ewma_bps_after_success, format_cache_marker, halved_fetch_len, is_fragmented_mp4_url,
+        can_return_partial_read,
         claim_prefetch_sequence_start, parse_cache_marker, parse_content_range, prefetch_lane_count,
         prefetch_plan, prefetch_window,
         ranges_cover_source,
@@ -4234,6 +4253,21 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         wav.resize(44 + data_len as usize, 0);
         wav
+    }
+
+    #[test]
+    fn permanent_range_error_is_not_folded_into_partial_eof() {
+        let permanent = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote range no longer satisfiable: 416",
+        );
+        let transient = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset while fetching range",
+        );
+
+        assert!(!can_return_partial_read(&permanent));
+        assert!(can_return_partial_read(&transient));
     }
 
     fn pcm_wav_24(samples: &[i32]) -> Vec<u8> {

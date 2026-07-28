@@ -10,6 +10,7 @@ import {
   useSettingsStore,
 } from './settings'
 import { useDownloadStore } from './download'
+import { useListenTogetherStore } from './listenTogether'
 import i18n from '@/i18n'
 import {
   canonicalizePlaybackTrack,
@@ -21,6 +22,7 @@ import {
   playbackPrefetchCacheId,
   playbackUrlResolver,
   resolvePlaybackResult,
+  isDirectStreamUrl,
   type PlaybackAudioSource,
   type PlaybackCacheReadCandidate,
   type PlaybackSourceSettings,
@@ -138,6 +140,7 @@ export interface LyricLine {
   words: LyricWord[]
   text: string
   translation?: string
+  roman?: string
 }
 
 export type RepeatMode = 'off' | 'all' | 'one'
@@ -277,6 +280,7 @@ const PAUSE_BACKWARD_TOLERANCE_MS = 250
 let consecutivePlayFailures = 0
 const MAX_CONSECUTIVE_FAILURES = 10
 let _isAutoSkipping = false
+let _stallRecovering = false
 
 // Shuffle 三栈模型
 let shuffleBag: number[] = []       // 未播放索引池
@@ -855,7 +859,7 @@ export const usePlayerStore = defineStore('player', () => {
     _interpAnchorMs = startMs
     _interpAnchorTime = performance.now()
     _interpRenderedMs = startMs
-    _interpSpeed = playbackSpeed.value
+    _interpSpeed = effectivePlaybackSpeed()
     _interpIsPlaying = true
     clearPauseGuard()
     // 从暂停停表状态恢复播放时重启插值循环
@@ -888,7 +892,7 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     const elapsedMs = Math.max(0, now - pendingSeek.issuedAt)
-    const speed = _interpIsPlaying ? Math.max(0.25, playbackSpeed.value || _interpSpeed || 1) : 0
+    const speed = _interpIsPlaying ? Math.max(0.25, effectivePlaybackSpeed() || _interpSpeed || 1) : 0
     const durationLimit = nextDurationMs || durationMs.value || currentTrack.value?.durationMs || 0
     const lowerBound = Math.max(0, pendingSeek.targetMs - SEEK_BACKWARD_TOLERANCE_MS)
     const upperCandidate = pendingSeek.targetMs + elapsedMs * speed + SEEK_FORWARD_TOLERANCE_MS
@@ -978,6 +982,23 @@ export const usePlayerStore = defineStore('player', () => {
     })
 
     // 系统媒体键事件（SMTC / MPRIS，来自 Rust 后端）
+    // 曲中断流: 后端发 stalled 而非 track-ended, 从当前位置重试当前曲, 超限再跳（PB-02）
+    listen<{ positionMs: number; requestGeneration: number }>('player:playback-stalled', (e) => {
+      if (e.payload.requestGeneration !== playbackRequestToken) return
+      const track = currentTrack.value
+      if (!track || _stallRecovering) return
+      _stallRecovering = true
+      const resumeAt = Math.max(0, Math.round(e.payload.positionMs))
+      void play(track, 'local', resumeAt, true)
+        .catch(() => {
+          if (!_isAutoSkipping) {
+            _isAutoSkipping = true
+            void next(true, 'local').finally(() => { _isAutoSkipping = false })
+          }
+        })
+        .finally(() => { _stallRecovering = false })
+    })
+
     listen('media:play', () => {
       void resume()
     })
@@ -1043,6 +1064,10 @@ export const usePlayerStore = defineStore('player', () => {
     replacePlaybackDemand(track)
     playbackStartupWatchdog.cancel()
     const previousTrack = currentTrack.value
+    // 直链只在本次请求确认有效时共享，切歌或强制刷新先清掉旧 URL
+    currentStreamUrl.value = !forceResolve && isDirectStreamUrl(track.audioUrl)
+      ? track.audioUrl.trim()
+      : null
     const wasPlayingBeforeSwitch = isPlaying.value
     const hadPlaybackSessionBeforeRequest = hasPlaybackSession.value
     const isSwitchingTrack = !!previousTrack && previousTrack.id !== track.id
@@ -1121,6 +1146,15 @@ export const usePlayerStore = defineStore('player', () => {
         track.id,
         track.playlistKey,
       )
+      // 推送元数据到后端镜像, 供系统媒体会话(SMTC/MPRIS)展示标题/歌手/封面/时长（PB-01）
+      void invoke('update_media_metadata', {
+        id: track.id,
+        title: track.title,
+        artist: track.artist,
+        album: track.album || '',
+        coverUrl: track.coverUrl || null,
+        durationMs: track.durationMs || 0,
+      }).catch(() => {})
       trackCommitted = true
     }
 
@@ -1134,8 +1168,12 @@ export const usePlayerStore = defineStore('player', () => {
     hasPlaybackSession.value = true
     // 网络和解码尚未完成时也保存用户的最新播放意图
     savePlayerState()
-    isPlaying.value = false
-    _interpIsPlaying = false
+    // overlap-crossfade 切歌时旧会话仍在出声直到新会话淡入, 立即置 false 会让播放按钮
+    // 闪示暂停态（PB-10）。此场景保持播放态, 仅非交叉淡入切歌才落 false
+    if (!(useOverlapCrossfade && wasPlayingBeforeSwitch)) {
+      isPlaying.value = false
+      _interpIsPlaying = false
+    }
 
     try {
       if (token !== playbackRequestToken) return
@@ -1311,11 +1349,7 @@ export const usePlayerStore = defineStore('player', () => {
               if (token !== playbackRequestToken) return 0
               const candidateStarted = performance.now()
               try {
-                const cacheWrite = playbackCacheWriteOptions(
-                  resolved,
-                  candidateIndex,
-                  candidateUrl,
-                )
+                const cacheWrite = playbackCacheWriteOptions(resolved, candidateIndex)
                   const startPlan = currentLoadStartPlan()
                   tracePlaybackUi(
                     'backend_stream_start',
@@ -1334,6 +1368,7 @@ export const usePlayerStore = defineStore('player', () => {
                   cacheWrite.cacheKey,
                   cacheWrite.expectedContentLength,
                   )
+                  if (token === playbackRequestToken) currentStreamUrl.value = candidateUrl
                   markLoadStartApplied(startPlan)
                   tracePlaybackUi(
                     'backend_stream_ready',
@@ -1365,7 +1400,6 @@ export const usePlayerStore = defineStore('player', () => {
             const refreshed = await resolvePlaybackUrl(
               track,
               true,
-              getPlaybackSourceKind(track) === 'youtube' ? 'high' : undefined,
             )
             if (refreshed.type !== 'success') throw firstError
             result = refreshed
@@ -1502,7 +1536,7 @@ export const usePlayerStore = defineStore('player', () => {
       _interpAnchorMs = startMs
       _interpAnchorTime = performance.now()
       _interpRenderedMs = startMs
-      _interpSpeed = playbackSpeed.value
+      _interpSpeed = effectivePlaybackSpeed()
       _interpIsPlaying = true
       _interpDurationMs = durationMs.value
       _startInterpolationLoop()
@@ -1554,7 +1588,10 @@ export const usePlayerStore = defineStore('player', () => {
       isPlayingFromDownload.value = false
       isPlayingFromCache.value = false
       hasPlaybackSession.value = false
-      const shouldRestorePreviousPlaybackState = useOverlapCrossfade && wasPlayingBeforeSwitch && !trackCommitted
+      // crossfade 失败时旧后端会话可能仍在出声（PCM ring 最多 4s 已解码帧），
+      // 一律回查后端真实状态决定 isPlaying，而非武断置 false。原 `!trackCommitted`
+      // 条件恒为 false（commitTrack 在 try 前已置位），使该恢复分支永为死代码（PB-05）
+      const shouldRestorePreviousPlaybackState = useOverlapCrossfade && wasPlayingBeforeSwitch
       if (shouldRestorePreviousPlaybackState) {
         try {
           const state = await invoke<{ is_playing?: boolean }>('get_player_state')
@@ -1674,6 +1711,9 @@ export const usePlayerStore = defineStore('player', () => {
       hasPlaybackSession.value = false
       _needsReload = !!currentTrack.value
       replacePlaybackDemand(null)
+      // 立即暂停旧会话输出：切歌加载中按暂停时，旧后端会话的 PCM ring（~4s 已解码帧）
+      // 会继续出声而 UI 已显示暂停。fire-and-forget，不阻塞取消流程（PB-06）
+      void invoke('pause').catch(() => {})
       try {
         await invoke<void>('begin_playback_request', {
           requestGeneration: cancellationToken,
@@ -1826,6 +1866,15 @@ export const usePlayerStore = defineStore('player', () => {
     lastTrackEndedId = trackId
     lastTrackEndedTime = Date.now()
 
+    // 一起听会话激活时听众不本地推进: 暂停并上报 TRACK_FINISHED, 由房主/服务端决定切歌,
+    // 避免因流时长差异先于房主播完而反向拖动整个房间（LB-02/LT-08）
+    const lt = useListenTogetherStore()
+    if (lt.isConnected && lt.roomId && !lt.isController) {
+      await pause('remote_sync')
+      lt.reportTrackFinished(trackId)
+      return
+    }
+
     // 睡眠定时器
     const isLast = !shuffleEnabled.value && queueIndex.value >= queue.value.length - 1
     if (sleepTimerMode.value === 'end_of_track') {
@@ -1958,25 +2007,19 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   async function toggleRepeatMode() {
-    try {
-      const mode = await invoke<string>('cycle_repeat')
-      repeatMode.value = mode as RepeatMode
-    } catch {
-      const modes: RepeatMode[] = ['off', 'all', 'one']
-      const idx = modes.indexOf(repeatMode.value)
-      repeatMode.value = modes[(idx + 1) % modes.length]
-    }
+    // 播放模式在前端本地推进（对齐 Android cycleRepeatModeImpl）, 不再采信后端
+    // PlayQueue 独立状态机的返回值: 后端进程启动恒为 Off, 与前端从 localStorage 恢复的
+    // 模式不同步, 会导致重启后首次点击跳档/无效（PB-03）
+    const modes: RepeatMode[] = ['off', 'all', 'one']
+    const idx = modes.indexOf(repeatMode.value)
+    repeatMode.value = modes[(idx + 1) % modes.length]
     log.info('repeat mode ->', repeatMode.value)
     savePlayerState()
   }
 
   async function toggleShuffle() {
-    try {
-      const enabled = await invoke<boolean>('toggle_shuffle')
-      shuffleEnabled.value = enabled
-    } catch {
-      shuffleEnabled.value = !shuffleEnabled.value
-    }
+    // 同 PB-03: 本地翻转, 不采信后端 toggle_shuffle 返回值
+    shuffleEnabled.value = !shuffleEnabled.value
     // Shuffle 三栈管理
     if (shuffleEnabled.value) {
       rebuildShuffleBag()
@@ -2078,6 +2121,36 @@ export const usePlayerStore = defineStore('player', () => {
 
   // 播放速度
   const playbackSpeed = ref(settings.playbackSpeed)
+  const currentStreamUrl = ref<string | null>(null)
+  let listenTogetherSyncRateMultiplier: number | null = null
+
+  function effectivePlaybackSpeed(): number {
+    const multiplier = listenTogetherSyncRateMultiplier ?? 1
+    return Math.max(0.25, Math.min(3, playbackSpeed.value * multiplier))
+  }
+
+  function setListenTogetherSyncPlaybackRate(multiplier: number | null) {
+    listenTogetherSyncRateMultiplier = multiplier === null
+      ? null
+      : Math.max(0.9, Math.min(1.1, multiplier))
+    const nowMs = currentRenderedPosition()
+    _interpSpeed = effectivePlaybackSpeed()
+    _interpAnchorMs = nowMs
+    _interpAnchorTime = performance.now()
+    _interpRenderedMs = nowMs
+    interpolatedPositionMs.value = nowMs
+    if (_speedInvokeTimer) clearTimeout(_speedInvokeTimer)
+    _speedInvokeTimer = setTimeout(() => {
+      _speedInvokeTimer = null
+      invoke('set_speed', { speed: effectivePlaybackSpeed() }).catch(() => {})
+    }, 80)
+  }
+
+  function getCurrentStreamUrl(trackId?: string): string | null {
+    if (!currentTrack.value || (trackId && currentTrack.value.id !== trackId)) return null
+    return currentStreamUrl.value
+  }
+
   async function setSpeed(spd: number) {
     const next = Math.max(0.25, Math.min(3, spd))
     const wasPlaying = _interpIsPlaying
@@ -2085,7 +2158,7 @@ export const usePlayerStore = defineStore('player', () => {
     const nowMs = currentRenderedPosition()
     playbackSpeed.value = next
     settings.playbackSpeed = next
-    _interpSpeed = next
+    _interpSpeed = effectivePlaybackSpeed()
     _interpAnchorMs = nowMs
     _interpAnchorTime = performance.now()
     _interpRenderedMs = nowMs
@@ -2104,7 +2177,7 @@ export const usePlayerStore = defineStore('player', () => {
     if (_speedInvokeTimer) clearTimeout(_speedInvokeTimer)
     _speedInvokeTimer = setTimeout(() => {
       _speedInvokeTimer = null
-      invoke('set_speed', { speed: playbackSpeed.value }).catch(() => {})
+      invoke('set_speed', { speed: effectivePlaybackSpeed() }).catch(() => {})
     }, 200)
   }
 
@@ -2153,6 +2226,7 @@ export const usePlayerStore = defineStore('player', () => {
     equalizerPresetId.value = 'flat'
     equalizerBands.value = [0, 0, 0, 0, 0]
     playbackSpeed.value = 1.0
+    listenTogetherSyncRateMultiplier = null
     settings.loudnessGainMb = 0
     settings.equalizerEnabled = false
     settings.equalizerPresetId = 'flat'
@@ -2176,7 +2250,7 @@ export const usePlayerStore = defineStore('player', () => {
 
     await Promise.allSettled([
       invoke('set_volume', { level: volume.value }),
-      invoke('set_speed', { speed: playbackSpeed.value }),
+      invoke('set_speed', { speed: effectivePlaybackSpeed() }),
       invoke('set_loudness_gain', { gainMb: loudnessGainMb.value }),
       invoke('set_normalize_volume', { enabled: settings.normalizeVolume }),
       invoke('set_equalizer', { enabled: equalizerEnabled.value, bandLevelsMb: equalizerBands.value }),
@@ -2373,13 +2447,14 @@ export const usePlayerStore = defineStore('player', () => {
     hasPlaybackSession,
     audioLevel, beatImpulse, audioInfo, isPlayingFromDownload, isPlayingFromCache,
     lastCommandSource, lastSeekCommand, isRemoteSyncGuardActive,
-    playbackSpeed, sleepTimerMode, sleepRemainingSeconds,
+    playbackSpeed, currentStreamUrl, sleepTimerMode, sleepRemainingSeconds,
     loudnessGainMb, equalizerEnabled, equalizerPresetId, equalizerBands, hasActiveEffects,
     progress, interpolatedPositionMs, interpolatedProgress,
     currentTimeFormatted, durationFormatted,
     play, togglePlayPause, pause, resume, seekTo, next, previous,
     flushPlayerState,
-    toggleRepeatMode, toggleShuffle, cyclePlayMode, applyListenTogetherPlaybackMode, playMode, setVolume, setSpeed,
+    toggleRepeatMode, toggleShuffle, cyclePlayMode, applyListenTogetherPlaybackMode,
+    playMode, setVolume, setSpeed, setListenTogetherSyncPlaybackRate, getCurrentStreamUrl,
     setLoudnessGain, setEqualizer, setEqualizerPreset, resetAudioEffects,
     applyPersistedSettings,
     startSleepTimer, startSleepTimerEndOfTrack, startSleepTimerEndOfQueue, cancelSleepTimer,
@@ -2526,4 +2601,3 @@ function playbackCacheLimitBytes(): number {
   )
   return Math.round(cacheSizeMb * 1024 * 1024)
 }
-

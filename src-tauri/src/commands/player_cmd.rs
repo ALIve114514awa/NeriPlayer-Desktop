@@ -877,8 +877,22 @@ async fn play_url_streaming_fallback(
 ) -> AppResult<u64> {
     ensure_playback_request(state, request_generation)?;
     if start_position_ms > 0 {
-        let path = download_url_to_temp_audio(url, state, request_generation).await?;
+        // 中途起播也复用本次已创建的隔离 staging，完整下载成功后发布为可复用缓存。
+        // 没有缓存配置时才落到临时文件，避免每次 Range 降级都遗留整曲副本
+        let path: PathBuf = match cache {
+            Some(cache) => download_url_to_playback_cache(
+                url,
+                state,
+                cache,
+                request_generation,
+            )
+            .await?,
+            None => download_url_to_temp_audio(url, state, request_generation)
+                .await?
+                .into(),
+        };
         ensure_playback_request(state, request_generation)?;
+        let path = path.to_string_lossy().into_owned();
         let dur = run_player_play(Arc::clone(&state.player), move |player| {
             player.request_play_file_at_with_hint(
                 &path,
@@ -1492,6 +1506,37 @@ async fn download_url_bytes(
     Ok(bytes.to_vec())
 }
 
+/// 回收系统临时目录中遗留的 neri-playback-*.audio 孤儿文件（SR-09）
+///
+/// 回退播放路径用 .keep() 持久化临时整曲文件后交给播放器打开，其生命周期脱离本模块
+/// 且无清理钩子，会在临时目录无限堆积。用 mtime 年龄阈值只回收明显过期的：单曲播放
+/// 时长远小于阈值，正在使用的文件 mtime 必新于阈值，不会被误删（best-effort，忽略 IO 错误）
+fn sweep_orphaned_temp_audio() {
+    const ORPHAN_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("neri-playback-") || !name.ends_with(".audio") {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= ORPHAN_MAX_AGE);
+        if expired {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 async fn download_url_to_temp_audio(
     url: &str,
     state: &State<'_, AppState>,
@@ -1499,6 +1544,8 @@ async fn download_url_to_temp_audio(
 ) -> AppResult<String> {
     let data = download_url_bytes(url, state, "playback_temp", request_generation).await?;
     tokio::task::spawn_blocking(move || -> AppResult<String> {
+        // 创建新临时文件前顺带回收上次会话遗留的同前缀孤儿文件
+        sweep_orphaned_temp_audio();
         let mut file = tempfile::Builder::new()
             .prefix("neri-playback-")
             .suffix(".audio")
@@ -1710,6 +1757,20 @@ async fn start_streaming_download(
             downloaded,
             start.elapsed().as_millis()
         );
+        if !stream_length_matches(total_len, downloaded as u64) {
+            let expected = total_len.unwrap_or_default();
+            log::error!(
+                target: tag,
+                "stream truncated: downloaded {} bytes, expected {}",
+                downloaded,
+                expected,
+            );
+            writer.fail(format!(
+                "stream truncated: downloaded {} bytes, expected {}",
+                downloaded, expected
+            ));
+            return;
+        }
         writer.finish();
         if let (Some(mut file), Some(cache)) = (cache_file, cache) {
             if let Err(error) = file.flush().await {
@@ -1732,6 +1793,10 @@ async fn wait_for_playback_superseded(generation: &AtomicU64, expected: u64) {
     while generation.load(Ordering::Acquire) == expected {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn stream_length_matches(expected: Option<u64>, downloaded: u64) -> bool {
+    expected.is_none_or(|expected| expected == downloaded)
 }
 
 async fn wait_for_stream_start(buffer: GrowingAudioBuffer) -> AppResult<usize> {
@@ -1758,6 +1823,32 @@ pub async fn get_player_state(state: State<'_, AppState>) -> AppResult<PlayerSta
     })
 }
 
+/// 前端切歌时推送当前曲目元数据到 AppState 镜像, 供 ticker 更新系统媒体会话（PB-01）
+#[tauri::command]
+pub async fn update_media_metadata(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+    artist: String,
+    album: String,
+    cover_url: Option<String>,
+    duration_ms: u64,
+) -> AppResult<()> {
+    *state.media_metadata.lock() = Some(crate::state::MediaMetadataMirror {
+        id,
+        title,
+        artist,
+        album,
+        cover_url,
+        duration_ms,
+    });
+    Ok(())
+}
+
+// 废弃/危险: next_track/prev_track/set_queue 以 request_play_file_with_hint 播放
+// TrackInfo.url——远程曲目该字段是 https 直链, 会走 File 解码器打开失败。前端对这些命令
+// 零调用（队列推进全在 player.ts）。改接媒体键前务必先改为按 source 解析直链, 否则所有
+// 远程曲目播放失败（PB-07）
 #[tauri::command]
 pub async fn next_track(state: State<'_, AppState>) -> AppResult<Option<crate::state::TrackInfo>> {
     let request_generation = advance_playback_request(&state);
@@ -1833,7 +1924,7 @@ pub async fn cycle_repeat(state: State<'_, AppState>) -> AppResult<crate::state:
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_generation, is_generation_current, playback_trace_field,
+        claim_generation, is_generation_current, playback_trace_field, stream_length_matches,
         CachedAudioPlaybackRequest, PlaybackUiTraceRequest,
     };
     use std::sync::atomic::AtomicU64;
@@ -1848,6 +1939,13 @@ mod tests {
         assert!(claim_generation(&generation, 11));
         assert!(is_generation_current(&generation, 11));
         assert!(!is_generation_current(&generation, 10));
+    }
+
+    #[test]
+    fn sequential_stream_length_guard_rejects_truncated_content() {
+        assert!(stream_length_matches(Some(128), 128));
+        assert!(!stream_length_matches(Some(128), 127));
+        assert!(stream_length_matches(None, 127));
     }
 
     #[test]

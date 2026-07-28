@@ -1,4 +1,4 @@
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Condvar, Mutex,
@@ -13,16 +13,20 @@ pub struct GrowingAudioBuffer {
 
 struct GrowingAudioInner {
     state: Mutex<GrowingAudioState>,
+    spool: Option<Mutex<std::fs::File>>,
     cv: Condvar,
     aborted: AtomicBool,
 }
 
 struct GrowingAudioState {
     data: Vec<u8>,
+    buffered_len: u64,
     complete: bool,
     error: Option<String>,
     total_len: Option<u64>,
 }
+
+const MEMORY_FALLBACK_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct GrowingAudioReader {
@@ -45,10 +49,14 @@ impl GrowingAudioBuffer {
             inner: Arc::new(GrowingAudioInner {
                 state: Mutex::new(GrowingAudioState {
                     data: Vec::new(),
+                    buffered_len: 0,
                     complete: false,
                     error: None,
                     total_len: None,
                 }),
+                // 流式回退可能是数百 MB 的长音频，匿名临时文件让内存占用
+                // 与曲目长度脱钩；磁盘不可用时仍有有限内存兜底
+                spool: tempfile::tempfile().ok().map(Mutex::new),
                 cv: Condvar::new(),
                 aborted: AtomicBool::new(false),
             }),
@@ -74,7 +82,32 @@ impl GrowingAudioBuffer {
             return;
         }
         if let Ok(mut state) = self.inner.state.lock() {
-            state.data.extend_from_slice(bytes);
+            if let Some(spool) = &self.inner.spool {
+                let write_result = spool
+                    .lock()
+                    .map_err(|_| io::Error::other("stream spool lock poisoned"))
+                    .and_then(|mut file| {
+                        file.seek(SeekFrom::End(0))?;
+                        file.write_all(bytes)
+                    });
+                if let Err(error) = write_result {
+                    state.error = Some(format!("stream spool write failed: {error}"));
+                    state.complete = true;
+                    self.inner.cv.notify_all();
+                    return;
+                }
+            } else if state.data.len().saturating_add(bytes.len()) <= MEMORY_FALLBACK_LIMIT_BYTES {
+                state.data.extend_from_slice(bytes);
+            } else {
+                state.error = Some(format!(
+                    "stream spool unavailable and memory fallback exceeded {} bytes",
+                    MEMORY_FALLBACK_LIMIT_BYTES
+                ));
+                state.complete = true;
+                self.inner.cv.notify_all();
+                return;
+            }
+            state.buffered_len = state.buffered_len.saturating_add(bytes.len() as u64);
             self.inner.cv.notify_all();
         }
     }
@@ -97,7 +130,14 @@ impl GrowingAudioBuffer {
     pub fn abort(&self) {
         self.inner.aborted.store(true, Ordering::SeqCst);
         if let Ok(mut state) = self.inner.state.lock() {
+            state.data.clear();
+            state.buffered_len = 0;
             state.complete = true;
+            if let Some(spool) = &self.inner.spool {
+                if let Ok(file) = spool.lock() {
+                    let _ = file.set_len(0);
+                }
+            }
             self.inner.cv.notify_all();
         }
     }
@@ -120,8 +160,9 @@ impl GrowingAudioBuffer {
             if self.is_aborted() {
                 return Err("stream aborted".to_string());
             }
-            if state.data.len() >= min_bytes || (state.complete && !state.data.is_empty()) {
-                return Ok(state.data.len());
+            let buffered = usize::try_from(state.buffered_len).unwrap_or(usize::MAX);
+            if buffered >= min_bytes || (state.complete && buffered > 0) {
+                return Ok(buffered);
             }
             if state.complete {
                 return Err("empty audio stream".to_string());
@@ -131,8 +172,7 @@ impl GrowingAudioBuffer {
             if now >= deadline {
                 return Err(format!(
                     "stream startup timeout: buffered {} bytes, need {} bytes",
-                    state.data.len(),
-                    min_bytes
+                    state.buffered_len, min_bytes
                 ));
             }
             let wait_for = deadline.saturating_duration_since(now);
@@ -145,8 +185,7 @@ impl GrowingAudioBuffer {
             if timeout_result.timed_out() {
                 return Err(format!(
                     "stream startup timeout: buffered {} bytes, need {} bytes",
-                    state.data.len(),
-                    min_bytes
+                    state.buffered_len, min_bytes
                 ));
             }
         }
@@ -161,7 +200,14 @@ impl GrowingAudioReader {
         // 之后 append 因 aborted 提前返回不再唤醒 —— 解码线程带着整首歌
         // 的缓冲永久阻塞。与 GrowingAudioBuffer::abort 保持一致
         if let Ok(mut state) = self.inner.state.lock() {
+            state.data.clear();
+            state.buffered_len = 0;
             state.complete = true;
+            if let Some(spool) = &self.inner.spool {
+                if let Ok(file) = spool.lock() {
+                    let _ = file.set_len(0);
+                }
+            }
             self.inner.cv.notify_all();
         }
     }
@@ -180,10 +226,10 @@ impl GrowingAudioReader {
 
     fn known_byte_len(&self) -> Option<u64> {
         let state = self.inner.state.lock().ok()?;
-        if !state.complete {
+        if !state.complete || state.error.is_some() || self.inner.aborted.load(Ordering::Acquire) {
             return None;
         }
-        state.total_len.or(Some(state.data.len() as u64))
+        state.total_len.or(Some(state.buffered_len))
     }
 }
 
@@ -211,11 +257,19 @@ impl Read for GrowingAudioReader {
                 return Err(io::Error::other(err.clone()));
             }
 
-            let available = state.data.len() as u64;
+            let available = state.buffered_len;
             if self.pos < available {
-                let start = self.pos as usize;
-                let len = out.len().min(state.data.len().saturating_sub(start));
-                out[..len].copy_from_slice(&state.data[start..start + len]);
+                let len = out.len().min((available - self.pos) as usize);
+                if let Some(spool) = &self.inner.spool {
+                    let mut file = spool
+                        .lock()
+                        .map_err(|_| io::Error::other("stream spool lock poisoned"))?;
+                    file.seek(SeekFrom::Start(self.pos))?;
+                    file.read_exact(&mut out[..len])?;
+                } else {
+                    let start = self.pos as usize;
+                    out[..len].copy_from_slice(&state.data[start..start + len]);
+                }
                 self.pos += len as u64;
                 return Ok(len);
             }
@@ -250,7 +304,7 @@ impl Seek for GrowingAudioReader {
             SeekFrom::End(offset) => {
                 let len = state
                     .total_len
-                    .or_else(|| state.complete.then_some(state.data.len() as u64));
+                    .or_else(|| state.complete.then_some(state.buffered_len));
                 match len {
                     Some(len) => len as i128 + offset as i128,
                     None => {
@@ -359,5 +413,27 @@ mod tests {
 
         assert!(reader.is_seekable());
         assert_eq!(reader.byte_len(), Some(4));
+    }
+
+    #[test]
+    fn completed_download_reports_buffered_length_without_total_length() {
+        let buffer = GrowingAudioBuffer::new();
+        buffer.append(&[1, 2, 3, 4]);
+        buffer.finish();
+
+        let reader = buffer.reader();
+        assert!(reader.is_seekable());
+        assert_eq!(reader.byte_len(), Some(4));
+    }
+
+    #[test]
+    fn aborted_reader_is_not_seekable() {
+        let buffer = GrowingAudioBuffer::new();
+        buffer.append(&[1, 2, 3, 4]);
+        let reader = buffer.reader();
+        reader.abort();
+
+        assert!(!reader.is_seekable());
+        assert_eq!(reader.byte_len(), None);
     }
 }

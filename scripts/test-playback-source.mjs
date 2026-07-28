@@ -126,7 +126,7 @@ await run('candidate streams use isolated formal cache keys', async () => {
   assert.deepEqual(
     playbackCacheWriteOptions(resolved, 1, resolved.candidateUrls[0]),
     {
-      cacheKey: 'resolved-cache|candidate:1|https://audio.example/fallback',
+      cacheKey: 'resolved-cache|candidate:1',
     },
   )
 })

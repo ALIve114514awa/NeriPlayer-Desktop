@@ -905,7 +905,9 @@ watch(nowPlayingTrackKey, async (trackKey) => {
       const lyrics = await invoke<any[]>('fetch_lyrics', {
         title: track.title,
         artist: track.artist,
-        durationSecs: Math.floor((track.durationMs || player.durationMs || 0) / 1000),
+        // 换歌瞬间 player.durationMs 仍是上一首的值, 会误触发后端时长硬门槛拒掉正确
+        // 歌词。未知时长传 0（后端对 0 不设门槛）（LY-12）
+        durationSecs: Math.floor((track.durationMs || 0) / 1000),
         audioPath: track.audioUrl || null,
         neteaseId: neteaseId || null,
         qqSongMid: qqSongMid || null,
@@ -913,6 +915,8 @@ watch(nowPlayingTrackKey, async (trackKey) => {
       })
       const mapped = mapBackendLyrics(lyrics)
       if (mapped.length > 0) cacheLyricsForTrack(track, mapped)
+      // 后端目前把明确无词与任一歌词源临时失败都归为 []，不能据此写负缓存。
+      // 否则一次网络/API 波动会让后续 24 小时都跳过在线歌词查询
       log.info('lyrics backend returned:', {
         requestId,
         trackId: track.id,
@@ -1128,6 +1132,13 @@ const moreSheetTransition = ref('slide-left')
 function goToSubView(view: typeof moreSheetView.value) {
   moreSheetTransition.value = 'slide-left'
   moreSheetView.value = view
+}
+
+// 点击进度条旁的音质标签直接打开音质切换面板（ST-05：让该设置真实可切换而非纯展示）
+function openQualitySwitcher() {
+  if (currentSource.value === 'local') return
+  showMoreSheet.value = true
+  goToSubView('quality')
 }
 function goBackToMain() {
   moreSheetTransition.value = 'slide-right'
@@ -1908,7 +1919,7 @@ const sliderActiveColor = computed(() => {
       v-if="player.hasPlaybackSession && settings.coverBlurBg"
       :cover-url="coverUrl"
       :blur-amount="settings.coverBlurAmount * 30"
-      :darken-alpha="Math.max(settings.coverBlurDarken, 0.42)"
+      :darken-alpha="Math.min(Math.max(settings.coverBlurDarken, 0), 0.8)"
     />
     <HyperBackground
       v-else-if="shouldRenderDynamicBackground"
@@ -2054,7 +2065,14 @@ const sliderActiveColor = computed(() => {
               <template v-for="(part, index) in audioInfoParts" :key="`${part.text}:${index}`">
                 <span
                   class="np-audio-detail-part"
-                  :class="{ 'np-audio-detail-part--accent': part.accent }"
+                  :class="{
+                    'np-audio-detail-part--accent': part.accent,
+                    'np-audio-detail-part--clickable': part.accent && currentSource !== 'local',
+                  }"
+                  :role="part.accent && currentSource !== 'local' ? 'button' : undefined"
+                  :tabindex="part.accent && currentSource !== 'local' ? 0 : undefined"
+                  @click="part.accent && openQualitySwitcher()"
+                  @keydown.enter="part.accent && openQualitySwitcher()"
                 >{{ part.text }}</span>
                 <span v-if="index < audioInfoParts.length - 1" class="np-audio-separator">·</span>
               </template>
@@ -3563,6 +3581,19 @@ const sliderActiveColor = computed(() => {
   color: color-mix(in srgb, var(--np-primary, var(--md-primary, #D0BCFF)) 58%, rgba(255,255,255,0.78));
   text-shadow: none;
   font-weight: 600;
+}
+
+.np-audio-detail-part--clickable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.45s ease, background-color 0.2s ease;
+}
+
+.np-audio-detail-part--clickable:hover,
+.np-audio-detail-part--clickable:focus-visible {
+  color: var(--np-primary, var(--md-primary, #D0BCFF));
+  background-color: rgba(255, 255, 255, 0.08);
+  outline: none;
 }
 
 .np-audio-separator {

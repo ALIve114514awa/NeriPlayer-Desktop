@@ -749,11 +749,14 @@ impl PlayerEngine {
     }
 
     pub fn position_ms(&self) -> u64 {
-        self.clock
-            .as_ref()
-            .map(|clock| clock.position_ms())
-            .unwrap_or(0)
-            .min(self.duration_ms.max(1))
+        let pos = self.clock.as_ref().map(|clock| clock.position_ms()).unwrap_or(0);
+        // duration 未知(=0)时不钳制：否则位置被永久钉在 1ms，进度条冻结、
+        // near_end / begin_finished_query 永不满足导致曲目播完不推进队列（PB-04）
+        if self.duration_ms > 0 {
+            pos.min(self.duration_ms)
+        } else {
+            pos
+        }
     }
 
     pub fn pause(&mut self) {

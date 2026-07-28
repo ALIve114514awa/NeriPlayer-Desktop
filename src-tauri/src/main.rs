@@ -11,6 +11,35 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackFinishState {
+    None,
+    Ended,
+    Stalled,
+}
+
+fn classify_playback_finish(
+    finished_flag: bool,
+    was_playing: bool,
+    position_ms: u64,
+    duration_ms: u64,
+) -> PlaybackFinishState {
+    if !finished_flag || !was_playing || position_ms <= 500 {
+        return PlaybackFinishState::None;
+    }
+
+    // 流式内容可能没有 Content-Length，duration 为 0 时 EOF 就是正常结束。
+    // 只有已知时长且明显不在结尾才作为中段断流恢复
+    if duration_ms == 0
+        || position_ms.saturating_add(5_000) >= duration_ms
+        || position_ms.saturating_mul(100) / duration_ms >= 98
+    {
+        PlaybackFinishState::Ended
+    } else {
+        PlaybackFinishState::Stalled
+    }
+}
+
 fn main() {
     // 崩溃收集必须最早安装：之后任何线程 panic 都会把现场落盘
     neri_player_desktop::logging::install_panic_hook(env!("CARGO_PKG_VERSION"));
@@ -110,6 +139,21 @@ fn main() {
                 });
             }
 
+            // 进程长时间保持运行时也要定期触发 SIDTS 主动轮换, 不能只依赖启动或下一次页面访问
+            {
+                let handle_yt = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(300));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        let state = handle_yt.state::<AppState>();
+                        auth_cmd::maybe_refresh_youtube_session(&handle_yt, state.inner(), false)
+                            .await;
+                    }
+                });
+            }
+
             // 启动时迁移同步 Token 和 WebDAV 密码到当前构建的凭据存储
             sync_cmd::initialize_secure_storage(&handle);
 
@@ -146,6 +190,7 @@ fn main() {
             let handle_ticker = handle.clone();
             std::thread::spawn(move || {
                 let mut last_ended = false;
+                let mut last_stalled = false;
                 let mut media_update_counter: u32 = 0;
                 // 缓存上次发送给 media session 的元数据 ID，避免重复设置
                 let mut last_media_track_id = String::new();
@@ -244,21 +289,18 @@ fn main() {
                     if let Some(ref ms) = media_session {
                         media_update_counter += 1;
 
-                        // 元数据更新：检查当前曲目是否变化
-                        let current_track_id = {
-                            let q = state.queue.lock();
-                            q.current().map(|t| t.id.clone()).unwrap_or_default()
-                        };
-                        if !current_track_id.is_empty() && current_track_id != last_media_track_id {
-                            last_media_track_id = current_track_id;
-                            let q = state.queue.lock();
-                            if let Some(track) = q.current() {
+                        // 元数据来源改为前端镜像: PlayQueue 从不被前端填充, 读它使
+                        // SMTC/MPRIS 永远拿不到曲目信息（PB-01）
+                        let current_meta = state.media_metadata.lock().clone();
+                        if let Some(meta) = current_meta {
+                            if !meta.id.is_empty() && meta.id != last_media_track_id {
+                                last_media_track_id = meta.id.clone();
                                 ms.update_metadata(
-                                    &track.title,
-                                    &track.artist,
-                                    &track.album,
-                                    track.cover_url.as_deref(),
-                                    track.duration_ms,
+                                    &meta.title,
+                                    &meta.artist,
+                                    &meta.album,
+                                    meta.cover_url.as_deref(),
+                                    meta.duration_ms,
                                 );
                             }
                         }
@@ -288,11 +330,32 @@ fn main() {
                                 rx.recv_timeout(Duration::from_millis(100)).unwrap_or(false)
                             })
                             .unwrap_or(false);
-                        let near_end = duration_ms > 0
-                            && (position_ms.saturating_add(5_000) >= duration_ms
-                                || position_ms.saturating_mul(100) / duration_ms.max(1) >= 98);
-                        let finished =
-                            finished_flag && was_playing && position_ms > 500 && near_end;
+                        let finish_state = classify_playback_finish(
+                            finished_flag,
+                            was_playing,
+                            position_ms,
+                            duration_ms,
+                        );
+                        let finished = finish_state == PlaybackFinishState::Ended;
+                        // 曲中断流/解码饿死/DeviceLost 重建失败不能当播完静默卡死，
+                        // 发独立 stalled 事件让前端从当前位置重试
+                        let stalled = finish_state == PlaybackFinishState::Stalled;
+                        if stalled && !last_stalled {
+                            last_stalled = true;
+                            let stalled_generation = {
+                                let player = state.player.lock();
+                                player.loaded_generation().unwrap_or(0)
+                            };
+                            let _ = handle_ticker.emit(
+                                "player:playback-stalled",
+                                serde_json::json!({
+                                    "positionMs": position_ms,
+                                    "requestGeneration": stalled_generation,
+                                }),
+                            );
+                        } else if !stalled {
+                            last_stalled = false;
+                        }
                         if finished && !last_ended {
                             last_ended = true;
                             let ended_generation = {
@@ -316,7 +379,14 @@ fn main() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            // 安全护栏：Tauri 无条件向每个 webview（含加载第三方远端页面的登录窗口）注入
+            // IPC 脚本，且应用自定义命令不经 ACL 校验。仅放行主窗口调用命令，阻止登录页
+            // （music.163.com / passport.bilibili.com / accounts.google.com）上的任意 JS
+            // 越权调用 save_file_bytes 等命令写/读任意文件或导出凭据
+            let app_handler: Box<
+                dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static,
+            > = Box::new(tauri::generate_handler![
             player_cmd::trace_playback_ui,
             player_cmd::begin_playback_request,
             player_cmd::play_file,
@@ -343,6 +413,7 @@ fn main() {
             player_cmd::crossfade_url_streaming,
             player_cmd::crossfade_file,
             player_cmd::get_player_state,
+            player_cmd::update_media_metadata,
             player_cmd::next_track,
             player_cmd::prev_track,
             player_cmd::set_queue,
@@ -459,7 +530,60 @@ fn main() {
             stats_cmd::clear_playback_stats,
             stats_cmd::remove_playback_stats,
             stats_cmd::playback_stats_identity_key,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+            ]);
+            move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+                let label = invoke.message.webview().label().to_string();
+                if label != "main" {
+                    let command = invoke.message.command().to_string();
+                    log::warn!(
+                        target: "security",
+                        "已拦截非主窗口 '{label}' 的 IPC 调用: {command}"
+                    );
+                    invoke
+                        .resolver
+                        .reject(format!("IPC not allowed from window '{label}'"));
+                    return true;
+                }
+                app_handler(invoke)
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // 退出前 flush 一次轮转 Cookie：60s 定时器之外，退出前最后一窗口的
+            // Set-Cookie 轮换令牌若不落盘，下次启动会重放旧令牌导致偶发掉登录（AU-05）
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let state = app_handle.state::<AppState>();
+                auth_cmd::persist_rotated_cookies(app_handle, state.inner());
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_playback_finish, PlaybackFinishState};
+
+    #[test]
+    fn unknown_duration_eof_ends_track() {
+        assert_eq!(
+            classify_playback_finish(true, true, 10_000, 0),
+            PlaybackFinishState::Ended,
+        );
+    }
+
+    #[test]
+    fn known_duration_near_end_eof_ends_track() {
+        assert_eq!(
+            classify_playback_finish(true, true, 97_000, 100_000),
+            PlaybackFinishState::Ended,
+        );
+    }
+
+    #[test]
+    fn known_duration_middle_eof_is_stalled() {
+        assert_eq!(
+            classify_playback_finish(true, true, 30_000, 100_000),
+            PlaybackFinishState::Stalled,
+        );
+    }
 }
