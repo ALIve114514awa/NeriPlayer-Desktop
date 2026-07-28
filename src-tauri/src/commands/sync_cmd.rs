@@ -7,6 +7,7 @@ use crate::settings::store::{self, AppSettings};
 use crate::state::AppState;
 use crate::sync::models::*;
 use crate::sync::manager;
+use crate::library::playlist;
 use crate::security;
 use tauri_plugin_store::StoreExt;
 
@@ -528,6 +529,24 @@ fn local_stats_payload(state: &State<'_, AppState>) -> manager::SyncStatsPayload
     manager::SyncStatsPayload { stats, buckets, cleared_at }
 }
 
+fn build_local_sync_snapshot(
+    app: &AppHandle,
+    history_entries: Option<&[manager::SyncHistoryEntry]>,
+    history_deletions: Option<&[manager::SyncHistoryDeletion]>,
+    stats: manager::SyncStatsPayload,
+) -> AppResult<(SyncData, u64)> {
+    // 快照与 epoch 必须在同一把歌单锁内取得。否则等待全局同步锁期间的
+    // 本地编辑会让旧快照搭配新 epoch，随后通过检查并覆盖刚保存的歌单
+    let _playlist_guard = playlist::lock_io();
+    let local_data = manager::build_local_sync_data(
+        app,
+        history_entries,
+        history_deletions,
+        Some(stats),
+    )?;
+    Ok((local_data, playlist::io_epoch()))
+}
+
 /// 把合并后的统计写回本地，并只保留本机分片，避免下轮上传重复累加他机增量
 fn apply_merged_stats(app: &AppHandle, state: &State<'_, AppState>, merged: &SyncData) {
     let device_id = manager::get_or_create_device_id_pub(app);
@@ -554,13 +573,19 @@ pub async fn sync_github(
         return Err(AppError::Api("GitHub sync not configured".into()));
     }
 
-    let local_data = manager::build_local_sync_data(
+    let (local_data, playlist_epoch) = build_local_sync_snapshot(
         &app,
         history_entries.as_deref(),
         history_deletions.as_deref(),
-        Some(local_stats_payload(&state)),
+        local_stats_payload(&state),
     )?;
-    let outcome = manager::sync_github(&state.http(), &mut config, &local_data).await?;
+    let outcome = manager::sync_github(
+        &state.http(),
+        &mut config,
+        &local_data,
+        playlist_epoch,
+    )
+    .await?;
     apply_merged_stats(&app, &state, &outcome.merged);
     save_github_config(&app, &config);
     // 仅本地数据确有变化时通知前端：App.vue 监听该事件后会防抖触发自动同步，
@@ -640,13 +665,19 @@ pub async fn sync_webdav(
         return Err(AppError::Api("WebDAV sync not configured".into()));
     }
 
-    let local_data = manager::build_local_sync_data(
+    let (local_data, playlist_epoch) = build_local_sync_snapshot(
         &app,
         history_entries.as_deref(),
         history_deletions.as_deref(),
-        Some(local_stats_payload(&state)),
+        local_stats_payload(&state),
     )?;
-    let outcome = manager::sync_webdav(&state.http(), &mut config, &local_data).await?;
+    let outcome = manager::sync_webdav(
+        &state.http(),
+        &mut config,
+        &local_data,
+        playlist_epoch,
+    )
+    .await?;
     apply_merged_stats(&app, &state, &outcome.merged);
     save_webdav_config(&app, &config);
     // 与 sync_github 同理：无本地变化不 emit，消除自激同步环
@@ -850,11 +881,41 @@ fn dialog_cancelled() -> Value {
     serde_json::json!({ "success": false, "reason": "cancelled" })
 }
 
+/// 合并导入歌单到本地快照（修复 SY-1）
+///
+/// 旧实现把导入的歌单当作全量集合直接喂给 save_synced_playlists，而后者会以
+/// merged.playlists 全量替换 store.playlists、以 merged.favorite_playlists 覆盖
+/// favorites 文件、以 merged.playlist_song_deletions 覆盖删除墓碑——传入的
+/// SyncData 除 playlists 外全为空，于是本地独有歌单 / 收藏 / 删除墓碑被一并清空。
+///
+/// 正确语义：以本地完整快照为基底，导入项按身份（sync id / 名称）覆盖匹配项，
+/// 本地独有歌单必须保留；导入不传播删除墓碑，避免误删本地歌单。
+fn build_import_merged_playlists(
+    app: &AppHandle,
+    imported: Vec<crate::sync::models::SyncPlaylist>,
+) -> AppResult<crate::sync::models::SyncData> {
+    let mut merged = crate::sync::manager::build_local_sync_data(app, None, None, None)?;
+    for imp in imported {
+        if imp.is_deleted {
+            continue;
+        }
+        let pos = merged
+            .playlists
+            .iter()
+            .position(|p| !p.is_deleted && (p.id == imp.id || p.name == imp.name));
+        match pos {
+            Some(i) => merged.playlists[i] = imp,
+            None => merged.playlists.push(imp),
+        }
+    }
+    Ok(merged)
+}
+
 /// 导入播放列表 JSON（兼容 Android BackupData 和 Desktop 两种格式）
 #[tauri::command]
 pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
     use crate::library::playlist::{PlaylistStore, Playlist};
-    use crate::sync::models::{SyncPlaylist, SyncData};
+    use crate::sync::models::SyncPlaylist;
     use crate::sync::manager::save_synced_playlists;
     let Some(path) = pick_file_path(&app, None).await? else {
         return Ok(dialog_cancelled());
@@ -877,11 +938,8 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
                 ).map_err(|e| AppError::Other(format!("Parse sync playlists: {}", e)))?;
                 count = sync_playlists.len();
 
-                // 通过 save_synced_playlists 转换并回写（复用已有的去重 + 转换逻辑）
-                let sync_data = SyncData {
-                    playlists: sync_playlists,
-                    ..Default::default()
-                };
+                // 并入本地快照后回写：保留本地独有歌单 / 收藏 / 删除墓碑（修复 SY-1）
+                let sync_data = build_import_merged_playlists(&app, sync_playlists)?;
                 save_synced_playlists(&sync_data)?;
             } else if parsed.is_array() {
                 // 尝试 Desktop 格式
@@ -905,10 +963,8 @@ pub async fn import_playlists(app: AppHandle) -> AppResult<Value> {
                     let sync_playlists: Vec<SyncPlaylist> = serde_json::from_value(parsed)
                         .map_err(|e| AppError::Other(format!("Parse playlists array: {}", e)))?;
                     count = sync_playlists.len();
-                    let sync_data = SyncData {
-                        playlists: sync_playlists,
-                        ..Default::default()
-                    };
+                    // 并入本地快照后回写（修复 SY-1）
+                    let sync_data = build_import_merged_playlists(&app, sync_playlists)?;
                     save_synced_playlists(&sync_data)?;
                 }
             } else {

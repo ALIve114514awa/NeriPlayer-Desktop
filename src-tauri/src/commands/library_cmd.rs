@@ -12,7 +12,7 @@ use crate::sync::manager;
 pub async fn scan_music_directory(
     dir: String,
     name_template: Option<String>,
-) -> AppResult<Vec<TrackInfo>> {
+) -> AppResult<scanner::ScanResult> {
     tokio::task::spawn_blocking(move || scanner::scan_directory(&dir, name_template.as_deref()))
         .await
         .map_err(|e| AppError::Other(e.to_string()))?
@@ -594,7 +594,7 @@ pub struct FavoritePlaylistWithTracks {
 /// 获取收藏歌单列表
 #[tauri::command]
 pub async fn list_favorite_playlists() -> AppResult<Vec<FavoritePlaylistWithTracks>> {
-    Ok(crate::sync::manager::load_favorite_playlists()
+    Ok(crate::sync::manager::load_favorite_playlists()?
         .into_iter()
         .map(|favorite| {
             let tracks = favorite

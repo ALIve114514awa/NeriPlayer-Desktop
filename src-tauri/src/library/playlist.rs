@@ -1,6 +1,7 @@
 // 播放列表管理（JSON 持久化）
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{atomic::{AtomicU64, Ordering}, Mutex, MutexGuard, OnceLock};
 use crate::state::TrackInfo;
 use crate::error::{AppError, AppResult};
 use crate::sync::models::{
@@ -10,6 +11,22 @@ use crate::sync::models::{
 };
 
 const MAX_SAFE_PLAYLIST_ID: i64 = (1_i64 << 53) - 1;
+
+static PLAYLIST_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PLAYLIST_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 串行化歌单读改写与同步应用，避免并发命令互相覆盖
+pub(crate) fn lock_io() -> MutexGuard<'static, ()> {
+    PLAYLIST_IO_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 返回进程内歌单写入版本，用于检测同步网络窗口中的本地编辑
+pub(crate) fn io_epoch() -> u64 {
+    PLAYLIST_EPOCH.load(Ordering::Acquire)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
@@ -67,9 +84,16 @@ impl PlaylistStore {
     }
 
     pub fn save(&self, path: &PathBuf) -> AppResult<()> {
+        let _guard = lock_io();
+        self.save_locked(path)
+    }
+
+    /// 在已持有 `lock_io` 时写入，避免同步应用检查 epoch 后再次获取同一把锁
+    pub(crate) fn save_locked(&self, path: &PathBuf) -> AppResult<()> {
         let json = serde_json::to_string_pretty(self)?;
         // 原子写：temp + fsync + rename，杜绝半截 JSON
         crate::fsutil::atomic_write(path, json)?;
+        PLAYLIST_EPOCH.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -287,5 +311,16 @@ mod tests {
             device_id: device_id.into(),
             counter,
         }
+    }
+
+    #[test]
+    fn save_advances_io_epoch() {
+        let before = io_epoch();
+        let dir = std::env::temp_dir().join(format!("neri-playlist-epoch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("playlists.json");
+        PlaylistStore::default().save(&path).unwrap();
+        assert!(io_epoch() > before);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

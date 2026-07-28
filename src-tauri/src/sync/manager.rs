@@ -6,7 +6,7 @@ use tauri::AppHandle;
 use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use crate::error::{AppError, AppResult};
 use crate::state::{TrackInfo, TrackSource};
-use crate::library::playlist::{Playlist, PlaylistStore};
+use crate::library::playlist::{self, Playlist, PlaylistStore};
 use super::models::*;
 use super::serializer;
 use super::github_api::GitHubApiClient;
@@ -62,8 +62,10 @@ pub async fn sync_github(
     http: &reqwest::Client,
     config: &mut GitHubSyncConfig,
     local_data: &SyncData,
+    playlist_epoch: u64,
 ) -> AppResult<SyncOutcome> {
     let _sync_guard = acquire_sync_lock().await;
+    ensure_local_playlist_epoch(playlist_epoch)?;
     let api = GitHubApiClient::new(http, &config.token);
     let data_saver = config.data_saver;
     let primary_file = serializer::get_filename(data_saver);
@@ -83,7 +85,7 @@ pub async fn sync_github(
             !config.last_remote_sha.is_empty()
                 && config.last_remote_sha != snapshot.version.sha.as_deref().unwrap_or_default()
         });
-    let base_snapshot = load_base_snapshot("github");
+    let base_snapshot = load_base_snapshot("github")?;
     let mut remote_data = remote_snapshot.as_ref().map(|snapshot| snapshot.data.clone());
     let mut remote_version = remote_snapshot
         .map(|snapshot| snapshot.version)
@@ -96,6 +98,7 @@ pub async fn sync_github(
     let mut upload_performed = false;
 
     for attempt in 0..=MAX_GITHUB_UPLOAD_CONFLICT_RETRIES {
+        ensure_local_playlist_epoch(playlist_epoch)?;
         let merged = match remote_data.as_ref() {
             Some(remote) => merge::three_way_merge(
                 local_data,
@@ -122,6 +125,7 @@ pub async fn sync_github(
 
         let use_binary_format = remote_version.file_name.ends_with(".bin");
         let content = serializer::serialize(&merged, use_binary_format)?;
+        ensure_local_playlist_epoch(playlist_epoch)?;
         match api
             .update_file_content(
                 &config.owner,
@@ -174,7 +178,7 @@ pub async fn sync_github(
         AppError::Api("GitHub upload conflict retry budget exhausted".into())
     })?;
 
-    save_synced_playlists(&merged)?;
+    save_synced_playlists_if_epoch(&merged, playlist_epoch)?;
     save_recent_play_history(&merged);
     save_base_snapshot(&merged, "github");
 
@@ -297,8 +301,10 @@ pub async fn sync_webdav(
     http: &reqwest::Client,
     config: &mut WebDavSyncConfig,
     local_data: &SyncData,
+    playlist_epoch: u64,
 ) -> AppResult<SyncOutcome> {
     let _sync_guard = acquire_sync_lock().await;
+    ensure_local_playlist_epoch(playlist_epoch)?;
     let api = WebDavApiClient::new(http, &config.server_url, &config.username, &config.password, &config.base_path);
 
     // 验证连接
@@ -312,9 +318,11 @@ pub async fn sync_webdav(
             let initial = local_data.normalized_for_sync();
             let content = serializer::serialize(&initial, config.data_saver)?;
             // 远端不存在文件，无 ETag 可作前提条件，无条件 PUT
+            ensure_local_playlist_epoch(playlist_epoch)?;
             let fp = api
                 .update_file_content(&content, config.data_saver, None)
                 .await?;
+            ensure_local_playlist_epoch(playlist_epoch)?;
             save_base_snapshot(&initial, "webdav");
             save_recent_play_history(&initial);
             config.last_remote_fingerprint = fp;
@@ -338,7 +346,7 @@ pub async fn sync_webdav(
     let mut remote_fingerprint = remote_fingerprint;
     let mut remote_etag = remote_etag;
 
-    let base_snapshot = load_base_snapshot("webdav");
+    let base_snapshot = load_base_snapshot("webdav")?;
     let mut final_merged = None;
     let mut final_fingerprint = None;
     let mut upload_performed = false;
@@ -346,6 +354,7 @@ pub async fn sync_webdav(
     // 冲突重试模式与 GitHub 路径一致：412 说明 GET→PUT 窗口内他端已写入，
     // 退避后重拉最新远端、重新合并再传，绝不带着陈旧远端强行覆盖
     for attempt in 0..=MAX_GITHUB_UPLOAD_CONFLICT_RETRIES {
+        ensure_local_playlist_epoch(playlist_epoch)?;
         let merged = merge::three_way_merge(
             local_data,
             &remote_data,
@@ -360,6 +369,7 @@ pub async fn sync_webdav(
         }
 
         let content = serializer::serialize(&merged, config.data_saver)?;
+        ensure_local_playlist_epoch(playlist_epoch)?;
         match api
             .update_file_content(&content, config.data_saver, remote_etag.as_deref())
             .await
@@ -404,7 +414,7 @@ pub async fn sync_webdav(
     // 本地回写与 base snapshot 必须等上传成功（或确认无需上传）之后再推进：
     // 若在 PUT 前推进 base，上传失败后下次同步会把本地新增歌曲误判为
     // "远端已删"而丢数据（与 GitHub 路径 manager.rs 上传后落盘的语义一致）
-    save_synced_playlists(&merged)?;
+    save_synced_playlists_if_epoch(&merged, playlist_epoch)?;
     save_recent_play_history(&merged);
     save_base_snapshot(&merged, "webdav");
 
@@ -449,12 +459,27 @@ pub fn build_local_sync_data(
     let device_id = get_or_create_device_id(app);
     let hostname = whoami::fallible::hostname().unwrap_or_else(|_| "Desktop".into());
 
+    let stored_history = if history_entries.is_none() || history_deletions.is_none() {
+        Some(load_recent_play_history()?)
+    } else {
+        None
+    };
     let recent_plays = history_entries
         .map(|entries| history_entries_to_sync(entries, &device_id))
-        .unwrap_or_else(load_recent_plays);
+        .unwrap_or_else(|| {
+            stored_history
+                .as_ref()
+                .map(|history| history.recent_plays.clone())
+                .unwrap_or_default()
+        });
     let recent_play_deletions = history_deletions
         .map(|deletions| history_deletions_to_sync(deletions, &device_id))
-        .unwrap_or_else(load_recent_play_deletions);
+        .unwrap_or_else(|| {
+            stored_history
+                .as_ref()
+                .map(|history| history.recent_play_deletions.clone())
+                .unwrap_or_default()
+        });
     let stats = stats.unwrap_or_default();
 
     Ok(SyncData {
@@ -463,7 +488,7 @@ pub fn build_local_sync_data(
         device_name: format!("NeriPlayer Desktop ({})", hostname),
         last_modified: chrono::Utc::now().timestamp_millis(),
         playlists: load_local_playlists(app)?,
-        favorite_playlists: load_favorite_playlists(),
+        favorite_playlists: load_favorite_playlists()?,
         recent_plays,
         sync_log: Vec::new(),
         recent_play_deletions,
@@ -526,20 +551,9 @@ fn recent_play_history_path() -> std::path::PathBuf {
     path
 }
 
-fn load_recent_plays() -> Vec<SyncRecentPlay> {
-    let path = recent_play_history_path();
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    serde_json::from_str::<PersistedRecentPlayHistory>(&content)
-        .map(|history| history.recent_plays)
-        .unwrap_or_default()
-}
-
-fn load_recent_play_deletions() -> Vec<SyncRecentPlayDeletion> {
-    let path = recent_play_history_path();
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    serde_json::from_str::<PersistedRecentPlayHistory>(&content)
-        .map(|history| history.recent_play_deletions)
-        .unwrap_or_default()
+fn load_recent_play_history() -> AppResult<PersistedRecentPlayHistory> {
+    read_optional_json(&recent_play_history_path(), "recent-play-history.json")
+        .map(|history| history.unwrap_or_default())
 }
 
 fn save_recent_play_history(data: &SyncData) {
@@ -727,6 +741,15 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
 
     let platform = sync_platform_identity(track);
 
+    // 本地/未知来源无 payload 时的兜底身份：把唯一路径写进 media_uri，
+    // 否则同专辑本地曲目 stable_key 全部坍缩为 "0|album|"（SC-3/SC-4：
+    // 视图去重只剩 1 首、按 key 删除会连带删同专辑全部）
+    let media_uri = match platform.media_uri {
+        Some(uri) => uri,
+        None if platform.channel_id.is_none() => track.id.clone(),
+        None => String::new(),
+    };
+
     SyncSong {
         id: platform.id,
         name: track.title.clone(),
@@ -735,7 +758,7 @@ fn track_to_sync_song(track: &TrackInfo) -> SyncSong {
         album_id: String::new(),
         duration_ms: track.duration_ms as i64,
         cover_url: track.cover_url.clone().unwrap_or_default(),
-        media_uri: platform.media_uri.unwrap_or_default(),
+        media_uri,
         added_at: track.added_at.max(0),
         matched_lyric: None,
         matched_translated_lyric: None,
@@ -994,6 +1017,30 @@ fn resolve_system_id(sp_id: &str, sp_name: &str) -> i64 {
 
 /// 将同步合并后的歌单回写到本地存储（对齐 Android applyMergedDataToLocal）
 pub fn save_synced_playlists(merged: &SyncData) -> AppResult<()> {
+    let _guard = playlist::lock_io();
+    save_synced_playlists_locked(merged)
+}
+
+/// 仅在同步期间没有本地歌单写入时应用合并结果
+///
+/// 网络请求可能持续数秒，期间用户仍可编辑歌单。epoch 变化时拒绝回写，
+/// 保留用户刚写入的文件，下一轮同步再合并远端结果，避免静默覆盖本地编辑
+pub fn save_synced_playlists_if_epoch(merged: &SyncData, expected_epoch: u64) -> AppResult<()> {
+    let _guard = playlist::lock_io();
+    ensure_local_playlist_epoch(expected_epoch)?;
+    save_synced_playlists_locked(merged)
+}
+
+fn ensure_local_playlist_epoch(expected_epoch: u64) -> AppResult<()> {
+    if playlist::io_epoch() != expected_epoch {
+        return Err(AppError::Other(
+            "Local playlists changed during sync; remote result was not applied".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn save_synced_playlists_locked(merged: &SyncData) -> AppResult<()> {
     let path = playlists_path();
     // 损坏时中止回写：在空库上重建会把用户本地独有的歌单 ID 映射全部丢弃
     let mut store = PlaylistStore::load_strict(&path)?;
@@ -1095,7 +1142,7 @@ pub fn save_synced_playlists(merged: &SyncData) -> AppResult<()> {
         .collect();
     store.fix_next_id();
     // 歌单库是同步的最终落点，写失败必须上抛，静默吞掉会让用户以为已同步
-    store.save(&path)?;
+    store.save_locked(&path)?;
 
     // 保存收藏歌单到独立文件
     save_favorite_playlists(merged);
@@ -1130,13 +1177,15 @@ fn save_favorite_playlists(merged: &SyncData) {
 }
 
 /// 读取收藏歌单（供 list 命令调用）
-pub fn load_favorite_playlists() -> Vec<SyncFavoritePlaylist> {
-    let path = favorites_path();
-    if !path.exists() { return Vec::new(); }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    serde_json::from_str::<Vec<SyncFavoritePlaylist>>(&content)
-        .map(|favorites| favorites.into_iter().map(|favorite| favorite.normalized_for_sync()).collect())
-        .unwrap_or_default()
+pub fn load_favorite_playlists() -> AppResult<Vec<SyncFavoritePlaylist>> {
+    read_optional_json::<Vec<SyncFavoritePlaylist>>(&favorites_path(), "favorites.json")
+        .map(|favorites| {
+            favorites
+                .unwrap_or_default()
+                .into_iter()
+                .map(|favorite| favorite.normalized_for_sync())
+                .collect()
+        })
 }
 
 fn load_local_playlist_song_deletions() -> AppResult<Vec<SyncPlaylistSongDeletion>> {
@@ -1164,16 +1213,43 @@ fn base_snapshot_path(scope: &str) -> std::path::PathBuf {
 
 /// 加载上次同步后每个歌单的歌曲 stable_key 集合
 /// 格式: { "playlist_id": ["key1", "key2", ...], ... }
-pub fn load_base_snapshot(scope: &str) -> HashMap<String, HashSet<String>> {
+pub fn load_base_snapshot(scope: &str) -> AppResult<HashMap<String, HashSet<String>>> {
     let path = base_snapshot_path(scope);
-    if !path.exists() {
-        return HashMap::new();
-    }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let raw: HashMap<String, Vec<String>> = serde_json::from_str(&content).unwrap_or_default();
-    raw.into_iter()
+    let raw: HashMap<String, Vec<String>> =
+        read_optional_json(&path, &format!("base snapshot {scope}"))?.unwrap_or_default();
+    Ok(raw
+        .into_iter()
         .map(|(k, v)| (k, v.into_iter().collect()))
-        .collect()
+        .collect())
+}
+
+/// 读取可选 JSON 文件：不存在表示首次运行，损坏则隔离现场并失败。
+/// 把解析错误当空数据会在下一轮同步中覆盖原文件并扩散错误状态（SY-4）。
+fn read_optional_json<T>(path: &std::path::Path, label: &str) -> AppResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::Other(format!("读取 {label} 失败: {error}"))),
+    };
+
+    match serde_json::from_str::<T>(&content) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let quarantined = crate::fsutil::quarantine_corrupt_file(path);
+            log::error!(
+                target: "sync",
+                "{label} 解析失败, 现场已隔离到 {:?}: {error}",
+                quarantined
+            );
+            Err(AppError::Other(format!(
+                "{label} 已损坏, 原文件已隔离到 {:?}: {error}",
+                quarantined
+            )))
+        }
+    }
 }
 
 /// 保存当前合并结果作为下次同步的 base snapshot
@@ -1292,6 +1368,49 @@ mod tests {
 
         assert!(snapshot.is_none());
         server.await.unwrap();
+    }
+
+    #[test]
+    fn stale_playlist_epoch_rejects_sync_before_remote_upload() {
+        let expected_epoch = playlist::io_epoch().wrapping_add(1);
+        let error = ensure_local_playlist_epoch(expected_epoch)
+            .expect_err("a stale local epoch must reject before remote upload");
+
+        assert!(error
+            .to_string()
+            .contains("Local playlists changed during sync"));
+    }
+
+    #[test]
+    fn corrupt_optional_json_is_quarantined_and_returns_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "neri-sync-optional-json-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("favorites.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+
+        let error = read_optional_json::<Vec<SyncFavoritePlaylist>>(&path, "favorites.json")
+            .expect_err("corrupt optional JSON must stop the read");
+
+        assert!(error.to_string().contains("favorites.json"));
+        assert!(!path.exists());
+        let quarantined: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("favorites.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(quarantined[0].path()).unwrap(), b"{not-json");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
