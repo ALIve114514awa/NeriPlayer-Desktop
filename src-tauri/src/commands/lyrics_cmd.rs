@@ -44,7 +44,10 @@ pub async fn fetch_lyrics(
         duration_secs,
         audio_path.is_some(),
     );
-    let manager = LyricsManager::new(&state.http());
+    let manager = LyricsManager::with_transport(
+        state.transport("lyrics"),
+        crate::auth::cookies::read_netease_csrf(&state.cookie_jar),
+    );
     let result = manager
         .fetch_lyrics(
             &title,

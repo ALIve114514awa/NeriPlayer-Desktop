@@ -101,10 +101,10 @@ function normalizeWordTimings(line: PlayerLyricLine): PlayerLyricWord[] {
   if (timedWords.length === 0) return words
 
   const lineStart = line.startMs
-  const lineDuration = Math.max(0, line.durationMs)
   const firstWordStart = Math.min(...timedWords.map(word => word.startMs))
-  const lastWordEnd = Math.max(...timedWords.map(word => word.startMs + word.durationMs))
-  const usesRelativeTime = firstWordStart < lineStart - 250 && lastWordEnd <= lineDuration + 500
+  // 对齐 Android normalizeSyllableTimes: 仅以首词早于行起点判定相对时间轴, 去掉
+  // lastWordEnd<=duration 上限, 否则词轨略超行长会被误判为绝对导致逐字跑偏（LY-5）
+  const usesRelativeTime = firstWordStart < lineStart - 250
 
   if (!usesRelativeTime) return words
 
@@ -262,7 +262,7 @@ function toAmllLine(line: PlayerLyricLine): AmllLyricLine {
   return {
     words,
     translatedLyric: settings.showTranslation ? (line.translation || '') : '',
-    romanLyric: '',
+    romanLyric: settings.showTranslation ? (line.roman || '') : '',
     startTime,
     endTime,
     isBG: false,

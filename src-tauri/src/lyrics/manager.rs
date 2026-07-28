@@ -5,17 +5,29 @@ use crate::api::lrclib::LrcLibClient;
 use crate::api::netease::client::NeteaseClient;
 use crate::api::qq::client::QqMusicClient;
 use crate::api::youtube::client::YouTubeClient;
+use crate::api::transport::FallbackHttp;
 use crate::error::AppResult;
 use crate::lyrics::parser::{self, LyricLine};
 use std::path::{Path, PathBuf};
 
 pub struct LyricsManager {
-    http: reqwest::Client,
+    transport: FallbackHttp,
+    netease_csrf: String,
 }
 
 impl LyricsManager {
     pub fn new(http: &reqwest::Client) -> Self {
-        Self { http: http.clone() }
+        Self {
+            transport: FallbackHttp::new(http, "lyrics"),
+            netease_csrf: String::new(),
+        }
+    }
+
+    pub fn with_transport(transport: FallbackHttp, netease_csrf: String) -> Self {
+        Self {
+            transport,
+            netease_csrf,
+        }
     }
 
     /// 多源获取歌词
@@ -62,7 +74,7 @@ impl LyricsManager {
 
         // 明确平台 id: 直接取对应源
         if let Some(song_mid) = qq_song_mid.filter(|id| !id.trim().is_empty()) {
-            let qq = QqMusicClient::new(&self.http);
+            let qq = QqMusicClient::with_transport(self.transport.clone());
             match self.parse_qq_lyrics(&qq, song_mid).await {
                 Ok(Some(lines)) => {
                     if lyrics_duration_acceptable(&lines, target_duration_ms) {
@@ -86,7 +98,8 @@ impl LyricsManager {
         }
 
         if let Some(id) = netease_id {
-            let client = NeteaseClient::new(&self.http);
+            let client = NeteaseClient::with_transport(self.transport.clone())
+                .with_csrf(self.netease_csrf.clone());
             if let Some(lines) = self.fetch_netease_lyrics(&client, id, target_duration_ms).await {
                 return Ok(lines);
             }
@@ -104,7 +117,7 @@ impl LyricsManager {
 
         // QQ 搜索匹配 (标题+歌手, 时长硬门槛)
         if netease_id.is_none() && qq_song_mid.map(|s| s.trim().is_empty()).unwrap_or(true) {
-            let qq = QqMusicClient::new(&self.http);
+            let qq = QqMusicClient::with_transport(self.transport.clone());
             match self
                 .search_qq_song_mid(&qq, track_title, track_artist, target_duration_ms)
                 .await
@@ -142,7 +155,8 @@ impl LyricsManager {
 
         // 网易云搜索匹配
         if netease_id.is_none() {
-            let client = NeteaseClient::new(&self.http);
+            let client = NeteaseClient::with_transport(self.transport.clone())
+                .with_csrf(self.netease_csrf.clone());
             if let Some(id) = self
                 .search_netease_id(&client, track_title, track_artist, target_duration_ms)
                 .await
@@ -193,11 +207,12 @@ impl LyricsManager {
             Ok(lyrics_data) => {
                 log::info!(
                     target: "lyrics",
-                    "netease lyrics for id={}: lrc={}, tlyric={}, yrc={}",
+                    "netease lyrics for id={}: lrc={}, tlyric={}, yrc={}, romalrc={}",
                     id,
                     lyrics_data.lrc.as_ref().map_or(0, |s| s.len()),
                     lyrics_data.tlyric.as_ref().map_or(0, |s| s.len()),
                     lyrics_data.yrc.as_ref().map_or(0, |s| s.len()),
+                    lyrics_data.romalrc.as_ref().map_or(0, |s| s.len()),
                 );
 
                 let translation = lyrics_data
@@ -212,6 +227,13 @@ impl LyricsManager {
                         if !lines.is_empty() {
                             if let Some(tl) = translation {
                                 parser::merge_translation(&mut lines, tl);
+                            }
+                            if let Some(roman) = lyrics_data
+                                .romalrc
+                                .as_deref()
+                                .filter(|s| !s.trim().is_empty())
+                            {
+                                parser::merge_roman(&mut lines, roman);
                             }
                             if lyrics_duration_acceptable(&lines, target_duration_ms) {
                                 log::info!(
@@ -235,6 +257,13 @@ impl LyricsManager {
                     if !lines.is_empty() {
                         if let Some(tl) = translation {
                             parser::merge_translation(&mut lines, tl);
+                        }
+                        if let Some(roman) = lyrics_data
+                            .romalrc
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            parser::merge_roman(&mut lines, roman);
                         }
                         if lyrics_duration_acceptable(&lines, target_duration_ms) {
                             log::info!(target: "lyrics", "using netease LRC: {} lines", lines.len());
@@ -263,7 +292,7 @@ impl LyricsManager {
         duration_secs: u64,
         target_duration_ms: u64,
     ) -> Option<Vec<LyricLine>> {
-        let lrclib = LrcLibClient::new(&self.http);
+        let lrclib = LrcLibClient::with_transport(self.transport.clone());
 
         // 精确匹配 (API 按 duration 查)
         if duration_secs > 0 {
@@ -370,7 +399,7 @@ impl LyricsManager {
         video_id: &str,
         target_duration_ms: u64,
     ) -> Option<Vec<LyricLine>> {
-        let yt = YouTubeClient::new(&self.http);
+        let yt = YouTubeClient::with_transport(self.transport.clone());
         match yt.get_lyrics(video_id).await {
             Ok(Some(text)) if !text.trim().is_empty() => {
                 // timed LRC / 纯文本
@@ -734,6 +763,7 @@ fn plain_text_to_lines(text: &str, target_duration_ms: u64) -> Vec<LyricLine> {
             duration_ms: step,
             text: line.to_string(),
             translation: None,
+            roman: None,
             words: Vec::new(),
         })
         .collect()
@@ -796,6 +826,7 @@ fn parse_sidecar_lyrics_text(content: &str) -> Vec<LyricLine> {
             duration_ms: 3000,
             text: text.to_string(),
             translation: None,
+            roman: None,
             words: Vec::new(),
         })
         .collect()
@@ -803,21 +834,26 @@ fn parse_sidecar_lyrics_text(content: &str) -> Vec<LyricLine> {
 
 fn find_nearby_lyric(audio_path: &Path) -> Option<PathBuf> {
     let parent = audio_path.parent()?;
+    let file_name = audio_path.file_name()?;
     let stem = audio_path.file_stem()?.to_str()?;
 
-    for ext in ["lrc", "txt"] {
-        let sibling = parent.join(format!("{}.{}", stem, ext));
-        if sibling.is_file() {
-            return Some(sibling);
-        }
+    // 下载器新写入的 sidecar 带完整音频名，例如 Song.m4a.lrc。
+    // 先查这一形式，避免 Song.m4a 和 Song.flac 共用旧 Song.lrc 时串词
+    if let Some(path) = find_audio_scoped_sidecar(parent, file_name, &["lrc", "txt"]) {
+        return Some(path);
     }
 
     let lyrics_dir = parent.join("Lyrics");
-    for ext in ["lrc", "txt"] {
-        let nested = lyrics_dir.join(format!("{}.{}", stem, ext));
-        if nested.is_file() {
-            return Some(nested);
-        }
+    if let Some(path) = find_audio_scoped_sidecar(&lyrics_dir, file_name, &["lrc", "txt"]) {
+        return Some(path);
+    }
+
+    // 保留旧版 stem 命名兼容，已有本地歌词无需迁移
+    if let Some(path) = find_stem_sidecar(parent, stem, &["lrc", "txt"]) {
+        return Some(path);
+    }
+    if let Some(path) = find_stem_sidecar(&lyrics_dir, stem, &["lrc", "txt"]) {
+        return Some(path);
     }
 
     None
@@ -825,32 +861,46 @@ fn find_nearby_lyric(audio_path: &Path) -> Option<PathBuf> {
 
 fn find_nearby_translation(audio_path: &Path) -> Option<PathBuf> {
     let parent = audio_path.parent()?;
+    let file_name = audio_path.file_name()?;
     let stem = audio_path.file_stem()?.to_str()?;
+    let suffixes = ["tlrc", "translated.lrc", "translation.lrc"];
 
-    for name in [
-        format!("{}.tlrc", stem),
-        format!("{}.translated.lrc", stem),
-        format!("{}.translation.lrc", stem),
-    ] {
-        let sibling = parent.join(&name);
-        if sibling.is_file() {
-            return Some(sibling);
-        }
+    if let Some(path) = find_audio_scoped_sidecar(parent, file_name, &suffixes) {
+        return Some(path);
     }
 
     let lyrics_dir = parent.join("Lyrics");
-    for name in [
-        format!("{}.tlrc", stem),
-        format!("{}.translated.lrc", stem),
-        format!("{}.translation.lrc", stem),
-    ] {
-        let nested = lyrics_dir.join(&name);
-        if nested.is_file() {
-            return Some(nested);
-        }
+    if let Some(path) = find_audio_scoped_sidecar(&lyrics_dir, file_name, &suffixes) {
+        return Some(path);
+    }
+    if let Some(path) = find_stem_sidecar(parent, stem, &suffixes) {
+        return Some(path);
+    }
+    if let Some(path) = find_stem_sidecar(&lyrics_dir, stem, &suffixes) {
+        return Some(path);
     }
 
     None
+}
+
+fn find_audio_scoped_sidecar(
+    dir: &Path,
+    audio_file_name: &std::ffi::OsStr,
+    suffixes: &[&str],
+) -> Option<PathBuf> {
+    suffixes.iter().find_map(|suffix| {
+        let mut name = audio_file_name.to_os_string();
+        name.push(format!(".{suffix}"));
+        let path = dir.join(name);
+        path.is_file().then_some(path)
+    })
+}
+
+fn find_stem_sidecar(dir: &Path, stem: &str, suffixes: &[&str]) -> Option<PathBuf> {
+    suffixes.iter().find_map(|suffix| {
+        let path = dir.join(format!("{stem}.{suffix}"));
+        path.is_file().then_some(path)
+    })
 }
 
 
@@ -956,8 +1006,36 @@ mod tests {
             duration_ms: 5_000,
             text: "a".into(),
             translation: None,
+            roman: None,
             words: vec![],
         }];
         assert!(!lyrics_duration_acceptable(&lines, 207_000));
+    }
+
+    #[test]
+    fn audio_scoped_sidecars_override_legacy_stem_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "neri-lyrics-sidecar-scope-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("Song.m4a");
+        std::fs::write(&audio, b"audio").unwrap();
+        let legacy_lyric = dir.join("Song.lrc");
+        let scoped_lyric = dir.join("Song.m4a.lrc");
+        let legacy_translation = dir.join("Song.tlrc");
+        let scoped_translation = dir.join("Song.m4a.tlrc");
+        std::fs::write(&legacy_lyric, "[00:00.00]legacy").unwrap();
+        std::fs::write(&scoped_lyric, "[00:00.00]scoped").unwrap();
+        std::fs::write(&legacy_translation, "[00:00.00]旧翻译").unwrap();
+        std::fs::write(&scoped_translation, "[00:00.00]新翻译").unwrap();
+
+        assert_eq!(super::find_nearby_lyric(&audio), Some(scoped_lyric));
+        assert_eq!(
+            super::find_nearby_translation(&audio),
+            Some(scoped_translation)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

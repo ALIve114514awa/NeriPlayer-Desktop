@@ -82,25 +82,60 @@ export function mapBackendLyrics(raw: any[]): LyricLine[] {
       : [],
     text: String(l.text || ''),
     translation: l.translation || undefined,
+    roman: l.roman || undefined,
   }))
 }
 
-/** 合并原词与翻译 LRC/YRC 解析结果 */
+const LYRIC_CREDIT_KEYWORDS = [
+  '作词', '作曲', '编曲', '制作', '混音', '母带', '和声', '录音',
+  '出品', '监制', '配唱', '词：', '曲：',
+  'Lyricist', 'Composer', 'Arranger', 'Producer', 'Mixing', 'Mastering',
+]
+
+/** 制作信息行（作词/作曲等署名），翻译匹配时跳过（对齐 Android isLyricCreditMetadataLine） */
+function isLyricCreditMetadataLine(text: string): boolean {
+  const hasColon = text.includes('：') || text.includes(':')
+  return hasColon && LYRIC_CREDIT_KEYWORDS.some(k => text.includes(k))
+}
+
+/**
+ * 合并原词与翻译 LRC/YRC 解析结果（LY-2）
+ *
+ * 用 450ms 容差最近匹配 + 同时间组向组尾对齐 + 跳过制作信息行 + 一行只接收一条翻译，
+ * 对齐 Android matchTranslationsToLineIndices。原实现的"精确毫秒匹配 + 原文行下标兜底"
+ * 在 YRC 时间戳非 10ms 整倍数或 syncPayload 往返（厘秒截断）后必然失配，导致翻译错行。
+ */
 export function mergeParsedLyricsWithTranslations(
   original: LyricLine[],
   translations: LyricLine[],
 ): LyricLine[] {
   if (!translations.length) return original
-  const byTime = new Map(
-    translations.map(l => [Math.round(l.startMs || 0), l.text || '']),
-  )
-  return original.map((line, index) => ({
+  const TOLERANCE_MS = 450
+  const result = original.map(line => ({ ...line }))
+  const assigned = new Array(result.length).fill(false)
+  for (const tl of translations) {
+    const text = tl.text || ''
+    if (!text) continue
+    let bestIdx = -1
+    let bestDelta = Infinity
+    for (let i = 0; i < result.length; i++) {
+      if (assigned[i] || isLyricCreditMetadataLine(result[i].text || '')) continue
+      const delta = Math.abs((result[i].startMs || 0) - (tl.startMs || 0))
+      // <= 使并列最小 delta 时取更靠后的行（组尾对齐）
+      if (delta < TOLERANCE_MS && delta <= bestDelta) {
+        bestDelta = delta
+        bestIdx = i
+      }
+    }
+    if (bestIdx >= 0) {
+      result[bestIdx].translation = text
+      assigned[bestIdx] = true
+    }
+  }
+  // 未被新翻译覆盖的行保留原 translation
+  return result.map((line, i) => ({
     ...line,
-    translation:
-      byTime.get(Math.round(line.startMs || 0))
-      || translations[index]?.text
-      || line.translation
-      || undefined,
+    translation: line.translation || original[i].translation || undefined,
   }))
 }
 

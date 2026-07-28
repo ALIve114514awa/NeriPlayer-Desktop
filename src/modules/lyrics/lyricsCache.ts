@@ -20,6 +20,7 @@ function normalizeLyricLine(line: LyricLine): LyricLine {
       : [],
     text: String(line.text || ''),
     translation: line.translation || undefined,
+    roman: line.roman || undefined,
   }
 }
 
