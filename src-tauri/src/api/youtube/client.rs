@@ -95,8 +95,7 @@ impl YouTubeClient {
             })
             .await?;
 
-        let data: Value = resp.json().await?;
-        Ok(data)
+        crate::api::transport::parse_json_response(resp, &format!("youtube {endpoint}")).await
     }
 
     /// 搜索音乐
@@ -190,6 +189,7 @@ impl YouTubeClient {
             cookies.get("SAPISID").map(String::as_str),
             cookies.get("__Secure-1PAPISID").map(String::as_str),
             cookies.get("__Secure-3PAPISID").map(String::as_str),
+            cookies.get("APISID").map(String::as_str),
             "https://music.youtube.com",
             user_session_id,
         )

@@ -29,6 +29,17 @@ pub struct DownloadTaskControl {
 }
 
 /// 全局应用状态，通过 tauri::State 注入
+/// 媒体会话元数据镜像（前端切歌时推送，供 ticker 更新 SMTC/MPRIS，PB-01）
+#[derive(Clone, Default)]
+pub struct MediaMetadataMirror {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub cover_url: Option<String>,
+    pub duration_ms: u64,
+}
+
 pub struct AppState {
     pub player: Arc<Mutex<PlayerEngine>>,
     pub playback_generation: Arc<AtomicU64>,
@@ -44,8 +55,13 @@ pub struct AppState {
     pub download_tasks: Mutex<HashMap<String, DownloadTaskControl>>,
     /// YouTube 会话保鲜闸门(冷却 + 熔断), 对齐 Android 自动刷新
     pub youtube_refresh: Mutex<crate::api::youtube::refresh::YouTubeRefreshGate>,
+    /// YouTube SIDTS 主动轮换闸门，避免 RotateCookies 请求风暴
+    pub youtube_cookie_rotation:
+        Mutex<crate::api::youtube::refresh::YouTubeCookieRotationGate>,
     /// 播放统计, 启动时从磁盘恢复
     pub stats: Mutex<crate::stats::StatsStore>,
+    /// 前端切歌时镜像的媒体会话元数据（PlayQueue 从不被前端填充, 不能作为元数据源, PB-01）
+    pub media_metadata: Mutex<Option<MediaMetadataMirror>>,
     /// 与 http 代理设置相反的备用客户端
     ///
     /// 系统代理配错时直连能通，需要代理才能出网时直连不通 —— 两种情况都存在，
@@ -93,7 +109,11 @@ impl AppState {
             lt_session: Mutex::new(LtSession::new()),
             download_tasks: Mutex::new(HashMap::new()),
             youtube_refresh: Mutex::new(crate::api::youtube::refresh::YouTubeRefreshGate::default()),
+            youtube_cookie_rotation: Mutex::new(
+                crate::api::youtube::refresh::YouTubeCookieRotationGate::default(),
+            ),
             stats: Mutex::new(crate::stats::load()),
+            media_metadata: Mutex::new(None),
             alt_http: parking_lot::RwLock::new(alt),
         }
     }
@@ -137,7 +157,10 @@ impl AppState {
     }
 
     pub fn netease(&self) -> crate::api::netease::client::NeteaseClient {
+        let csrf = crate::auth::cookies::read_netease_csrf(&self.cookie_jar);
         crate::api::netease::client::NeteaseClient::with_fallback(&self.http(), &self.alt_http())
+            .with_csrf(csrf)
+            .with_cookie_jar(self.cookie_jar.clone())
     }
 
     pub fn youtube(&self) -> crate::api::youtube::client::YouTubeClient {

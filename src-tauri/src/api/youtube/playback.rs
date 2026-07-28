@@ -9,7 +9,7 @@
 //    WEB_REMIX 库接口继续用完整 hash; 播放侧故意不走 WEB_REMIX + PO token 完整浏览器模拟
 // 3. googlevideo CDN 拉流不附带登录 Cookie (Android buildYouTubeStreamRequestHeaders 同款)
 // 4. 仅接受 plain url 或已带 sig 的 cipher; 加密 s= 需 player JS 解签, 当前跳过并回退
-// 5. 排序优先 audio/mp4 (AAC): rodio/symphonia 未启 opus, webm/opus 会 unsupported codec
+// 5. 排序优先 audio/mp4 (AAC): cpal/symphonia 未启 opus, webm/opus 会 unsupported codec
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -505,7 +505,7 @@ fn extract_audio_streams(resp: &Value) -> Vec<YtAudioStream> {
         .collect();
 
     // 若完全没有 audio/* 直链, 尝试 progressive muxed 里可解析 url 的条目
-    // (少数 TV 响应只有 muxed; rodio/symphonia 可解常见容器中的音轨)
+    // (少数 TV 响应只有 muxed; cpal/symphonia 可解常见容器中的音轨)
     if streams.is_empty() {
         streams = formats
             .iter()

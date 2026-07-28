@@ -156,27 +156,65 @@ mod encrypted_secret_storage {
         #[cfg(target_os = "linux")]
         {
             if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-                return id.trim().as_bytes().to_vec();
+                let id = id.trim();
+                if !id.is_empty() {
+                    return id.as_bytes().to_vec();
+                }
             }
         }
         #[cfg(target_os = "macos")]
         {
-            if let Ok(output) = std::process::Command::new("ioreg")
-                .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-                .output()
-            {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    if let Some(rest) = line.split("\"IOPlatformUUID\" = \"").nth(1) {
-                        if let Some(uuid) = rest.split('"').next() {
-                            return uuid.as_bytes().to_vec();
+            // ioreg 偶发启动失败时重试，避免一次瞬时命令错误切换到不稳定的环境变量回退
+            for _ in 0..3 {
+                if let Ok(output) = std::process::Command::new("ioreg")
+                    .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+                    .output()
+                {
+                    if !output.status.success() {
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    for line in text.lines() {
+                        if let Some(rest) = line.split("\"IOPlatformUUID\" = \"").nth(1) {
+                            if let Some(uuid) = rest.split('"').next().filter(|id| !id.is_empty()) {
+                                return uuid.as_bytes().to_vec();
+                            }
                         }
                     }
                 }
             }
         }
-        // Windows 与兜底：用户与主机的稳定组合。弱于硬件 UUID，
-        // 但仍满足「拷到别的机器/别的账号读不出」
+        #[cfg(target_os = "windows")]
+        {
+            // 主机名/用户名可变，Windows MachineGuid 才是跨启动稳定的本机标识
+            if let Ok(output) = std::process::Command::new("reg")
+                .args([
+                    "query",
+                    r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                    "/v",
+                    "MachineGuid",
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    if let Some(value) = text
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().contains("machineguid"))
+                        .and_then(|line| line.split_whitespace().last())
+                        .filter(|value| !value.is_empty())
+                    {
+                        return value.as_bytes().to_vec();
+                    }
+                }
+            }
+        }
+        fallback_machine_identity()
+    }
+
+    // 早期 Windows 构建与非 Windows 兜底使用这一组环境变量派生密钥。
+    // MachineGuid 上线后仍需保留它作为旧密文的只读迁移候选
+    fn fallback_machine_identity() -> Vec<u8> {
         let mut fallback = Vec::new();
         for var in ["COMPUTERNAME", "HOSTNAME", "USER", "USERNAME", "HOME", "USERPROFILE"] {
             if let Ok(value) = std::env::var(var) {
@@ -187,11 +225,25 @@ mod encrypted_secret_storage {
         fallback
     }
 
-    fn derive_keys() -> ([u8; 32], [u8; 32]) {
-        let identity = machine_identity();
+    fn legacy_machine_identity_candidates() -> Vec<Vec<u8>> {
+        #[cfg(target_os = "windows")]
+        {
+            vec![fallback_machine_identity()]
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Vec::new()
+        }
+    }
+
+    fn derive_keys_for_identity(identity: &[u8]) -> ([u8; 32], [u8; 32]) {
         let enc = Sha256::digest([APP_SALT, b"/enc/", identity].concat());
         let mac = Sha256::digest([APP_SALT, b"/mac/", identity].concat());
         (enc.into(), mac.into())
+    }
+
+    fn derive_keys() -> ([u8; 32], [u8; 32]) {
+        derive_keys_for_identity(machine_identity())
     }
 
     pub(super) fn get(key: &str) -> Option<String> {
@@ -201,11 +253,28 @@ mod encrypted_secret_storage {
 
     fn get_inner(key: &str) -> Option<String> {
         let path = secret_path(key);
-        let blob = std::fs::read(&path).ok()?;
-        match decode_blob(key, &blob) {
-            Ok((plain, legacy)) => {
-                if legacy {
-                    // 旧格式（MAC 未绑定 key 名）验证通过：透明重写为新格式，
+        let blob = match std::fs::read(&path) {
+            Ok(blob) => blob,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                // 权限/磁盘等瞬时读取故障不能当作损坏文件隔离，保留现场等待下次重试
+                log::warn!(
+                    target: "security",
+                    "读取加密凭据失败, 保留文件等待重试: {error}"
+                );
+                return None;
+            }
+        };
+        let legacy_identities = legacy_machine_identity_candidates();
+        match decode_blob_with_identity_candidates(
+            key,
+            &blob,
+            machine_identity(),
+            &legacy_identities,
+        ) {
+            Ok((plain, needs_reencrypt)) => {
+                if needs_reencrypt {
+                    // 旧 MAC 格式或旧 Windows 身份验证通过后立即用当前身份重写，
                     // 之后 blob 改名冒充其它凭据不再可行
                     let _ = set_inner(key, &plain);
                 }
@@ -229,11 +298,15 @@ mod encrypted_secret_storage {
     /// 布局: MAGIC(4) | IV(16) | MAC(32) | ciphertext。
     /// 新格式 MAC 覆盖 `key 名 + IV + 密文`；旧格式仅 `IV + 密文`。
     /// 先按新格式验，失败退回旧格式（向后兼容存量文件）
-    fn decode_blob(key: &str, blob: &[u8]) -> Result<(String, bool), &'static str> {
+    fn decode_blob_with_identity(
+        key: &str,
+        blob: &[u8],
+        identity: &[u8],
+    ) -> Result<(String, bool), &'static str> {
         if blob.len() < 4 + 16 + 32 + 16 || &blob[..4] != MAGIC {
             return Err("bad header");
         }
-        let (enc_key, mac_key) = derive_keys();
+        let (enc_key, mac_key) = derive_keys_for_identity(identity);
         let iv: [u8; 16] = blob[4..20].try_into().map_err(|_| "bad iv")?;
         let stored_mac = &blob[20..52];
         let ciphertext = &blob[52..];
@@ -263,6 +336,33 @@ mod encrypted_secret_storage {
             .map_err(|_| "decrypt failed")?;
         let plain = String::from_utf8(plain.to_vec()).map_err(|_| "invalid utf8")?;
         Ok((plain, legacy))
+    }
+
+    fn decode_blob(key: &str, blob: &[u8]) -> Result<(String, bool), &'static str> {
+        decode_blob_with_identity(key, blob, machine_identity())
+    }
+
+    fn decode_blob_with_identity_candidates(
+        key: &str,
+        blob: &[u8],
+        current_identity: &[u8],
+        legacy_identities: &[Vec<u8>],
+    ) -> Result<(String, bool), &'static str> {
+        let current_error = match decode_blob_with_identity(key, blob, current_identity) {
+            Ok(result) => return Ok(result),
+            Err(error) => error,
+        };
+
+        for identity in legacy_identities {
+            if identity.as_slice() == current_identity {
+                continue;
+            }
+            if let Ok((plain, _legacy_format)) = decode_blob_with_identity(key, blob, identity) {
+                return Ok((plain, true));
+            }
+        }
+
+        Err(current_error)
     }
 
     pub(super) fn set(key: &str, value: &str) -> bool {
@@ -378,6 +478,30 @@ mod encrypted_secret_storage {
             crate::fsutil::atomic_write_private(super::secret_path(key), &blob).unwrap();
         }
 
+        fn blob_with_identity(key: &str, value: &str, identity: &[u8]) -> Vec<u8> {
+            use super::{Aes256CbcEnc, HmacSha256, MAGIC};
+            use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+            use hmac::Mac;
+
+            let (enc_key, mac_key) = super::derive_keys_for_identity(identity);
+            let iv = [7_u8; 16];
+            let mut buffer = vec![0_u8; value.len() + 16];
+            let ciphertext = Aes256CbcEnc::new(&enc_key.into(), &iv.into())
+                .encrypt_padded_b2b_mut::<Pkcs7>(value.as_bytes(), &mut buffer)
+                .unwrap();
+            let mut mac = HmacSha256::new_from_slice(&mac_key).unwrap();
+            mac.update(key.as_bytes());
+            mac.update(&iv);
+            mac.update(ciphertext);
+            let tag = mac.finalize().into_bytes();
+            let mut blob = Vec::new();
+            blob.extend_from_slice(MAGIC);
+            blob.extend_from_slice(&iv);
+            blob.extend_from_slice(&tag);
+            blob.extend_from_slice(ciphertext);
+            blob
+        }
+
         /// 旧格式 blob 可读，且读取后透明升级为新格式（key 参与 MAC）
         #[test]
         fn legacy_blob_is_readable_and_transparently_upgraded() {
@@ -390,6 +514,25 @@ mod encrypted_secret_storage {
             assert_eq!(plain, "legacy-secret");
             assert!(!legacy, "读取后必须已重写为新格式");
             assert!(super::delete(key));
+        }
+
+        #[test]
+        fn legacy_identity_candidate_is_readable_and_requires_reencryption() {
+            let key = "test-legacy-identity";
+            let old_identity = b"old-windows-environment-identity";
+            let current_identity = b"new-windows-machine-guid";
+            let blob = blob_with_identity(key, "legacy-secret", old_identity);
+
+            let (plain, needs_reencrypt) = super::decode_blob_with_identity_candidates(
+                key,
+                &blob,
+                current_identity,
+                &[old_identity.to_vec()],
+            )
+            .expect("legacy identity candidate should decrypt");
+
+            assert_eq!(plain, "legacy-secret");
+            assert!(needs_reencrypt, "旧身份密文必须用当前身份重写");
         }
 
         /// 新格式 MAC 绑定 key 名：blob 拷到别的 key 路径读不出且被隔离
@@ -449,8 +592,8 @@ fn delete_keyring_secret(key: &str) -> bool {
 mod debug_secret_storage {
     use super::{AUTH_STATE_KEY, GITHUB_TOKEN_KEY, SERVICE_NAME, WEBDAV_PASSWORD_KEY};
     use serde::{Deserialize, Serialize};
-    use std::fs::{self, OpenOptions};
-    use std::io::{self, ErrorKind, Write};
+    use std::fs;
+    use std::io::{self, ErrorKind};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
     use uuid::Uuid;
@@ -497,10 +640,9 @@ mod debug_secret_storage {
         match read_secret_from_root(&root) {
             Ok(value) => value,
             Err(error) => {
-                log::error!(target: "security", "调试凭据存储读取失败: {error}");
-                if let Err(cleanup_error) = delete_store_root(&root) {
-                    log::error!(target: "security", "损坏的调试凭据存储清理失败: {cleanup_error}");
-                }
+                // 瞬时 IO 错误（EACCES 等）不再整库删除（会静默丢失登录且不留现场）:
+                // 保留数据本次返回 None, 交下次启动重试或人工排查（AU-10, 对齐 Release 侧不销毁）
+                log::error!(target: "security", "调试凭据存储读取失败, 已保留现场: {error}");
                 None
             }
         }
@@ -633,16 +775,8 @@ mod debug_secret_storage {
     }
 
     fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(contents)?;
-        file.sync_all()
+        // 走仓库统一的原子写（temp + fsync + rename + 0600）, 避免半截写坏凭据文件（AU-10）
+        crate::fsutil::atomic_write_private(path, contents)
     }
 
     fn delete_store_root(root: &Path) -> io::Result<()> {

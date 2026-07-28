@@ -13,6 +13,55 @@ use crate::security;
 const STORE_FILE: &str = "auth.json";
 const STORE_KEY: &str = "auth_state";
 
+const NETEASE_COOKIE_DOMAINS: &[&str] = &["music.163.com", "interface.music.163.com"];
+const NETEASE_COOKIE_KEYS: &[&str] = &[
+    "MUSIC_U",
+    "MUSIC_A",
+    "__csrf",
+    "NMTID",
+    "__remember_me",
+    "ntes_utid",
+    "os",
+    "appver",
+    "channel",
+    "playerid",
+];
+const BILIBILI_COOKIE_DOMAINS: &[&str] = &[
+    "www.bilibili.com",
+    "api.bilibili.com",
+    "passport.bilibili.com",
+];
+const BILIBILI_COOKIE_KEYS: &[&str] = &[
+    "SESSDATA",
+    "bili_jct",
+    "DedeUserID",
+    "DedeUserID__ckMd5",
+    "sid",
+    "buvid3",
+    "buvid4",
+    "b_nut",
+    "b_lsid",
+    "bili_ticket",
+    "bili_ticket_expires",
+];
+const YOUTUBE_COOKIE_DOMAINS: &[&str] = &[
+    "music.youtube.com",
+    "www.youtube.com",
+    "accounts.google.com",
+    "www.google.com",
+];
+
+// 轮换会话令牌（与 api::youtube::session::ROTATING_SESSION_COOKIE_KEYS 一致）:
+// 一旦本地已有值就不从共享 Jar 收编轮换值, 把轮换主导权让给主力设备,
+// 避免与 session 侧 merge 策略打架（AU-06）
+const ROTATING_SESSION_COOKIE_KEYS: &[&str] = &["__Secure-1PSIDTS", "__Secure-3PSIDTS"];
+
+fn is_rotating_session_cookie(name: &str) -> bool {
+    ROTATING_SESSION_COOKIE_KEYS
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(name))
+}
+
 /// 持久化 AuthState
 pub fn save_auth(app: &AppHandle, auth: &AuthState) {
     if !has_any_auth(auth) {
@@ -28,8 +77,9 @@ pub fn save_auth(app: &AppHandle, auth: &AuthState) {
     };
 
     if !security::set_secret(security::AUTH_STATE_KEY, &serialized) {
-        log::error!(target: "auth", "登录凭据存储不可用，已跳过登录凭据持久化");
-        clear_legacy_auth(app);
+        // 写入失败通常是磁盘或钥匙串的瞬时问题，删除旧密文或迁移源会把
+        // 原本可恢复的登录直接变成永久登出，保留它们供下次启动重试
+        log::error!(target: "auth", "登录凭据存储不可用，已保留现有凭据等待重试");
         return;
     }
 
@@ -66,10 +116,10 @@ pub fn load_auth(app: &AppHandle) -> AuthState {
         return legacy;
     }
 
-    // 目标存储不可用时不继续使用旧明文凭据，避免下次启动再次暴露
-    log::error!(target: "auth", "旧版登录凭据迁移失败，已清除明文凭据");
-    clear_legacy_auth(app);
-    AuthState::default()
+    // 目标存储瞬时不可用（如磁盘满）时销毁有效旧凭据会造成不可恢复的掉登录:
+    // 保留明文供下次启动重试迁移（代价: 一个启动周期的明文暴露窗口）, 本次先用起来（AU-12）
+    log::error!(target: "auth", "旧版登录凭据迁移失败，暂保留明文等待下次启动重试");
+    legacy
 }
 
 /// 删除所有持久化登录凭据，包括旧版明文数据
@@ -127,6 +177,22 @@ pub fn inject_cookies(jar: &Arc<Jar>, entries: &[CookieEntry]) {
     }
 }
 
+/// 使指定 Cookie 失效，供粘贴登录失败时回滚共享 Jar
+pub fn expire_cookie_entries(jar: &Arc<Jar>, entries: &[CookieEntry]) {
+    for entry in entries {
+        let url = domain_to_url(&entry.domain);
+        if let Ok(url) = url.parse::<Url>() {
+            jar.add_cookie_str(
+                &format!(
+                    "{}=deleted; Domain={}; Path=/; Max-Age=0",
+                    entry.name, entry.domain
+                ),
+                &url,
+            );
+        }
+    }
+}
+
 /// 从共享 Jar 回收服务端轮换后的 Cookie 值
 ///
 /// 服务端会在响应的 Set-Cookie 中轮换会话令牌，reqwest 会把新值写进 Jar，
@@ -139,24 +205,48 @@ pub fn sync_auth_from_jar(jar: &Arc<Jar>, auth: &mut AuthState) -> bool {
     let mut cache: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut changed = false;
     if let Some(netease) = auth.netease.as_mut() {
-        changed |= refresh_entries_from_jar(jar, &mut netease.cookies, &mut cache);
+        changed |= refresh_platform_auth_entries(
+            jar,
+            &mut netease.cookies,
+            "netease",
+            NETEASE_COOKIE_DOMAINS,
+            &mut cache,
+        );
     }
     if let Some(bilibili) = auth.bilibili.as_mut() {
-        changed |= refresh_entries_from_jar(jar, &mut bilibili.cookies, &mut cache);
+        changed |= refresh_platform_auth_entries(
+            jar,
+            &mut bilibili.cookies,
+            "bilibili",
+            BILIBILI_COOKIE_DOMAINS,
+            &mut cache,
+        );
     }
     if let Some(youtube) = auth.youtube.as_mut() {
-        changed |= refresh_entries_from_jar(jar, &mut youtube.cookies, &mut cache);
+        changed |= refresh_platform_auth_entries(
+            jar,
+            &mut youtube.cookies,
+            "youtube",
+            YOUTUBE_COOKIE_DOMAINS,
+            &mut cache,
+        );
     }
     changed
 }
 
-fn refresh_entries_from_jar(
+fn refresh_platform_auth_entries(
     jar: &Arc<Jar>,
-    entries: &mut [CookieEntry],
+    entries: &mut Vec<CookieEntry>,
+    platform: &str,
+    domains: &[&str],
     cache: &mut HashMap<String, HashMap<String, String>>,
 ) -> bool {
     let mut changed = false;
     for entry in entries.iter_mut() {
+        // SIDTS 家族与 session 侧策略统一: 已持有值就保留登录当天的那份, 不从 Jar 收编轮换值
+        if is_rotating_session_cookie(&entry.name) {
+            continue;
+        }
         let values = cache
             .entry(entry.domain.clone())
             .or_insert_with(|| read_jar_cookies(jar, &entry.domain));
@@ -169,7 +259,42 @@ fn refresh_entries_from_jar(
         entry.value = current.clone();
         changed = true;
     }
+
+    let mut existing_names: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.name.clone()).collect();
+    for domain in domains {
+        let values = cache
+            .entry((*domain).to_string())
+            .or_insert_with(|| read_jar_cookies(jar, domain));
+        for (name, value) in values.iter() {
+            if value.is_empty()
+                || existing_names.contains(name)
+                || !persisted_cookie_allowed(platform, name)
+            {
+                continue;
+            }
+            entries.push(CookieEntry {
+                name: name.clone(),
+                value: value.clone(),
+                domain: format!(".{domain}"),
+            });
+            existing_names.insert(name.clone());
+            changed = true;
+        }
+    }
     changed
+}
+
+fn persisted_cookie_allowed(platform: &str, name: &str) -> bool {
+    match platform {
+        "netease" => NETEASE_COOKIE_KEYS.iter().any(|key| key.eq_ignore_ascii_case(name)),
+        "bilibili" => BILIBILI_COOKIE_KEYS.iter().any(|key| key.eq_ignore_ascii_case(name)),
+        "youtube" => {
+            crate::api::youtube::session::cookie_key_allowed(name)
+                && !is_rotating_session_cookie(name)
+        }
+        _ => false,
+    }
 }
 
 fn read_jar_cookies(jar: &Arc<Jar>, domain: &str) -> HashMap<String, String> {
@@ -194,6 +319,15 @@ fn read_jar_cookies(jar: &Arc<Jar>, domain: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// 读取网易云 __csrf Cookie, 供 WEAPI 请求作为 csrf_token 查询参数
+/// 对齐 Android NeteaseClient: 所有 WEAPI 调用都附加 csrf_token(缺失时为空串)
+pub fn read_netease_csrf(jar: &Arc<Jar>) -> String {
+    read_jar_cookies(jar, "music.163.com")
+        .get("__csrf")
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// 登出时过期指定平台的 Cookie
 pub fn expire_platform_cookies(jar: &Arc<Jar>, auth: &AuthState, platform: &str) {
     let entries = match platform {
@@ -204,17 +338,29 @@ pub fn expire_platform_cookies(jar: &Arc<Jar>, auth: &AuthState, platform: &str)
     };
 
     if let Some(entries) = entries {
-        for entry in entries {
-            let url = domain_to_url(&entry.domain);
-            if let Ok(url) = url.parse::<Url>() {
-                // 必须带 Domain + Path 属性，与注入时一致，才能正确覆盖并过期
-                jar.add_cookie_str(
-                    &format!("{}=deleted; Domain={}; Path=/; Max-Age=0", entry.name, entry.domain),
-                    &url,
-                );
+        // 必须带 Domain + Path 属性，与注入时一致，才能正确覆盖并过期
+        expire_cookie_entries(jar, entries);
+    }
+
+    let domains = match platform {
+        "netease" => NETEASE_COOKIE_DOMAINS,
+        "bilibili" => BILIBILI_COOKIE_DOMAINS,
+        "youtube" => YOUTUBE_COOKIE_DOMAINS,
+        _ => return,
+    };
+    let mut discovered = Vec::new();
+    for domain in domains {
+        for (name, value) in read_jar_cookies(jar, domain) {
+            if persisted_cookie_allowed(platform, &name) && !value.is_empty() {
+                discovered.push(CookieEntry {
+                    name,
+                    value,
+                    domain: format!(".{domain}"),
+                });
             }
         }
     }
+    expire_cookie_entries(jar, &discovered);
 }
 
 /// 解析 document.cookie 字符串为 CookieEntry 列表
@@ -289,7 +435,7 @@ fn domain_to_url(domain: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::state::NeteaseAuth;
+    use crate::auth::state::{NeteaseAuth, YouTubeAuth};
 
     #[test]
     fn raw_cookie_parser_accepts_all_supported_separators() {
@@ -339,5 +485,102 @@ mod tests {
         assert_eq!(cookies.iter().find(|c| c.name == "os").unwrap().value, "pc");
         // 无变化时不应报告变更，避免每次心跳都写钥匙串
         assert!(!sync_auth_from_jar(&jar, &mut auth));
+    }
+
+    #[test]
+    fn allowlisted_new_cookie_is_persisted_without_collecting_unknown_keys() {
+        let jar = Arc::new(Jar::default());
+        jar.add_cookie_str(
+            "__csrf=csrf-value; Domain=music.163.com; Path=/",
+            &"https://music.163.com".parse::<Url>().unwrap(),
+        );
+        jar.add_cookie_str(
+            "account_secret=must-not-persist; Domain=music.163.com; Path=/",
+            &"https://music.163.com".parse::<Url>().unwrap(),
+        );
+        let mut auth = AuthState {
+            netease: Some(NeteaseAuth {
+                cookies: vec![CookieEntry {
+                    name: "MUSIC_U".into(),
+                    value: "music".into(),
+                    domain: "music.163.com".into(),
+                }],
+                user_id: None,
+                nickname: None,
+                avatar_url: None,
+            }),
+            ..Default::default()
+        };
+
+        assert!(sync_auth_from_jar(&jar, &mut auth));
+        let cookies = &auth.netease.as_ref().unwrap().cookies;
+        assert!(cookies.iter().any(|cookie| {
+            cookie.name == "__csrf" && cookie.value == "csrf-value"
+        }));
+        assert!(!cookies.iter().any(|cookie| cookie.name == "account_secret"));
+    }
+
+    #[test]
+    fn logout_expiry_clears_allowlisted_runtime_cookie() {
+        let jar = Arc::new(Jar::default());
+        let url = "https://music.163.com".parse::<Url>().unwrap();
+        jar.add_cookie_str(
+            "__csrf=csrf-value; Domain=music.163.com; Path=/",
+            &url,
+        );
+        let auth = AuthState {
+            netease: Some(NeteaseAuth {
+                cookies: Vec::new(),
+                user_id: None,
+                nickname: None,
+                avatar_url: None,
+            }),
+            ..Default::default()
+        };
+
+        expire_platform_cookies(&jar, &auth, "netease");
+
+        assert!(!read_jar_cookies(&jar, "music.163.com").contains_key("__csrf"));
+    }
+
+    #[test]
+    fn rotating_youtube_cookie_is_not_recovered_from_generic_jar() {
+        let jar = Arc::new(Jar::default());
+        jar.add_cookie_str(
+            "__Secure-1PSIDTS=jar-value; Domain=.google.com; Path=/",
+            &"https://accounts.google.com".parse::<Url>().unwrap(),
+        );
+        let mut auth = AuthState {
+            youtube: Some(YouTubeAuth {
+                cookies: vec![
+                    CookieEntry {
+                        name: "SAPISID".into(),
+                        value: "binding".into(),
+                        domain: ".google.com".into(),
+                    },
+                    CookieEntry {
+                        name: "__Secure-1PSIDTS".into(),
+                        value: "persisted".into(),
+                        domain: ".google.com".into(),
+                    },
+                ],
+                nickname: None,
+                avatar_url: None,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!sync_auth_from_jar(&jar, &mut auth));
+        assert_eq!(
+            auth.youtube
+                .as_ref()
+                .unwrap()
+                .cookies
+                .iter()
+                .find(|cookie| cookie.name == "__Secure-1PSIDTS")
+                .unwrap()
+                .value,
+            "persisted"
+        );
     }
 }

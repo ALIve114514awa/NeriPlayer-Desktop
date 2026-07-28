@@ -47,7 +47,7 @@ fn is_rotating_session_cookie(name: &str) -> bool {
         .any(|key| key.eq_ignore_ascii_case(name))
 }
 
-fn cookie_key_allowed(name: &str) -> bool {
+pub(crate) fn cookie_key_allowed(name: &str) -> bool {
     PERSISTED_COOKIE_KEYS
         .iter()
         .any(|key| key.eq_ignore_ascii_case(name))
@@ -188,6 +188,33 @@ pub fn merge_youtube_auth_cookies(
     }
 }
 
+/// 应用 Google RotateCookies 明确签发的新 SIDTS
+///
+/// 普通页面响应仍走 `merge_youtube_auth_cookies` 的保守策略，避免共享 Jar 的
+/// 轮换值覆盖登录态；RotateCookies 是唯一允许替换已有 SIDTS 的受控入口
+pub fn merge_rotated_youtube_cookies(
+    base: &YouTubeAuth,
+    rotated: &[CookieEntry],
+) -> YouTubeAuth {
+    let mut cookies = base.cookies.clone();
+    for observed in rotated {
+        if !is_rotating_session_cookie(&observed.name) || observed.value.is_empty() {
+            continue;
+        }
+        if let Some(existing) = cookies.iter_mut().find(|cookie| cookie.name == observed.name) {
+            *existing = observed.clone();
+        } else {
+            cookies.push(observed.clone());
+        }
+    }
+    cookies.sort_by(|left, right| left.name.cmp(&right.name));
+    YouTubeAuth {
+        cookies,
+        nickname: base.nickname.clone(),
+        avatar_url: base.avatar_url.clone(),
+    }
+}
+
 pub fn youtube_auth_changed(previous: &YouTubeAuth, current: &YouTubeAuth) -> bool {
     let left: HashSet<_> = previous
         .cookies
@@ -316,5 +343,35 @@ mod tests {
             .cookies
             .iter()
             .any(|c| c.name == "__Secure-1PSIDTS" && c.value == "sidts-first"));
+    }
+
+    #[test]
+    fn explicit_rotation_replaces_existing_session_tokens() {
+        let base = YouTubeAuth {
+            cookies: vec![CookieEntry {
+                name: "__Secure-3PSIDTS".into(),
+                value: "sidts-old".into(),
+                domain: ".google.com".into(),
+            }],
+            nickname: Some("name".into()),
+            avatar_url: None,
+        };
+        let rotated = vec![CookieEntry {
+            name: "__Secure-3PSIDTS".into(),
+            value: "sidts-new".into(),
+            domain: ".google.com".into(),
+        }];
+
+        let merged = merge_rotated_youtube_cookies(&base, &rotated);
+
+        assert_eq!(
+            merged
+                .cookies
+                .iter()
+                .find(|cookie| cookie.name == "__Secure-3PSIDTS")
+                .map(|cookie| cookie.value.as_str()),
+            Some("sidts-new")
+        );
+        assert_eq!(merged.nickname.as_deref(), Some("name"));
     }
 }

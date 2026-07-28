@@ -139,9 +139,12 @@ pub fn weapi_encrypt(json: &str) -> (String, String) {
 
 /// EAPI 加密
 pub fn eapi_encrypt(url: &str, json: &str) -> String {
-    let message = format!("nobody{}use{}md5forencrypt", url, json);
+    // 对齐 Android NeteaseCrypto.eApiEncrypt：digest 与载荷都用 /api 路径，
+    // 传入 /eapi 路径时先替换（幂等，传 /api 也安全）
+    let path = url.replace("/eapi", "/api");
+    let message = format!("nobody{}use{}md5forencrypt", path, json);
     let digest = format!("{:x}", Md5::digest(message.as_bytes()));
-    let data = format!("{}-36cd479b6b5-{}-36cd479b6b5-{}", url, json, digest);
+    let data = format!("{}-36cd479b6b5-{}-36cd479b6b5-{}", path, json, digest);
     let encrypted = aes_ecb_encrypt(data.as_bytes(), EAPI_KEY);
     hex::encode_upper(&encrypted)
 }

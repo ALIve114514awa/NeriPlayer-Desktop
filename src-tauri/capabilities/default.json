@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "NeriPlayer default capabilities",
-  "windows": ["main", "netease-login", "bilibili-login", "youtube-login"],
+  "windows": ["main"],
   "permissions": [
     "core:default",
     {
@@ -10,6 +10,7 @@
     },
     "store:default",
     "dialog:default",
+    "log:default",
     "core:window:default",
     "core:window:allow-show",
     "core:window:allow-minimize",
@@ -17,6 +18,7 @@
     "core:window:allow-unmaximize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
+    "core:window:allow-destroy",
     "core:window:allow-start-dragging",
     "core:window:allow-is-maximized",
     "core:webview:default",

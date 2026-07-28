@@ -112,6 +112,20 @@ pub async fn get_user_account(
             let client = state.bilibili();
             client.get_user_info().await
         }
+        "youtube" => {
+            let auth = {
+                let auth_state = state.auth.lock();
+                auth_state
+                    .youtube
+                    .as_ref()
+                    .filter(|value| value.has_login())
+                    .cloned()
+                    .ok_or_else(|| AppError::Api("YouTube not logged in".into()))?
+            };
+            let client = state.youtube();
+            let profile = client.get_account_profile(&auth).await?;
+            serde_json::to_value(profile).map_err(Into::into)
+        }
         _ => Err(AppError::Api(format!("Unsupported platform: {}", platform))),
     }
 }
@@ -386,13 +400,18 @@ pub async fn get_youtube_playlist_detail(
     .await?;
 
     // 会话保鲜: 落盘 + 注入共享 jar, 与 maybe_refresh_youtube_session 一致
+    // 展开分页耗时可达数十秒, 期间用户可能登出/换号: 仅当仍是同一账号且未登出时才落盘,
+    // 否则旧账号的刷新 cookie 会整体覆盖新登录（AU-09）
     if let Some(updated) = refreshed_auth {
         let mut auth_state = state.auth.lock();
         if let Some(saved) = auth_state.youtube.as_mut() {
-            *saved = updated;
-            let refreshed_cookies = saved.cookies.clone();
-            crate::auth::cookies::save_auth(&app, &auth_state);
-            crate::auth::cookies::inject_cookies(&state.cookie_jar, &refreshed_cookies);
+            let same_account = saved.get_sapisid() == yt_auth.get_sapisid();
+            if saved.has_login() && same_account {
+                *saved = updated;
+                let refreshed_cookies = saved.cookies.clone();
+                crate::auth::cookies::save_auth(&app, &auth_state);
+                crate::auth::cookies::inject_cookies(&state.cookie_jar, &refreshed_cookies);
+            }
         }
     }
 

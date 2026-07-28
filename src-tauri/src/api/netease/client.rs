@@ -1,7 +1,8 @@
 // 网易云音乐 API 客户端
-use reqwest::Client;
+use reqwest::{cookie::Jar, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
 use super::crypto;
@@ -13,6 +14,10 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 pub struct NeteaseClient {
     http: FallbackHttp,
+    /// 无共享 Jar 时的 csrf_token 回退值，歌词管理器等独立调用仍可使用
+    csrf: String,
+    /// AppState 的共享 Cookie Jar，首页预热后必须从这里重新读取 __csrf
+    cookie_jar: Option<Arc<Jar>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,15 +55,42 @@ pub struct NeteaseLyrics {
     pub tlyric: Option<String>,
     pub yrc: Option<String>,
     pub ytlrc: Option<String>,
+    pub romalrc: Option<String>,
 }
 
 impl NeteaseClient {
+    pub fn with_transport(http: crate::api::transport::FallbackHttp) -> Self {
+        Self {
+            http,
+            csrf: String::new(),
+            cookie_jar: None,
+        }
+    }
+
     pub fn new(http: &Client) -> Self {
-        Self { http: FallbackHttp::new(http, "netease") }
+        Self::with_transport(FallbackHttp::new(http, "netease"))
     }
 
     pub fn with_fallback(http: &Client, fallback: &Client) -> Self {
-        Self { http: FallbackHttp::with_fallback(http, fallback, "netease") }
+        Self::with_transport(FallbackHttp::with_fallback(http, fallback, "netease"))
+    }
+
+    /// 注入 WEAPI 使用的 csrf_token(取自 __csrf Cookie), 对齐 Android 行为
+    pub fn with_csrf(mut self, csrf: String) -> Self {
+        self.csrf = csrf;
+        self
+    }
+
+    pub fn with_cookie_jar(mut self, cookie_jar: Arc<Jar>) -> Self {
+        self.cookie_jar = Some(cookie_jar);
+        self
+    }
+
+    fn csrf_token(&self) -> String {
+        match self.cookie_jar.as_ref() {
+            Some(cookie_jar) => crate::auth::cookies::read_netease_csrf(cookie_jar),
+            None => self.csrf.clone(),
+        }
     }
 
     async fn send_with_fallback(
@@ -68,21 +100,58 @@ impl NeteaseClient {
         Ok(self.http.send(build).await?)
     }
 
-    /// WEAPI POST 请求
-    async fn weapi_post(&self, url: &str, params: &Value) -> AppResult<Value> {
-        let json_str = serde_json::to_string(params)?;
-        let (encrypted_params, enc_sec_key) = crypto::weapi_encrypt(&json_str);
+    /// 非幂等写请求专用：只在连接失败时兜底，避免超时重发造成重复提交
+    async fn send_once_with_fallback(
+        &self,
+        build: impl Fn(&Client) -> reqwest::RequestBuilder,
+    ) -> AppResult<reqwest::Response> {
+        Ok(self.http.send_once(build).await?)
+    }
 
-        let resp = self
+    /// 访问一次站点首页，通常会下发 __csrf 等 Cookie，用于取流 code==301 后预热重试
+    /// 对齐 Android NeteaseClient.ensureWeapiSession
+    async fn ensure_weapi_session(&self) {
+        let _ = self
             .send_with_fallback(|client| {
                 client
-                    .post(url)
+                    .get(BASE_URL)
                     .header("User-Agent", USER_AGENT)
                     .header("Referer", "https://music.163.com")
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .form(&[("params", &encrypted_params), ("encSecKey", &enc_sec_key)])
             })
-            .await?;
+            .await;
+    }
+
+    /// WEAPI POST 请求（幂等读接口）
+    async fn weapi_post(&self, url: &str, params: &Value) -> AppResult<Value> {
+        self.weapi_request(url, params, true).await
+    }
+
+    /// WEAPI POST 写接口（非幂等）：只在连接失败时兜底，避免超时重发造成重复提交
+    async fn weapi_post_write(&self, url: &str, params: &Value) -> AppResult<Value> {
+        self.weapi_request(url, params, false).await
+    }
+
+    /// WEAPI POST 公共实现；`idempotent` 决定传输层是否允许超时重试
+    async fn weapi_request(&self, url: &str, params: &Value, idempotent: bool) -> AppResult<Value> {
+        let json_str = serde_json::to_string(params)?;
+        let (encrypted_params, enc_sec_key) = crypto::weapi_encrypt(&json_str);
+        let csrf = self.csrf_token();
+
+        let build = |client: &Client| {
+            client
+                .post(url)
+                .query(&[("csrf_token", csrf.as_str())])
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", "https://music.163.com")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[("params", &encrypted_params), ("encSecKey", &enc_sec_key)])
+        };
+
+        let resp = if idempotent {
+            self.send_with_fallback(build).await?
+        } else {
+            self.send_once_with_fallback(build).await?
+        };
 
         parse_json_response(resp, "netease weapi").await
     }
@@ -145,12 +214,25 @@ impl NeteaseClient {
 
         log::debug!(target: "netease", "get_song_url: id={}, level={}", song_id, level);
 
-        let body = self.weapi_post(
+        let mut body = self.weapi_post(
             &format!("{}/weapi/song/enhance/player/url/v1", BASE_URL),
             &params,
         ).await?;
 
         log::debug!(target: "netease", "song url response code: {:?}", body["code"]);
+
+        // code==301 多见于登录态 __csrf 会话失效；预热首页后重试一次，对齐 Android getSongDownloadUrl
+        if body["code"].as_i64() == Some(301) {
+            log::debug!(target: "netease", "song url code 301, warming session then retrying once");
+            self.ensure_weapi_session().await;
+            body = self
+                .weapi_post(
+                    &format!("{}/weapi/song/enhance/player/url/v1", BASE_URL),
+                    &params,
+                )
+                .await?;
+            log::debug!(target: "netease", "song url retry response code: {:?}", body["code"]);
+        }
 
         let result = parse_song_url_response(&body);
         log::debug!(target: "netease", "song url result: url={}, br={}",
@@ -161,7 +243,9 @@ impl NeteaseClient {
     /// 获取歌词（plain API，无需加密，最可靠）
     pub async fn get_lyrics(&self, song_id: u64) -> AppResult<NeteaseLyrics> {
         // 使用 v1 端点获取逐字歌词支持
-        let url = format!("{}/api/song/lyric/v1?id={}&cp=false&lv=0&tv=0&rv=0&kv=0&yv=0&ytv=0&yrv=0",
+        // tv/yv/ytv 显式请求翻译、逐字与翻译逐字字段；网易云在省略或传 0
+        // 时可能省略 romalrc/ytlrc，导致音译链路只能偶发命中
+        let url = format!("{}/api/song/lyric/v1?id={}&cp=false&lv=0&tv=1&rv=0&kv=0&yv=1&ytv=1&yrv=0",
             BASE_URL, song_id);
 
         log::debug!(target: "netease", "get_lyrics: id={}", song_id);
@@ -175,18 +259,34 @@ impl NeteaseClient {
             })
             .await?;
 
-        let body: Value = parse_json_response(resp, "netease lyrics")
+        let mut body: Value = parse_json_response(resp, "netease lyrics")
             .await
             .inspect_err(|error| {
                 log::error!(target: "netease", "lyrics response invalid: {}", error);
             })?;
 
+        // 登录态失效时接口会返回 301；预热首页让 __csrf/会话恢复后只重试一次，
+        // 避免把临时鉴权过期误报成无歌词
+        if body["code"].as_i64() == Some(301) {
+            self.ensure_weapi_session().await;
+            let retry_resp = self
+                .send_with_fallback(|client| {
+                    client
+                        .get(&url)
+                        .header("User-Agent", USER_AGENT)
+                        .header("Referer", "https://music.163.com")
+                })
+                .await?;
+            body = parse_json_response(retry_resp, "netease lyrics retry").await?;
+        }
+
         let code = body["code"].as_i64().unwrap_or(-1);
-        log::debug!(target: "netease", "lyrics response code={}, has_lrc={}, has_tlyric={}, has_yrc={}",
+        log::debug!(target: "netease", "lyrics response code={}, has_lrc={}, has_tlyric={}, has_yrc={}, has_romalrc={}",
             code,
             body["lrc"]["lyric"].is_string(),
             body["tlyric"]["lyric"].is_string(),
             body["yrc"]["lyric"].is_string(),
+            body["romalrc"]["lyric"].is_string(),
         );
 
         if code != 200 {
@@ -198,6 +298,7 @@ impl NeteaseClient {
             tlyric: body["tlyric"]["lyric"].as_str().map(String::from),
             yrc: body["yrc"]["lyric"].as_str().map(String::from),
             ytlrc: body["ytlrc"]["lyric"].as_str().map(String::from),
+            romalrc: body["romalrc"]["lyric"].as_str().map(String::from),
         })
     }
 
@@ -289,8 +390,8 @@ impl NeteaseClient {
 
     /// 喜欢/取消喜欢歌曲
     pub async fn like_song(&self, song_id: u64, like: bool) -> AppResult<Value> {
-        self.weapi_post(
-            &format!("{}/weapi/radio/like", BASE_URL),
+        self.weapi_post_write(
+            &format!("{}/weapi/song/like", BASE_URL),
             &json!({
                 "trackId": song_id.to_string(),
                 "like": like.to_string(),
@@ -508,9 +609,30 @@ fn json_u64(value: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_song_url_response, NeteasePlaybackUnavailableReason,
+        parse_song_url_response, NeteaseClient, NeteasePlaybackUnavailableReason,
     };
+    use crate::api::transport::FallbackHttp;
+    use reqwest::cookie::Jar;
     use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn weapi_csrf_uses_latest_value_from_shared_cookie_jar() {
+        let jar = Arc::new(Jar::default());
+        let http = reqwest::Client::builder()
+            .cookie_provider(jar.clone())
+            .build()
+            .unwrap();
+        let url = "https://music.163.com/".parse().unwrap();
+        jar.add_cookie_str("__csrf=before; Domain=music.163.com; Path=/", &url);
+        let client = NeteaseClient::with_transport(FallbackHttp::new(&http, "test"))
+            .with_csrf("fallback".into())
+            .with_cookie_jar(jar.clone());
+
+        assert_eq!(client.csrf_token(), "before");
+        jar.add_cookie_str("__csrf=after; Domain=music.163.com; Path=/", &url);
+        assert_eq!(client.csrf_token(), "after");
+    }
 
     #[test]
     fn playback_response_marks_explicit_free_trial_as_preview() {

@@ -167,6 +167,7 @@ async fn fetch_account_menu(
         cookie_values.get("SAPISID").map(String::as_str),
         cookie_values.get("__Secure-1PAPISID").map(String::as_str),
         cookie_values.get("__Secure-3PAPISID").map(String::as_str),
+        cookie_values.get("APISID").map(String::as_str),
         MUSIC_ORIGIN,
         &bootstrap.user_session_id,
     )

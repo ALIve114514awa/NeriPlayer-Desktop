@@ -4,17 +4,12 @@
 
 use sha1::{Digest, Sha1};
 
-/// 计算 SAPISIDHASH Authorization 头
-pub fn compute_sapisidhash(sapisid: &str, origin: &str) -> String {
-    let timestamp = chrono::Utc::now().timestamp();
-    build_sid_authorization("SAPISIDHASH", sapisid, origin, timestamp, "")
-}
-
 /// 构建 YouTube Web 使用的完整 SID Authorization 头
 pub fn build_youtube_authorization(
     sapisid: Option<&str>,
     sapisid_1p: Option<&str>,
     sapisid_3p: Option<&str>,
+    apisid: Option<&str>,
     origin: &str,
     user_session_id: &str,
 ) -> Option<String> {
@@ -23,6 +18,7 @@ pub fn build_youtube_authorization(
         sapisid,
         sapisid_1p,
         sapisid_3p,
+        apisid,
         origin,
         user_session_id,
         timestamp,
@@ -33,11 +29,12 @@ fn build_youtube_authorization_at(
     sapisid: Option<&str>,
     sapisid_1p: Option<&str>,
     sapisid_3p: Option<&str>,
+    apisid: Option<&str>,
     origin: &str,
     user_session_id: &str,
     timestamp: i64,
 ) -> Option<String> {
-    let primary_sapisid = sapisid.or(sapisid_3p).or(sapisid_1p);
+    let primary_sapisid = sapisid.or(sapisid_3p).or(sapisid_1p).or(apisid);
     let mut headers = Vec::with_capacity(3);
     if let Some(sid) = primary_sapisid.filter(|value| !value.is_empty()) {
         headers.push(build_sid_authorization(
@@ -90,30 +87,19 @@ fn build_sid_authorization(
     }
 }
 
-/// 构建完整的 YouTube 认证请求头集合
-pub fn build_youtube_auth_headers(
-    sapisid: &str,
-    cookie_header: &str,
-) -> Vec<(&'static str, String)> {
-    let origin = "https://music.youtube.com";
-    let auth = compute_sapisidhash(sapisid, origin);
-
-    vec![
-        ("Authorization", auth),
-        ("X-Goog-AuthUser", "0".to_string()),
-        ("Cookie", cookie_header.to_string()),
-        ("Origin", origin.to_string()),
-        ("X-Origin", origin.to_string()),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_sapisidhash_format() {
-        let result = compute_sapisidhash("test_sapisid", "https://music.youtube.com");
+        let result = build_sid_authorization(
+            "SAPISIDHASH",
+            "test_sapisid",
+            "https://music.youtube.com",
+            1_700_000_000,
+            "",
+        );
         assert!(result.starts_with("SAPISIDHASH "));
         let parts: Vec<&str> = result["SAPISIDHASH ".len()..].split('_').collect();
         assert_eq!(parts.len(), 2);
@@ -129,6 +115,7 @@ mod tests {
             Some("main"),
             Some("one"),
             Some("three"),
+            None,
             "https://music.youtube.com",
             "session",
             1_700_000_000,

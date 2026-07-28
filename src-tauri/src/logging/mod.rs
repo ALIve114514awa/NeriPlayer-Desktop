@@ -303,12 +303,15 @@ fn format_record(
     push_recent(record, message);
     // 使用本地时区的墙钟时间，毫秒精度，便于与用户操作时间对齐
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    // 写入 sink（文件/stdout）前同样打码：push_recent 的打码只作用于内存环副本，
+    // 这里若直写原始 message，logToFile 开启时 Warn+ 级别带 cookie/Authorization 会明文落盘（AU-04）
+    let redacted = redact_sensitive(&message.to_string());
     out.finish(format_args!(
         "{} [{}] [{}] {}",
         ts,
         record.target(),
         record.level(),
-        message
+        redacted
     ));
 }
 
@@ -335,6 +338,8 @@ fn format_record_colored(
     const DIM: &str = "\x1b[90m";
     const SCOPE: &str = "\x1b[36m";
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    // 与 format_record 一致：sink 前打码，防明文凭据落 stdout（AU-04）
+    let redacted = redact_sensitive(&message.to_string());
     out.finish(format_args!(
         "{dim}{ts}{reset} {scope}[{target}]{reset} {lc}[{level}]{reset} {msg}",
         dim = DIM,
@@ -344,7 +349,7 @@ fn format_record_colored(
         target = record.target(),
         lc = level_ansi(record.level()),
         level = record.level(),
-        msg = message,
+        msg = redacted,
     ));
 }
 

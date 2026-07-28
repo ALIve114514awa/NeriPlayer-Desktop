@@ -185,7 +185,7 @@ impl QqMusicClient {
 
         Ok((
             decode_qq_lyric_payload(response.lyric),
-            decode_qq_lyric_payload(response.trans),
+            strip_untranslated_placeholder_lines(decode_qq_lyric_payload(response.trans)),
         ))
     }
 
@@ -312,6 +312,28 @@ fn decode_qq_lyric_payload(input: Option<String>) -> Option<String> {
         return Some(html_unescape(&decoded));
     }
     Some(unescaped)
+}
+
+// QQ 用只含 // 的一行表示这句未翻译，原样保留会在歌词视图里显示成整排斜杠
+// 去掉时间标签后内容恰为 // 的行整行丢弃，其余翻译行仍各自对准原句
+fn strip_untranslated_placeholder_lines(input: Option<String>) -> Option<String> {
+    let source = input?;
+    let filtered = source
+        .lines()
+        .filter(|line| {
+            let content = match line.rfind(']') {
+                Some(idx) => &line[idx + 1..],
+                None => line,
+            };
+            content.trim() != "//"
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if filtered.trim().is_empty() {
+        None
+    } else {
+        Some(filtered)
+    }
 }
 
 fn decode_base64_lrc(value: &str) -> Option<String> {

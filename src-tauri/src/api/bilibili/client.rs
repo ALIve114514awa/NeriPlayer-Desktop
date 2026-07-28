@@ -3,16 +3,26 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::error::{AppError, AppResult};
 use crate::api::transport::{parse_json_response, FallbackHttp};
 use super::wbi;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const MIXIN_KEY_TTL: Duration = Duration::from_secs(10 * 60);
+
+type MixinKeyCache = TokioMutex<Option<(String, Instant)>>;
+
+fn mixin_key_cache() -> &'static MixinKeyCache {
+    static CACHE: OnceLock<MixinKeyCache> = OnceLock::new();
+    CACHE.get_or_init(|| TokioMutex::new(None))
+}
 
 pub struct BiliClient {
     http: FallbackHttp,
-    mixin_key: parking_lot::Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,16 +49,18 @@ impl BiliClient {
     }
 
     pub fn with_transport(http: FallbackHttp) -> Self {
-        Self {
-            http,
-            mixin_key: parking_lot::Mutex::new(None),
-        }
+        Self { http }
     }
 
     /// 获取或刷新 mixin_key
     async fn ensure_mixin_key(&self) -> AppResult<String> {
-        if let Some(ref key) = *self.mixin_key.lock() {
-            return Ok(key.clone());
+        // BiliClient 按命令临时构造，缓存必须放在客户端之外；用异步锁
+        // 合并并发冷启动，避免收藏夹分页同时触发多次 nav（AP-02）
+        let mut cache = mixin_key_cache().lock().await;
+        if let Some((key, expires_at)) = cache.as_ref() {
+            if *expires_at > Instant::now() {
+                return Ok(key.clone());
+            }
         }
 
         let resp: Value = self
@@ -75,7 +87,7 @@ impl BiliClient {
             .split('.').next().unwrap_or("");
 
         let key = wbi::get_mixin_key(img_key, sub_key);
-        *self.mixin_key.lock() = Some(key.clone());
+        *cache = Some((key.clone(), Instant::now() + MIXIN_KEY_TTL));
         Ok(key)
     }
 

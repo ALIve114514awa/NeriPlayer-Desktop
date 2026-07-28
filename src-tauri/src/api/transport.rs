@@ -47,7 +47,7 @@ impl FallbackHttp {
         &self.primary
     }
 
-    /// 发送请求；传输层失败时用相反代理设置重试一次
+    /// 发送幂等请求；传输层失败时用相反代理设置重试一次
     ///
     /// `build` 会被调用最多两次，因此必须是可重复执行的纯构造，
     /// 不要在里面做带副作用的操作。
@@ -55,11 +55,32 @@ impl FallbackHttp {
         &self,
         build: impl Fn(&Client) -> RequestBuilder,
     ) -> Result<Response, reqwest::Error> {
+        self.send_with_predicate(build, is_transport_failure).await
+    }
+
+    /// 发送非幂等写请求；只在连接建立阶段失败时换代理重试一次
+    ///
+    /// 读超时发生在请求体已送达服务端之后，此时重发会造成重复提交
+    /// （建歌单、加歌、点赞等），因此写请求不做超时/解码重试，只认
+    /// `is_connect()`——此时 TCP/TLS/代理握手尚未完成，服务端不可能已处理。
+    pub async fn send_once(
+        &self,
+        build: impl Fn(&Client) -> RequestBuilder,
+    ) -> Result<Response, reqwest::Error> {
+        self.send_with_predicate(build, |error| error.is_connect())
+            .await
+    }
+
+    async fn send_with_predicate(
+        &self,
+        build: impl Fn(&Client) -> RequestBuilder,
+        retryable: impl Fn(&reqwest::Error) -> bool,
+    ) -> Result<Response, reqwest::Error> {
         let error = match build(&self.primary).send().await {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        let Some(fallback) = self.fallback.as_ref().filter(|_| is_transport_failure(&error)) else {
+        let Some(fallback) = self.fallback.as_ref().filter(|_| retryable(&error)) else {
             return Err(error);
         };
         log::warn!(
