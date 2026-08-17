@@ -8,13 +8,24 @@ public static partial class SongIdentity
     public static string StableKey(this SongItem song)
     {
         if (song.IsLocalSong())
-            return $"local|{NormalizePath(song.LocalFilePath ?? song.MediaUri ?? "")}";
+        {
+            var path = song.LocalFilePath ?? song.MediaUri;
+            if (!string.IsNullOrEmpty(path))
+                return $"local|{NormalizePath(path)}";
+            // 本地歌曲无路径：回退到包含 Id 的碰撞安全键，避免所有无路径歌曲生成相同的 "local|"
+            return $"id|{song.Id}|local|{song.Name}|{song.Artist}";
+        }
 
         return song.ChannelId switch
         {
             "netease" => $"netease|{song.AudioId ?? song.Id.ToString()}",
-            "bilibili" => $"bilibili|{song.AudioId}|{song.SubAudioId}",
-            "youtube_music" => $"ytm|{ExtractYouTubeVideoId(song.MediaUri)}",
+            "bilibili" => !string.IsNullOrEmpty(song.AudioId) || !string.IsNullOrEmpty(song.SubAudioId)
+                ? $"bilibili|{song.AudioId}|{song.SubAudioId}"
+                : $"id|{song.Id}|bilibili|{song.Name}|{song.Artist}",   // 双 ID 均缺失 → 碰撞安全回退
+            "youtube_music" when !string.IsNullOrEmpty(ExtractYouTubeVideoId(song.MediaUri)) =>
+                $"ytm|{ExtractYouTubeVideoId(song.MediaUri)}",
+            "youtube_music" =>
+                $"id|{song.Id}|ytm|{song.Name}|{song.Artist}",           // 视频 ID 提取失败 → 碰撞安全回退
             _ => $"id|{song.Id}|{song.Album}|{song.MediaUri}"
         };
     }

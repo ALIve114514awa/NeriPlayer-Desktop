@@ -4,6 +4,9 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="NeriPlayer.App.MainWindow"
-        Title="NeriPlayer.App">
-    Welcome to Avalonia!
+        Title="NeriPlayer">
+    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+        <TextBlock Text="NeriPlayer" FontSize="28" FontWeight="Bold" HorizontalAlignment="Center" />
+        <TextBlock Text="Windows 桌面端 · .NET 8 + Avalonia" Opacity="0.7" HorizontalAlignment="Center" />
+    </StackPanel>
 </Window>

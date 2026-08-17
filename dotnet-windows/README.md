@@ -19,7 +19,7 @@
 |------|------|
 | 运行时 | .NET 8 LTS |
 | UI | Avalonia UI 11.x |
-| 播放引擎 | LibVLCSharp 8.x（VLC 3.0.x） |
+| 播放引擎 | LibVLCSharp 3.8.0（VLC 3.0.x） |
 | 数据库 | EF Core 8 + SQLite |
 | 音效 | NAudio (WASAPI) / Biquad 滤波器 |
 | 系统集成 | SMTC / 托盘 / Toast |
