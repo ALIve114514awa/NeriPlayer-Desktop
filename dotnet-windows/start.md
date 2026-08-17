@@ -86,6 +86,7 @@ git push origin feat/dotnet-windows-impl
 | 日期 | 对应章节 | 本地提交 | 独立远端 | fork 分支 | 上游 PR |
 |------|----------|----------|----------|-----------|---------|
 | 2026-08-17 | 三、核心数据模型（初版） | `097e8b7` | master 已推送 | `feat/dotnet-windows-impl` @ `2e8d15e` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
+| 2026-08-17 | 三、核心数据模型（CodeRabbit 审核修复） | `22dfae6` | master @ `22dfae6` | `feat/dotnet-windows-impl` @ `c39ced8` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open，已修复） |
 
 ---
 
