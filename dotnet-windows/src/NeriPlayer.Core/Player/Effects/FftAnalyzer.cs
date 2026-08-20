@@ -4,11 +4,20 @@ namespace NeriPlayer.Core.Player.Effects;
 public sealed class FftAnalyzer
 {
     private readonly int _size;
+    private readonly float _sampleRate;
     private readonly float[] _window;
 
-    public FftAnalyzer(int size = 1024)
+    public FftAnalyzer(int size = 1024, float sampleRate = 44_100f)
     {
+        // 参数校验（CodeRabbit review）：size 须为大于 1 的 2 的幂；sampleRate 须为正有限值
+        if (size <= 1 || (size & (size - 1)) != 0)
+            throw new ArgumentOutOfRangeException(nameof(size),
+                "FFT size must be a power of two greater than 1.");
+        if (!float.IsFinite(sampleRate) || sampleRate <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sampleRate));
+
         _size = size;
+        _sampleRate = sampleRate;
         _window = Enumerable.Range(0, size)
             .Select(i => 0.5f * (1 - MathF.Cos(2 * MathF.PI * i / (size - 1))))  // Hann
             .ToArray();
@@ -29,9 +38,10 @@ public sealed class FftAnalyzer
 
         const int bands = 64;
         var result = new float[bands];
-        var nyquist = 20_000f;
+        var nyquist = _sampleRate / 2;
+        var maxFrequency = MathF.Min(20_000f, nyquist);   // 人耳范围上限
         var logMin = MathF.Log10(20);
-        var logMax = MathF.Log10(nyquist);
+        var logMax = MathF.Log10(maxFrequency);
 
         for (var b = 0; b < bands; b++)
         {

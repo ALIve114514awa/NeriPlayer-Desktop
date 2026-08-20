@@ -50,4 +50,30 @@ public class EqualizerEffectTests
         var output = eq.Process(1.0f);
         Assert.True(float.IsFinite(output));   // clamp 后数值稳定
     }
+
+    // ── 参数校验（CodeRabbit review） ────────────────────────────────
+
+    [Theory]
+    [InlineData(9)]    // 过少
+    [InlineData(11)]   // 过多
+    public void ApplyGains_WrongLength_Throws(int count)
+    {
+        var eq = new EqualizerEffect(44100);
+        var gain = new double[count];
+        Assert.Throws<ArgumentException>(() => eq.ApplyGains(gain));
+    }
+
+    [Fact]
+    public void Biquad_InvalidParams_Throw()
+    {
+        var f = new BiquadFilter();
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            f.Configure(BiquadFilter.FilterType.Peaking, 1000, 0, 0));        // sampleRate=0
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            f.Configure(BiquadFilter.FilterType.Peaking, 0, 0, 44100));       // freqHz=0
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            f.Configure(BiquadFilter.FilterType.Peaking, 30_000, 0, 44100));  // freq 超 Nyquist
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            f.Configure(BiquadFilter.FilterType.Peaking, 1000, 0, 44100, 0)); // q=0
+    }
 }

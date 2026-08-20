@@ -32,6 +32,12 @@ public sealed class EqualizerEffect
 
     public void ApplyGains(IReadOnlyList<double> gainsDb)
     {
+        // 参数校验（CodeRabbit review）：每个频段必须有恰好一个增益值
+        if (gainsDb.Count != _filters.Length)
+            throw new ArgumentException(
+                $"Expected {_filters.Length} gain values for {_filters.Length} bands, but got {gainsDb.Count}.",
+                nameof(gainsDb));
+
         for (var i = 0; i < _filters.Length; i++)
         {
             var type = i == 0 ? BiquadFilter.FilterType.LowShelf

@@ -15,6 +15,16 @@ public sealed class BiquadFilter
     public void Configure(FilterType type, double freqHz, double gainDb,
         double sampleRate, double q = 0.707)
     {
+        // 参数校验（CodeRabbit review）：除零/非有限值/非法频率会产生无效系数
+        if (!double.IsFinite(sampleRate) || sampleRate <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sampleRate));
+        if (!double.IsFinite(freqHz) || freqHz <= 0 || freqHz >= sampleRate / 2)
+            throw new ArgumentOutOfRangeException(nameof(freqHz));
+        if (!double.IsFinite(q) || q <= 0)
+            throw new ArgumentOutOfRangeException(nameof(q));
+        if (!double.IsFinite(gainDb))
+            throw new ArgumentOutOfRangeException(nameof(gainDb));
+
         var a = Math.Pow(10, gainDb / 40.0);   // A = 10^(dB/40)
         var w0 = 2 * Math.PI * freqHz / sampleRate;
         var cos = Math.Cos(w0);
