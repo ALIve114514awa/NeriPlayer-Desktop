@@ -11,8 +11,9 @@ public static class AppStartup
         // 数据层（第四章实现后取消注释）
         // services.AddDbContext<Data.Database.NeriDbContext>();
 
-        // 核心层（第五/七章实现后取消注释）
-        // services.AddSingleton<Core.Player.PlayerManager>();
+        // 核心层
+        services.AddSingleton<Core.Player.PlayerManager>();
+
         // services.AddSingleton<Core.Api.Common.HttpClientFactory>();
         // services.AddSingleton<Core.Api.Netease.NeteaseClient>();
         // services.AddSingleton<Core.Api.Bili.BiliClient>();
