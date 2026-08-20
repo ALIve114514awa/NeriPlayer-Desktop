@@ -81,9 +81,21 @@ public sealed class VlcPlaybackEngine : IPlaybackEngine
         _player.SetEqualizer(eq);
     }
 
-    public void ApplyStereoBalance(float balance) { /* 第 6 章接 NAudio WasapiOut */ }
-    public void ApplyVolumeNormalization(float gainDb) { /* 第 6 章实现 */ }
-    public void ApplyPitch(float semitones) { /* 第 6 章 SoundTouch 实现 */ }
+    public void ApplyStereoBalance(float balance)
+    {
+        // StereoBalanceEffect 已实现于 Core/Player/Effects（第六章）；
+        // 接入 WasapiOut 软件渲染路径待后续章节
+    }
+
+    public void ApplyVolumeNormalization(float gainDb)
+    {
+        // EBU R128 音量归一化见 Process.md 7.1，尚未接入渲染管线
+    }
+
+    public void ApplyPitch(float semitones)
+    {
+        // 变速变调（SpeedEffect/PitchEffect）见 Process.md 7.1，SoundTouch 实现待后续章节
+    }
 
     public void Dispose()
     {
