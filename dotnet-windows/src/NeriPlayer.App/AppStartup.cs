@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using NeriPlayer.Core.Api.Common;
 
 namespace NeriPlayer.App;
 
@@ -14,10 +15,15 @@ public static class AppStartup
         // 核心层
         services.AddSingleton<Core.Player.PlayerManager>();
 
-        // services.AddSingleton<Core.Api.Common.HttpClientFactory>();
-        // services.AddSingleton<Core.Api.Netease.NeteaseClient>();
-        // services.AddSingleton<Core.Api.Bili.BiliClient>();
-        // services.AddSingleton<Core.Api.YouTube.YouTubeMusicClient>();
+        // API 客户端（第七章）
+        services.AddSingleton<HttpClientFactory>();
+        services.AddSingleton<Core.Api.Netease.NeteaseClient>();
+        services.AddSingleton<Core.Api.Bili.BiliClient>();
+        services.AddSingleton<Core.Api.YouTube.YouTubePlayerScriptStore>();
+        services.AddSingleton<Core.Api.YouTube.YouTubeMusicClient>(sp =>
+            new Core.Api.YouTube.YouTubeMusicClient(
+                sp.GetRequiredService<HttpClientFactory>(),
+                sp.GetRequiredService<Core.Api.YouTube.YouTubePlayerScriptStore>()));
 
         // 后台（第九章实现后取消注释）
         // services.AddHostedService<Background.Services.SyncScheduledService>();
