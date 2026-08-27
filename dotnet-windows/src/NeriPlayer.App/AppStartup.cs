@@ -9,11 +9,19 @@ public static class AppStartup
     {
         var services = new ServiceCollection();
 
-        // 数据层（第四章实现后取消注释）
-        // services.AddDbContext<Data.Database.NeriDbContext>();
+        // 数据层
+        services.AddDbContext<Data.Database.NeriDbContext>();
 
         // 核心层
         services.AddSingleton<Core.Player.PlayerManager>();
+
+        // 下载管理（第八章）
+        services.AddSingleton<Core.Download.DownloadQueue>(sp =>
+        {
+            var factory = sp.GetRequiredService<HttpClientFactory>();
+            return new Core.Download.DownloadQueue(factory.Http);
+        });
+        services.AddScoped<Data.Repositories.DownloadRepository>();
 
         // API 客户端（第七章）
         services.AddSingleton<HttpClientFactory>();

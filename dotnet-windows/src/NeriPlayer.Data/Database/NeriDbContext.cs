@@ -18,6 +18,12 @@ public sealed class NeriDbContext(DbContextOptions<NeriDbContext> options) : DbC
     public DbSet<PlaybackStatsEntity> PlaybackStats => Set<PlaybackStatsEntity>();
     public DbSet<StatBucketEntity> StatBuckets => Set<StatBucketEntity>();
 
+    // 第八章：下载索引（对标 Analysis.md 24.2）
+    public DbSet<DownloadEntity> Downloads => Set<DownloadEntity>();
+    public DbSet<DownloadSnapshotEntity> DownloadSnapshots => Set<DownloadSnapshotEntity>();
+    public DbSet<DownloadRecoveryEntity> DownloadRecoveries => Set<DownloadRecoveryEntity>();
+    public DbSet<DownloadQueueEntity> DownloadQueues => Set<DownloadQueueEntity>();
+
     protected override void OnModelCreating(ModelBuilder b)
     {
         b.Entity<SongEntity>(e =>
@@ -57,6 +63,34 @@ public sealed class NeriDbContext(DbContextOptions<NeriDbContext> options) : DbC
         {
             e.ToTable("stat_buckets");
             e.HasKey(x => new { x.SongId, x.DayKey });
+        });
+
+        // 第八章：下载索引（对标 Analysis.md 24.2）
+        b.Entity<DownloadEntity>(e =>
+        {
+            e.ToTable("downloads");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => x.StableKey).IsUnique();
+        });
+
+        b.Entity<DownloadSnapshotEntity>(e =>
+        {
+            e.ToTable("download_snapshots");
+            e.HasKey(x => new { x.RootKey, x.Bucket, x.EntryKey });
+        });
+
+        b.Entity<DownloadRecoveryEntity>(e =>
+        {
+            e.ToTable("download_recovery");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => x.DownloadId);
+        });
+
+        b.Entity<DownloadQueueEntity>(e =>
+        {
+            e.ToTable("download_queue");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => x.StableKey);
         });
     }
 }
