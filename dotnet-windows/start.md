@@ -96,6 +96,7 @@ git push origin feat/dotnet-windows-impl
 | 2026-08-27 | 八、下载管理（记录提交日志） | `d6c603e` | master @ `d6c603e` | `feat/dotnet-windows-impl` @ `959626f` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
 | 2026-08-29 | 九、数据同步 | `64c29bd` | master @ `64c29bd` | `feat/dotnet-windows-impl` @ `19e1698` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open，修复 dotnet-windows 为普通文件） |
 | 2026-08-29 | 阶段A 在线播放URL保鲜 + 清理 | `8e911e5` | master @ `8e911e5` | `feat/dotnet-windows-impl` @ `16560fd` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
+| 2026-08-29 | 十、UI主框架 | `5303f99` | master @ `5303f99` | `feat/dotnet-windows-impl` @ `a35e0d2` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
 
 
 ---
