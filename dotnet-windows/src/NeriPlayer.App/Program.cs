@@ -1,8 +1,10 @@
-﻿using Avalonia;
+﻿using System.Runtime.Versioning;
+using Avalonia;
 using System;
 
 namespace NeriPlayer.App;
 
+[SupportedOSPlatform("windows")]
 class Program
 {
     // Initialization code. Don't use any Avalonia, third-party APIs or any

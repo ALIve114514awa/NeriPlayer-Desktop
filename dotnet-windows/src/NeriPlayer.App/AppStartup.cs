@@ -55,7 +55,7 @@ public static class AppStartup
         services.AddSingleton<Data.Auth.CredentialStore>();
         services.AddSingleton<Data.Sync.GitHubSyncProvider>(sp =>
             new Data.Sync.GitHubSyncProvider(
-                token: "your-github-token",     // 实际运行时从 CredentialStore / 配置读取
+                token: "your-github-token",
                 owner: "your-github-owner",
                 repo: "neriplayer-sync"));
         services.AddSingleton<Data.Sync.WebDavSyncProvider>(sp =>
@@ -68,6 +68,9 @@ public static class AppStartup
                 sp.GetRequiredService<Data.Sync.GitHubSyncProvider>(),
                 sp.GetRequiredService<Data.Repositories.SongRepository>(),
                 sp.GetRequiredService<Data.Repositories.SyncRepository>()));
+
+        // UI 层（第十章）
+        services.AddSingleton<UI.ViewModels.MainWindowViewModel>();
 
         // 后台（第十章 UI 完成后取消注释，供定时同步）
         // services.AddHostedService<Background.Services.SyncScheduledService>();

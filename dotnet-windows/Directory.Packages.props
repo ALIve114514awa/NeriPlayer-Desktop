@@ -31,6 +31,7 @@
     <PackageVersion Include="Quartz" Version="3.8.1" />
     <PackageVersion Include="WebDav.Client" Version="2.9.0" />
     <PackageVersion Include="Octokit" Version="9.0.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.0" />
     <PackageVersion Include="coverlet.collector" Version="6.0.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageVersion Include="xunit" Version="2.5.3" />
