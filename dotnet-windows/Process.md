@@ -540,6 +540,9 @@ public sealed record SongItem
     public string? LocalFilePath { get; init; }
 
     // 同步
+    // PLANNED: SyncMembershipTokens 对应 Analysis.md 的 observed-remove 语义
+    // （syncMembershipTokens / removedMembershipTokens）；当前 .NET SongItem 未定义此字段，
+    // 待数据同步（第九章）完善后补充实现、序列化持久化及往返测试。
     public List<SyncToken>? SyncMembershipTokens { get; init; }
     public long AddedAt { get; init; }
 }
