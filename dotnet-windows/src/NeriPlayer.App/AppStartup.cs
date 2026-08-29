@@ -1,8 +1,10 @@
+using System.Runtime.Versioning;
 using Microsoft.Extensions.DependencyInjection;
 using NeriPlayer.Core.Api.Common;
 
 namespace NeriPlayer.App;
 
+[SupportedOSPlatform("windows")]
 public static class AppStartup
 {
     public static ServiceProvider BuildServices()
@@ -12,8 +14,22 @@ public static class AppStartup
         // 数据层
         services.AddDbContext<Data.Database.NeriDbContext>();
 
-        // 核心层
-        services.AddSingleton<Core.Player.PlayerManager>();
+        // 核心层：播放器（在线歌曲 URL 保鲜，注入三平台解析委托，A1）
+        services.AddSingleton<Core.Player.PlayerManager>(sp =>
+        {
+            var netease = sp.GetRequiredService<Core.Api.Netease.NeteaseClient>();
+            var bili = sp.GetRequiredService<Core.Api.Bili.BiliClient>();
+            var ytm = sp.GetRequiredService<Core.Api.YouTube.YouTubeMusicClient>();
+            return new Core.Player.PlayerManager(
+                new Core.Player.Engine.VlcPlaybackEngine(),
+                async song => song.ChannelId switch
+                {
+                    "netease" => (await netease.ResolveSongUrlAsync(song, "standard")) is { Success: true } nr ? nr.Url : null,
+                    "bili" => (await bili.ResolveSongUrlAsync(song)) is { Success: true } br ? br.Url : null,
+                    "youtube_music" => (await ytm.ResolveSongUrlAsync(song)) is { Success: true } yr ? yr.Url : null,
+                    _ => null,
+                });
+        });
 
         // 下载管理（第八章）
         services.AddSingleton<Core.Download.DownloadQueue>(sp =>

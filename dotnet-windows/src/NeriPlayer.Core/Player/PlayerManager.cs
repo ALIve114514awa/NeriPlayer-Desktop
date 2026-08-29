@@ -28,6 +28,7 @@ public sealed class PlayerManager : IDisposable
 
     // ── 依赖 ──────────────────────────────────────────────────────────
     private readonly IPlaybackEngine _engine;
+    private readonly Func<SongItem, Task<string?>>? _urlRefresher;
     private readonly PlaybackFailurePolicy _failurePolicy = new();
     private readonly TrackEndDedupPolicy _endDedupPolicy = new();
     private readonly IDisposable _eventSub;
@@ -54,9 +55,10 @@ public sealed class PlayerManager : IDisposable
     public SongItem? NowPlaying { get; private set; }
 
     // ── 构造 ─────────────────────────────────────────────────────────
-    public PlayerManager(IPlaybackEngine engine)
+    public PlayerManager(IPlaybackEngine engine, Func<SongItem, Task<string?>>? urlRefresher = null)
     {
         _engine = engine;
+        _urlRefresher = urlRefresher;
         // 订阅引擎事件：Ended → 去重后自动下一首；Error → 走失败策略
         _eventSub = _engine.Events.Subscribe(OnEngineEvent);
         // 桥接引擎进度 → 对外 Position 流
@@ -82,6 +84,15 @@ public sealed class PlayerManager : IDisposable
     private async Task PlayAtIndexAsync()
     {
         var song = _queue[_index];
+
+        // 在线歌曲 URL 保鲜（A1）：流 URL 过期时重新解析并回写队列
+        var candidate = await MaybeRefreshStreamUrlAsync(song);
+        if (!ReferenceEquals(candidate, song))
+        {
+            _queue[_index] = candidate;
+            song = candidate;
+        }
+
         var url = ResolveMediaUri(song);
         if (string.IsNullOrEmpty(url))
         {
@@ -149,7 +160,42 @@ public sealed class PlayerManager : IDisposable
     }
 
     /// <summary>
-    /// URL 保鲜：本地歌曲优先 MediaUri；远程歌曲用 StreamUrl，超过 10min 标记可刷新。
+    /// 在线歌曲 URL 保鲜（A1，对标 start.md 5.4 MediaUrlRefreshPolicy）：
+    /// 流 URL 超过保鲜期时调用注入的 UrlRefresher 重新解析，成功则返回换新 URL 的副本；
+    /// 未过期、无 refresher、本地歌曲或刷新失败则原样返回。冷却由 MediaUrlStale 覆盖，避免频繁重取。
+    /// </summary>
+    private async Task<SongItem> MaybeRefreshStreamUrlAsync(SongItem song)
+    {
+        if (song.IsLocalSong() || _urlRefresher is null || string.IsNullOrEmpty(song.StreamUrl))
+            return song;
+
+        var sinceLast = DateTimeOffset.UtcNow - _lastUrlRefreshAt;
+        // 首次（MinValue）或超过保鲜期 → 需要刷新；否则命中保鲜期，保持现 URL（UrlRefreshCooldown 被 MediaUrlStale 覆盖）
+        var shouldRefresh = _lastUrlRefreshAt == DateTimeOffset.MinValue || sinceLast >= MediaUrlStale;
+        if (!shouldRefresh) return song;
+
+        _lastUrlRefreshAt = DateTimeOffset.UtcNow;   // 先记录，避免并发/重复刷新
+        AppLogger.Instance.Debug("Stream URL stale ({Age}ms), refreshing for {Name}",
+            sinceLast.TotalMilliseconds, song.DisplayName);
+        try
+        {
+            var newUrl = await _urlRefresher(song);
+            if (!string.IsNullOrEmpty(newUrl) && newUrl != song.StreamUrl)
+            {
+                AppLogger.Instance.Information("Stream URL refreshed for {Name} - {Artist}",
+                    song.DisplayName, song.DisplayArtist);
+                return song with { StreamUrl = newUrl };
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Instance.Warning(ex, "Stream URL refresh failed for {Name}, using cached URL", song.DisplayName);
+        }
+        return song;
+    }
+
+    /// <summary>
+    /// 解析用于播放的媒体 URI：本地歌曲优先 MediaUri，回退到 LocalFilePath；远程歌曲用 StreamUrl。
     /// </summary>
     private string? ResolveMediaUri(SongItem song)
     {
@@ -161,16 +207,7 @@ public sealed class PlayerManager : IDisposable
                 return $"file:///{song.LocalFilePath.Replace('\\', '/')}";
             return null;
         }
-        if (!string.IsNullOrEmpty(song.StreamUrl))
-        {
-            var age = DateTimeOffset.UtcNow - _lastUrlRefreshAt;
-            if (age >= MediaUrlStale)
-            {
-                _lastUrlRefreshAt = DateTimeOffset.UtcNow;
-                AppLogger.Instance.Debug("Stream URL stale ({Age}ms), refresh needed", age.TotalMilliseconds);
-            }
-            return song.StreamUrl;
-        }
+        if (!string.IsNullOrEmpty(song.StreamUrl)) return song.StreamUrl;
         return song.MediaUri;
     }
 

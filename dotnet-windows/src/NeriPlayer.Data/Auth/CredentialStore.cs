@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -7,6 +8,7 @@ namespace NeriPlayer.Data.Auth;
 /// 凭据加密存储（对标 Process.md 13.1 / start.md 13.1 DPAPI）。
 /// 用 DPAPI（CurrentUser）加密 Cookie / 刷新 Token / 同步凭据，写入安全目录。
 /// </summary>
+[SupportedOSPlatform("windows")]
 public sealed class CredentialStore
 {
     private readonly string _dir;

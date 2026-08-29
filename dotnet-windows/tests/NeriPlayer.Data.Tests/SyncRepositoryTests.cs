@@ -37,7 +37,7 @@ public class SyncRepositoryTests
         // 再次 upsert → 更新 etag
         await repo.UpsertMetadataAsync("playlists", "def456", "rev2");
         meta = await repo.GetMetadataAsync("playlists");
-        Assert.Equal("def456", meta.Etag);
+        Assert.Equal("def456", meta!.Etag);
     }
 
     [Fact]

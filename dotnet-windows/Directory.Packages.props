@@ -29,7 +29,6 @@
     <PackageVersion Include="SkiaSharp" Version="2.88.8" />
     <PackageVersion Include="TagLibSharp" Version="2.3.0" />
     <PackageVersion Include="Quartz" Version="3.8.1" />
-    <PackageVersion Include="Microsoft.International.Converters.PinYinConverter" Version="1.0.0" />
     <PackageVersion Include="WebDav.Client" Version="2.9.0" />
     <PackageVersion Include="Octokit" Version="9.0.0" />
     <PackageVersion Include="coverlet.collector" Version="6.0.0" />

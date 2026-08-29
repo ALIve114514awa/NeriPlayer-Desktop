@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Reactive.Linq;
 using NeriPlayer.Core.Player;
 using NeriPlayer.Core.Player.Engine;
@@ -16,6 +17,17 @@ public class PlayerManagerTests
         ChannelId = "local", LocalFilePath = path,
         MediaUri = $"file:///{path.Replace('\\', '/')}"
     };
+
+    private static SongItem MakeRemoteSong(long id, string streamUrl = "https://old.example/song.mp3") => new()
+    {
+        Id = id, Name = $"Remote{id}", Artist = "Test", Album = "Album",
+        ChannelId = "netease", AudioId = id.ToString(), StreamUrl = streamUrl,
+    };
+
+    /// <summary>通过反射将保鲜时间戳设为给定值，触发/抑制 URL 保鲜判定。</summary>
+    private static void SetLastRefresh(PlayerManager pm, DateTimeOffset value) =>
+        typeof(PlayerManager).GetField("_lastUrlRefreshAt", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(pm, value);
 
     [Fact]
     public async Task PlayAsync_TransitionsToPlaying()
@@ -204,5 +216,57 @@ public class PlayerManagerTests
         using var pm = new PlayerManager(new MemoryPlaybackEngine());
         pm.SetRepeatMode(RepeatMode.One);
         Assert.Equal(RepeatMode.One, pm.RepeatMode);
+    }
+
+    // ── A1：在线歌曲 URL 保鲜 ─────────────────────────────────────────
+
+    [Fact]
+    public async Task UrlRefresh_WhenStale_ReplacesStreamUrlAndUpdatesQueue()
+    {
+        var engine = new MemoryPlaybackEngine();
+        var calls = 0;
+        var pm = new PlayerManager(engine,
+            song => { calls++; return Task.FromResult<string?>($"https://new.example/{song.Id}.mp3"); });
+
+        SetLastRefresh(pm, DateTimeOffset.UtcNow.AddMinutes(-11));   // 视为已过期
+
+        var queue = new[] { MakeRemoteSong(1), MakeRemoteSong(2) };
+        await pm.PlayAsync(queue, 0);
+        await Task.Delay(30);
+
+        Assert.Equal(1, calls);
+        Assert.Equal("https://new.example/1.mp3", pm.NowPlaying!.StreamUrl);
+    }
+
+    [Fact]
+    public async Task UrlRefresh_WithinFreshWindow_DoesNotRefresh()
+    {
+        var engine = new MemoryPlaybackEngine();
+        var calls = 0;
+        var pm = new PlayerManager(engine,
+            song => { calls++; return Task.FromResult<string?>($"https://new.example/{song.Id}.mp3"); });
+
+        SetLastRefresh(pm, DateTimeOffset.UtcNow);   // 刚刷新过 → 保鲜期内
+
+        await pm.PlayAsync([MakeRemoteSong(1)], 0);
+        await Task.Delay(30);
+
+        Assert.Equal(0, calls);
+        Assert.Equal("https://old.example/song.mp3", pm.NowPlaying!.StreamUrl);
+    }
+
+    [Fact]
+    public async Task UrlRefresh_Fails_FallsBackToCachedUrl()
+    {
+        var engine = new MemoryPlaybackEngine();
+        var pm = new PlayerManager(engine,
+            song => Task.FromException<string?>(new InvalidOperationException("network down")));
+
+        SetLastRefresh(pm, DateTimeOffset.UtcNow.AddMinutes(-11));
+
+        await pm.PlayAsync([MakeRemoteSong(1)], 0);
+        await Task.Delay(30);
+
+        Assert.Equal("https://old.example/song.mp3", pm.NowPlaying!.StreamUrl);
     }
 }
