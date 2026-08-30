@@ -69,11 +69,16 @@ public static class AppStartup
                 sp.GetRequiredService<Data.Repositories.SongRepository>(),
                 sp.GetRequiredService<Data.Repositories.SyncRepository>()));
 
+        // 第十一章：后台与系统集成
+        // SMTC（Singleton：全局一个实例，持 Windows.Media.MediaPlayer 用于系统媒体控制）
+        services.AddSingleton<Background.Services.SmtcIntegration>();
+        // 后台播放服务（托管：窗口关闭后保持播放，接 SMTC 按钮）
+        services.AddHostedService<Background.Services.PlaybackService>();
+        // 定时同步服务（第 9 章已有，启用）
+        services.AddHostedService<Background.Services.SyncScheduledService>();
+
         // UI 层（第十章）
         services.AddSingleton<UI.ViewModels.MainWindowViewModel>();
-
-        // 后台（第十章 UI 完成后取消注释，供定时同步）
-        // services.AddHostedService<Background.Services.SyncScheduledService>();
 
         return services.BuildServiceProvider();
     }
