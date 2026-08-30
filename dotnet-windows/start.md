@@ -101,7 +101,7 @@ git push origin feat/dotnet-windows-impl
 | 2026-08-29 | 阶段A（记录提交日志） | `89cfc12` | master @ `89cfc12` | `feat/dotnet-windows-impl` @ `d1a3817` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
 | 2026-08-29 | 十、UI主框架 | `5303f99` | master @ `5303f99` | `feat/dotnet-windows-impl` @ `a35e0d2` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
 | 2026-08-29 | 十、UI主框架（记录提交日志） | `4abe829` | master @ `4abe829` | `feat/dotnet-windows-impl` @ `bdc759a` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
-| 2026-08-29 | 十一、后台与系统集成（代码完成，待 Windows 10 SDK 启用 SMTC） | *(待本地提交后填写)* | *(待推送后填写)* | *(待同步后填写)* | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
+| 2026-08-30 | 十一、后台与系统集成（代码完成，待 Windows 10 SDK 启用 SMTC） | `04d0081` | master @ `04d0081` | `feat/dotnet-windows-impl` @ `a055e99` | [PR #20](https://github.com/cwuom/NeriPlayer-Desktop/pull/20)（open） |
 
 
 ---
